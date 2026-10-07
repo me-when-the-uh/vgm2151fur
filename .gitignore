@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# A local Furnace drop-in. The tools also accept a furnace/ folder next to
+# the project, which is the layout to prefer: keep checkouts out of the tree.
+third_party/
+
+# Build and run artifacts.
+output/
+build/
+dist/
+*.egg-info/
+.venv/
