@@ -116,6 +116,17 @@ Tekken Tag 05's "05 Jin Stage BGM":
   a note the driver stops before the running address meets `wave_end` never
   loops, so its payload stays the intro. The loop-carrying bodies are the
   notes that hold past the intro.
+- E8xx/E9xx on the sample chips are the engine's "delayed legato": the note
+  is moved by +-y and the voice legs to it, an absolute pitch set in the
+  note's domain that also wipes the row accumulator. The sweep writer used
+  to emit the row's overflow there as if it were the FM platform's relative
+  transpose (which the FM keeps: see test_furnace_roundtrip), so any dive
+  too steep for one row's slide snapped the note down and stayed. It now
+  writes the whole-semitone offset the trajectory wants against the note
+  drift it causes and restarts the slides from the legato value. Ridge
+  Racer 2 "Grip"'s eight opening pads fell ~5.5 st for ~0.2 s each dive;
+  the solo pitch track now follows the source (within a row-length transient
+  at each legato). Affects every module whose pitch sweeps overflow a row.
 - Mid-note geometry rewrites (start/end/loop/bank writes with no strobe): the
   jump and the loop region are planned from the `wave_start`/`wave_loop` a
   rewrite leaves while the voice has not crossed `wave_end`, not from the

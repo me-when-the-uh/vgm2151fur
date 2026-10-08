@@ -774,20 +774,34 @@ def _emit_sweep(
             # sub-semitone remainder.
             full = limit * span
             need = want_end - cur
-            short = 0.0
-            if abs(need) > full:
-                short = need - (full if need > 0 else -full)
-            if k > 0 and abs(short) >= 64:
+            if abs(need) > full and k > 0:
                 cell = grid[ev.ch].get(row0 + k)
                 if cell is None or not (0 <= cell.note < 180):
-                    y = max(-15, min(15, int(round(short / 64.0))))
-                    if y:
-                        if cell is None:
-                            cell = _blank_row()
-                            grid[ev.ch][row0 + k] = cell
-                        _add_fx(cell, 0xE8 if y > 0 else 0xE9, abs(y), fx_cols)
-                        xpose += 64.0 * y
-                        cur += 64.0 * y
+                    if ev.pcm:
+                        shift = int(round(xpose / 64.0))
+                        y = int(round(want_end / 64.0)) - shift
+                        y = max(-15, min(15, y))
+                        if y:
+                            if cell is None:
+                                cell = _blank_row()
+                                grid[ev.ch][row0 + k] = cell
+                            _add_fx(cell, 0xE8 if y > 0 else 0xE9, abs(y), fx_cols)
+                            xpose += 64.0 * y
+                            slide = 0.0
+                            cur = (e5w - ev.e5) / 2.0 + xpose
+                    else:
+                        # The FM platform adds the value to the note and stays
+                        # until the next note (measured: 2 then 3 then -1 reads
+                        # +2, +5, +4), so the overflow is a relative transpose.
+                        short = need - (full if need > 0 else -full)
+                        y = max(-15, min(15, int(round(short / 64.0))))
+                        if y:
+                            if cell is None:
+                                cell = _blank_row()
+                                grid[ev.ch][row0 + k] = cell
+                            _add_fx(cell, 0xE8 if y > 0 else 0xE9, abs(y), fx_cols)
+                            xpose += 64.0 * y
+                            cur += 64.0 * y
             rate = max(-limit, min(limit, (want_end - cur) / span))
         param = int(round(rate * 2)) if ev.pcm else int(round(rate))
         param = max(-255, min(255, param))
