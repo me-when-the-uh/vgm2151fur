@@ -5,6 +5,27 @@ reference renderer and the bundled Furnace build, not estimated.
 
 Cue the song "Take Me Baby" by Mickey B.
 
+## 0.9.36
+
+Loop finding keeps the loop length the VGM header gave the track. The seam
+search used to look forward from the marker for any span that repeated,
+which followed inner repetitions and cut the head off the loop: Metal Hawk
+"03 Game BGM 1" moved the marker at row 357 (5.8 s) onto the copy at row
+583, shrinking the loop to 111.3 s against the rip's catalogued 1:58, and
+Map Mode A followed a riff 1921 rows in, shrinking its 0:38 loop to 0:31.
+A candidate start's copy is now looked for one loop length later, never
+closer, and the earliest run of near-perfect matches wins, so a marker
+that fell inside the phrase opens the loop on the phrase's first command:
+"03 Game BGM 1" opens at row 199 (3.25 s, 1:58 kept), Map Mode A at row
+102 (0:38 kept). Every applied fix on the Metal Hawk pack now keeps the
+rip's catalogued length (Map Mode A 0:38, BGM 1 1:58, BGM 2 1:31, BGM 5
+0:55, Name Entry C 0:35), and the fixes that used to cut a loop now leave
+the marker alone instead ("Game BGM 3" was cut from 2:23 to 2:15). The
+length lock made the search cheaper too: a candidate probes a few rows
+around one point instead of across the whole ending. On 44 tracks sampled
+across the packs, loop finding takes 1.5 s against 17.6 s before, and the
+worst track drops from 4.1 s to 0.3 s.
+
 ## 0.9.35
 
 Convert moves a VGM loop onto the downbeat when the note grid repeats every

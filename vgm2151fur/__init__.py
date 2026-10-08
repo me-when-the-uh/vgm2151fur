@@ -11,7 +11,7 @@ Release notes live in docs/changelog.md. The operating guide is the README.
 
 from __future__ import annotations
 
-__version__ = "0.9.35"
+__version__ = "0.9.36"
 
 from vgm2151fur.convert import convert_vgm, dump_pcm, report_vgm
 

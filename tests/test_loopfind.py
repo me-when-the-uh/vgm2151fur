@@ -124,22 +124,31 @@ class TestFindLoop(unittest.TestCase):
         self.assertEqual(fix.shift_pulses, -1)
         self.assertEqual(fix.start_row, loop_row - fix.step_rows - 1)
 
-    def test_phrase_ahead_of_the_marker_becomes_the_loop(self):
-        # The marker sits in a fill. The repeating phrase starts 12 rows
-        # later, and the end of the track is that phrase coming back.
-        notes = [(row, 0, 40 + row // 3) for row in range(0, 36, 3)]
-        for rep in range(5):
-            base = 48 + rep * 48
-            notes.extend((base, ch, pitch) for ch, pitch in ((0, 60), (1, 64), (2, 67)))
-            notes.extend((base + offset, 3, 72) for offset in range(0, 40, 2))
-            notes.extend((base + offset, 0, pitch) for offset, pitch in (
-                (6, 62), (14, 65), (22, 69), (30, 64), (38, 67),
-            ))
-        fix = find_loop(notes, loop_row=36, end_row=280, forward_rows=40)
+    def test_phrase_ahead_of_the_marker_is_not_a_seam(self):
+        # The head of the loop repeats 96 rows in, an inner repetition. The
+        # loop keeps the length the VGM gave it, so a copy that close is not
+        # the seam the marker is missing; the marker stays where it is.
+        notes = [(row, 0, 40 + row // 3) for row in range(0, 48, 3)]
+        notes += [(48, 0, 60), (48, 1, 64), (48, 2, 67)]
+        notes += [(48 + i * 2, 3, 72) for i in range(24)]
+        notes += [(144, 0, 60), (144, 1, 64), (144, 2, 67)]
+        notes += [(144 + i * 2, 3, 72) for i in range(24)]
+        notes += [(100 + i * 4, 1, 50 + i) for i in range(35)]
+        self.assertIsNone(find_loop(notes, loop_row=96, end_row=239, forward_rows=64))
+
+    def test_phrase_behind_the_marker_becomes_the_loop(self):
+        # The body starts 48 rows in and the marker sits inside it. The head
+        # of the body comes back at the end of the track, so the loop has to
+        # open at the body, 85 rows behind the marker, and keep its length.
+        notes = [(row, 0, 40 + row // 3) for row in range(0, 48, 3)]
+        notes += [(48, 0, 60), (48, 2, 67)]
+        notes += [(48 + j * 4, 1, pitch) for j, pitch in enumerate(range(50, 98))]
+        notes += [(240, 0, 60), (240, 2, 67)]
+        notes += [(240 + j * 4, 1, pitch) for j, pitch in enumerate(range(50, 71))]
+        fix = find_loop(notes, loop_row=132, end_row=320, forward_rows=128)
         self.assertIsNotNone(fix)
         self.assertEqual(fix.start_row, 47)
-        self.assertEqual(fix.end_row, 47 + (240 - 48) - 1)
-        self.assertIsNone(find_loop(notes, loop_row=36, end_row=280))
+        self.assertEqual(fix.end_row, 238)
 
     def test_marker_one_row_after_the_chord_lands_before_the_chord(self):
         notes, loop_row, end_row = _bar(loop_pulse=0)
@@ -286,8 +295,10 @@ class TestFixtureLoops(unittest.TestCase):
         self.assertEqual(fix.end_row - fix.start_row, end_row - loop_row)
 
     def test_game_bgm1_opens_on_the_sample_chord(self):
-        # Order 1D line 136 is the row before this chord returns. The copy
-        # inside the four seconds after the VGM marker is absolute row 584.
+        # The VGM marker sits inside the first loop phrase. The phrase's own
+        # first command is the sample chord at absolute row 199, and its copy
+        # near the end of the track is row 7406. The loop opens one row
+        # before the chord, not on the copy the marker points at.
         if not HAWK.is_file():
             self.skipTest("fur missing")
         notes, loop_row, end_row = _fur_loop(HAWK)
@@ -296,12 +307,15 @@ class TestFixtureLoops(unittest.TestCase):
             forward_rows=_forward_rows(HAWK),
         )
         self.assertIsNotNone(fix)
-        self.assertEqual(fix.start_row, 583)
+        self.assertEqual(fix.start_row, 198)
         self.assertEqual(fix.end_row, 7404)
-        self.assertEqual(fix.end_row - fix.start_row, 7406 - 584 - 1)
+        self.assertEqual(fix.end_row - fix.start_row, 7406 - 199 - 1)
 
-    def test_map_mode_a_opens_on_the_riff(self):
-        # The riff that comes back at the end begins just past four seconds.
+    def test_map_mode_a_opens_on_the_phrase_head(self):
+        # The marker sits inside the phrase. The head of the phrase copies
+        # 2303 rows later and the loop opens there, at row 102, keeping the
+        # rip's 0:38 length. The riff 1921 rows in is an inner repetition:
+        # following it would shorten the loop to 0:31.
         if not MAP.is_file():
             self.skipTest("fur missing")
         notes, loop_row, end_row = _fur_loop(MAP)
@@ -310,8 +324,11 @@ class TestFixtureLoops(unittest.TestCase):
             forward_rows=_forward_rows(MAP),
         )
         self.assertIsNotNone(fix)
-        self.assertEqual(fix.start_row, 486)
+        self.assertEqual(fix.start_row, 102)
         self.assertEqual(fix.end_row, 2406)
+        self.assertLessEqual(
+            abs((fix.end_row - fix.start_row + 1) - (end_row - loop_row + 1)), 4
+        )
 
 
 if __name__ == "__main__":

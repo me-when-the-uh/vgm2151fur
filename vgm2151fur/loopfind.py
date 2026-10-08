@@ -15,11 +15,17 @@ on the VGM marker. A clock with no repeating cell stays too, except when
 the marker sits on the empty row after a chord: the cut moves to the row
 before that chord.
 
-The marker is also often early by a whole phrase, not just a pulse. That
-phrase starts somewhere in the next four seconds (or inside the loop, when
-the loop itself is shorter). The rows after that start are the same rows
-that come back at the end of the track. The order opens one row before
-those commands, and the jump stops one row before the same commands return.
+The marker is also often off by a whole phrase, not just a pulse: it can
+sit inside the phrase, seconds after its first command. The loop keeps the
+length the VGM gave it — a marker late at the start matches the end of the
+log being late too — so the seam search looks for the phrase start whose
+copy sits one loop length later, still inside the log. A copy closer than
+that is an inner repetition, not the seam the marker is missing.
+Candidates run a window on either side of the marker, and the earliest
+long run of near-perfect matches wins, so a marker inside the phrase still
+opens the loop on the phrase's first command without dropping the head.
+The order opens one row before those commands, and the jump stops one row
+before the same commands return.
 """
 
 from __future__ import annotations
@@ -455,11 +461,10 @@ def _phase_loop(
     )
 
 
-# A phrase match has to be this close, and this far above the marker's own
-# slice, before the forward search will move the loop. A short coincidence
-# (a riff that agrees for under a second) does not.
+# A phrase match has to be this close before the seam search will move the
+# loop. A short coincidence (an inner repetition that agrees for under a
+# second) does not.
 _SEAM_SCORE = 0.95
-_SEAM_MARGIN = 0.15
 _SEAM_TOL = 2
 
 
@@ -478,21 +483,32 @@ def _pedals(notes: list[tuple[int, int, int]]) -> set[int]:
     return pedals
 
 
-def _widened(by: dict[int, set[tuple[int, int]]], tol: int) -> dict[int, set[tuple[int, int]]]:
-    if not by:
-        return {}
-    lo, hi = min(by), max(by)
-    out = {}
-    for row in range(lo, hi + 1):
-        acc: set[tuple[int, int]] = set()
-        for delta in range(-tol, tol + 1):
-            acc |= by.get(row + delta, frozenset())
-        if acc:
-            out[row] = acc
-    return out
+def _note_maps(notes: list[tuple[int, int, int]]):
+    """`(row -> {(ch, pc)})`, `(row -> note bits)`, and notes per row.
+
+    A row's bits are one bit per (channel, pitch class); the widened map ORs
+    the rows within `_SEAM_TOL` so a seam match can sit a couple of rows off.
+    """
+    by: dict[int, set[tuple[int, int]]] = defaultdict(set)
+    bits: dict[int, int] = defaultdict(int)
+    weight: dict[int, int] = defaultdict(int)
+    for row, ch, pitch in notes:
+        pc = pitch % 12
+        by[row].add((ch, pc))
+        bits[row] |= 1 << (ch * 12 + pc)
+        weight[row] += 1
+    wide: dict[int, int] = {}
+    if bits:
+        lo, hi = min(bits), max(bits)
+        for row in range(lo - _SEAM_TOL, hi + _SEAM_TOL + 1):
+            acc = 0
+            for delta in range(-_SEAM_TOL, _SEAM_TOL + 1):
+                acc |= bits.get(row + delta, 0)
+            wide[row] = acc
+    return by, bits, wide, weight
 
 
-def _seam_score(by, wide, start: int, other: int, width: int) -> float:
+def _seam_score(bits, wide, start: int, other: int, width: int) -> float:
     """How much of each side's notes show up on the other, a couple of rows off.
 
     Both directions count. A sparse slice that is merely contained in a
@@ -500,31 +516,27 @@ def _seam_score(by, wide, start: int, other: int, width: int) -> float:
     """
     left = right = hit_left = hit_right = 0
     for offset in range(width):
-        here = by.get(start + offset)
-        there = by.get(other + offset)
-        near_here = wide.get(start + offset)
-        near_there = wide.get(other + offset)
+        here = bits.get(start + offset, 0)
+        there = bits.get(other + offset, 0)
         if here:
-            left += len(here)
-            if near_there:
-                hit_left += sum(1 for note in here if note in near_there)
+            left += here.bit_count()
+            hit_left += (here & wide.get(other + offset, 0)).bit_count()
         if there:
-            right += len(there)
-            if near_here:
-                hit_right += sum(1 for note in there if note in near_here)
+            right += there.bit_count()
+            hit_right += (there & wide.get(start + offset, 0)).bit_count()
     if left < 8 or right < 8:
         return 0.0
     return min(hit_left / left, hit_right / right)
 
 
-def _best_return(by, wide, start: int, end_row: int, lo: int, hi: int, width: int, step: int):
+def _best_return(bits, wide, start: int, end_row: int, lo: int, hi: int, width: int, step: int):
     best_score = 0.0
     best_at = None
     for other in range(lo, hi + 1, step):
         span = min(width, end_row - other)
         if span < width // 3:
             continue
-        score = _seam_score(by, wide, start, other, span)
+        score = _seam_score(bits, wide, start, other, span)
         if score > best_score:
             best_score = score
             best_at = other
@@ -545,62 +557,58 @@ def _attack_agrees(by, command: int, ret: int, pedals: set[int]) -> int:
     return sum(1 for ch, pcs in left.items() if pcs & right.get(ch, frozenset()))
 
 
-def _forward_seam(
+def _phrase_seam(
     notes: list[tuple[int, int, int]],
     loop_row: int,
     end_row: int,
     forward_rows: int,
 ) -> LoopFix | None:
-    """Move the loop forward to the phrase the ending of the track repeats.
+    """Move the loop onto the phrase start the ending of the track repeats.
 
-    Candidates sit in the four seconds after the marker. The same span at
-    the end of the track is the only place that repeat is allowed to be.
-    A loop shorter than four seconds is searched only across itself.
+    The VGM loop length is the invariant: the marker can sit inside the
+    phrase, but the loop keeps its length, so a candidate start's copy sits
+    one loop length later. The marker being late at the start matches the
+    end of the log being late too, and a shorter copy (an inner repetition)
+    is not a seam at all. Candidates run a window on either side of the
+    marker; the earliest long run of near-perfect matches wins, and its
+    heaviest command row opens the loop.
     """
     span = end_row - loop_row
     window = min(int(forward_rows), span)
     if window < 16 or span < 16:
         return None
-    by: dict[int, set[tuple[int, int]]] = defaultdict(set)
-    weight: dict[int, int] = defaultdict(int)
-    for row, ch, pitch in notes:
-        by[row].add((ch, pitch % 12))
-        weight[row] += 1
-    wide = _widened(by, _SEAM_TOL)
+    by, bits, wide, weight = _note_maps(notes)
+    if not bits:
+        return None
     compare = max(16, int(forward_rows * 0.375))
     tail = max(12, int(forward_rows * 0.125))
     end_lo = end_row - window
     end_hi = end_row - tail
+    # One loop length later is where a candidate's copy has to sit; the
+    # slack covers the marker's own rounding and per-row alignment.
+    loop_rows = span + 1
+    slack = max(4, loop_rows // 200)
+    first = max(0, loop_row - window)
+    last = loop_row + window
 
     def scan(first: int, last: int) -> dict[int, tuple[float, int]]:
         found = {}
         for start in range(first, last + 1, 2):
-            score, ret = _best_return(
-                by, wide, start, end_row, max(end_lo, start + tail), end_hi, compare, 2,
-            )
+            near = start + loop_rows
+            lo = max(end_lo, start + tail, near - slack)
+            hi = min(end_hi, near + slack)
+            if hi < lo:
+                continue
+            score, ret = _best_return(bits, wide, start, end_row, lo, hi, compare, 2)
             if ret is not None:
                 found[start] = (score, ret)
         return found
 
-    scores = scan(loop_row, loop_row + window)
+    scores = scan(first, last)
     if not scores:
         return None
-    # A barline sitting on the four-second mark still belongs to this search.
-    # Follow a score that is still the best at the edge, for at most a second
-    # and a half, and only keep it when it actually clears the bar below.
-    edge = loop_row + window
-    edge_best = max(
-        (scores[row][0] for row in scores if row >= edge - max(4, window // 10)),
-        default=0.0,
-    )
-    overall = max(item[0] for item in scores.values())
-    if edge_best >= overall - 0.02:
-        extra = min(int(forward_rows * 0.375), span - window)
-        if extra > 4:
-            scores.update(scan(edge + 1, edge + extra))
     peak = max(item[0] for item in scores.values())
-    marker = scores.get(loop_row, scores.get(loop_row + 1, (0.0, end_row)))[0]
-    if peak < _SEAM_SCORE or peak - marker < _SEAM_MARGIN:
+    if peak < _SEAM_SCORE:
         return None
     high = sorted(row for row, (score, _ret) in scores.items() if score >= max(_SEAM_SCORE, peak - 0.03))
     if not high:
@@ -612,6 +620,8 @@ def _forward_seam(
             runs.append([row])
         else:
             runs[-1].append(row)
+    # The earliest run that reaches the peak band is the phrase start; a
+    # later copy is the same phrase again and drops everything before it.
     band = next((run for run in runs if run[-1] - run[0] >= need), None)
     if band is None:
         return None
@@ -657,8 +667,6 @@ def _forward_seam(
             ret = agreed_at
     if command is None or ret is None or ret <= command:
         return None
-    if command <= loop_row:
-        return None
     start = command - 1 if step > 1 and command > 0 else command
     if start < 0:
         start = 0
@@ -687,14 +695,14 @@ def find_loop(
 ) -> LoopFix | None:
     """Return a new loop, or None to keep the VGM marker.
 
-    `forward_rows` is how far past the marker a phrase start may sit. The
-    converter passes four seconds of rows, and a shorter loop passes its own
-    length. Omitted, only the within-bar downbeat is considered.
+    `forward_rows` is the window around the marker a phrase start may sit
+    in. The converter passes four seconds of rows, and a shorter loop passes
+    its own length. Omitted, only the within-bar downbeat is considered.
     """
     fix = _phase_loop(notes, loop_row=loop_row, end_row=end_row)
     if fix is not None or not forward_rows or forward_rows < 8:
         return fix
-    return _forward_seam(notes, loop_row, end_row, int(forward_rows))
+    return _phrase_seam(notes, loop_row, end_row, int(forward_rows))
 
 
 def describe_fix(fix: LoopFix, loop_row: int) -> str:
@@ -744,8 +752,8 @@ def apply_loop(song) -> str | None:
     end_row = _last_content_row(song)
     if not notes or end_row < loop_row:
         return "loop kept"
-    # Four seconds after the marker, or the whole loop when it is shorter.
-    # The seam search applies that cap itself.
+    # Four seconds either side of the marker, or the whole loop when it is
+    # shorter. The seam search applies that cap itself.
     forward = 0
     if song.hz > 0 and song.speed > 0:
         forward = int(round(4.0 * song.hz / float(song.speed)))

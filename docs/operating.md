@@ -31,15 +31,16 @@ seconds; docs/mix-levels.md has the method). `--no-normalize` skips the
 render and writes the module at unity.
 
 The same pass looks at the note grid and, when the loop is a whole number of
-bars, moves it onto the downbeat. It also looks at the four seconds after
-the marker — or the whole loop, when that is shorter — for the phrase the
-end of the track repeats, and moves the loop there when that phrase is
-later than the marker. The order starts one row before that downbeat, so a
-sample keyed a row early is inside the loop and the downbeat commands are
-not the row `Bxx` jumps from. A grid that does not repeat, or a loop that
-is not a whole bar and has no phrase in that window, keeps the VGM offset.
+bars, moves it onto the downbeat. It also looks a window on either side of
+the marker — four seconds, or the whole loop when that is shorter — for the
+phrase start whose copy sits one loop length later, and moves the loop
+there: a marker that fell inside the phrase lands on the phrase's own head,
+behind it, and the loop keeps the length the VGM gave it, the end of the
+log being the other end of that length. A grid that does not repeat, or a
+loop with no phrase start in that window, keeps the VGM offset.
 `--no-loop-find` keeps it on every track. The convert line says `loop kept`
-or how far the marker moved (`loop -1/8`, `loop 226 rows late`).
+or how far the marker moved (`loop -1/8`, `loop 226 rows late`,
+`loop 158 rows early`).
 
 Each track runs in its own worker process. The default count is one less
 than the physical core count, leaving one core free. `--workers 1` runs the
