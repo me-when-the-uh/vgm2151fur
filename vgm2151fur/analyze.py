@@ -244,6 +244,13 @@ class NoteEvent:
     # None to leave it). Emitted as volume-column (and pan) updates on rows
     # without a note, so software fades survive.
     vol_pts: tuple[tuple[int, int, int | None], ...] = ()
+    # Mid-note *carrier* TL steps (sample, absolute YM2151 carrier TL).  Some
+    # drivers implement a note's volume envelope by rewriting the carrier TL
+    # while the voice is held (Namco System 86 fades a held note out with
+    # 0x60+ writes that never retrigger); the key-on snapshot cannot carry
+    # them, so the writer maps them onto the Furnace volume column relative to
+    # the instrument's own carrier TL.
+    tl_pts: tuple[tuple[int, int], ...] = ()
     # PCM pan 0x00 is a real "both off". OKI/MSM6258 are mono and must not
     # write 08xx (that effect is the K007232/YM2151 split pan).
     no_pan: bool = False
@@ -387,6 +394,14 @@ class YM2151State:
         if rl == 1:
             return 0xF0  # L
         return 0x00
+
+    def carrier_tl(self, ch: int) -> int:
+        """Loudest carrier's TL (min) for the channel's current algorithm."""
+        tls = [
+            self.ops[ch][i].tl & 0x7F
+            for i in CARRIERS.get(self.rl_fb_con[ch] & 7, (3,))
+        ]
+        return min(tls) if tls else 0x7F
 
 
 # Furnace chip-wide OPM effects (see doc/7-systems/ym2151.md).
@@ -538,7 +553,14 @@ def analyze(vgm: VgmFile, *, speed: int | None = None, pcm: bool = True) -> Song
     warnings: list[str] = list(vgm.warnings)
     pending_off = [None] * 8  # type: list[int | None]
     chip_fx: list[tuple[int, int, int]] = []
-    last_lfrq = last_wave = last_amd = last_pmd = -1
+    last_lfrq = last_wave = -1
+    # The OPM resets its LFO depth register (0x19) to 0, but Furnace's arcade
+    # core defaults PMD and AMD to 0x7f (arcade.cpp reset).  A driver that
+    # never writes 0x19 - Namco System 86 does not - but still loads PMS/AMS
+    # into its instruments would otherwise play the maximum vibrato/tremolo
+    # the rip never had, because the depth is a chip-wide register the score
+    # does not carry.  Send the hardware reset depth explicitly.
+    last_amd = last_pmd = 0
     pms_acc: dict[int, list] = {}
     held_ins = [-1] * 8
     held_kon = [-1] * 8
@@ -547,6 +569,12 @@ def analyze(vgm: VgmFile, *, speed: int | None = None, pcm: bool = True) -> Song
     sweep_pts: list[list[tuple[int, int, int]]] = [[] for _ in range(8)]
     sweep_base: list[tuple[int, int]] = [(0, 0)] * 8
     sweep_ev: list[int | None] = [None] * 8
+    # Mid-note carrier TL writes of a held note (the driver's software volume
+    # envelope).  Only the carrier is tracked: the volume column can express a
+    # carrier attenuation shift, not a modulator timbre change.
+    tl_pts: list[list[tuple[int, int]]] = [[] for _ in range(8)]
+    tl_ev: list[int | None] = [None] * 8
+    tl_last = [0x7F] * 8
     # Last KON operator mask per channel: key state is per operator, and an
     # envelope restarts only on a 0->1 transition of its bit.
     op_mask = [0] * 8
@@ -556,6 +584,12 @@ def analyze(vgm: VgmFile, *, speed: int | None = None, pcm: bool = True) -> Song
         if idx is not None:
             _finalize_sweep(events[idx], sweep_pts[ch], sweep_base[ch][0], sweep_base[ch][1])
             sweep_ev[ch] = None
+
+    def close_tl(ch: int) -> None:
+        idx = tl_ev[ch]
+        if idx is not None and tl_pts[ch]:
+            events[idx].tl_pts = tuple(tl_pts[ch])
+        tl_ev[ch] = None
 
     def intern_patch(ch: int, mask: int = 0xF) -> int:
         snap = ym.snapshot(ch)
@@ -588,6 +622,13 @@ def analyze(vgm: VgmFile, *, speed: int | None = None, pcm: bool = True) -> Song
         if chip_fx and chip_fx[-1][1] == cmd and chip_fx[-1][2] == val:
             return
         chip_fx.append((sample, cmd, val))
+
+    # See last_amd/last_pmd above: pin the chip-wide depth to the OPM's reset
+    # value before the first row (a module without any YM2151 write must not
+    # carry YM2151 effects).
+    if any(w.chip == "ym2151" for w in vgm.writes):
+        emit_chip_fx(0, FX_LFO_AMD, 0)
+        emit_chip_fx(0, FX_LFO_PMD, 0)
 
     last_keyon_sample = [-10**9] * 8
     for w in vgm.writes:
@@ -626,6 +667,16 @@ def analyze(vgm: VgmFile, *, speed: int | None = None, pcm: bool = True) -> Song
                 ch = w.reg & 7
                 if ym.kon[ch] and sweep_ev[ch] is not None:
                     sweep_pts[ch].append((w.sample, ym.kc[ch], ym.kf[ch]))
+            elif 0x60 <= w.reg <= 0x7F:
+                # A carrier TL write while the voice is held is a software
+                # volume step; record only steps that move the carrier, so a
+                # modulator rewrite (timbre) does not fake a fade.
+                ch = w.reg & 7
+                if ym.kon[ch] and tl_ev[ch] is not None:
+                    cur = ym.carrier_tl(ch)
+                    if cur != tl_last[ch]:
+                        tl_pts[ch].append((w.sample, cur))
+                        tl_last[ch] = cur
             continue
         ch = w.val & 7
         mask = (w.val & 0x78) >> 3
@@ -636,6 +687,7 @@ def analyze(vgm: VgmFile, *, speed: int | None = None, pcm: bool = True) -> Song
             _flush_pms_ramp(pms_acc, held_ins[ch], held_ramp[ch], held_kon[ch])
             held_ramp[ch] = []
             close_sweep(ch)
+            close_tl(ch)
             ins = intern_patch(ch, mask)
             note = kc_to_furnace_note(ym.kc[ch])
             events.append(NoteEvent(
@@ -651,6 +703,9 @@ def analyze(vgm: VgmFile, *, speed: int | None = None, pcm: bool = True) -> Song
             sweep_base[ch] = (ym.kc[ch], ym.kf[ch])
             sweep_pts[ch] = []
             sweep_ev[ch] = len(events) - 1
+            tl_pts[ch] = []
+            tl_last[ch] = ym.carrier_tl(ch)
+            tl_ev[ch] = len(events) - 1
             keyon_times.append(w.sample)
             last_keyon_sample[ch] = w.sample
             ym.kon[ch] = True
@@ -667,12 +722,14 @@ def analyze(vgm: VgmFile, *, speed: int | None = None, pcm: bool = True) -> Song
             _flush_pms_ramp(pms_acc, held_ins[ch], held_ramp[ch], held_kon[ch])
             held_ramp[ch] = []
             close_sweep(ch)
+            close_tl(ch)
             ym.kon[ch] = False
             held_ins[ch] = -1
 
     for ch in range(8):
         _flush_pms_ramp(pms_acc, held_ins[ch], held_ramp[ch], held_kon[ch])
         close_sweep(ch)
+        close_tl(ch)
 
     # Flush key-offs that were not a same-sample retrigger.
     # We recorded only key-ons above; add offs that sit > 1 sample after last on

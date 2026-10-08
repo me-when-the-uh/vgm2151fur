@@ -324,6 +324,22 @@ for anything audible, with the caveat above: they only see KC/KF pitch and key-o
   the note keeps all four operators sounding; there is no per-operator gate in Furnace's OPM.
   Identification route: scan `0x08` writes for masks other than `00`/`78` and compare with the
   converted `.fur` note counts.
+  A carrier TL write while the voice is held *is* now carried: it becomes a volume-column step
+  relative to the instrument's own carrier TL (0.9.37; see "Mid-note carrier TL fades").  Only
+  the carrier is representable — a modulator rewrite still leaves the timbre static.
+- **Mid-note carrier TL fades.**  Some drivers (Namco System 86: Genpei Toumaden) fade a held note
+  by rewriting `0x60`-`0x7F` with no retrigger.  The key-on snapshot cannot carry that, so
+  `analyze` records the carrier TL steps of a held note and `furwrite` writes them on the volume
+  column as `127 - (TL - instrument TL)`.  The OPM volume column only attenuates a KVS carrier,
+  and the log curve (`newVolumeScaling`) makes the mapping exact, so a fade-out survives; a step
+  *louder* than the instrument cannot (the column's ceiling is the instrument TL).  A region that
+  also changes the modulator stays static.  On "14 Game Over" the exported envelope now tracks the
+  source within ~1 dB; before, the held chord stayed ~50 dB loud through the fade-out.
+- **The OPM LFO depth is seeded with the hardware reset.**  Furnace's arcade core defaults PMD/AMD
+  to `0x7f`, the OPM resets them to 0.  A driver that never writes `0x19` but loads PMS/AMS into
+  its instruments (Namco System 86) would otherwise play maximum vibrato/tremolo the rip never
+  had; `analyze` sends `1E 00`/`1F 00` before row 0 and any real `0x19` write overrides it.
+
 - **KC/KF movement below the sweep threshold is dropped.**  `_finalize_sweep` emits a trajectory
   only when peak-to-peak is ≥ 4 units of `kc_kf_units` (≈ 6 cents); register-written vibrato
   narrower than that disappears entirely.

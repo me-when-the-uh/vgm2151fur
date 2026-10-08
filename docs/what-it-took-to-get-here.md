@@ -1,9 +1,38 @@
-# Release notes
-
-One entry per released version. The numbers are measured against the
-reference renderer and the bundled Furnace build, not estimated.
+# How things were before
 
 Cue the song "Take Me Baby" by Mickey B.
+
+## 0.9.37
+
+Namco System 86 (Genpei Toumaden) uses two operator tricks that the key-on
+snapshot flattened. Both are chip-wide/per-operator state a static instrument
+cannot carry, and both are now sent:
+
+- **The OPM LFO depth the rip never set.** Genpei's driver never writes register
+  `0x19`, so the hardware PMD and AMD stay at their reset value 0, but it still
+  loads nonzero PMS/AMS into its instruments. Furnace's arcade core defaults
+  `pmDepth`/`amDepth` to `0x7f` (`arcade.cpp` reset), so every converted note
+  played with maximum vibrato/tremolo the rip never had: the onset was muted for
+  the first seconds and the whole track wobbled. `analyze` now seeds the
+  chip-wide depth with the hardware reset (`1E 00` AMD / `1F 00` PMD) before the
+  first row; the rip's own `0x19` writes still override it. Every FM module
+  carries the reset now, a no-op where PMS/AMS are zero.
+
+- **A held voice's carrier TL fade.** Genpei fades a sustained note by
+  rewriting the carrier TL (`0x60`-`0x7F`) with no retrigger; the key-on
+  snapshot kept only the first value, so a note the rip faded to silence held at
+  full level (Game Over's held chord rang ~3 s past the rip's release, up to
+  +55 dB late). `analyze` now records the carrier TL steps of a held note and
+  `furwrite` writes them as volume-column values relative to the instrument's
+  own carrier TL. The OPM volume column only attenuates a KVS carrier and the
+  log curve (`newVolumeScaling`) makes `vol = 127 - dtl` exact, so a fade-out
+  survives; a louder-than-instrument step cannot, and a modulator rewrite does
+  not fake a fade. Tracks without such steps are byte-identical.
+
+Measured (reference renderer, `vgm2wav-mute.exe`, source vs exported VGM, 50 ms
+RMS): Genpei "14 Game Over" now tracks the source within ~1 dB from onset to
+release. Before, the export sat ~55 dB low through the rip's fade-in, was offset
+1.5 s, and held ~50 dB loud through the fade-out.
 
 ## 0.9.36
 
@@ -16,19 +45,26 @@ Map Mode A followed a riff 1921 rows in, shrinking its 0:38 loop to 0:31.
 A candidate start's copy is now looked for one loop length later, never
 closer, and the earliest run of near-perfect matches wins, so a marker
 that fell inside the phrase opens the loop on the phrase's first command:
-"03 Game BGM 1" opens at row 199 (3.25 s, 1:58 kept), Map Mode A at row
+"03 Game BGM 1" opens at row 199 (3.2 s, 1:58 kept), Map Mode A at row
 102 (0:38 kept). Every applied fix on the Metal Hawk pack now keeps the
 rip's catalogued length (Map Mode A 0:38, BGM 1 1:58, BGM 2 1:31, BGM 5
 0:55, Name Entry C 0:35), and the fixes that used to cut a loop now leave
 the marker alone instead ("Game BGM 3" was cut from 2:23 to 2:15). The
-length lock made the search cheaper too: a candidate probes a few rows
-around one point instead of across the whole ending. A candidate's
-comparison window must also fit completely inside the track now: a module
-already cut at its loop end has no copy to follow and keeps its loop, so
-reconverting a converted tree is stable (a recheck of the collection under
-this rule corrected 28 tracks whose loop had moved on a clipped window).
-On 44 tracks sampled across the packs, loop finding takes 1.5 s against
-17.6 s before, and the worst track drops from 4.1 s to 0.3 s.
+order cut opens one row before the first commands. A three-row cut was
+tried and rejected: the rows further back are not row-exact copies of
+their log counterparts - the PCM and effect columns drift a row or two
+between the first and last iteration - so the loop audibly wobbles at
+the seam. The end follows the start, so the jump stops the same distance
+before the commands return, every row across the seam plays exactly once,
+and the played span keeps its length. The length lock made the search
+cheaper too: a candidate probes a few rows around one point instead of
+across the whole ending. A candidate's comparison window must also fit
+completely inside the track: a module already cut at its loop end has no
+copy to follow and keeps its loop, so reconverting a converted tree is
+stable (a recheck of the collection under this rule corrected 28 tracks
+whose loop had moved on a clipped window). On 44 tracks sampled across the
+packs, loop finding takes 1.5 s against 17.6 s before, and the worst track
+drops from 4.1 s to 0.3 s.
 
 Writing got cheaper as well, with byte-identical output: pattern rows and
 their effect slots are made on first use instead of one filled list per

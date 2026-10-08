@@ -1,4 +1,4 @@
-"""Loop finding: the downbeat, one row before the commands that play it.
+"""Loop finding: the downbeat, a few rows before the commands that play it.
 
 The synthetic grids never render. The fixture checks run the finder over the
 source rips in `VGM_collection` and skip when a pack is not on disk.
@@ -76,7 +76,7 @@ class TestFindLoop(unittest.TestCase):
         notes, loop_row, end_row = _bar(loop_pulse=1)
         fix = find_loop(notes, loop_row=loop_row, end_row=end_row)
         self.assertIsNotNone(fix)
-        # Pulse 0 of the cell, then one row before those commands.
+        # Pulse 0 of the cell, then the row before those commands.
         self.assertEqual(fix.shift_pulses, -1)
         self.assertEqual(fix.period, 8)
         self.assertEqual(fix.start_row, loop_row - fix.step_rows - 1)
@@ -140,7 +140,7 @@ class TestFindLoop(unittest.TestCase):
     def test_phrase_behind_the_marker_becomes_the_loop(self):
         # The body starts 48 rows in and the marker sits inside it. The head
         # of the body comes back at the end of the track, so the loop has to
-        # open at the body, 85 rows behind the marker, and keep its length.
+        # open at the body, 87 rows behind the marker, and keep its length.
         notes = [(row, 0, 40 + row // 3) for row in range(0, 48, 3)]
         notes += [(48, 0, 60), (48, 2, 67)]
         notes += [(48 + j * 4, 1, pitch) for j, pitch in enumerate(range(50, 98))]
@@ -217,7 +217,10 @@ class TestFixtureLoops(unittest.TestCase):
         song = analyze(load_vgm(src), speed=None, pcm=True)
         return song, apply_loop(song)
 
-    def test_closing_game_stays_on_its_beat(self):
+    def test_closing_game_keeps_the_marker(self):
+        # The marker sits on the downbeat and the one-row cut would land on
+        # the row before it, where no command sits. The loop stays where the
+        # rip put it.
         if not CLOSE.is_file():
             self.skipTest("source rip missing")
         song, text = self._loop(CLOSE)
@@ -241,8 +244,8 @@ class TestFixtureLoops(unittest.TestCase):
 
     def test_game_bgm1_opens_on_the_sample_chord(self):
         # The VGM marker sits inside the first loop phrase. The phrase's own
-        # first command is the sample chord around rows 199-200; the loop
-        # opens one row before it and keeps the rip's 1:58 length.
+        # first command is the sample chord at row 199; the loop opens one
+        # row before it and keeps the rip's 1:58 length.
         if not HAWK.is_file():
             self.skipTest("source rip missing")
         song, text = self._loop(HAWK)

@@ -1039,6 +1039,16 @@ def _build_patterns(song: Song, n_ch: int, pat_len: int, fx_cols: int, ch_offset
     # Writing each value only when it changes, including back to the neutral
     # 0x80, keeps a note's fine tune from leaking into the next one.
     note_e5: dict[tuple[int, int], int] = {}
+    # Mid-note carrier-TL fades (the driver's software volume envelope).  The
+    # OPM volume column only attenuates a carrier the log curve already scales
+    # (VOL_SCALE_LOG: written TL = op.tl + (127 - vol)), so a fade-out survives
+    # as a volume value relative to the instrument's own carrier TL.  The
+    # column is channel state, so every FM note-on re-asserts 127 (the
+    # instrument's TL) whenever any note in the track carries a fade.
+    fm_tl = any(
+        ev.on and not ev.pcm and ev.tl_pts and 0 <= ev.ch + ch_offset < n_ch
+        for ev in song.events
+    )
     # One cell holds one PCM note. A later trigger moves to the next free row
     # when that row is still before the following trigger. When it is not,
     # the later trigger keeps the row: it is the cursor the channel plays.
@@ -1071,6 +1081,8 @@ def _build_patterns(song: Song, n_ch: int, pat_len: int, fx_cols: int, ch_offset
             cell.ins = ev.ins
         if ev.vol >= 0:
             cell.vol = ev.vol
+        elif fm_tl and cell.vol == EMPTY:
+            cell.vol = 127
         if delay:
             _add_fx(cell, 0xED, delay, fx_cols)
         note_e5[(ev_ch, row)] = ev.e5
@@ -1078,6 +1090,29 @@ def _build_patterns(song: Song, n_ch: int, pat_len: int, fx_cols: int, ch_offset
         # default (both full). FM pan 0 still means "no 08xx on this row".
         if (ev.pcm or ev.pan) and not ev.no_pan:
             _add_fx(cell, 0x08, ev.pan & 0xFF, fx_cols)
+
+    # A held note's carrier fade steps land on their own rows (only when no
+    # note owns the row, so a following note's own volume wins).
+    if fm_tl:
+        for ev in song.events:
+            ev_ch = ev.ch + ch_offset
+            if not ev.on or ev.pcm or not ev.tl_pts or not (0 <= ev_ch < n_ch):
+                continue
+            if 0 <= ev.ins < len(song.fm_patches):
+                t0 = song.fm_patches[ev.ins].carrier_tl()
+            else:
+                t0 = 0x7F
+            for sample, tl in ev.tl_pts:
+                row, _delay = song.place(sample)
+                if row < 0 or row >= total_rows:
+                    continue
+                cell = grid[ev_ch].get(row)
+                if cell is None:
+                    cell = _blank_row()
+                    grid[ev_ch][row] = cell
+                if cell.note >= 0:
+                    continue
+                cell.vol = max(0, min(127, 127 - (tl - t0)))
 
     # Pitch sweeps (percussion): after every event is placed so the ramps can
     # share the note-off rows (and their ED delays).  The sweep may step E5 on

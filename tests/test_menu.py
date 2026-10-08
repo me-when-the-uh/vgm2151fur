@@ -39,6 +39,19 @@ class Reader:
         return self.answers.pop(0)
 
 
+class _Interrupter(Reader):
+    """Reader that raises KeyboardInterrupt for the 'INT' answer."""
+
+    def __call__(self, prompt=""):
+        self.prompts.append(prompt)
+        if not self.answers:
+            raise EOFError
+        answer = self.answers.pop(0)
+        if answer == "INT":
+            raise KeyboardInterrupt
+        return answer
+
+
 def _music_vgm() -> bytes:
     cmds = bytearray()
     for reg, val in PATCH:
@@ -346,6 +359,18 @@ class TestMenu(unittest.TestCase):
             with redirect_stdout(io.StringIO()):
                 rc = run_menu(read=reader, out=print, state_path=Path(tmp) / "state.json")
             self.assertEqual(rc, 0)
+
+    def test_ctrl_c_at_the_prompt_keeps_the_menu(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log = io.StringIO()
+            with redirect_stdout(log):
+                rc = run_menu(
+                    read=_Interrupter(["nope", "INT", "q"]),
+                    out=print,
+                    state_path=Path(tmp) / "state.json",
+                )
+            self.assertEqual(rc, 0)
+            self.assertIn("unknown command", log.getvalue())
 
 
 if __name__ == "__main__":

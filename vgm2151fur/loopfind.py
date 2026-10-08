@@ -6,13 +6,14 @@ hit the key. The note grid usually repeats every 4, 8, 12, or 16 pulses
 The marker should open that cell, not sit on the second or third pulse.
 
 Furnace runs a row's notes and sample commands when it lands on the row,
-and a `Bxx` on that same row jumps away at the end of it. The order cut is
-therefore one row before the downbeat commands: a sample keyed a row early
-is inside the loop, and the downbeat itself is not the jump row.
+and a `Bxx` on that same row jumps away at the end of it. The order cut
+therefore opens a few rows before the downbeat commands (three): voices
+keyed just before the main chord are inside the loop, and the downbeat
+itself is not the jump row.
 
 A grid with no clock, or a loop that is not a whole number of bars, stays
 on the VGM marker. A clock with no repeating cell stays too, except when
-the marker sits on the empty row after a chord: the cut moves to the row
+the marker sits on the empty row after a chord: the cut moves to the rows
 before that chord.
 
 The marker is also often off by a whole phrase, not just a pulse: it can
@@ -24,8 +25,8 @@ that is an inner repetition, not the seam the marker is missing.
 Candidates run a window on either side of the marker, and the earliest
 long run of near-perfect matches wins, so a marker inside the phrase still
 opens the loop on the phrase's first command without dropping the head.
-The order opens one row before those commands, and the jump stops one row
-before the same commands return.
+The order opens a few rows before those commands, and the jump stops the
+same distance before the returned copy.
 """
 
 from __future__ import annotations
@@ -52,6 +53,12 @@ MIN_PHASE_GAIN = 0.75
 # The loop beat is an arrival when it brings in this many more voices than
 # the candidate behind it. That is a pickup resolving, not a late marker.
 TEXTURE_JUMP = 2
+# The order cut opens this many rows before the first commands. One row is
+# the row whose copy the seam search actually verified. Wider cuts (three
+# rows were tried) land the seam on rows that are not exact copies of their
+# log counterparts - the PCM and effect columns drift a row or two between
+# the first and last iteration - and the loop audibly wobbles at the seam.
+CUT_ROWS = 1
 
 
 @dataclass(frozen=True)
@@ -60,8 +67,8 @@ class LoopFix:
 
     `start_row` is the first row of the loop order. `end_row` is the row
     `Bxx` sits on (the last row that plays). `shift_pulses` is the musical
-    move; the order cut is additionally one row before the downbeat commands
-    when the clock is wider than one row.
+    move; the order cut additionally opens a few rows before the downbeat
+    commands when the clock is wider than one row.
     """
 
     start_row: int
@@ -362,8 +369,10 @@ def _snap_empty_marker(notes, loop_row: int, end_row: int, step: int) -> LoopFix
     hits = sum(1 for row, _ch, _pitch in notes if row == chord)
     if hits < 2 or chord < 1:
         return None
-    # One execution row before the commands, unless that row is a whole pulse.
-    start = chord - 1 if step > 1 else chord
+    # A few execution rows before the commands, unless that row is a whole
+    # pulse. The end follows the start by the same delta, so the played
+    # span keeps its length and every row across the seam plays once.
+    start = chord - CUT_ROWS if step > 1 else chord
     if start < 0:
         start = 0
     delta = start - loop_row
@@ -422,9 +431,9 @@ def _phase_loop(
             shift = None
     if shift is not None and vote_ok and shift != vote:
         shift = None
-    # Shift 0 is a confirmed downbeat, so the order still opens one row early.
-    # A vote that did not clear the bar is not that confirmation: the marker
-    # stays where the VGM put it.
+    # Shift 0 is a confirmed downbeat, so the order still opens a few rows
+    # early. A vote that did not clear the bar is not that confirmation: the
+    # marker stays where the VGM put it.
     confirmed = vote_ok or (vote == 0 and margin >= MIN_VOTE_MARGIN)
     if shift is None:
         if not confirmed:
@@ -438,11 +447,10 @@ def _phase_loop(
         return _snap_empty_marker(notes, loop_row, end_row, clock.step)
     if abs(command - loop_row) > (period * clock.step) // 2 + clock.step:
         return None
-    # The row before the commands. A one-row clock would make this the
-    # previous pulse, which is the mid-bar cut this pass is trying to leave.
-    start = command - 1 if clock.step > 1 and command > 0 else command
-    if start < 0:
-        start = 0
+    # A few rows before the commands. A one-row clock would put the cut on
+    # the previous pulse, which is the mid-bar cut this pass is trying to
+    # leave. The end follows the start by the same delta.
+    start = max(0, command - CUT_ROWS) if clock.step > 1 else command
     delta = start - loop_row
     end = end_row + delta
     # The VGM jump can already sit a few rows past the last note. Moving
@@ -675,11 +683,12 @@ def _phrase_seam(
             ret = agreed_at
     if command is None or ret is None or ret <= command:
         return None
-    start = command - 1 if step > 1 and command > 0 else command
-    if start < 0:
-        start = 0
+    start = max(0, command - CUT_ROWS) if step > 1 else command
     # Played length equals the distance between the two copies of the chord,
     # so the jump lands on the early row and the chord is not struck twice.
+    # The end follows the start: both ends move by the same amount, so the
+    # seam stays continuous (the row after the end copies the loop's first
+    # row) and the played span keeps its length.
     end = start + (ret - command) - 1
     if end <= start or end > end_row or start > end_row:
         return None

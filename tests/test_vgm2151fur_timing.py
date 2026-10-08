@@ -719,5 +719,87 @@ class TestVibratoRamp(unittest.TestCase):
             self.assertGreater(dur / VGM_RATE, 0.35, f"ramp {dur:.0f} samples is too quick")
 
 
+class TestOpmLfoDepth(unittest.TestCase):
+    """The OPM resets PMD/AMD to 0, but Furnace's arcade core defaults 0x7f.
+
+    A driver that never writes 0x19 - Namco System 86 does not - still loads
+    PMS/AMS into its instruments, so the converted module would play maximum
+    vibrato/tremolo the rip never had unless the reset depth is sent.
+    """
+
+    AMD, PMD = 0x1E, 0x1F
+
+    def test_reset_depth_is_sent_when_0x19_is_never_written(self):
+        writes = [ChipWrite(sample=0, chip="ym2151", chip_id=0, reg=0x20, val=0xC0)]
+        song = analyze(_vgm_with_writes(writes), pcm=False)
+        self.assertIn((0, self.AMD, 0), song.chip_fx)
+        self.assertIn((0, self.PMD, 0), song.chip_fx)
+
+    def test_pcm_only_module_carries_no_ym2151_effects(self):
+        writes = [ChipWrite(sample=0, chip="c140", chip_id=0, reg=0x00, val=0x00)]
+        song = analyze(_vgm_with_writes(writes), pcm=True)
+        self.assertEqual(song.chip_fx, [])
+
+    def test_driver_writes_override_the_reset(self):
+        writes = [
+            ChipWrite(sample=100, chip="ym2151", chip_id=0, reg=0x19, val=0x30),
+            ChipWrite(sample=200, chip="ym2151", chip_id=0, reg=0x19, val=0x90),
+        ]
+        song = analyze(_vgm_with_writes(writes), pcm=False)
+        amd = [v for _s, c, v in song.chip_fx if c == self.AMD]
+        pmd = [v for _s, c, v in song.chip_fx if c == self.PMD]
+        self.assertEqual(amd, [0, 0x30])  # reset, then the log's own value
+        self.assertEqual(pmd, [0, 0x10])
+
+
+class TestMidNoteCarrierTl(unittest.TestCase):
+    """A held voice's carrier TL writes are a software volume envelope.
+
+    The key-on snapshot cannot carry them; they become volume-column steps
+    relative to the instrument's own carrier TL (alg 0 carrier = op 4, 0x78).
+    """
+
+    def _song(self):
+        writes = [
+            ChipWrite(sample=0, chip="ym2151", chip_id=0, reg=0x20, val=0xC0),
+            ChipWrite(sample=0, chip="ym2151", chip_id=0, reg=0x60, val=0x10),
+            ChipWrite(sample=0, chip="ym2151", chip_id=0, reg=0x68, val=0x10),
+            ChipWrite(sample=0, chip="ym2151", chip_id=0, reg=0x70, val=0x10),
+            ChipWrite(sample=0, chip="ym2151", chip_id=0, reg=0x78, val=0x10),
+            ChipWrite(sample=0, chip="ym2151", chip_id=0, reg=0x28, val=0x4A),
+            ChipWrite(sample=1000, chip="ym2151", chip_id=0, reg=0x08, val=0x78),
+            ChipWrite(sample=5000, chip="ym2151", chip_id=0, reg=0x78, val=0x20),
+            ChipWrite(sample=9000, chip="ym2151", chip_id=0, reg=0x78, val=0x30),
+            ChipWrite(sample=20000, chip="ym2151", chip_id=0, reg=0x08, val=0x00),
+        ]
+        return analyze(_vgm_with_writes(writes), pcm=False)
+
+    def test_fade_steps_are_captured(self):
+        ev = [e for e in self._song().events if e.on][0]
+        self.assertEqual(ev.tl_pts, ((5000, 0x20), (9000, 0x30)))
+
+    def test_modulator_tl_write_is_not_a_fade(self):
+        # op 1 (0x60) is a modulator under alg 0; moving it must not fake a
+        # carrier volume step.
+        writes = [
+            ChipWrite(sample=0, chip="ym2151", chip_id=0, reg=0x20, val=0xC0),
+            ChipWrite(sample=0, chip="ym2151", chip_id=0, reg=0x78, val=0x10),
+            ChipWrite(sample=1000, chip="ym2151", chip_id=0, reg=0x08, val=0x78),
+            ChipWrite(sample=5000, chip="ym2151", chip_id=0, reg=0x60, val=0x50),
+            ChipWrite(sample=20000, chip="ym2151", chip_id=0, reg=0x08, val=0x00),
+        ]
+        ev = [e for e in analyze(_vgm_with_writes(writes), pcm=False).events if e.on][0]
+        self.assertEqual(ev.tl_pts, ())
+
+    def test_fade_becomes_a_volume_column(self):
+        song = self._song()
+        m = parse_fur(write_fur(song, include_pcm=False, include_fm=True))
+        rows = m.patterns[(0, m.orders[0][0])]
+        vols = {r.vol for r in rows if r.vol not in (-1, 0xFFFF)}
+        self.assertIn(127, vols)              # the note's own instrument TL
+        self.assertIn(127 - 0x10, vols)       # carrier TL 0x20 vs 0x10
+        self.assertIn(127 - 0x20, vols)       # carrier TL 0x30 vs 0x10
+
+
 if __name__ == "__main__":
     unittest.main()

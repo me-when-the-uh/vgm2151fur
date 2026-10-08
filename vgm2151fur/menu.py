@@ -107,6 +107,9 @@ def run_menu(read=input, out=print, *, state_path: Path | None = None) -> int:
             raw = read("> ").strip()
         except EOFError:
             return 0
+        except KeyboardInterrupt:
+            out("")
+            continue
         if not raw:
             continue
         key = raw.lower()

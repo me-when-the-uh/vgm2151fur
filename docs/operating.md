@@ -36,10 +36,14 @@ the marker — four seconds, or the whole loop when that is shorter — for the
 phrase start whose copy sits one loop length later, and moves the loop
 there: a marker that fell inside the phrase lands on the phrase's own head,
 behind it, and the loop keeps the length the VGM gave it, the end of the
-log being the other end of that length. A grid that does not repeat, or a
-loop with no phrase start in that window, keeps the VGM offset.
-`--no-loop-find` keeps it on every track. The convert line says `loop kept`
-or how far the marker moved (`loop -1/8`, `loop 226 rows late`,
+log being the other end of that length. The loop opens one row before the
+first commands — a wider cut lands the seam on rows the log does not
+repeat exactly, and the loop wobbles there — and the jump stops the same
+distance before the commands return, keeping every row across the seam
+played exactly once. A grid that
+does not repeat, or a loop with no phrase start in that window, keeps the
+VGM offset. `--no-loop-find` keeps it on every track. The convert line says
+`loop kept` or how far the marker moved (`loop -1/8`, `loop 226 rows late`,
 `loop 158 rows early`).
 
 Each track runs in its own worker process. The default count is pinned to
