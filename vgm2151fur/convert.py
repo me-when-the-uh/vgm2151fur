@@ -16,7 +16,7 @@ from vgm2151fur.pcm import dump_pcm as dump_pcm_files
 from vgm2151fur.priority import low_priority, resolve_workers, set_low_priority
 from vgm2151fur.vgm import load_vgm
 
-# One less than the physical cores. `resolve_workers` is the cap a call uses.
+# The desktop default: logical CPUs minus one or two threads, capped at 16.
 CONVERT_WORKERS = resolve_workers(None, jobs=10**6)[0]
 VGM_SUFFIXES = {".vgm", ".vgz"}
 VGM_GLOBS = ("*.vgm", "*.vgz", "*.VGM", "*.VGZ")
@@ -86,8 +86,8 @@ def report_files(
 ) -> Iterator[tuple[Path, str | None, str | None]]:
     """Analyze each file. Yields (src, report, None) in input order.
 
-    One track per worker process, at low priority. The count stops at one
-    less than the physical core count.
+    One track per worker process, at low priority. The default count follows
+    the logical CPUs (see `priority.default_workers`).
     """
     if not files:
         return
@@ -235,7 +235,7 @@ def convert_folder(
 
     Yields (src, info, None) as each file finishes, or (src, None, error) for a
     file that raised. The rest still convert. One track per worker process,
-    at low priority. The count stops at one less than the physical core count.
+    at low priority. The default count follows the logical CPUs.
     """
     try:
         if not files:

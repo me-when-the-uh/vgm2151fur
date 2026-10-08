@@ -530,13 +530,19 @@ def _seam_score(bits, wide, start: int, other: int, width: int) -> float:
 
 
 def _best_return(bits, wide, start: int, end_row: int, lo: int, hi: int, width: int, step: int):
+    """Best copy of `[start, start+width)` in `[lo, hi]`, or `(0.0, None)`.
+
+    The comparison window has to fit completely inside the track: a copy
+    clipped by the end of the log would be scored over fewer rows and can
+    beat a real seam. A module already cut at its loop end has no complete
+    copy inside the track, so its loop is left alone.
+    """
     best_score = 0.0
     best_at = None
     for other in range(lo, hi + 1, step):
-        span = min(width, end_row - other)
-        if span < width // 3:
+        if end_row - other < width:
             continue
-        score = _seam_score(bits, wide, start, other, span)
+        score = _seam_score(bits, wide, start, other, width)
         if score > best_score:
             best_score = score
             best_at = other
@@ -567,9 +573,11 @@ def _phrase_seam(
 
     The VGM loop length is the invariant: the marker can sit inside the
     phrase, but the loop keeps its length, so a candidate start's copy sits
-    one loop length later. The marker being late at the start matches the
-    end of the log being late too, and a shorter copy (an inner repetition)
-    is not a seam at all. Candidates run a window on either side of the
+    one loop length later, with the comparison window fitting completely
+    inside the track. The marker being late at the start matches the end of
+    the log being late too, and a shorter copy (an inner repetition) is not
+    a seam at all. A module already cut at its loop end is left alone, so
+    reconversion is stable. Candidates run a window on either side of the
     marker; the earliest long run of near-perfect matches wins, and its
     heaviest command row opens the loop.
     """
@@ -596,7 +604,7 @@ def _phrase_seam(
         for start in range(first, last + 1, 2):
             near = start + loop_rows
             lo = max(end_lo, start + tail, near - slack)
-            hi = min(end_hi, near + slack)
+            hi = min(end_hi, near + slack, end_row - compare)
             if hi < lo:
                 continue
             score, ret = _best_return(bits, wide, start, end_row, lo, hi, compare, 2)

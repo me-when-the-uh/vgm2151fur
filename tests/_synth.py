@@ -104,14 +104,14 @@ def inject_rows(song, plan: list[tuple[int, int, int]], key_on: int):
     row0, _delay = song.place(key_on)
     original = fw._emit_sweep
 
-    def hook(grid, song_arg, ev, fx_cols, total_rows, sweep_e5):
-        original(grid, song_arg, ev, fx_cols, total_rows, sweep_e5)
+    def hook(grid, song_arg, ev, fx_cols, total_rows, sweep_e5, note_rows, chan=None):
+        original(grid, song_arg, ev, fx_cols, total_rows, sweep_e5, note_rows, chan)
         if not ev.on or ev.ch >= 8:
             return
         for k, cmd, val in plan:
             cell = grid[ev.ch].get(row0 + k)
             if cell is None:
-                cell = fw._blank_row(fx_cols)
+                cell = fw._blank_row()
                 grid[ev.ch][row0 + k] = cell
             fw._add_fx(cell, cmd, val, fx_cols)
 

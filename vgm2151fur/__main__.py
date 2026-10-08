@@ -26,7 +26,10 @@ from vgm2151fur.packs import pack_tracks
 from vgm2151fur.paths import clean_text, dedupe, expand_token, fur_targets, vgm_targets
 
 COMMANDS = {"convert", "report", "edit", "compare", "render", "menu"}
-_WORKERS_HELP = "tracks at once, at low priority (default: physical cores minus one)"
+_WORKERS_HELP = (
+    "tracks at once, at low priority (default: logical CPUs minus one or two "
+    "threads, capped at 16; requests cap at threads minus one, 31 max)"
+)
 
 EPILOG = """\
 paths:

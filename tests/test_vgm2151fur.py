@@ -814,12 +814,12 @@ class TestColumnFit(unittest.TestCase):
     """
 
     def test_fit_fx_cols_floor_and_ceiling(self):
-        rows = [fw._blank_row(8) for _ in range(4)]
+        rows = [fw._blank_row() for _ in range(4)]
         rows[0].fx = [(0x08, 0x80), (0xE5, 0x90), (0xED, 0x10)]
-        full = fw._blank_row(8)
+        full = fw._blank_row()
         for cmd in range(1, 9):
             fw._add_fx(full, cmd, 0x11, 8)
-        cols = fw._fit_fx_cols([(0, 0, rows), (1, 0, [full]), (2, 0, [fw._blank_row(8)])], 4)
+        cols = fw._fit_fx_cols([(0, 0, rows), (1, 0, [full]), (2, 0, [fw._blank_row()])], 4)
         self.assertEqual(cols, [3, 8, 1, 1])
 
     def test_effect_columns_match_content(self):

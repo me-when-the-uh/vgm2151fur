@@ -1,7 +1,12 @@
 """How many cores a batch may use, and how quiet those processes stay.
 
-Physical cores set the count. One core stays free. Worker processes and
-Furnace renders run at the Windows priority Task Manager calls Low.
+Workers are pinned to the logical CPUs. One thread stays free on small
+CPUs and two on bigger ones (a 6 core/12 thread desktop runs 10 workers),
+with a ceiling of 16; an explicit count may go up to one below the thread
+count — every thread below eight — and 31 is the safety ceiling, because
+past that the renders compete with each other and the batch runs slower.
+Worker processes and Furnace renders run at low priority: Idle on Windows,
+nice 10 elsewhere.
 """
 
 from __future__ import annotations
@@ -9,44 +14,73 @@ from __future__ import annotations
 import os
 import subprocess
 from contextlib import contextmanager
-from ctypes import wintypes
 
 # Task Manager "Low". Child processes inherit it.
 LOW_PRIORITY_CLASS = 0x00000040
-_RELATION_PROCESSOR_CORE = 0
+# Rendering is one thread per worker; past this the renders fight each
+# other more than they parallelize, and the batch goes slower.
+WORKER_CEILING = 31
 
 
-def physical_cores() -> int:
-    """Physical cores the process can see. Falls back to half the logical count."""
-    logical = os.cpu_count() or 1
-    if os.name != "nt":
-        return logical
+def visible_cpus() -> int:
+    """CPUs this process may run on, narrowed by affinity where available."""
     try:
-        counted = _windows_physical_cores()
-    except OSError:
-        counted = None
-    if not counted:
-        return max(1, logical // 2)
-    return counted
+        return len(os.sched_getaffinity(0))  # type: ignore[attr-defined]
+    except (AttributeError, OSError):
+        return os.cpu_count() or 1
+
+
+def default_workers(threads: int) -> int:
+    """One thread stays free below six, two at six or more; ceiling 16.
+
+    The heavy part of a worker is a single-threaded Furnace render, so the
+    count follows logical CPUs; the spare threads keep the desktop
+    responsive. A 6 core 12 thread machine gets 10 workers, a 22 thread one
+    gets 16.
+    """
+    if threads < 6:
+        return max(1, threads - 1)
+    return max(1, min(16, threads - 2))
 
 
 def worker_limit() -> int:
-    """1 .. N-1 physical cores. A one-core machine still gets a single worker."""
-    return max(1, physical_cores() - 1)
+    """The default worker count for this machine."""
+    return default_workers(visible_cpus())
+
+
+def worker_cap(threads: int) -> int:
+    """Most workers an explicit `--workers` may use, and the default's ceiling.
+
+    Below eight threads every thread may run a worker (a two-thread machine
+    can use both). At eight or more one thread stays free, and 31 is the
+    safety ceiling: past that the single-threaded renders fight over the
+    CPU and the batch goes slower, not faster.
+    """
+    if threads < 8:
+        return max(1, threads)
+    return max(1, min(threads - 1, WORKER_CEILING))
 
 
 def resolve_workers(requested: int | None, jobs: int) -> tuple[int, str]:
-    """`(count, note)`. `requested` None uses the limit. Above the limit is capped."""
-    cap = worker_limit()
-    cores = physical_cores()
-    note = f"low priority, {cores} physical cores"
+    """`(count, note)`. `requested` None uses the default, anything else is capped."""
+    threads = visible_cpus()
+    note = f"low priority, {threads} threads"
     if requested is None:
-        chosen = cap
+        chosen = default_workers(threads)
     else:
         asked = max(1, int(requested))
+        cap = worker_cap(threads)
         chosen = min(asked, cap)
         if asked > cap:
-            note += f", capped at {cap}"
+            if cap >= WORKER_CEILING:
+                note += (
+                    f", capped at {cap} by the safety cap; past {WORKER_CEILING} workers "
+                    "the renders compete and the converter runs slower, not faster"
+                )
+            elif threads < 8:
+                note += f", capped at {cap} (all logical threads)"
+            else:
+                note += f", capped at {cap} (one thread stays free)"
     if jobs > 0:
         chosen = min(chosen, jobs)
     return max(1, chosen), note
@@ -100,6 +134,7 @@ def low_priority():
 
 def _kernel():
     import ctypes
+    from ctypes import wintypes
 
     kernel = ctypes.windll.kernel32
     kernel.GetCurrentProcess.restype = ctypes.c_void_p
@@ -108,53 +143,3 @@ def _kernel():
     kernel.SetPriorityClass.argtypes = [ctypes.c_void_p, wintypes.DWORD]
     kernel.SetPriorityClass.restype = wintypes.BOOL
     return kernel
-
-
-def _windows_physical_cores() -> int | None:
-    """Count RelationProcessorCore records. Each record is one physical core."""
-    import ctypes
-
-    class _Cache(ctypes.Structure):
-        _fields_ = [
-            ("Level", ctypes.c_ubyte),
-            ("Associativity", ctypes.c_ubyte),
-            ("LineSize", wintypes.WORD),
-            ("Size", wintypes.DWORD),
-            ("Type", wintypes.DWORD),
-        ]
-
-    class _Union(ctypes.Union):
-        _fields_ = [
-            ("ProcessorCore", ctypes.c_ubyte),
-            ("NumaNode", wintypes.DWORD),
-            ("Cache", _Cache),
-            ("Reserved", ctypes.c_ulonglong * 2),
-        ]
-
-    class _Info(ctypes.Structure):
-        _fields_ = [
-            ("ProcessorMask", ctypes.c_void_p),
-            ("Relationship", wintypes.DWORD),
-            ("u", _Union),
-        ]
-
-    kernel = ctypes.windll.kernel32
-    query = kernel.GetLogicalProcessorInformation
-    query.argtypes = [ctypes.c_void_p, ctypes.POINTER(wintypes.DWORD)]
-    query.restype = wintypes.BOOL
-    returned = wintypes.DWORD(0)
-    query(None, ctypes.byref(returned))
-    if returned.value == 0:
-        return None
-    buf = ctypes.create_string_buffer(returned.value)
-    if not query(buf, ctypes.byref(returned)):
-        return None
-    stride = ctypes.sizeof(_Info)
-    if stride <= 0 or returned.value % stride != 0:
-        return None
-    count = 0
-    for index in range(returned.value // stride):
-        entry = _Info.from_buffer_copy(buf.raw[index * stride:(index + 1) * stride])
-        if entry.Relationship == _RELATION_PROCESSOR_CORE:
-            count += 1
-    return count or None

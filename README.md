@@ -10,17 +10,18 @@ It was pretty challenging to implement this level of broad support. If you
 spot any spots in your .fur files that are rough around the edges, this should
 give you an idea of how difficult it really was.
 
-Everything is Windows 10/11 only, matching the Furnace console build the
-verification tools use.
+The converter runs on Windows and Linux (Python 3.11 or later). It needs a
+Furnace console build only for the render/export checks; the Windows-only
+verification tools call the same builds.
 
 ## Requirements
 
 - Python 3.11 or later.
 - The Furnace console build for render/export checks. Furnace is not
   vendored. Keep a checkout or an unpacked release next to the project as
-  `furnace/` (the tools also find `furnace/build/furnace.exe`), or set
-  `VGM2151FUR_FURNACE` to the binary. A local `third_party/furnace/` drop-in
-  works too and is gitignored.
+  `furnace/` (the tools also find the build directory, `furnace`,
+  `furnace.exe` on Windows), or set `VGM2151FUR_FURNACE` to the binary. A
+  local `third_party/furnace/` drop-in works too and is gitignored.
 - Optional: `vgm2wav-mute.exe` (the reference VGM renderer) for
   `tools/fur_soundcheck.py` and `tools/vgmchroma.py`. Set
   `VGM2151FUR_VGM2WAV` to point at it.
@@ -89,11 +90,16 @@ and writes one `.fur` per input next to the name you give with `-o`
 (default: a `fur/` folder beside the input). A folder of packs writes each
 pack to its own `fur/` folder, or to `-o/<pack>` when `-o` is set.
 `--speed N` pins ticks per row when the automatic grid estimate is not what
-you want. `--workers N` sets how many tracks run at once (default: one less
-than the physical core count; the workers and their Furnace renders run at
-low priority). `--melody-only` skips the sample chips and `--pcm-only` skips
-the YM2151. Every file reports its size, grid speed, instrument and sample
-counts and any warnings. `report` uses the same worker count.
+you want. `--workers N` sets how many tracks run at once (default: the
+logical CPUs minus one thread, minus two when there are six or more, capped
+at 16, because the heavy part of a track is a single-threaded Furnace
+render; the workers and their renders run at low priority). An explicit
+count may go up to one below the logical thread count — every thread when
+there are fewer than eight — with 31 as the safety ceiling: past that the
+renders compete and the batch runs slower, not faster, and the clamp says
+so when it applies. `--melody-only` skips the sample chips and `--pcm-only`
+skips the YM2151. Every file reports its size, grid speed, instrument and
+sample counts and any warnings. `report` uses the same worker count.
 
 `report` prints the same analysis without writing anything. Use it to see
 which chips a VGM uses and how the grid was estimated.

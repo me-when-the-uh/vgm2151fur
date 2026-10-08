@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vgm2151fur"
-version = "0.9.34"
+version = "0.9.36"
 description = "Transcribe YM2151 + sample-chip VGMs into Furnace .fur modules"
 readme = "README.md"
 requires-python = ">=3.11"

@@ -93,7 +93,9 @@ def _refine_unit(deltas: list[int], guess: float) -> float:
     def cost(t: float) -> float:
         total = 0.0
         for d in usable:
-            k = max(1, round(d / t))
+            k = round(d / t)
+            if k < 1:
+                k = 1
             r = d - k * t
             total += r * r / k  # weight long deltas a little less
         return total

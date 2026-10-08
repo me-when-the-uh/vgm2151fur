@@ -89,7 +89,10 @@ def main() -> int:
     ap.add_argument("--only", default=None, help="comma-separated slugs")
     ap.add_argument(
         "--workers", type=int, default=None,
-        help="tracks at once, at low priority (default: physical cores minus one)",
+        help=(
+            "tracks at once, at low priority (default: logical CPUs minus one "
+            "or two threads, capped at 16; requests cap at threads minus one, 31 max)"
+        ),
     )
     ap.add_argument("--dry-run", action="store_true", help="print the plan only")
     args = ap.parse_args()

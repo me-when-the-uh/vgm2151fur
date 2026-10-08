@@ -22,9 +22,42 @@ rip's catalogued length (Map Mode A 0:38, BGM 1 1:58, BGM 2 1:31, BGM 5
 0:55, Name Entry C 0:35), and the fixes that used to cut a loop now leave
 the marker alone instead ("Game BGM 3" was cut from 2:23 to 2:15). The
 length lock made the search cheaper too: a candidate probes a few rows
-around one point instead of across the whole ending. On 44 tracks sampled
-across the packs, loop finding takes 1.5 s against 17.6 s before, and the
-worst track drops from 4.1 s to 0.3 s.
+around one point instead of across the whole ending. A candidate's
+comparison window must also fit completely inside the track now: a module
+already cut at its loop end has no copy to follow and keeps its loop, so
+reconverting a converted tree is stable (a recheck of the collection under
+this rule corrected 28 tracks whose loop had moved on a clipped window).
+On 44 tracks sampled across the packs, loop finding takes 1.5 s against
+17.6 s before, and the worst track drops from 4.1 s to 0.3 s.
+
+Writing got cheaper as well, with byte-identical output: pattern rows and
+their effect slots are made on first use instead of one filled list per
+row, empty rows are written as runs instead of a call per row, a sweep's
+next-note check uses one sorted row index per channel instead of scanning
+the channel grid per sweep, and the seam score runs on bitmasks. The
+C140-heavy "03 Game BGM 1" writer drops from 1.70 s to 0.40 s, the C352
+"01 The Outfoxies" from 0.92 s to 0.16 s, and the grid estimator is a
+third cheaper (that track's analyze: 1.06 s to 0.66 s; Gradius III "06
+Sand Storm": 2.08 s to 1.42 s). The four sample tracks (YM2151 + C140,
+C352, K007232, SegaPCM) re-convert byte for byte.
+
+The converter is cross-platform: Windows and Linux. The worker default
+follows the CPUs the process may run on (sched_getaffinity where the
+platform reports it); the Furnace lookup probes `furnace` as well as
+`furnace.exe`; and worker processes and renders go to nice 10 on POSIX
+(Idle priority on Windows, as before). The optional verification tools
+that shell out to vgm2wav-mute.exe remain Windows-only.
+
+The default worker count is pinned to logical CPUs: one thread stays free
+below six threads, two at six or more, capped at 16, so a 6 core/12 thread
+desktop runs 10 workers instead of 5. An explicit `--workers` may go up to
+one below the thread count (every thread below eight), and 31 is the
+safety ceiling: past that the single-threaded renders compete and the
+converter runs slower, not faster — the clamp reports that when it kicks
+in. The heavy part of a track is a single-threaded Furnace render: on one
+2 minute module, 10 simultaneous renders measured 9.4 tracks/min against
+6.4 at 5 (+48%), and a full collection reconversion of 1166 tracks ran in
+47 minutes.
 
 ## 0.9.35
 

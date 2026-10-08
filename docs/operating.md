@@ -42,14 +42,22 @@ loop with no phrase start in that window, keeps the VGM offset.
 or how far the marker moved (`loop -1/8`, `loop 226 rows late`,
 `loop 158 rows early`).
 
-Each track runs in its own worker process. The default count is one less
-than the physical core count, leaving one core free. `--workers 1` runs the
-tracks in order on that one worker. The Python workers and the Furnace
-renders they start run at low priority, and Furnace stays off the menu's
-console so the next prompt still takes a line. `report` on a pack uses the same
-count. Files convert independently; one failure does not stop the batch, and
-every failure is printed with the file name. Read the warnings on each line:
-they name the register oddities the converter worked around.
+Each track runs in its own worker process. The default count is pinned to
+the logical CPUs: one thread stays free below six, two at six or more, and
+16 is the ceiling (a 6 core/12 thread desktop runs 10 workers). The heavy
+part of a track is a single-threaded Furnace render, so the count follows
+threads rather than cores, and the spare threads keep the desktop
+responsive. `--workers N` may go up to one below the thread count — every
+thread when there are fewer than eight — with 31 as the safety ceiling:
+past that the renders compete and the batch runs slower, not faster, and
+the clamp reports that when it applies (it never exceeds the track count
+either). `--workers 1` runs the tracks in order on that one worker. The
+Python workers and the Furnace renders they start run at low priority, and
+Furnace stays off the menu's console so the next prompt still takes a line.
+`report` on a pack uses the same count. Files convert independently; one
+failure does not stop the batch, and every failure is printed with the file
+name. Read the warnings on each line: they name the register oddities the
+converter worked around.
 
 If the grid sounds wrong (notes landing between rows), run `report` on the
 offending track, find the measured rows per second, and pin it with

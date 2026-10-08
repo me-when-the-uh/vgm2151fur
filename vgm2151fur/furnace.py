@@ -53,23 +53,29 @@ def restore_console() -> None:
         return
 
 
+def binary_name() -> str:
+    """The console build's file name on this platform."""
+    return "furnace.exe" if os.name == "nt" else "furnace"
+
+
 def _candidates() -> list[Path]:
     here = Path(__file__).resolve().parents[1]
+    exe = binary_name()
     out: list[Path] = []
     env = os.environ.get("VGM2151FUR_FURNACE")
     if env:
         p = Path(env)
         if p.is_dir():
-            out.append(p / "furnace.exe")
+            out.append(p / exe)
         else:
             out.append(p)
     out += [
-        here.parent / "furnace" / "furnace.exe",
-        here.parent / "furnace" / "build" / "furnace.exe",
-        here / "third_party" / "furnace-console" / "furnace.exe",
-        here.parent / "third_party" / "furnace-console" / "furnace.exe",
-        here / "third_party" / "furnace" / "furnace.exe",
-        here.parent / "third_party" / "furnace" / "furnace.exe",
+        here.parent / "furnace" / exe,
+        here.parent / "furnace" / "build" / exe,
+        here / "third_party" / "furnace-console" / exe,
+        here.parent / "third_party" / "furnace-console" / exe,
+        here / "third_party" / "furnace" / exe,
+        here.parent / "third_party" / "furnace" / exe,
     ]
     return out
 
@@ -86,7 +92,7 @@ def _run(fur: Path, out: Path, extra: list[str]) -> Path:
     exe = find_furnace()
     if exe is None:
         raise FurnaceError(
-            "furnace.exe not found. Put a Furnace build next to the project as "
+            f"{binary_name()} not found. Put a Furnace build next to the project as "
             "furnace/, drop it in third_party/furnace/, or point "
             "VGM2151FUR_FURNACE at it"
         )

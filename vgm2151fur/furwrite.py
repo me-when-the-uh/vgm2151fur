@@ -10,8 +10,9 @@ K007232 0xC6, SegaPCM 0x9B, C140 0xCE, C352 0xD0).
 from __future__ import annotations
 
 import struct
+from bisect import bisect_right
 from collections import Counter
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 
 from vgm2151fur.analyze import CARRIERS, Song
 from vgm2151fur.c140 import c140_furnace_clock
@@ -429,38 +430,45 @@ class Row:
     note: int = -1  # furnace 0-179, 180=off, -1 empty
     ins: int = EMPTY
     vol: int = EMPTY
-    fx: list[tuple[int, int]] = field(default_factory=list)
+    # None until the row holds an effect. Blank rows are the overwhelming
+    # majority of a pattern, so the slot list is made on the first effect.
+    fx: list[tuple[int, int]] | None = None
 
     def is_empty(self) -> bool:
         if self.note >= 0 or self.ins != EMPTY or self.vol != EMPTY:
             return False
+        if self.fx is None:
+            return True
         return all(c == EMPTY for c, _ in self.fx)
 
 
-def _blank_row(fx_cols: int) -> Row:
-    return Row(fx=[(EMPTY, EMPTY)] * fx_cols)
+def _blank_row() -> Row:
+    return Row()
 
 
 def _add_fx(row: Row, cmd: int, val: int, fx_cols: int) -> None:
-    for i, (c, _) in enumerate(row.fx):
+    fx = row.fx
+    if fx is None:
+        fx = row.fx = [(EMPTY, EMPTY)] * fx_cols
+    for i, (c, _) in enumerate(fx):
         if c == cmd:
-            row.fx[i] = (cmd, val)
+            fx[i] = (cmd, val)
             return
-    for i, (c, _) in enumerate(row.fx):
+    for i, (c, _) in enumerate(fx):
         if c == EMPTY:
-            row.fx[i] = (cmd, val)
+            fx[i] = (cmd, val)
             return
-    if row.fx:
-        row.fx[-1] = (cmd, val)
+    if fx:
+        fx[-1] = (cmd, val)
     elif fx_cols:
-        row.fx.append((cmd, val))
+        fx.append((cmd, val))
 
 
 def _encode_patn_row(row: Row, fx_cols: int) -> bytes:
     """One PATN row. Empty → 0x00 (skip 1)."""
     if row.is_empty():
         return b"\x00"
-    fx = [(c, v) for c, v in row.fx[:fx_cols] if c != EMPTY]
+    fx = [(c, v) for c, v in (row.fx or ())[:fx_cols] if c != EMPTY]
     mask = 0
     extra = 0
     payload = bytearray()
@@ -499,14 +507,25 @@ def _encode_patn_row(row: Row, fx_cols: int) -> bytes:
     return bytes(out)
 
 
-def _write_patn(b: Buf, channel: int, index: int, rows: list[Row], fx_cols: int, name: str = "") -> None:
+def _write_patn(b: Buf, channel: int, index: int, rows: list[Row | None], fx_cols: int, name: str = "") -> None:
     size_off, start = b.begin_block(b"PATN")
     b.u8(0)  # subsong
     b.u8(channel)
     b.u16(index)
     b.strz(name)
+    # Empty rows encode as 0x00; a pattern is mostly empty ones, so they are
+    # counted and written as runs instead of one call per row.
+    empty = 0
     for row in rows:
+        if row is None or (row.note < 0 and row.ins == EMPTY and row.vol == EMPTY and not row.fx):
+            empty += 1
+            continue
+        if empty:
+            b.raw(b"\x00" * empty)
+            empty = 0
         b.raw(_encode_patn_row(row, fx_cols))
+    if empty:
+        b.raw(b"\x00" * empty)
     b.u8(0xFF)
     b.end_block(size_off, start)
 
@@ -593,6 +612,7 @@ def _emit_sweep(
     fx_cols: int,
     total_rows: int,
     e5_writes: dict[tuple[int, int], int],
+    note_rows: dict[int, list[int]],
     chan: int | None = None,
 ) -> None:
     """Encode a key-on pitch trajectory as per-row 01xx/02xx ramps + E5 steps.
@@ -648,7 +668,7 @@ def _emit_sweep(
                 cell = grid[ev.ch].get(row1)
                 if cell is None or not (0 <= cell.note < 180):
                     if cell is None:
-                        cell = _blank_row(fx_cols)
+                        cell = _blank_row()
                         grid[ev.ch][row1] = cell
                     _add_fx(cell, 0xE8 if y > 0 else 0xE9, abs(y), fx_cols)
         return
@@ -662,9 +682,10 @@ def _emit_sweep(
     # rate/fine tune.  The crossing is usually a tick or two. The frozen
     # pitch loses almost nothing.
     crossed = False
-    later = [r for r, c in grid[ev.ch].items() if r > row0 and 0 <= c.note < 180]
-    if later:
-        limit = int(song.t0 + min(later) * row_len)
+    after = note_rows.get(ev.ch, ())
+    i = bisect_right(after, row0)
+    if i < len(after):
+        limit = int(song.t0 + after[i] * row_len)
         if limit < end:
             end = limit
             crossed = True
@@ -762,7 +783,7 @@ def _emit_sweep(
                     y = max(-15, min(15, int(round(short / 64.0))))
                     if y:
                         if cell is None:
-                            cell = _blank_row(fx_cols)
+                            cell = _blank_row()
                             grid[ev.ch][row0 + k] = cell
                         _add_fx(cell, 0xE8 if y > 0 else 0xE9, abs(y), fx_cols)
                         xpose += 64.0 * y
@@ -776,12 +797,15 @@ def _emit_sweep(
             # pitch freezes after the first row of a constant-rate glide.
             cell = grid[ev.ch].get(row0 + k)
             if cell is None:
-                cell = _blank_row(fx_cols)
+                cell = _blank_row()
                 grid[ev.ch][row0 + k] = cell
             # Never leave a slide of the opposite direction next to the new
             # one: 01xx and 02xx are separate effect codes. Both would
             # survive on the row and the net slide becomes column-order luck.
-            cell.fx = [(c, v) for c, v in cell.fx if c not in (0x01, 0x02)]
+            # The filter keeps the row's effect slots, or the next effect
+            # would overwrite a live one instead of filling a free slot.
+            cell.fx = [(c, v) for c, v in (cell.fx or [(EMPTY, EMPTY)] * fx_cols)
+                       if c not in (0x01, 0x02)]
             if param:
                 _add_fx(cell, 0x01 if param > 0 else 0x02, min(255, abs(param)), fx_cols)
             else:
@@ -825,9 +849,9 @@ def _emit_sweep(
         # whole row of the tail's travel (Block Hole's 0.38 s dives).
         cell = grid[ev.ch].get(stop_row)
         if cell is None:
-            cell = _blank_row(fx_cols)
+            cell = _blank_row()
             grid[ev.ch][stop_row] = cell
-        if last_rate and not any(c in (0x01, 0x02) for c, _v in cell.fx):
+        if last_rate and not any(c in (0x01, 0x02) for c, _v in (cell.fx or ())):
             _add_fx(cell, 0x01 if last_rate > 0 else 0x02, 0, fx_cols)
         return
     if stop_row >= total_rows:
@@ -838,10 +862,11 @@ def _emit_sweep(
     if not last_rate and (foreign or pin == e5w):
         return
     if cell is None:
-        cell = _blank_row(fx_cols)
+        cell = _blank_row()
         grid[ev.ch][stop_row] = cell
     if last_rate:
-        cell.fx = [(c, v) for c, v in cell.fx if c not in (0x01, 0x02)]
+        cell.fx = [(c, v) for c, v in (cell.fx or [(EMPTY, EMPTY)] * fx_cols)
+                   if c not in (0x01, 0x02)]
         _add_fx(cell, 0x01 if last_rate > 0 else 0x02, 0, fx_cols)
     if not foreign and pin != e5w:
         e5_writes[(ev.ch, stop_row)] = pin
@@ -906,12 +931,16 @@ def _assign_pcm_rows(
 
 
 def _build_patterns(song: Song, n_ch: int, pat_len: int, fx_cols: int, ch_offset: int = 0) -> tuple[
-    list[list[int]], list[tuple[int, int, list[Row]]], int
+    list[list[int]], list[tuple[int, int, list[Row | None]]], int
 ]:
-    """Return (orders[ch][ord], patterns as (ch, idx, rows), loop_order)."""
+    """Return (orders[ch][ord], patterns as (ch, idx, rows), loop_order).
+
+    Untouched rows stay `None`: most of a pattern is empty and the writers
+    skip those without materializing a row object per slot.
+    """
     if not song.events:
         orders = [[0] for _ in range(n_ch)]
-        pats = [(ch, 0, [_blank_row(fx_cols) for _ in range(pat_len)]) for ch in range(n_ch)]
+        pats = [(ch, 0, [None] * pat_len) for ch in range(n_ch)]
         return orders, pats, 0
 
     last_sample = song.events[-1].sample if song.events else 0
@@ -974,7 +1003,7 @@ def _build_patterns(song: Song, n_ch: int, pat_len: int, fx_cols: int, ch_offset
             continue
         cell = grid[0].get(row)
         if cell is None:
-            cell = _blank_row(fx_cols)
+            cell = _blank_row()
             grid[0][row] = cell
         _add_fx(cell, cmd, val, fx_cols)
 
@@ -987,7 +1016,7 @@ def _build_patterns(song: Song, n_ch: int, pat_len: int, fx_cols: int, ch_offset
             continue
         cell = grid[ch].get(row)
         if cell is None:
-            cell = _blank_row(fx_cols)
+            cell = _blank_row()
             grid[ch][row] = cell
         _add_fx(cell, cmd, val, fx_cols)
 
@@ -1015,7 +1044,7 @@ def _build_patterns(song: Song, n_ch: int, pat_len: int, fx_cols: int, ch_offset
             continue
         cell = grid[ev_ch].get(row)
         if cell is None:
-            cell = _blank_row(fx_cols)
+            cell = _blank_row()
             grid[ev_ch][row] = cell
         if not ev.on:
             if cell.note < 0:
@@ -1039,15 +1068,22 @@ def _build_patterns(song: Song, n_ch: int, pat_len: int, fx_cols: int, ch_offset
     # Pitch sweeps (percussion): after every event is placed so the ramps can
     # share the note-off rows (and their ED delays).  The sweep may step E5 on
     # its own rows (jump correction), recorded alongside the note values.
+    # Every note row is known before this pass and sweeps only add effects,
+    # so each channel's note rows are listed once for the crossing checks.
+    note_rows: dict[int, list[int]] = {
+        ch: sorted(r for r, cell in grid[ch].items() if 0 <= cell.note < 180)
+        for ch in range(n_ch)
+    }
     sweep_e5: dict[tuple[int, int], int] = {}
     if song.events:
         for ev in song.events:
             if ev.on and ev.sweep and 0 <= ev.ch + ch_offset < n_ch:
                 if ch_offset:
                     _emit_sweep(grid, song, ev, fx_cols, total_rows, sweep_e5,
-                                ev.ch + ch_offset)
+                                note_rows, ev.ch + ch_offset)
                 else:
-                    _emit_sweep(grid, song, ev, fx_cols, total_rows, sweep_e5)
+                    _emit_sweep(grid, song, ev, fx_cols, total_rows, sweep_e5,
+                                note_rows)
 
     # C140 volume trajectories (fades): the driver steps the voice's volume
     # registers and Furnace feeds the column into the chip gain live
@@ -1066,7 +1102,7 @@ def _build_patterns(song: Song, n_ch: int, pat_len: int, fx_cols: int, ch_offset
                     continue
                 cell = grid[ev_ch].get(row)
                 if cell is None:
-                    cell = _blank_row(fx_cols)
+                    cell = _blank_row()
                     grid[ev_ch][row] = cell
                 if cell.note >= 0:
                     continue
@@ -1087,7 +1123,7 @@ def _build_patterns(song: Song, n_ch: int, pat_len: int, fx_cols: int, ch_offset
                 continue
             cell = grid[ch].get(row)
             if cell is None:
-                cell = _blank_row(fx_cols)
+                cell = _blank_row()
                 grid[ch][row] = cell
             _add_fx(cell, 0xE5, val, fx_cols)
             cur_e5 = val
@@ -1099,12 +1135,12 @@ def _build_patterns(song: Song, n_ch: int, pat_len: int, fx_cols: int, ch_offset
             break
 
     orders: list[list[int]] = [[] for _ in range(n_ch)]
-    patterns: list[tuple[int, int, list[Row]]] = []
+    patterns: list[tuple[int, int, list[Row | None]]] = []
     for ch in range(n_ch):
         for oi in range(n_ord):
             start_row = bounds[oi]
             end_row = bounds[oi + 1]
-            rows = [_blank_row(fx_cols) for _ in range(pat_len)]
+            rows: list[Row | None] = [None] * pat_len
             span = min(pat_len, end_row - start_row)
             for i in range(span):
                 src = grid[ch].get(start_row + i)
@@ -1113,7 +1149,10 @@ def _build_patterns(song: Song, n_ch: int, pat_len: int, fx_cols: int, ch_offset
             # Short non-last orders: D00 so we don't play trailing empty rows
             # before the next order (used for the intro/loop split).
             if oi != n_ord - 1 and 0 < span < pat_len:
-                _add_fx(rows[span - 1], 0x0D, 0, fx_cols)
+                cell = rows[span - 1]
+                if cell is None:
+                    cell = rows[span - 1] = _blank_row()
+                _add_fx(cell, 0x0D, 0, fx_cols)
             # Loop jump on the last row that carries content, not on the last
             # row of the padded order: the final order is only as long as the
             # music, and a Bxx on the padded end would insert silence before
@@ -1126,15 +1165,19 @@ def _build_patterns(song: Song, n_ch: int, pat_len: int, fx_cols: int, ch_offset
                 jump_row = min(pat_len, max(0, content_end - start_row + 1)) - 1
                 if jump_row < 0:
                     jump_row = 0
-                rows[jump_row].fx = [(c, v) for c, v in rows[jump_row].fx if c != 0xED]
-                _add_fx(rows[jump_row], 0x0B, loop_order, fx_cols)
+                cell = rows[jump_row]
+                if cell is None:
+                    cell = rows[jump_row] = _blank_row()
+                cell.fx = [(c, v) for c, v in (cell.fx or [(EMPTY, EMPTY)] * fx_cols)
+                           if c != 0xED]
+                _add_fx(cell, 0x0B, loop_order, fx_cols)
             orders[ch].append(oi)
             patterns.append((ch, oi, rows))
 
     return orders, patterns, loop_order
 
 
-def _fit_fx_cols(patterns: list[tuple[int, int, list[Row]]], n_ch: int) -> list[int]:
+def _fit_fx_cols(patterns: list[tuple[int, int, list[Row | None]]], n_ch: int) -> list[int]:
     """Effect columns per channel: one per effect the busiest row uses, 1..8.
 
     Furnace sizes a pattern column from its effect column count, so this is
@@ -1145,7 +1188,10 @@ def _fit_fx_cols(patterns: list[tuple[int, int, list[Row]]], n_ch: int) -> list[
     for ch, _idx, rows in patterns:
         if not 0 <= ch < n_ch:
             continue
-        used = max((sum(c != EMPTY for c, _v in row.fx) for row in rows), default=0)
+        used = max(
+            (sum(c != EMPTY for c, _v in (row.fx or ())) for row in rows if row is not None),
+            default=0,
+        )
         if used > cols[ch]:
             cols[ch] = used
     return [min(8, c) for c in cols]

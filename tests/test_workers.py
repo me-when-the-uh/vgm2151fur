@@ -8,21 +8,26 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from _synth import raw_vgm  # noqa: E402
+from vgm2151fur import priority  # noqa: E402
 from vgm2151fur.convert import convert_folder, report_files  # noqa: E402
 from vgm2151fur.priority import (  # noqa: E402
     LOW_PRIORITY_CLASS,
+    WORKER_CEILING,
     creationflags,
     current_priority,
-    physical_cores,
+    default_workers,
     resolve_workers,
     set_low_priority,
     set_priority,
+    visible_cpus,
+    worker_cap,
     worker_limit,
 )
 
@@ -37,24 +42,55 @@ def _child_env() -> dict[str, str]:
 
 
 class TestWorkerCount(unittest.TestCase):
-    def test_cap_is_physical_cores_minus_one(self):
-        cores = physical_cores()
-        logical = os.cpu_count() or 1
-        self.assertGreaterEqual(cores, 1)
-        self.assertLessEqual(cores, logical)
-        self.assertEqual(worker_limit(), max(1, cores - 1))
+    def test_default_follows_the_thread_rule(self):
+        # One thread stays free below six, two at six or more, ceiling 16.
+        self.assertEqual(default_workers(1), 1)
+        self.assertEqual(default_workers(2), 1)
+        self.assertEqual(default_workers(5), 4)
+        self.assertEqual(default_workers(6), 4)
+        self.assertEqual(default_workers(12), 10)  # 6 core/12 thread desktop
+        self.assertEqual(default_workers(16), 14)
+        self.assertEqual(default_workers(22), 16)  # P+E cores; ceiling applies
+        self.assertEqual(default_workers(64), 16)
+        self.assertEqual(worker_limit(), default_workers(visible_cpus()))
 
-    def test_resolve_workers_clamps(self):
-        cap = worker_limit()
+    def test_worker_cap_for_explicit_requests(self):
+        # Every thread below eight, one free from eight up, safety cap at 31.
+        self.assertEqual(WORKER_CEILING, 31)
+        self.assertEqual(worker_cap(1), 1)
+        self.assertEqual(worker_cap(2), 2)
+        self.assertEqual(worker_cap(7), 7)
+        self.assertEqual(worker_cap(8), 7)
+        self.assertEqual(worker_cap(12), 11)
+        self.assertEqual(worker_cap(32), 31)
+        self.assertEqual(worker_cap(64), 31)
+        self.assertEqual(worker_cap(visible_cpus()), max(1, min(visible_cpus() - 1, 31))
+                         if visible_cpus() >= 8 else visible_cpus())
+
+    def test_resolve_workers_honors_a_request_up_to_the_cap(self):
+        limit = worker_limit()
+        cap = worker_cap(visible_cpus())
         count, note = resolve_workers(None, 100)
-        self.assertEqual(count, cap)
+        self.assertEqual(count, limit)
         self.assertIn("low priority", note)
-        self.assertIn("physical cores", note)
+        self.assertIn("threads", note)
         self.assertEqual(resolve_workers(1, 100)[0], 1)
-        count, note = resolve_workers(10**6, 3)
-        self.assertEqual(count, min(3, cap))
-        if 10**6 > cap:
-            self.assertIn("capped", note)
+        count, _note = resolve_workers(10**6, 3)
+        self.assertEqual(count, 3)  # never more workers than jobs
+        if cap > 1:
+            count, _note = resolve_workers(cap - 1, cap + 5)
+            self.assertEqual(count, cap - 1)  # within the cap: as given
+        count, note = resolve_workers(cap + 5, cap + 20)
+        self.assertEqual(count, cap)  # beyond it: clamped, with a reason
+        self.assertIn("capped", note)
+
+    def test_safety_cap_note_on_a_many_thread_cpu(self):
+        with mock.patch.object(priority, "visible_cpus", return_value=64):
+            count, note = priority.resolve_workers(64, 100)
+            self.assertEqual(worker_cap(64), 31)
+        self.assertEqual(count, 31)
+        self.assertIn("safety cap", note)
+        self.assertIn("slower", note)
 
 
 @unittest.skipUnless(os.name == "nt", "Windows priority classes")
@@ -159,6 +195,19 @@ class TestBatch(unittest.TestCase):
 
 
 class TestFurnaceConsole(unittest.TestCase):
+    def test_candidates_use_the_platform_binary_name(self):
+        from vgm2151fur.furnace import _candidates, binary_name
+
+        self.assertEqual(binary_name(), "furnace.exe" if os.name == "nt" else "furnace")
+        had_env = os.environ.pop("VGM2151FUR_FURNACE", None)
+        try:
+            candidates = _candidates()
+        finally:
+            if had_env is not None:
+                os.environ["VGM2151FUR_FURNACE"] = had_env
+        self.assertTrue(candidates)
+        self.assertTrue(all(p.name == binary_name() for p in candidates))
+
     def test_render_does_not_take_the_console(self):
         import subprocess
         from unittest.mock import patch
