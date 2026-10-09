@@ -577,6 +577,14 @@ def _run_paths(argv: list[str]) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    try:
+        return _main(argv)
+    except KeyboardInterrupt:
+        sys.stderr.write("cancelled (Ctrl+C)\n")
+        return 130
+
+
+def _main(argv: list[str] | None = None) -> int:
     args_in = list(sys.argv[1:] if argv is None else argv)
     if not args_in or args_in == ["menu"]:
         if args_in == ["menu"] or (sys.stdin.isatty() and sys.stdout.isatty()):

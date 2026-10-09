@@ -3,6 +3,9 @@
 Not a full-screen interface. `run_menu(read, out, state_path)` is the testable
 entry: every action calls the same functions the command line uses.
 
+Ctrl+C cancels a running command and returns to the menu. At the menu prompt
+it quits.
+
 A path typed at the prompt can be quoted (Explorer's Copy as path), a file,
 a pack folder, or a folder of packs. A file converts. A pack opens. A folder
 of packs lists them.
@@ -90,7 +93,7 @@ def _banner(state: dict) -> str:
         "  5  render     .fur to WAV",
         "  6  report     analysis, nothing written",
         "  7  condense   write 1x..4x BPM-variant copies, pick the safe one",
-        _TONE.dim("  paste a path, or a number.   m menu    q quit"),
+        _TONE.dim("  paste a path, or a number.  m menu, q quit, Ctrl+C quit"),
     ]
     last = state.get("browse_root")
     if last:
@@ -112,7 +115,8 @@ def run_menu(read=input, out=print, *, state_path: Path | None = None) -> int:
             return 0
         except KeyboardInterrupt:
             out("")
-            continue
+            out("  quit (Ctrl+C)")
+            return 130
         if not raw:
             continue
         key = raw.lower()
@@ -125,6 +129,7 @@ def run_menu(read=input, out=print, *, state_path: Path | None = None) -> int:
             result = _dispatch(read, out, state, path, raw, key)
         except KeyboardInterrupt:
             out("")
+            out("  cancelled")
             continue
         except (OSError, ValueError) as exc:
             out(f"  ERROR: {exc}")

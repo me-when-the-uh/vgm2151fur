@@ -7,7 +7,7 @@ import json
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -364,17 +364,41 @@ class TestMenu(unittest.TestCase):
                 rc = run_menu(read=reader, out=print, state_path=Path(tmp) / "state.json")
             self.assertEqual(rc, 0)
 
-    def test_ctrl_c_at_the_prompt_keeps_the_menu(self):
+    def test_ctrl_c_at_the_prompt_quits(self):
         with tempfile.TemporaryDirectory() as tmp:
             log = io.StringIO()
             with redirect_stdout(log):
                 rc = run_menu(
-                    read=_Interrupter(["nope", "INT", "q"]),
+                    read=_Interrupter(["nope", "INT"]),
                     out=print,
                     state_path=Path(tmp) / "state.json",
                 )
-            self.assertEqual(rc, 0)
+            self.assertEqual(rc, 130)
             self.assertIn("unknown command", log.getvalue())
+            self.assertIn("quit (Ctrl+C)", log.getvalue())
+
+    def test_ctrl_c_in_a_command_returns_to_the_menu(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _make_pack(root)
+            log = io.StringIO()
+            with redirect_stdout(log):
+                rc = run_menu(
+                    read=_Interrupter(["1", str(root), "1", "INT", "q"]),
+                    out=print,
+                    state_path=root / "state.json",
+                )
+            self.assertEqual(rc, 0)
+            self.assertIn("cancelled", log.getvalue())
+
+    def test_ctrl_c_in_a_cli_run_exits_130(self):
+        from unittest import mock
+
+        with mock.patch.object(cli, "_main", side_effect=KeyboardInterrupt):
+            with redirect_stderr(io.StringIO()) as err:
+                rc = cli.main(["convert", "whatever.vgm"])
+        self.assertEqual(rc, 130)
+        self.assertIn("cancelled", err.getvalue())
 
 
 if __name__ == "__main__":

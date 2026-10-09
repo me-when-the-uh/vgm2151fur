@@ -27,7 +27,8 @@ python -m vgm2151fur
 ```
 
 With no arguments the tool opens a short menu. Numbered commands, and a path
-pasted at the prompt. Quotes from Explorer's Copy as path are fine.
+pasted at the prompt. Quotes from Explorer's Copy as path are fine. `q` or
+Ctrl+C quits.
 
 ```
  1  packs      scan a folder, then convert, volumes, render

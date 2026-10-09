@@ -14,6 +14,9 @@ has one, with a dash next to the tracks that have no `.fur` yet. From there
 `c` converts (all tracks or a selection like `2-6`), `e` adjusts a chip
 volume, and `r` renders one track to WAV.
 
+Ctrl+C cancels a running command and returns to the menu. At the menu prompt
+it quits (exit code 130).
+
 The CLI equivalent for scripts:
 
 ```
@@ -187,5 +190,6 @@ they can be run from anywhere.
 
 ## Exit codes
 
-`0` success, `1` a file failed, `2` a usage error. `compare` returns 1 when
-runs were found, so it doubles as a check in a script.
+`0` success, `1` a file failed, `2` a usage error, `130` cancelled with
+Ctrl+C. `compare` returns 1 when runs were found, so it doubles as a check
+in a script.

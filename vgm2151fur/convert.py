@@ -7,6 +7,7 @@ from collections.abc import Iterator, Sequence
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
+from vgm2151fur import furio
 from vgm2151fur.analyze import analyze, format_report
 from vgm2151fur.furnace import FurnaceError, restore_console
 from vgm2151fur.furwrite import dev_max, loss_total, write_fur
@@ -18,6 +19,13 @@ from vgm2151fur.vgm import load_vgm
 
 # The desktop default: logical CPUs minus one or two threads, capped at 16.
 CONVERT_WORKERS = resolve_workers(None, jobs=10**6)[0]
+# Divergent pitch time a rendition may carry, as a share of its played time.
+# The relative test alone cannot police a track whose 1x rendition already
+# drifts: with a quarter of a bad baseline allowed, Genpei Toumaden
+# "12 Yoritomo" (5.1 s of 15.9 s) and "07 Theme of Yoshitsune" (18.3 s of
+# 30.2 s) condensed freely.  The worst faithful rendition in the same pack is
+# "06 Theme of Heiankyo" at 2.6 s of 29.8 s, so the two groups are far apart.
+DIVERGENCE_SHARE = 0.15
 VGM_SUFFIXES = {".vgm", ".vgz"}
 VGM_GLOBS = ("*.vgm", "*.vgz", "*.VGM", "*.VGZ")
 
@@ -115,7 +123,8 @@ def report_files(
                     yield f, None, str(exc)
         return
     log(f"workers: {n_workers} ({note})")
-    with ProcessPoolExecutor(max_workers=n_workers, initializer=set_low_priority) as pool:
+    pool = ProcessPoolExecutor(max_workers=n_workers, initializer=set_low_priority)
+    try:
         futs = [
             pool.submit(_report_one, str(f), speed, pcm, tick_samples, min_row)
             for f in files
@@ -125,6 +134,10 @@ def report_files(
                 yield f, fut.result(), None
             except Exception as exc:
                 yield f, None, str(exc)
+    finally:
+        # A cancelled batch must not wait on every queued track: drop the
+        # queue, let the analyses already running finish on their own.
+        pool.shutdown(wait=False, cancel_futures=True)
 
 
 def dump_pcm(path: Path, out_dir: Path) -> dict:
@@ -140,19 +153,22 @@ def furnace_bpm(song) -> float:
 def _verify_runs(
     src_vgm, fur_path: Path, channels: int = 8,
     threshold_st: float = 0.25, min_run_ms: float = 60.0,
-) -> int:
-    """Pitch runs between the source and the .fur's Furnace export.
+) -> float:
+    """Milliseconds of divergent pitch between the source and the export.
 
     The structural counters cannot see everything (retrigger/envelope wobble
-    and sub-threshold drift), so `--verify` renders each candidate and counts
-    the sustained divergences the `compare` command reports.  The threshold is
-    finer than `compare`'s default (0.5 st / 100 ms), where a marginal variant
-    can still hide.
+    and sub-threshold drift), so `--verify` renders each candidate and measures
+    the divergences the `compare` command reports.  The threshold is finer than
+    `compare`'s default (0.5 st / 100 ms), where a marginal variant can hide.
+
+    The result is total divergent time, not a count of runs.  A count moves
+    with `min_run_ms`, and the baseline moves with it, which makes the
+    comparison between candidates depend on the floor instead of the music.
 
     `min_run_ms` has to stay under the candidate's own row length. A note
     pushed one row late diverges for exactly one row, and at 60 ms against a
     55 ms row (Genpei Toumaden "03 Small Mode" x4) that run is discarded
-    before it is counted.
+    before it is measured.
     """
     from vgm2151fur.diag import export_fur, pitch_runs
 
@@ -160,11 +176,12 @@ def _verify_runs(
     try:
         export_fur(fur_path, exp)
         other = load_vgm(exp)
-        return sum(
-            len(pitch_runs(src_vgm, other, ch, threshold_st=threshold_st,
-                           min_run_ms=min_run_ms))
-            for ch in range(channels)
-        )
+        total = 0
+        for ch in range(channels):
+            for run in pitch_runs(src_vgm, other, ch, threshold_st=threshold_st,
+                                  min_run_ms=min_run_ms):
+                total += run.t1 - run.t0
+        return total / 44.1
     finally:
         try:
             exp.unlink()
@@ -174,9 +191,16 @@ def _verify_runs(
 
 def _emit(
     song, out_path: Path, *, pcm: bool, include_fm: bool, normalize: bool,
-    warnings: list, stats: dict,
+    warnings: list, stats: dict, gain: float | None = None,
 ) -> tuple[bytes, float | None, float | None]:
-    """Write one Song to `out_path`, optionally normalizing. (bytes, peak, gain)."""
+    """Write one Song to `out_path`, optionally normalizing. (bytes, peak, gain).
+
+    `gain` reuses a master volume measured on another rendition of the same
+    track.  Measuring costs a full render per variant, and the variants differ
+    only in row rate: across x1..x4 the peak of one track spans about 1 dB, so
+    one measurement levels the whole set and keeps the variants at the same
+    volume, which a per-variant fit does not.
+    """
     # A track with no FM key-ons must not carry an empty YM2151: the chip adds a
     # second device to the export, and VGM players rescale the mix for it, which
     # drops the sample chip's level.
@@ -184,7 +208,11 @@ def _emit(
     data = write_fur(song, include_pcm=pcm, include_fm=use_fm, stats=stats)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_bytes(data)
-    peak = gain = None
+    if normalize and gain is not None:
+        data = furio.set_master_volume(data, gain)
+        out_path.write_bytes(data)
+        return data, None, gain
+    peak = applied = None
     if normalize:
         try:
             result = normalize_module(data, name=out_path.stem)
@@ -200,9 +228,9 @@ def _emit(
         else:
             if result is not None:
                 data = result.data
-                peak, gain = result.peak, result.gain
+                peak, applied = result.peak, result.gain
                 out_path.write_bytes(data)
-    return data, peak, gain
+    return data, peak, applied
 
 
 def convert_vgm(
@@ -305,7 +333,7 @@ _MANIFEST_HEADER = "track\tfactor\tfile\tbpm\tloss\tdev\tdiv\tlossless\tpick\tgr
 
 
 def _manifest_line(src: Path, v: dict) -> str:
-    div = "" if v.get("div_runs") is None else str(v["div_runs"])
+    div = "" if v.get("div_ms") is None else f"{v['div_ms']:.1f}"
     return "\t".join((
         src.stem, f"{v['factor']:g}", Path(v["dst"]).name,
         f"{v['bpm']:.1f}", str(v["loss_total"]), str(v["dev_max"]), div,
@@ -349,6 +377,7 @@ def convert_variants(
     src = Path(path)
     out_dir = Path(out_dir)
     results: list[dict] = []
+    shared_gain: float | None = None
     for f in factors:
         factor = float(f)
         song = analyze(vgm, speed=speed, pcm=pcm, min_row=min_row, condense=factor)
@@ -360,7 +389,10 @@ def convert_variants(
         data, peak, gain = _emit(
             song, out_path, pcm=pcm, include_fm=include_fm,
             normalize=normalize, warnings=warnings, stats=stats,
+            gain=shared_gain,
         )
+        if shared_gain is None and gain is not None:
+            shared_gain = gain
         row_ms = song.samples_per_row / 44.1
         results.append({
             "factor": factor,
@@ -378,12 +410,17 @@ def convert_variants(
             "loop": loop_note,
             "peak": peak,
             "gain": gain,
-            "div_runs": (
+            "div_ms": (
                 _verify_runs(
                     vgm, out_path, min_run_ms=max(4.0, min(60.0, row_ms * 0.75)),
                 ) if verify else None
             ),
         })
+    # The variants sharing a measurement all report the track's peak.
+    measured = next((r["peak"] for r in results if r["peak"] is not None), None)
+    for r in results:
+        if r["peak"] is None:
+            r["peak"] = measured
     base = next((r for r in results if r["factor"] == 1), results[0])
     # Structural counters that change content and that the rendered pitch
     # comparison cannot see: a dropped note, a swallowed note-off, an evicted
@@ -396,15 +433,21 @@ def convert_variants(
         "fx_dropped", "orders_truncated",
     )
     tol = 6
-    base_runs = base.get("div_runs")
+    base_div = base.get("div_ms")
     base_hard = sum(base["loss"].get(k, 0) for k in hard_keys)
+    play_ms = (vgm.loop_samples or vgm.total_samples) / 44.1
+    div_cap = play_ms * DIVERGENCE_SHARE
 
     def _lossless(r: dict) -> bool:
         if verify:
             if sum(r["loss"].get(k, 0) for k in hard_keys) > base_hard:
                 return False
-            if base_runs is not None and r.get("div_runs") is not None:
-                if r["div_runs"] > base_runs + 1:
+            if base_div is not None and r.get("div_ms") is not None:
+                # Divergent time scales with the length of the piece, so the
+                # slack is relative with a floor for near-perfect baselines.
+                if r["div_ms"] > base_div + max(20.0, base_div * 0.25):
+                    return False
+                if r["div_ms"] > div_cap:
                     return False
             return True
         # Without a render the analytic counters are all there is.
@@ -417,16 +460,30 @@ def convert_variants(
     for r in results:
         r["lossless"] = _lossless(r)
     ok = [r for r in results if r["lossless"]]
-    if mode == "none":
+    if mode == "none" or not ok:
         pick = base
     elif mode == "lossless":
-        pick = max(ok, key=lambda r: r["factor"])
+        measured = [r for r in ok if r.get("div_ms") is not None]
+        if measured:
+            # Divergent time is not monotone in the factor: it falls to a
+            # minimum and climbs again (Genpei Toumaden "03 Small Mode" x1..
+            # x4 = 1174, 1216, 1105, 920, 1134, 1059, 2261 ms). Taking the
+            # largest accepted factor walks straight past that minimum, so
+            # pick the largest factor still within a tenth of it.
+            best = min(r["div_ms"] for r in measured)
+            near = [r for r in measured if r["div_ms"] <= best + max(20.0, best * 0.10)]
+            pick = max(near, key=lambda r: r["factor"])
+        else:
+            pick = max(ok, key=lambda r: r["factor"])
     else:
         pick = max(results, key=lambda r: r["factor"])
     for r in results:
         r["pick"] = r is pick
     if layout == "dirs":
+        # 1x is the canonical file and the reference every verdict is measured
+        # against, so it is written even when nothing else survives.
         keep = {r["factor"] for r in (results if mode == "all" else ok)}
+        keep.add(base["factor"])
         _place_dirs(results, out_dir, keep=keep)
     return results
 
@@ -454,7 +511,7 @@ def format_variant_lines(variants: list[dict], dest: Path) -> list[str]:
     for factor, where, v in zip(factors, wheres, variants):
         mark = "  <= pick" if v["pick"] else ""
         dropped = "" if v.get("lossless", True) else "  (dropped)"
-        div = f"  div {v['div_runs']:>4}" if v.get("div_runs") is not None else ""
+        div = f"  div {v['div_ms']:>7.1f}ms" if v.get("div_ms") is not None else ""
         lines.append(
             f"{factor:<{factor_w}}  BPM {v['bpm']:7.0f}  {where:<{where_w}}  "
             f"loss {v['loss_total']:>4}  dev {v['dev_max']:>4}{div}{mark}{dropped}"
@@ -625,11 +682,12 @@ def convert_folder(
             "verify": verify,
             "layout": layout,
         }
-        with ProcessPoolExecutor(
+        pool = ProcessPoolExecutor(
             max_workers=n_workers,
             initializer=_init_worker,
             initargs=(cfg,),
-        ) as pool:
+        )
+        try:
             futs = {pool.submit(_worker, str(f)): f for f in files}
             for fut in as_completed(futs):
                 f = futs[fut]
@@ -640,5 +698,9 @@ def convert_folder(
                 else:
                     _note(f, info)
                     yield f, info, None
+        finally:
+            # A cancelled batch must not wait on every queued track: drop the
+            # queue, let the renders already running finish on their own.
+            pool.shutdown(wait=False, cancel_futures=True)
     finally:
         restore_console()
