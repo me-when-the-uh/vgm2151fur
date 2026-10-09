@@ -44,9 +44,8 @@ C352_VOICES = 32
 C352_RATE_DIVISOR = 288 * 65536
 C352_DEFAULT_CLOCK = 24_192_000
 C352_REFIT_SAMPLES = 735  # one 60 Hz VGM frame: these drivers strobe first and
-# write the note's own pitch right after, inside the same frame (Ending BGM 232
-# hits up to +18.9 st, Ridge Racer 2 1032 up to +4.8 st). A first write in that
-# window is the note pitch, not a slide.
+# write the note's own pitch right after, inside the same frame. A first write
+# in that window is the note pitch, not a slide.
 C352_MAX_FRAMES = 1 << 20
 
 FLG_BUSY = 0x8000
@@ -441,11 +440,10 @@ def _plan(hit: C352Hit, rom: bytes, vgm: VgmFile, acc: dict[str, int]) -> dict |
                 }
 
     if loop_off >= n:
-        # The loop register lies outside the sampled span - Tekken Tag 05's
-        # 0x9b009b hit writes wave_end 0x928d and wave_loop 0x928e, one byte
-        # past the end. The chip jumps at wave_end to the arrival bank's copy
-        # of `loop`, plays there until the low 16 bits meet wave_end again (a
-        # full bank for the +1 case) and repeats. Without the region the
+        # The loop register lies outside the sampled span: a loop register one
+        # byte past wave_end. The chip jumps at wave_end to the arrival bank's
+        # copy of `loop`, plays there until the low 16 bits meet wave_end again
+        # (a full bank for the +1 case) and repeats. Without the region the
         # sample plays its intro once and stops.
         if not reaches_loop:
             return {
@@ -751,12 +749,11 @@ def collect_c352(
         elif r in (REG_START, REG_LOOP):
             # The chip jumps with the live registers when the running address
             # reaches wave_end, and these drivers rewrite start/loop a few ms
-            # after the strobe (Tekken Tag 05 pairs start=0x4cd4 / loop=0x009b
-            # with start=0x009b / loop=0x928e, which points the LINK jump at
-            # the byte after the intro, the sample's real continuation). The
-            # body must use the rewrite; a write after the crossing is for
-            # the next pass. end and bank are also rewritten mid-note, but as
-            # stop/shorten tricks, so the key-on values stay in charge.
+            # after the strobe, pointing the LINK jump at the byte after the
+            # intro (the sample's real continuation). The body must use the
+            # rewrite; a write after the crossing is for the next pass. end
+            # and bank are also rewritten mid-note, but as stop/shorten
+            # tricks, so the key-on values stay in charge.
             if st["played"][voice] < ((reg[voice][REG_END] - hit.start) & 0xFFFF):
                 hit.geo_at_cross = (reg[voice][REG_START], reg[voice][REG_LOOP])
         elif r in (REG_END, REG_LOOP):

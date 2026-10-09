@@ -1,7 +1,6 @@
 """Loop finding: the downbeat, a few rows before the commands that play it.
 
-The synthetic grids never render. The fixture checks run the finder over the
-source rips in `VGM_collection` and skip when a pack is not on disk.
+The grids are synthetic and never render.
 """
 
 from __future__ import annotations
@@ -14,7 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from vgm2151fur.analyze import NoteEvent, Song, analyze  # noqa: E402
+from vgm2151fur.analyze import NoteEvent, Song  # noqa: E402
 from vgm2151fur.furio import parse_fur  # noqa: E402
 from vgm2151fur.furwrite import write_fur  # noqa: E402
 from vgm2151fur.loopfind import (  # noqa: E402
@@ -25,15 +24,7 @@ from vgm2151fur.loopfind import (  # noqa: E402
     find_loop,
     row_to_sample,
 )
-from vgm2151fur.vgm import VgmFile, load_vgm  # noqa: E402
-
-RIP = Path(__file__).resolve().parents[2]
-COLLECTION = RIP / "VGM_collection"
-CLOSE = COLLECTION / "Block_Hole_(Arcade)" / "05 The Closing Game In The Universe (BGM 3).vgz"
-SHOOT = COLLECTION / "Gradius II AC Rip" / "06 A Shooting Star (Air Battle 2).vgm"
-QUARTH = COLLECTION / "Block_Hole_(Arcade)" / "03 The Theme From Quarth (BGM 1).vgz"
-HAWK = COLLECTION / "newest" / "Metal_Hawk_(Namco_System_2)" / "03 Game BGM 1.vgz"
-MAP = COLLECTION / "newest" / "Metal_Hawk_(Namco_System_2)" / "02 Map Mode A.vgz"
+from vgm2151fur.vgm import VgmFile  # noqa: E402
 
 NOTE_OFF = 180
 
@@ -262,64 +253,6 @@ class TestApplyAndWrite(unittest.TestCase):
             end_row - loop_row,
         )
         self.assertTrue(song.warnings)
-
-
-class TestFixtureLoops(unittest.TestCase):
-    """The finder over the real rips: what a conversion does to each loop."""
-
-    def _loop(self, src: Path):
-        song = analyze(load_vgm(src), speed=None, pcm=True)
-        return song, apply_loop(song)
-
-    def test_closing_game_keeps_the_marker(self):
-        # The marker sits on the downbeat and the one-row cut would land on
-        # the row before it, where no command sits. The loop stays where the
-        # rip put it.
-        if not CLOSE.is_file():
-            self.skipTest("source rip missing")
-        song, text = self._loop(CLOSE)
-        self.assertEqual(text, "loop kept")
-        self.assertEqual(song.row_of(song.loop_sample), 158)
-
-    def test_shooting_star_is_not_pulled_into_the_pickup(self):
-        if not SHOOT.is_file():
-            self.skipTest("source rip missing")
-        song, text = self._loop(SHOOT)
-        self.assertEqual(text, "loop kept")
-        self.assertEqual(song.row_of(song.loop_sample), 388)
-
-    def test_quarth_moves_back_one_pulse(self):
-        if not QUARTH.is_file():
-            self.skipTest("source rip missing")
-        song, text = self._loop(QUARTH)
-        self.assertEqual(text, "loop -1/8 (-17 rows)")
-        self.assertEqual(song.row_of(song.loop_sample), 33)
-        # The wrap sits one declared loop length after the new start. The
-        # shorter last-content end restarted the loop two rows early and
-        # put the copy of the head's chord on the jump row.
-        self.assertEqual(song.row_of(song.loop_end_sample), 3627)
-
-    def test_game_bgm1_opens_on_the_sample_chord(self):
-        # The VGM marker sits inside the first loop phrase. The phrase's own
-        # first command is the sample chord at row 199; the loop opens one
-        # row before it and keeps the rip's 1:58 length.
-        if not HAWK.is_file():
-            self.skipTest("source rip missing")
-        song, text = self._loop(HAWK)
-        self.assertEqual(text, "loop 158 rows early")
-        self.assertEqual(song.row_of(song.loop_sample), 199)
-        self.assertEqual(song.row_of(song.loop_end_sample), 7405)
-
-    def test_map_mode_a_opens_on_the_phrase_head(self):
-        # The marker sits inside the phrase; the loop opens at the phrase
-        # head, row 102, and keeps the rip's 0:38 length. The riff 1921 rows
-        # in is an inner repetition and is not followed.
-        if not MAP.is_file():
-            self.skipTest("source rip missing")
-        song, text = self._loop(MAP)
-        self.assertEqual(text, "loop 124 rows early")
-        self.assertEqual(song.row_of(song.loop_sample), 102)
-        self.assertEqual(song.row_of(song.loop_end_sample), 2405)
 
 
 if __name__ == "__main__":

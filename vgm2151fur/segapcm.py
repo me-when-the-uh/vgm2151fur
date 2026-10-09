@@ -15,9 +15,8 @@ ROM byte is
     ((ctrl & bankmask) << bankshift) | reg_addr
 
 where bankshift is VGM header 0x3C, bankmask is header 0x3E (0 means 0x70)
-masked with (0x1fffff >> shift). Out Run uses shift 12; Galaxy Force II
-uses 13. The stored body is those unsigned bytes XOR 0x80 (silence 0x80
-becomes 0). The playback rate is
+masked with (0x1fffff >> shift). The stored body is those unsigned bytes
+XOR 0x80 (silence 0x80 becomes 0). The playback rate is
 
     bytes/second = clock * freq / 32768      (16 voices -> clock / 128 ticks)
 
@@ -50,8 +49,8 @@ SEGAPCM_BANK_MASK7 = 0x70  # libvgm default when header 0x3E is 0
 # 16 voices, each updated at clock/128 (MAME CLOCK_DIVIDER = voices*8).
 _TICK_DENOM = 128 * VGM_RATE
 _ADDR_MASK = 0xFFFFFF
-# Width of one register dump. Measured span is <= 3 samples (Galaxy Force,
-# Out Run, Super Hang-On, Power Drift); restarts 13 samples apart stay apart.
+# Width of one register dump. Drivers write a dump within ~3 samples;
+# restarts 13 samples apart stay apart.
 _REGISTER_BURST = 4
 
 

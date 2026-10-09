@@ -17,7 +17,7 @@ volume, and `r` renders one track to WAV.
 The CLI equivalent for scripts:
 
 ```
-python -m vgm2151fur "VGM_collection/newest/Metal_Hawk_(Namco_System_2)" -o "output/metal-hawk/fur"
+python -m vgm2151fur "My Rips/Hyper Game (System 2)" -o "output/hyper-game/fur"
 ```
 
 The same command on a folder of packs converts every pack. With `-o`, each
@@ -39,50 +39,59 @@ python -m vgm2151fur convert "pack/02 Track.vgz" -o out --variants --optimize lo
 - `none` (default): write only the 1x file, as before.
 - `lossless`: pick the largest factor that adds no structural loss and no more
   than 0.1 st of pitch-model deviation over 1x; fall back to 1x when condensing
-  is not safe (dense rips like FZ2DX "Cholacoray" are already lossy at 1x).
+  is not safe (some dense rips are already lossy at 1x).
 - `all`: keep the largest factor.
 
 `--verify` makes `lossless` authoritative: every candidate is rendered through
 Furnace and rejected if it adds a sustained pitch divergence over 1x (0.25 st /
 60 ms, one run of slack). It costs a render per variant but is the only gate
 that catches what the structural counters miss; the menu entry `7` always
-verifies. `--condense N` sets the largest factor (default 4) and
-`--factors 1,1.5,2,2.5,3,4` writes an explicit ladder (fractional allowed).
-Before trusting a whole pack, run `compare` on the chosen variant.
+verifies. `--condense N` sets the largest factor (default 4) and the ladder
+keeps the half steps - `1, 1.5, 2, 2.5, 3, 3.5, 4`. A row does not have to be
+a whole number of samples, and a musical unit that lands between two whole
+steps would otherwise be skipped. `--factors 1,1.5,2,2.5,3,4` writes an
+explicit ladder instead (fractional allowed). Before trusting a whole pack,
+run `compare` on the chosen variant.
+
+The grid is measured from a lattice of note starts. The YM2151 key-on register
+supplies it when the rip has a usable FM stream. When it does not - the C352
+and SegaPCM-only board rips have no YM2151 at all - the sample-chip trigger
+times are measured the same way, which keeps those rips off the 60 Hz frame
+fallback. That fallback reads as exactly 900 BPM (60 rows/s) and carries no
+musical information. A rip whose FM lattice already measures uses it alone.
 
 The TUI runs this by default: a plain `c convert` writes the 1x file to
 `default/` and each lossless factor to `x2 optimised/`, `x3 optimised/`, ...,
 drops the factors that would lose detail, and records every verdict in
-`condense.tsv`. The CLI keeps the flat `<name> xN.fur` siblings unless you pass
-`--dirs`. The verdict is re-derived from the source on every run, so a
-reconversion (`tools/reconvert_all.py --optimize lossless [--verify]`) reaches
-the same set with or without the manifest - the manifest just lets you read it.
+`condense.tsv`. Each manifest row names the grid it came from, which tells a
+measured lattice from a frame fallback at a glance. The CLI keeps the
+flat `<name> xN.fur` siblings unless you pass `--dirs`. The verdict is
+re-derived from the source on every run, so a reconversion
+(`tools/reconvert_all.py --optimize lossless [--verify]`) reaches the same set
+with or without the manifest - the manifest just lets you read it.
 
 Conversion renders each finished track once through the Furnace console and
-fits the module's master volume to a -1.5 dBFS peak (one render, a few
-seconds; docs/mix-levels.md has the method). `--no-normalize` skips the
-render and writes the module at unity.
+fits the module's master volume to a -2.5 dBFS peak (one render per track,
+a few seconds). `--no-normalize` skips the render and writes the module at
+unity.
 
 The same pass looks at the note grid and, when the loop is a whole number of
-bars, moves it onto the downbeat. It also looks a window on either side of
-the marker — four seconds, or the whole loop when that is shorter — for the
-phrase start whose copy sits one loop length later, and moves the loop
-there: a marker that fell inside the phrase lands on the phrase's own head,
-and the loop keeps the length the VGM header declares — the jump sits
-exactly that many rows after the new start, so the recording's overshoot,
-the next iteration's own head, stays outside the loop; a jump row carrying
-its notes would play them and strike the head twice at the seam. The loop
-opens one row before the
-first commands — a wider cut lands the seam on rows the log does not
-repeat exactly, and the loop wobbles there — and
-the cut is seated after that: it moves a row or two
-only when a neighbouring seat lines the rows after the jump up exactly,
-because a shift does not change which rows pair across the seam — it only
-changes which pairs sit right after it. A grid that
-does not repeat, or a loop with no phrase start in that window, keeps the
-VGM offset. `--no-loop-find` keeps it on every track. The convert line says
-`loop kept` or how far the marker moved (`loop -1/8`, `loop 226 rows late`,
-`loop 158 rows early`).
+bars, moves it onto the downbeat. It also searches a window on either side of
+the marker (four seconds, or the whole loop when that is shorter) for the
+phrase start whose copy sits one loop length later, and moves the loop there:
+a marker that fell inside the phrase lands on the phrase's own head, and the
+loop keeps the length the VGM header declares. The jump sits exactly that many
+rows after the new start, so the recording's overshoot, the next iteration's
+own head, stays outside the loop; a jump row carrying notes would play them
+and strike the head twice at the seam. The loop opens one row before the first
+commands, because a wider cut lands the seam on rows the log does not repeat
+exactly and the loop wobbles there. The cut is then seated: it moves a row or
+two only when a neighbouring seat lines the rows after the jump up exactly,
+because a shift does not change which rows pair across the seam, only which
+pairs sit right after it. A grid that does not repeat, or a loop with no
+phrase start in that window, keeps the VGM offset. `--no-loop-find` keeps it
+on every track. The convert line says `loop kept` or how far the marker moved
+(`loop -1/8`, `loop 30 rows late`, `loop 120 rows early`).
 
 Each track runs in its own worker process. The default count is pinned to
 the logical CPUs: one thread stays free below six, two at six or more, and
@@ -111,8 +120,8 @@ A converted pack often needs a level tweak before it sits right in a mix.
 For example, a Namco C140 track where the samples are too quiet:
 
 ```
-python -m vgm2151fur edit "output/sled/fur/02 Silent Fight.fur" --list
-python -m vgm2151fur edit "output/sled/fur/02 Silent Fight.fur" --chip C140 --factor 1.2
+python -m vgm2151fur edit "output/game-pack/fur/02 Track.fur" --list
+python -m vgm2151fur edit "output/game-pack/fur/02 Track.fur" --chip C140 --factor 1.2
 ```
 
 The first call prints the chip table with the current values. The second
@@ -149,12 +158,12 @@ they can be run from anywhere.
 
 - `tools/fur2vgm.py <file|folder>`: export `.fur` to `.vgm` with Furnace.
 - `tools/fur2wav.py <file|folder>`: render `.fur` to WAV with Furnace.
-- `tools/reconvert_all.py [--only slug] [--workers N]`: reconvert every
-  `output/<slug>/fur` from its VGM_collection source on the estimator's grid
-  (a stored speed is never re-passed; see the changelog) and fit the volume;
-  prints the gain per track. A track that needs a manual pin converts alone
-  with `--speed N` afterwards. `*-old` folders are skipped. The worker
-  count and low priority match `convert`.
+- `tools/reconvert_all.py --sources DIR [--output DIR] [--only slug]
+  [--workers N]`: reconvert every `output/<slug>/fur` from its source pack
+  on the estimator's grid (a stored speed is never re-passed) and fit the
+  volume; prints the gain per track. A track that needs a manual pin
+  converts alone with `--speed N` afterwards. The worker count and low
+  priority match `convert`.
 - `tools/vgmdiff.py <source.vgm> <other.vgm> [ch ...]`: pitch runs between
   two VGMs.
 - `tools/vgmchroma.py <source> <export>`: chroma windows, with `--mute` to
@@ -164,21 +173,17 @@ they can be run from anywhere.
 - `tools/vgm_scan.py [root ...]`: which VGM packs use SegaPCM, C140, C352 or
   C219 and at which clock. C219 is a C140-family part the converter does not
   support; never batch-convert those into the C140 target. C352 converts as
-  chip 0xD0. The bundled Furnace 0.6.8.3 does not play that chip, but the
-  local build in `furnace/` does. See docs/c352.md.
+  chip 0xD0; a Furnace build with a C352 core can play it. See docs/c352.md.
 
 ## Environment
 
 - `VGM2151FUR_FURNACE`: path to `furnace.exe`, or to a folder holding it.
   Without it the tools look for a `furnace/` folder next to the project (a
-  source checkout with `build/furnace.exe` works too), then the bundled
-  headless console build in `third_party/furnace-console/` (the patched
-  C352-capable build, ~4 MB, so a clone converts and measures C352 without
-  building Furnace), then a `third_party/furnace/` drop-in, then PATH.
+  source checkout with `build/furnace.exe` works too), then a
+  `third_party/furnace-console/` or `third_party/furnace/` drop-in, then
+  PATH.
 - `VGM2151FUR_VGM2WAV`: path to `vgm2wav-mute.exe` for the soundcheck and
   chroma tools.
-- `VGM2151FUR_FIXTURES`: folder holding the game packs for the fixture-gated
-  tests. The tests skip when a pack is missing.
 
 ## Exit codes
 

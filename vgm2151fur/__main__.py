@@ -423,8 +423,10 @@ def _add_convert_flags(parser: argparse.ArgumentParser, *, bare: bool) -> None:
     )
     parser.add_argument(
         "--condense", type=int, default=None, metavar="N",
-        help="largest condense factor for the variants (default 4); "
-             "1x = today's grid, Nx = N times longer rows",
+        help="largest condense factor for the variants (default 4). "
+             "1x = today's grid, Nx = N times longer rows. The ladder keeps "
+             "the half steps (1, 1.5, 2, ...) because a musical unit that "
+             "lands between whole steps would otherwise be skipped",
     )
     parser.add_argument(
         "--optimize", choices=("none", "lossless", "all"), default="none",
@@ -455,7 +457,7 @@ def _add_convert_flags(parser: argparse.ArgumentParser, *, bare: bool) -> None:
     parser.add_argument(
         "--no-normalize",
         action="store_true",
-        help="skip the -1.5 dBFS volume fit (it renders each track once)",
+        help="skip the -2.5 dBFS volume fit (it renders each track once)",
     )
     parser.add_argument(
         "--no-loop-find",

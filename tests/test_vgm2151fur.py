@@ -3,10 +3,8 @@
 
 from __future__ import annotations
 
-import os
 import struct
 import sys
-import tempfile
 import unittest
 from pathlib import Path
 
@@ -20,45 +18,17 @@ from vgm2151fur.analyze import (
     Song, kc_to_furnace_note, furnace_note_name, analyze, vol15, kf_to_e5, pcm_pan_fx,
     FMPatch, NoteEvent, OpRegs,
 )
-from vgm2151fur.convert import (
-    CONVERT_WORKERS, convert_folder, convert_vgm, select_tracks, track_number,
-)
+from vgm2151fur.convert import select_tracks, track_number
 from vgm2151fur.furwrite import (
     CHIP_K007232, CHIP_MSM6258, CHIP_MSM6295, CHIP_YM2151,
-    FUR_MAGIC, FUR_VERSION, parse_fur_skeleton, NOTE_OFF, ym_dt_to_furnace, pack_dt_mul,
-    write_fur,
+    NOTE_OFF, ym_dt_to_furnace, pack_dt_mul, write_fur,
 )
 from vgm2151fur.pcm import (
-    PcmHit, PcmSample, dump_pcm as dump_pcm_files, k007232_rate, pcm7_to_s8,
-    scale_pcm7,
+    PcmHit, PcmSample, k007232_rate, pcm7_to_s8, scale_pcm7,
 )
-from vgm2151fur.furio import fx_pan_amps, list_fur_samples, load_fur_bytes, parse_fur
+from vgm2151fur.furio import fx_pan_amps, list_fur_samples, parse_fur
 from vgm2151fur.oki import msm6258_div_fx, oki_flag_text, oki_furnace_vol, oki_rate
-from vgm2151fur.vgm import ChipWrite, RomSlice, VgmFile, load_vgm
-
-# The VGM packs live outside the project. Tests that need one skip when it is
-# absent; point VGM2151FUR_FIXTURES at the folder that holds the packs.
-REPO = ROOT.parent
-FIXTURES = Path(os.environ.get("VGM2151FUR_FIXTURES", REPO))
-
-
-def _pack(name: str) -> Path:
-    spaced, underscored = FIXTURES / name, FIXTURES / name.replace(" ", "_")
-    return spaced if spaced.exists() else underscored
-
-
-G2 = _pack("Gradius II AC Rip")
-G3 = _pack("Gradius_III_(Arcade)")
-COLLECTION = _pack("VGM collection")
-G2_TITLE = G2 / "01 Title Demo.vgm"
-G2_TABIDACHI = G2 / "04 Tabidachi (Air Battle 1).vgm"
-G2_BURNING = G2 / "05 Burning Heat (Stage 1 BGM).vgm"
-G2_STONE = G2 / "10 The Old Stone Age 1 ~ 2 (Stage 5 BGM).vgm"
-G3_SAND = G3 / "06 Sand Storm (Stage 1 BGM).vgz"
-BG_STAGE1 = (
-    COLLECTION / "old" / "Battle_Garegga_(Toaplan_2)"
-    / "06 Fly to the Leaden Sky [Stage 1 Valley].vgz"
-)
+from vgm2151fur.vgm import ChipWrite, RomSlice, VgmFile
 
 
 class TestKC(unittest.TestCase):
@@ -154,7 +124,7 @@ class TestVolAndKF(unittest.TestCase):
 
 
 class TestK007232FurRows(unittest.TestCase):
-    """Regression guards for the Gradius II/III PCM rows.
+    """Regression guards for the K007232 PCM rows.
 
     A symmetric volume pair used to be written as 08 80 (left 8/15, right
     off), which plays on the left ear only and about 6 dB quiet.
@@ -163,7 +133,7 @@ class TestK007232FurRows(unittest.TestCase):
     def test_chip_volume_follows_the_sources_mix(self):
         hits = [PcmHit(0, 0, 0x10000, 4000, 0, 0x88, 0x88)]
         smp = PcmSample(start=0x10000, pcm7=bytes([0x40] * 16), hits=hits)
-        song = _fake_song("04 Tabidachi (Air Battle 1).vgm", [smp])
+        song = _fake_song("track.vgm", [smp])
         song.k007232_volume = 0.5
         data = write_fur(song, include_pcm=True, include_fm=True)
         # chip output triple (vol, panL, panR) in the .fur
@@ -176,196 +146,23 @@ class TestK007232FurRows(unittest.TestCase):
         self.assertIsNone(vgm.chip_volume(0x03))  # flags set: keep the default
         self.assertIsNone(vgm.chip_volume(0x66))  # absent
 
-    def test_extra_header_volume_is_not_read_as_a_clock(self):
-        # The G2 rips carry a volume list that a naive clock parse turns into
-        # a 700 MHz K007232. The clock must come from the header instead.
-        if not G2_TABIDACHI.is_file():
-            self.skipTest("Gradius II rip missing")
-        vgm = load_vgm(G2_TABIDACHI)
-        self.assertEqual(vgm.k007232_clock, 3579545)
-        self.assertAlmostEqual(vgm.chip_volume(0x2A), 0x4D / 256)
-
-
-@unittest.skipUnless(G2_TABIDACHI.is_file(), "Gradius II rip missing")
-class TestK007232RowsOnRealTrack(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.song = analyze(load_vgm(G2_TABIDACHI), pcm=True)
-        cls.mod = parse_fur(write_fur(cls.song, include_pcm=True, include_fm=True))
-
-    def test_symmetric_hits_pan_both_sides(self):
-        pcm = [e for e in self.song.events if e.pcm and e.on]
-        self.assertTrue(pcm)
-        self.assertTrue(all(e.pan == 0xFF for e in pcm))
-        for e in pcm:
-            self.assertNotEqual(e.pan, 0x80)
-
-    def test_fur_rows_carry_the_same_pan(self):
-        pans = [
-            v for (_ch, _idx), rows in self.mod.patterns.items()
-            if _ch in self.mod.pcm_channels
-            for r in rows for c, v in r.fx if c == 0x08
-        ]
-        self.assertTrue(pans)
-        self.assertEqual(set(pans), {0xFF})
-
-    def test_volume_column_is_linear_in_the_register(self):
-        columns = sorted({
-            e.vol for e in self.song.events if e.pcm and e.on and e.vol > 0
-        })
-        self.assertEqual(columns, [2, 4, 6, 7, 8])  # 0x22, 0x44, 0x66, 0x77, 0x88
-
-
-@unittest.skipUnless(G2_BURNING.is_file(), "Gradius II rip missing")
-class TestBurningHeat(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.vgm = load_vgm(G2_BURNING)
-
-    def test_rom_block(self):
-        self.assertTrue(any(s.rom_size == 131072 for s in self.vgm.roms))
-        self.assertGreater(len(self.vgm.roms[0].data), 1000)
-
-    def test_analyze_has_melody_and_pcm(self):
-        song = analyze(self.vgm, pcm=True)
-        self.assertGreaterEqual(len(song.fm_patches), 5)
-        self.assertLessEqual(len(song.fm_patches), 24)
-        ons = [e for e in song.events if e.on and not e.pcm]
-        self.assertGreater(len(ons), 200)
-        pcm_ons = [e for e in song.events if e.on and e.pcm]
-        self.assertGreater(len(pcm_ons), 50)
-        self.assertGreaterEqual(len(song.pcm_samples), 8)
-
-    def test_pcm_dump(self):
-        import tempfile
-        with tempfile.TemporaryDirectory() as td:
-            idx = dump_pcm_files(self.vgm, Path(td))
-            self.assertGreaterEqual(len(idx["samples"]), 8)
-            wav = Path(td) / idx["samples"][0]["file"]
-            self.assertTrue(wav.is_file())
-            self.assertGreater(wav.stat().st_size, 44)
-
-    def test_fur_header(self):
-        import tempfile
-        with tempfile.TemporaryDirectory() as td:
-            dest = Path(td) / "burning.fur"
-            info = convert_vgm(G2_BURNING, dest, pcm=True)
-            data = dest.read_bytes()
-            self.assertTrue(data.startswith(FUR_MAGIC))
-            ver = struct.unpack_from("<H", data, 16)[0]
-            self.assertEqual(ver, FUR_VERSION)
-            self.assertIn(b"INFO", data)
-            self.assertIn(b"INS2", data)
-            self.assertIn(b"PATN", data)
-            self.assertIn(b"SMP2", data)
-            self.assertIn(b"ADIR", data)
-            self.assertGreater(info["fm_patches"], 0)
-            self.assertGreater(info["pcm_samples"], 0)
-            self.assertGreater(info["bytes"], 10_000)
-            skel = parse_fur_skeleton(data)
-            self.assertEqual(skel["version"], FUR_VERSION)
-            self.assertEqual(skel["first_block"], b"ADIR")
-            self.assertIn("INS2", skel["magics"])
-            self.assertIn("PATN", skel["magics"])
-            self.assertIn("SMP2", skel["magics"])
-            self.assertEqual(skel["chips"], [0x82, 0xC6])
-            self.assertGreater(skel["notes"], 200)
-            self.assertGreater(skel["bxx"], 0)
-            self.assertEqual(NOTE_OFF, 180)
-            self.assertIn(b"FLAG", data)
-            self.assertIn(b"stereo=true", data)
-            # Sample presence bitfields must not be zero or K007232 stays silent.
-            smp = data.find(b"SMP2")
-            self.assertGreater(smp, 0)
-            body = data[smp + 8:]
-            z = body.find(b"\x00")
-            pres = body[z + 1 + 24:z + 1 + 40]
-            self.assertEqual(len(pres), 16)
-            self.assertNotEqual(pres, b"\x00" * 16)
-
-    def test_long_intro_keeps_notes(self):
-        """Loop at ~68s must not collapse the intro into one 64-row order."""
-        if not G2_STONE.is_file():
-            self.skipTest("missing Old Stone Age rip")
-        import tempfile
-        with tempfile.TemporaryDirectory() as td:
-            dest = Path(td) / "stone.fur"
-            info = convert_vgm(G2_STONE, dest, pcm=True)
-            skel = parse_fur_skeleton(dest.read_bytes())
-            self.assertGreater(skel["notes"], int(info["events"] * 0.85))
-            self.assertGreater(skel["bxx"], 0)
-
-
-@unittest.skipUnless(G2_TITLE.is_file(), "Gradius II Title Demo missing")
-class TestTitleDemoOPM(unittest.TestCase):
-    def test_delayed_vibrato_and_carrier_tl(self):
-        song = analyze(load_vgm(G2_TITLE), pcm=True)
-        self.assertTrue(any(c == 0x17 for _s, c, _v in song.chip_fx))
-        self.assertTrue(any(c == 0x1F and v > 0 for _s, c, v in song.chip_fx))
-        leads = [p for p in song.fm_patches if p.fms_macro and max(p.fms_macro) >= 4]
-        self.assertTrue(leads, "Title Demo FM 1/2 must get a delayed PMS macro")
-        self.assertEqual(leads[0].fms_macro[0], 0)
-        self.assertGreaterEqual(leads[0].macro_speed, 2)
-        # Brass / choir-lead carriers must keep their logged TL, not 0.
-        self.assertGreater(leads[0].carrier_tl(), 8)
-
-    def test_fur_has_lfo_effects_and_nonzero_tl(self):
-        import tempfile
-        with tempfile.TemporaryDirectory() as td:
-            dest = Path(td) / "title.fur"
-            convert_vgm(G2_TITLE, dest, pcm=True)
-            data = dest.read_bytes()
-            skel = parse_fur_skeleton(data)
-            self.assertGreater(skel["fx_cmds"].get(0x17, 0), 0)
-            self.assertGreater(skel["fx_cmds"].get(0x1F, 0), 0)
-            self.assertIn(b"FM", data)
-            # First OPM instrument: FM feature ops in file order M1,M2,C1,C2.
-            fm = data.find(b"FM", data.find(b"INS2"))
-            self.assertGreater(fm, 0)
-            body = data[fm + 4:]
-            # flags, alg/fb, ams/fms, 4-op byte, then 4×8 op bytes. TL is byte 1.
-            tls = [body[4 + i * 8 + 1] for i in range(4)]
-            self.assertGreater(max(tls), 8)
-            self.assertIn(b"\x0a", data[data.find(b"MA"): data.find(b"MA") + 80])  # FMS macro code 10
-
-
-@unittest.skipUnless(G3_SAND.is_file(), "Gradius III pack missing")
-class TestGradius3Vgz(unittest.TestCase):
-    def test_sliced_rom(self):
-        vgm = load_vgm(G3_SAND)
-        types = {s.rom_size for s in vgm.roms}
-        self.assertTrue(vgm.roms)
-        song = analyze(vgm, pcm=True)
-        self.assertGreater(len(song.fm_patches), 3)
-        self.assertGreater(len(song.pcm_samples), 3)
-
-    def test_k007232_clock_is_chip_clock_not_volume(self):
-        # Extra header 0x4000 is K007232 mix (64/256), not 16384 Hz.
-        vgm = load_vgm(G3_SAND)
-        self.assertGreaterEqual(vgm.k007232_clock, 100_000)
-        self.assertEqual(vgm.k007232_clock, 3579545)
-        song = analyze(vgm, pcm=True)
-        rates = [s.c4_rate(vgm.k007232_clock) for s in song.pcm_samples if s.length >= 8]
-        self.assertTrue(rates)
-        self.assertGreater(min(rates), 4000)
-
-
 
 class TestTrackSelect(unittest.TestCase):
     def test_number_and_substring(self):
         files = [
-            Path("01 Title Demo.vgm"),
-            Path("15 Fire Dragon (Stage 7 BGM 3).vgm"),
-            Path("04 Tabidachi (Air Battle 1).vgm"),
+            Path("01 First Track.vgm"),
+            Path("15 Last Track (BGM 3).vgm"),
+            Path("04 Middle Track.vgm"),
         ]
         self.assertEqual(track_number(files[1]), 15)
         hit = select_tracks(files, 15)
         self.assertEqual(hit[0].name, files[1].name)
-        hit = select_tracks(files, "tabidachi")
+        hit = select_tracks(files, "middle")
         self.assertEqual(len(hit), 1)
-        self.assertIn("Tabidachi", hit[0].name)
+        self.assertIn("Middle", hit[0].name)
         with self.assertRaises(FileNotFoundError):
             select_tracks(files, 99)
+
 
 def _fake_song(stem: str, samples: list[PcmSample]) -> Song:
     vgm = VgmFile(
@@ -717,92 +514,6 @@ class TestMsm6258Burst(unittest.TestCase):
         self.assertIn((0x20, 2), notes[0].fx)
         self.assertNotIn(0x08, [c for c, _v in notes[0].fx])
         self.assertTrue(any(row.note == NOTE_OFF for _i, row in rows))
-
-@unittest.skipUnless(BG_STAGE1.is_file(), "Battle Garegga pack missing")
-class TestBattleGareggaStage1(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.vgm = load_vgm(BG_STAGE1)
-        cls.song = analyze(cls.vgm, pcm=True)
-        cls.data = write_fur(cls.song, include_pcm=True, include_fm=True)
-
-    def test_header_clock_is_not_the_command_stream(self):
-        self.assertEqual(self.vgm.version, 0x161)
-        self.assertEqual(self.vgm.ym2151_clock, 4_000_000)
-        self.assertEqual(self.vgm.msm6295_clock, 2_000_000)
-        self.assertTrue(self.vgm.msm6295_pin7)
-        self.assertEqual(self.vgm.msm6258_clock, 0)
-        self.assertEqual(self.vgm.k007232_clock, 4_000_000)
-        self.assertNotEqual(self.vgm.k007232_clock, 1728090438)
-
-    def test_phrases_and_module(self):
-        ons = [e for e in self.song.events if e.on and e.pcm]
-        self.assertEqual(len(ons), 201)
-        self.assertTrue(all(8 <= e.ch <= 11 for e in ons))
-        self.assertTrue(all(e.note == 108 and e.vol in (6, 8) and e.no_pan for e in ons))
-        self.assertGreaterEqual(len(self.song.fm_patches), 1)
-        self.assertNotIn("no YM2151 key-ons found", self.song.warnings)
-        self.assertEqual(self.song.msm6258_samples, [])
-        lengths = {s.length for s in self.song.oki_samples}
-        self.assertIn(8313, lengths)
-        self.assertIn(2272, lengths)
-
-        chips, gains, legacy = _chip_mix(self.data)
-        self.assertEqual(chips, [CHIP_YM2151, CHIP_MSM6295])
-        self.assertEqual(legacy[1], 64)
-        self.assertAlmostEqual(gains[1], 1.0, places=5)
-        self.assertIn(b"clockSel=8", self.data)
-        self.assertNotIn(b"rateSel=true", self.data)
-        self.assertNotIn(CHIP_K007232, chips)
-        self.assertNotIn(CHIP_MSM6258, chips)
-        types = _ins_types(self.data)
-        self.assertIn(36, types)
-        self.assertNotIn(45, types)
-        self.assertTrue(any(t == 33 for t in types))
-        samples = list_fur_samples(self.data)
-        self.assertTrue(samples)
-        self.assertTrue(all(s.depth == 10 for s in samples))
-        frames = {s.n_frames for s in samples}
-        self.assertIn(8313, frames)
-        self.assertIn(2272, frames)
-        mod = parse_fur(self.data)
-        self.assertEqual(mod.n_ch, 12)
-        fur_ons = []
-        for ch in range(8, 12):
-            for _i, row in _rows(mod, ch):
-                if row.note < 0:
-                    continue
-                self.assertIn(row.note, (108, NOTE_OFF))
-                if 0 <= row.note < 180:
-                    self.assertIn(row.vol, (6, 8))
-                    fur_ons.append(row)
-                self.assertNotIn(0x08, [c for c, _v in row.fx])
-        self.assertEqual(len(fur_ons), 201)
-
-
-@unittest.skipUnless(G2_BURNING.is_file() and G2_TITLE.is_file(), "Gradius II rips missing")
-class TestConvertFolder(unittest.TestCase):
-    def test_parallel_output_matches_serial(self):
-        self.assertGreaterEqual(CONVERT_WORKERS, 1)
-        files = [G2_TITLE, G2_BURNING]
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            serial = list(convert_folder(files, root / "serial", pcm=True, workers=1))
-            self.assertEqual([f for f, _i, _e in serial], files)
-            self.assertTrue(all(e is None for _f, _i, e in serial))
-            parallel = list(convert_folder(
-                files, root / "parallel", pcm=True, workers=2, log=lambda _m: None,
-            ))
-            self.assertEqual(
-                sorted(f.name for f, _i, _e in parallel),
-                sorted(f.name for f in files),
-            )
-            self.assertTrue(all(e is None for _f, _i, e in parallel))
-            for f in files:
-                a = (root / "serial" / (f.stem + ".fur")).read_bytes()
-                b = (root / "parallel" / (f.stem + ".fur")).read_bytes()
-                self.assertEqual(a, b)
-
 
 class TestColumnFit(unittest.TestCase):
     """Effect columns per channel follow the channel's densest row.

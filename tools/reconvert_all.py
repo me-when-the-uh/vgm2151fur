@@ -1,21 +1,16 @@
-"""Reconvert every pack under output/ from its VGM_collection source.
+"""Reconvert every pack under an output tree from its source collection.
 
-    python tools/reconvert_all.py [--only slug,...] [--workers N] [--dry-run]
+    python tools/reconvert_all.py --sources DIR [--output DIR] [--only slug,...]
 
 The output tree is the source of truth for what to reconvert: every
-`output/<slug>/fur/*.fur` is matched back to the VGM_collection pack its
-track stems came from. Volume normalization is on (the CLI default), so
-every track lands at -1.5 dBFS peak.
+`output/<slug>/fur/*.fur` is matched back to the source pack its track stems
+came from. Volume normalization is on (the CLI default), which lands every
+track at a -2.5 dBFS peak.
 
 The grid comes from the estimator, never from the stored speed. A stored
-`--speed` is the legacy manual path, which forces hz to 60; re-passing a
-measured grid's speed as a manual speed collapses the row rate (Fantasy
-Zone II DX: 500 Hz / speed 5 is 100 rows/s and converts to 60 Hz / speed 5,
-12 rows/s; Assault 04: 497.7 Hz / speed 8 is 62 rows/s and converts to
-7.5 rows/s), swallowing notes, vibrato and sub-row detail. The estimator
-reproduces the stored grids (verified against the hand-kept
-`fantasy-zone-2-dx-old` copies and the sources). A track that truly needs a
-manual pin should be converted alone with `--speed N` afterwards.
+`speed` is the legacy manual path, which forces hz to 60 and collapses the
+row rate, swallowing notes, vibrato and sub-row detail. A track that truly
+needs a manual pin converts alone with `--speed N` afterwards.
 
 Prints one line per track and a summary. Failures do not stop the batch.
 """
@@ -28,9 +23,8 @@ import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
-BASE = Path(__file__).resolve().parents[2]
-FUR_DIR = BASE / "vgm2151fur"
-sys.path.insert(0, str(FUR_DIR))
+REPO = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO))
 
 from vgm2151fur.convert import (
     _MANIFEST,
@@ -38,6 +32,7 @@ from vgm2151fur.convert import (
     _manifest_line,
     convert_variants,
     convert_vgm,
+    default_factors,
 )
 from vgm2151fur.levels import peak_dbfs
 from vgm2151fur.packs import find_packs
@@ -56,7 +51,7 @@ def job(src: str, dst: str, slug: str, optimize: str = "none",
     try:
         if optimize != "none":
             results = convert_variants(
-                Path(src), _fur_root(dst), factors=(1, 2, 3, 4), mode=optimize,
+                Path(src), _fur_root(dst), factors=default_factors(4), mode=optimize,
                 normalize=True, verify=verify, layout="dirs",
             )
             info = dict(next(r for r in results if r["pick"]))
@@ -68,16 +63,14 @@ def job(src: str, dst: str, slug: str, optimize: str = "none",
     return slug, info, None
 
 
-def plan() -> list[tuple[str, Path, Path]]:
+def plan(sources_root: Path, output_root: Path) -> list[tuple[str, Path, Path]]:
     """(slug, source, destination) for every existing .fur."""
-    sources = find_packs(BASE / "VGM_collection", max_depth=6, limit=400)
+    sources = find_packs(sources_root, max_depth=6, limit=400)
     index = [(p, {t.stem.lower(): t for t in p.tracks}) for p in sources]
     jobs: list[tuple[str, Path, Path]] = []
-    for pack_dir in sorted((BASE / "output").iterdir()):
+    for pack_dir in sorted(output_root.iterdir()):
         if not pack_dir.is_dir() or pack_dir.name.startswith((".", "_")):
             continue
-        if pack_dir.name.endswith("-old"):
-            continue  # hand-kept reference copies, never reconvert in place
         fur_dir = pack_dir / "fur"
         if not fur_dir.is_dir():
             continue
@@ -93,7 +86,7 @@ def plan() -> list[tuple[str, Path, Path]]:
             if score > best_score:
                 best, best_score = by_stem, score
         if best is None or best_score * 2 < len(furs):
-            print(f"skip {pack_dir.name}: no VGM_collection source matched ({len(furs)} fur)",
+            print(f"skip {pack_dir.name}: no source pack matched ({len(furs)} fur)",
                   flush=True)
             continue
         unmatched = [f.stem for f in furs if f.stem.lower() not in best]
@@ -110,6 +103,9 @@ def plan() -> list[tuple[str, Path, Path]]:
 def main() -> int:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--sources", required=True, help="root to scan for source packs")
+    ap.add_argument("--output", default="output",
+                    help="output tree to reconvert (default: output)")
     ap.add_argument("--only", default=None, help="comma-separated slugs")
     ap.add_argument(
         "--workers", type=int, default=None,
@@ -132,7 +128,7 @@ def main() -> int:
     args = ap.parse_args()
 
     print("planning...", flush=True)
-    jobs = plan()
+    jobs = plan(Path(args.sources), Path(args.output))
     if args.only:
         wanted = {s.strip() for s in args.only.split(",") if s.strip()}
         jobs = [j for j in jobs if j[0] in wanted]

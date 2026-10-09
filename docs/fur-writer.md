@@ -57,11 +57,10 @@ triples start 31 bytes plus 12 per chip before the first ADIR pointer.
   default.
 - The OKI flag encodes pin 7 and banking; the C140 flag carries the clock and
   the type. The C352 flag is `customClock` set to the crystal a core that
-  divides by 288 should run. The local `0xD0` core in `furnace/` ticks at
-  `clock/288` and takes this value as-is; a core copied from `c140.cpp`
-  instead ticks at clock/192 and would need the C140 2/3 scale. C352
-  instruments are Amiga type 4, which that core plays. This writer stores
-  the real crystal.
+  divides by 288 should run. A core that ticks at `clock/288` takes this
+  value as-is; a core copied from `c140.cpp` instead ticks at clock/192 and
+  would need the C140 2/3 scale. C352 instruments are Amiga type 4, which
+  such a core plays. This writer stores the real crystal.
 - The volume byte per chip comes from the reference player's mix, not a flat
   unity: libvgm defaults, extra-header volume entries, the C140 core scale
   (2/3) and instance division. `_FURNACE_VOLUME_SCALE` corrects the Furnace
@@ -94,7 +93,7 @@ Two effects move pitch, and their scales differ per platform:
 
 E8xx/E9xx quick legato adds semitones to the playing note in one write. It is
 cumulative (`note += y`), applies one tick after the row, and resets at the
-next note. Measured on 0.6.8.3 through both platforms.
+next note. Checked against Furnace 0.6.8.3 on both platforms.
 
 ## The sweep model
 
@@ -109,7 +108,7 @@ the staircase into per-row slides:
 - The written parameter is a whole number per tick, and the model accrues
   exactly what the engine will do: `param` per tick on FM, `param / 2` per
   tick on PCM. Accruing the ideal rate instead compounds a
-  fraction-of-a-unit error into semitones over long climbs (see 0.9.29).
+  fraction-of-a-unit error into semitones over long climbs.
 - Moves the slide cannot deliver inside a row become E8/E9 transposes, with
   the slide covering the remainder.
 - Sub-semitone residue is pinned with E5 on the row after the rate stops.
@@ -138,6 +137,16 @@ disagree. `row_subdiv` (rows per measured 16th) is cosmetic - only `Song.bpm`
 reads it - so a 3x factor, which does not land on the subdivision lattice, is
 fine.
 
+`estimate_grid` reads its lattice from `vgm.writes` by default (the YM2151
+key-on register, reg 0x08). `analyze` can hand it an `onsets` mapping instead,
+`{channel: [sample, ...]}`, when the FM stream is too thin to measure. The
+C352 and SegaPCM-only board rips have no YM2151 at all, and their only lattice
+is the sample-chip trigger times the chip modules already extracted. Triggers
+100 samples apart on one voice merge first, because one trigger is often a
+key-on followed by its own pitch and volume writes. The FM lattice wins
+whenever it measures, which keeps a working grid from moving. Only the 60 Hz
+fallback (900 BPM, 60 rows/s) is replaced.
+
 Condensing is not free. A row carries one note cell and one slide rate:
 
 - two notes in the merged row collide (`note_collision`; the later one wins),
@@ -151,17 +160,16 @@ fidelity number. `convert_variants` writes the 1x..Nx set and, in `lossless`
 mode, marks the largest factor with no added structural loss and no more than
 6 units (0.1 st) more deviation than 1x, else falls back to 1x.
 
-`dev_max` saturates on sweep-heavy tracks - Battle Garegga 02 reads 47/52/54/56
-units for 1x/2x/3x/4x, so it cannot separate the good 3x from the bad 4x. With
-`verify` (CLI `--verify`, always on in the menu) `convert_variants` instead
-renders every candidate through Furnace and counts pitch runs against the
-source at 0.25 st / 60 ms, accepting a factor only up to `baseline + 1` runs.
-On Battle Garegga 02 that is 0/0/1/44 runs - 3x passes, 4x does not; on
-Salamander Starfield 4/6/9/23 and on FZ2DX Cholacoray 3/8/7/12, so both stay
-at 1x. A factor is a row-length multiplier, so it may be fractional
-(`--factors 1,1.5,2,2.5,3,4`). The counters are structural: sub-semitone
-shimmer that survives as amplitude or timbre is invisible to them, which is
-exactly what `--verify` exists to catch.
+`dev_max` saturates on sweep-heavy tracks, so it cannot always separate a
+good coarser grid from a bad one. With `verify` (CLI `--verify`, always on in
+the menu) `convert_variants` instead renders every candidate through Furnace
+and counts pitch runs against the source at 0.25 st / 60 ms, accepting a
+factor only up to `baseline + 1` runs. A factor is a row-length multiplier,
+and it may be fractional. The default ladder walks the half steps
+(`1, 1.5, 2, 2.5, ...`, `default_factors`) and `--factors 1,1.5,2,2.5,3,4`
+overrides it. The counters are structural: sub-semitone shimmer that
+survives as amplitude or timbre is invisible to them, which is exactly what
+`--verify` exists to catch.
 
 `layout="dirs"` (menu default, CLI `--dirs`) moves each accepted factor to
 `<out_dir>/default/` or `<out_dir>/xN optimised/` and deletes the rest, and

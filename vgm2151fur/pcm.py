@@ -111,10 +111,6 @@ class PcmHit:
     bank: int
     vol_l: int
     vol_r: int
-    # Per-hit Mix tweaks (1.0 = unchanged). Tabidachi's quiet 06867 stabs
-    # play 1% slower and louder than the rapid-fire hits of the same sample.
-    rate_mul: float = 1.0
-    vol_mul: float = 1.0
 
 
 @dataclass
@@ -122,19 +118,12 @@ class PcmSample:
     start: int
     pcm7: bytes
     hits: list[PcmHit] = field(default_factory=list)
-    # Set by remap.apply_mapping when the body comes from a G3 start.
-    g3_start: int | None = None
-    # Multiply hardware Hz (Furnace C-4 and synth). G3 389B8 is ~2× G2's 8 kHz stabs.
+    # Multiply hardware Hz (Furnace C-4 and the synth path).
     rate_scale: float = 1.0
     # If set, C-4 / pattern notes use this pitch instead of mode_pitch().
     c4_pitch: int | None = None
-    # Linear amplitude vs the G3 ROM body (snare 72%×1.06; choirs/toms 88%).
+    # Linear amplitude correction against the recorded ROM body.
     volume_scale: float = 1.0
-    # Semitones added to pattern notes after C-4 is applied. +12 = G-3→G-4.
-    note_shift: int = 0
-    # Reverse snare lever: Mix plays the whole body even if this K007232
-    # channel retriggers early (short kick_light slots, dummy stops).
-    play_full: bool = False
 
     @property
     def length(self) -> int:

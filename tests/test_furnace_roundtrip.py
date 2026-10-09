@@ -99,8 +99,8 @@ class TestSweepModel(unittest.TestCase):
     A dense 0.25 st staircase climb makes the engine run a fraction of a unit
     per tick faster than the written parameter when a rate sits between two
     integers. The model accrues the written parameter, so the exported pitch
-    must land on the source's final pitch and stay. 0.9.28 and earlier
-    compounded the fraction and held the note up to 1.7 st sharp.
+    must land on the source's final pitch and stay. A model that accrued the
+    ideal rate instead would compound the fraction and hold the note sharp.
     """
 
     def test_staircase_climb_lands_on_pitch(self):

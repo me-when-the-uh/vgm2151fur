@@ -1,7 +1,7 @@
 """Peak normalisation: the WAV scan, the master-volume patch, the fit.
 
 `normalize_module` renders the module once at a reduced volume, reads the
-peak, and writes the master volume that lands the track at -1.5 dBFS. The
+peak, and writes the master volume that lands the track at -2.5 dBFS. The
 render is the measurement, so the tests that render are the real ones;
 they are skipped when the Furnace console build is missing.
 """
@@ -66,7 +66,7 @@ class TestWavPeak(unittest.TestCase):
         self.assertAlmostEqual(wav_peak(wav), 1.0, places=6)
 
     def test_peak_dbfs(self):
-        self.assertAlmostEqual(peak_dbfs(TARGET_PEAK), -1.5, places=6)
+        self.assertAlmostEqual(peak_dbfs(TARGET_PEAK), -2.5, places=6)
         self.assertEqual(peak_dbfs(0.0), float("-inf"))
 
 
@@ -102,14 +102,14 @@ class TestNormalize(unittest.TestCase):
         self.assertAlmostEqual(result.gain, TARGET_PEAK / unity, places=3)
         self.assertAlmostEqual(furio.master_volume(result.data), result.gain, places=6)
         after = self._render_peak(result.data, "after")
-        self.assertAlmostEqual(peak_dbfs(after), -1.5, places=2)
+        self.assertAlmostEqual(peak_dbfs(after), -2.5, places=2)
 
     def test_loud_module_steps_down_the_probe(self):
         loud = furio.set_master_volume(_song_module(), 40.0)
         result = normalize_module(loud, name="loud")
         self.assertIsNotNone(result)
         after = self._render_peak(result.data, "loud_after")
-        self.assertAlmostEqual(peak_dbfs(after), -1.5, places=2)
+        self.assertAlmostEqual(peak_dbfs(after), -2.5, places=2)
 
 
 if __name__ == "__main__":

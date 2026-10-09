@@ -4,9 +4,7 @@ A 90/10 tool, not a general VGM importer. It wires OPM key-on, KC, KF and
 patch writes plus the sample chips (K007232, MSM6295, MSM6258, SegaPCM, C140,
 C352) into a .fur that Furnace plays and a human can finish by hand.
 Furnace 0.6.8.3 does not emulate C352 (chip 0xD0); those channels are still
-written. See docs/c352.md.
-
-Release notes live in docs/changelog.md. The operating guide is the README.
+written. See docs/c352.md. The operating guide is docs/operating.md.
 """
 
 from __future__ import annotations

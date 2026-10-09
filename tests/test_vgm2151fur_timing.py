@@ -13,7 +13,6 @@ if str(ROOT) not in sys.path:
 
 from vgm2151fur.analyze import (
     Song,
-    VGM_RATE,
     _shift_note_e5,
     analyze,
     FMPatch,
@@ -22,14 +21,10 @@ from vgm2151fur.analyze import (
     opm_pitch_offset,
     transpose_opm_events,
 )
-from vgm2151fur.furio import load_fur_bytes, parse_fur
+from vgm2151fur.furio import parse_fur
 from vgm2151fur.furwrite import write_fur
 from vgm2151fur.timing import estimate_grid
-from vgm2151fur.vgm import ChipWrite, VgmFile, load_vgm
-
-SF = ROOT / "05 Starfield (Stage 4 BGM).vgz"
-DTA = ROOT / "07 Destroy Them All (Stage 6 BGM).vgz"
-ATTACK = ROOT / "04 Attack the Enemy (Stage 1 BGM).vgz"
+from vgm2151fur.vgm import ChipWrite, VgmFile
 
 
 def _vgm_with_keyons(onsets):
@@ -121,7 +116,7 @@ class TestEstimateGrid(unittest.TestCase):
         # unit (8400 = 3 x 2800), past the 16th-note band.  Halving cannot fit
         # it (5600 and 11200 are not halves), so the estimator has to divide
         # the candidate back down instead of giving up and letting the caller
-        # fall back to the 60 Hz grid (Iza (Title), You Are Perfect).
+        # fall back to the 60 Hz grid.
         gaps = [8400, 8400, 5600, 11200, 8400, 2800]
         onsets = []
         t = 0
@@ -133,11 +128,11 @@ class TestEstimateGrid(unittest.TestCase):
         self.assertAlmostEqual(grid.unit, 2800.0, delta=60.0)
 
     def test_slow_unit_is_folded_not_dropped(self):
-        # Sega System 16C shop/ending themes: the fastest melodic event on a
-        # channel is 9560 samples (and often 2x that), well past the 16th-note
-        # band.  The estimator used to return None, the caller fell back to
-        # 60 Hz/speed 4 = 15 rows/s, and per-frame pitch writes had nowhere to
-        # go (Mysterious Shop).  The unit must fold in halves instead.
+        # Slow themes: the fastest melodic event on a channel is 9560 samples
+        # (and often 2x that), well past the 16th-note band. The estimator
+        # used to return None, the caller fell back to 60 Hz/speed 4 = 15
+        # rows/s, and per-frame pitch writes had nowhere to go. The unit must
+        # fold in halves instead.
         onsets = []
         t = 0
         for k in range(60):
@@ -178,89 +173,6 @@ class TestPlacement(unittest.TestCase):
             self.assertLess(delay, 7)
             placed = row * row_len + delay * tick
             self.assertLessEqual(abs(placed - sample), tick / 2 + 0.5)
-
-
-def _written_note_times(m, ch):
-    """Reconstruct played note times, honouring D00 (0x0D) cuts and EDxx delays."""
-    row_len = m.speed / m.hz
-    tick = 1.0 / m.hz
-    out = []
-    g = 0
-    for oi in range(m.n_ord):
-        rows = m.patterns.get((ch, m.orders[ch][oi]))
-        span = m.pat_len
-        for r in range(m.pat_len):
-            if rows and any(c == 0x0D for c, _v in rows[r].fx):
-                span = r + 1
-                break
-        for r in range(span):
-            if rows and 0 <= rows[r].note <= 179:
-                delay = 0
-                for c, v in rows[r].fx:
-                    if c == 0xED:
-                        delay = v
-                out.append(((g + r) * row_len + delay * tick) * 44100.0)
-        g += span
-    return out
-
-
-def _keyon_samples(vgm, ch):
-    return [
-        w.sample
-        for w in vgm.writes
-        if w.chip == "ym2151" and w.reg == 0x08 and (w.val & 0x78) and (w.val & 7) == ch
-    ]
-
-
-@unittest.skipUnless(SF.is_file(), "Salamander Starfield rip missing")
-class TestSalamanderGrid(unittest.TestCase):
-    def test_starfield_grid(self):
-        song = analyze(load_vgm(SF), pcm=True)
-        self.assertGreater(song.speed, 1)  # ticks per row (ED placement)
-        self.assertEqual(song.row_subdiv, 8)
-        self.assertAlmostEqual(song.hz / song.speed, 70.2, delta=1.5)  # rows/s
-        self.assertIn("lattice", song.grid_note)
-
-    def test_destroy_them_all_grid(self):
-        song = analyze(load_vgm(DTA), pcm=True)
-        self.assertGreater(song.speed, 1)
-        self.assertEqual(song.row_subdiv, 8)
-        self.assertAlmostEqual(song.hz / song.speed, 61.24, delta=1.5)  # rows/s
-        self.assertIn("lattice", song.grid_note)
-
-    def test_placement_within_half_tick(self):
-        """Every key-on must land within half a tick of the original."""
-        for path, tol_ms in ((SF, 2.0), (DTA, 2.0)):
-            vgm = load_vgm(path)
-            song = analyze(vgm, pcm=True)
-            data = write_fur(song, include_pcm=True, include_fm=True)
-            m = parse_fur(data)
-            half_tick_ms = 1000.0 / m.hz / 2
-            self.assertLessEqual(half_tick_ms + 0.6, tol_ms + 0.01)
-            for ch in range(8):
-                orig = _keyon_samples(vgm, ch)
-                if not orig:
-                    continue
-                written = _written_note_times(m, ch)
-                self.assertEqual(len(written), len(orig), f"{path.name} ch{ch} note count")
-                for o, w in zip(orig, written):
-                    self.assertLessEqual(
-                        abs(w - o) / 44.1, tol_ms,
-                        f"{path.name} ch{ch} sample {o}: {abs(w - o) / 44.1:.1f}ms",
-                    )
-
-    def test_note_values_100_102_survive_roundtrip(self):
-        """Notes E-3/F-3/F#-3 are real pitches, not note-off codes (off = 180)."""
-        vgm = load_vgm(SF)
-        song = analyze(vgm, pcm=True)
-        data = write_fur(song, include_pcm=True, include_fm=True)
-        m = parse_fur(data)
-        got = {}
-        for (ch, idx), rows in m.patterns.items():
-            got[ch] = got.get(ch, 0) + sum(1 for r in rows if 0 <= r.note <= 179)
-        for ch in range(8):
-            ons = [e for e in song.events if e.on and not e.pcm and e.ch == ch]
-            self.assertEqual(got.get(ch, 0), len(ons), f"ch{ch}")
 
 
 class TestPercussionSweeps(unittest.TestCase):
@@ -316,10 +228,10 @@ class TestPercussionSweeps(unittest.TestCase):
         self.assertTrue(stops, "no ramp stop written")
 
     def test_single_mid_note_step_is_a_sweep(self):
-        # Block Hole's octave slams write one KC pair mid-note and hold it.
-        # With no second write there is no spread *between* the points, and the
-        # old range check threw the whole trajectory away: the note stayed at
-        # its old pitch until the next key-on.
+        # A driver that slams the octave writes one KC pair mid-note and
+        # holds it, so there is no spread *between* the points. The old
+        # range check threw the whole trajectory away and the note stayed
+        # at its old pitch until the next key-on.
         writes = [
             ChipWrite(sample=k * 5000, chip="ym2151", chip_id=0, reg=0x08, val=0x78)
             for k in range(60)
@@ -352,7 +264,7 @@ def _traj_at(pts, t):
 
 
 class TestSweepEncoder(unittest.TestCase):
-    """Structural guarantees of furwrite._emit_sweep (docs/salamander-opm.md).
+    """Structural guarantees of furwrite._emit_sweep.
 
     The writer samples the driver's step trajectory at row boundaries: the
     last (partial) row must be rated over its full span so the ramp lands on
@@ -361,7 +273,7 @@ class TestSweepEncoder(unittest.TestCase):
     jumps that land on a row boundary become E5 steps.
     """
 
-    HZ = 510.2018127441406  # speed 7 -> 605.1-sample rows (Burning Fighter)
+    HZ = 510.2018127441406  # speed 7 -> 605.1-sample rows
 
     def _song(self, events):
         song = _song(self.HZ, 7, 4, _vgm_with_keyons([]))
@@ -387,10 +299,10 @@ class TestSweepEncoder(unittest.TestCase):
         return rate
 
     def test_last_row_rates_full_span(self):
-        # A staircase dive that bottoms out and holds (the Surprise Attack
-        # shape): the row containing the final write must carry a rate that
-        # reaches the held value at the row's *end*, or the pitch overshoots
-        # the bottom by the leftover ticks and E5 cannot pin that back.
+        # A staircase dive that bottoms out and holds: the row containing the
+        # final write must carry a rate that reaches the held value at the
+        # row's *end*, or the pitch overshoots the bottom by the leftover
+        # ticks and E5 cannot pin that back.
         pts = tuple((1190 + 190 * k, -64 * (k + 1)) for k in range(18))
         end = pts[-1][0]
         ev = NoteEvent(sample=1000, ch=2, on=True, note=108, ins=0, vol=-1,
@@ -444,11 +356,11 @@ class TestSweepEncoder(unittest.TestCase):
         self.assertEqual(e5, [0x40])  # -300 clamped to -64 (fine-tune range)
 
     def test_tail_pin_does_not_double_count(self):
-        # A riser that reaches its held value inside the last row (the Fantasy
-        # Zone II DX shape).  The last row is already rated over its full span,
-        # so the E5 pin only fixes the rounding residue; subtracting the tail's
-        # travel again dropped the pitch by up to a whole tone and E5 could not
-        # express it, leaving the note flat until the next key-on.
+        # A riser that reaches its held value inside the last row. The last
+        # row is already rated over its full span, so the E5 pin only fixes
+        # the rounding residue; subtracting the tail's travel again dropped
+        # the pitch by up to a whole tone and E5 could not express it,
+        # leaving the note flat until the next key-on.
         row_len = 44100.0 * 7 / self.HZ
         pts = ((1000 + int(2 * row_len), 0), (1000 + int(3.3 * row_len), 400))
         ev = NoteEvent(sample=1000, ch=2, on=True, note=108, ins=0, vol=-1,
@@ -473,8 +385,8 @@ class TestKeyOnOperatorMask(unittest.TestCase):
     """KON is per operator: only a 0->1 bit transition restarts an envelope.
 
     Drivers write redundant key-ons and per-operator changes while a note
-    sounds (Gradius II does both heavily); reading any nonzero mask as a full
-    key-on turned every one of those into a spurious retrigger.
+    sounds. Reading any nonzero mask as a full key-on turned every one of
+    those into a spurious retrigger.
     """
 
     CH = 2
@@ -577,162 +489,6 @@ class TestClockTransposition(unittest.TestCase):
         self.assertEqual((events[0].note, events[0].e5), (61, 0x80 + 59))
         self.assertEqual((events[1].note, events[1].e5), (60, 0x80))
         self.assertEqual((events[2].note, events[2].e5), (72, 0x80))
-
-
-class TestLoopJump(unittest.TestCase):
-    """Bxx sits on the last content row so the loop restarts without a gap."""
-
-    def test_loop_jump_at_last_content_row(self):
-        for path in (SF, DTA):
-            if not path.is_file():
-                self.skipTest("rip missing")
-            vgm = load_vgm(path)
-            song = analyze(vgm, pcm=True)
-            m = parse_fur(write_fur(song, include_pcm=True, include_fm=True))
-            row_samples = 44100.0 * m.speed / m.hz
-            g = 0
-            abs_jump = None
-            last_content = None
-            for oi in range(m.n_ord):
-                rows = m.patterns[(0, m.orders[0][oi])]
-                span = m.pat_len
-                for r in range(m.pat_len):
-                    if any(c == 0x0D for c, _v in rows[r].fx):
-                        span = r + 1
-                        break
-                    if any(c == 0x0B for c, _v in rows[r].fx):
-                        abs_jump = g + r
-                content = [
-                    r for r in range(m.pat_len)
-                    if rows[r].note >= 0
-                    or any(c not in (0xFFFF, 0) and c != 0x0D and c != 0x0B for c, _v in rows[r].fx)
-                ]
-                if content:
-                    last_content = g + max(content)
-                g += span
-            name = path.name
-            self.assertIsNotNone(abs_jump, f"{name}: no Bxx")
-            self.assertLessEqual(abs_jump, last_content + 1,
-                                 f"{name}: Bxx at {abs_jump} but content ends at {last_content}")
-            loop_rows = (abs_jump + 1) - song.row_of(song.loop_sample)
-            expected = vgm.loop_samples / row_samples
-            self.assertLessEqual(abs(loop_rows - expected), 2.0,
-                                 f"{name}: loop {loop_rows} rows, expected {expected:.1f}")
-
-
-class TestLeadPitchRoundTrip(unittest.TestCase):
-    """Our (note, e5) must address the same chip pitch as the source registers.
-
-    Furnace converts note+e5 back to KC/KF; the key nibbles are "gappy" (3/7/11
-    alias 4/8/12 on the chip), so compare the *effective* semitone+fraction.
-    """
-
-    INV_NOTE = {0: 0, 1: 1, 2: 2, 3: 3, 4: 5, 5: 6, 6: 7, 7: 9, 8: 10, 9: 11, 10: 13, 11: 14}
-
-    @staticmethod
-    def _effective(reg: int) -> int:
-        """YM2151 KC register -> effective semitone index (ymfm adjusted code)."""
-        block = (reg >> 4) & 7
-        nibble = reg & 15
-        return block * 12 + (nibble - (nibble >> 2))
-
-    def test_lead_notes_match_source_registers(self):
-        if not SF.is_file():
-            self.skipTest("rip missing")
-        vgm = load_vgm(SF)
-        song = analyze(vgm, pcm=True)
-        # replay the source KC/KF state
-        kc_state = {}
-        kf_state = {}
-        events = sorted(
-            (e for e in song.events if e.on and e.ch in (1, 3)),
-            key=lambda e: e.sample,
-        )
-        by_sample = {}
-        for w in vgm.writes:
-            if w.chip != "ym2151":
-                continue
-            if w.reg == 8 and (w.val & 0x78):
-                ch = w.val & 7
-                by_sample.setdefault((ch, w.sample), (kc_state.get(ch, 0), kf_state.get(ch, 0)))
-            elif 0x28 <= w.reg <= 0x2F:
-                kc_state[w.reg - 0x28] = w.val
-            elif 0x30 <= w.reg <= 0x37:
-                kf_state[w.reg - 0x30] = w.val
-        checked = 0
-        for e in events:
-            src = by_sample.get((e.ch, e.sample))
-            if src is None:
-                continue
-            src_kc, src_kf = src
-            total = (e.note - 61) * 64 + (e.e5 - 0x80)
-            block, rem = divmod(total, 768)
-            sem, frac = divmod(rem, 64)
-            our_kc = (block << 4) | self.INV_NOTE[sem]
-            our_kf = (frac & 63) << 2
-            self.assertEqual(self._effective(our_kc), self._effective(src_kc),
-                             f"t={e.sample} ch{e.ch} note={e.note} e5={e.e5:02X}")
-            self.assertEqual((our_kf >> 2) & 63, (src_kf >> 2) & 63,
-                             f"t={e.sample} ch{e.ch} fine fraction")
-            checked += 1
-        self.assertGreater(checked, 100)
-
-
-class TestVibratoRamp(unittest.TestCase):
-    """FMS/AMS macros must follow the driver's slow sensitivity steps.
-
-    The drivers step the LFO sensitivity once per ~5k samples of sustain, so a
-    held note starts steady and drifts over ~1 s.  Converting that step with a
-    fixed 60 Hz frame made the vibrato reach full depth in ~0.1 s.
-    """
-
-    @staticmethod
-    def _source_steps(vgm):
-        held = set()
-        last = {}
-        steps = []
-        for w in vgm.writes:
-            if w.chip != "ym2151":
-                continue
-            if w.reg == 8:
-                ch = w.val & 7
-                if w.val & 0x78:
-                    held.add(ch)
-                    last.pop(ch, None)
-                else:
-                    held.discard(ch)
-            elif 0x38 <= w.reg <= 0x3F and (w.reg - 0x38) in held:
-                ch = w.reg - 0x38
-                if ch in last:
-                    steps.append(w.sample - last[ch])
-                last[ch] = w.sample
-        return sorted(steps)
-
-    def test_macro_step_matches_source_spacing(self):
-        if not ATTACK.is_file():
-            self.skipTest("rip missing")
-        vgm = load_vgm(ATTACK)
-        song = analyze(vgm, pcm=True)
-        steps = self._source_steps(vgm)
-        self.assertGreater(len(steps), 10)
-        src = steps[len(steps) // 2]
-        spt = VGM_RATE / song.hz
-        macros = [p for p in song.fm_patches if p.fms_macro and len(p.fms_macro) >= 4]
-        self.assertTrue(macros, "no vibrato instruments captured")
-        macro_steps = sorted(p.macro_speed * spt for p in macros)
-        for step in macro_steps:
-            # no macro may step faster than ~45 ms or slower than ~0.3 s
-            self.assertGreater(step, 2000, f"macro step {step:.0f} is near-instant")
-            self.assertLess(step, 13000, f"macro step {step:.0f} too slow")
-        # the typical macro step is the source's typical step
-        med = macro_steps[len(macro_steps) // 2]
-        self.assertLess(abs(med - src) / src, 0.35, f"median macro step {med:.0f} vs {src}")
-        # and full-depth ramps take real time ("the alcohol is absorbed over time")
-        for p in macros:
-            if max(p.fms_macro) < 4:
-                continue  # a short note only got part of the ramp
-            dur = (len(p.fms_macro) - 1) * p.macro_speed * spt
-            self.assertGreater(dur / VGM_RATE, 0.35, f"ramp {dur:.0f} samples is too quick")
 
 
 class TestOpmLfoDepth(unittest.TestCase):

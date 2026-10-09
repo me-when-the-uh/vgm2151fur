@@ -10,9 +10,6 @@ with the reference player, converts it to a .fur and renders that through
 Furnace. The printed table is the band energy in the probe window (default:
 the last two seconds of the window). A voice where ref has energy and fur
 does not (or the reverse) is the one to inspect further.
-
-Measured example (Tekken Tag 05, window 68.2-68.8 s, probe 68.6-68.8):
-all the ambient voices show ref energy with fur equal or slightly below.
 """
 
 import argparse

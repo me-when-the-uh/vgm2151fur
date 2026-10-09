@@ -146,8 +146,8 @@ def _verify_runs(
     The structural counters cannot see everything (retrigger/envelope wobble
     and sub-threshold drift), so `--verify` renders each candidate and counts
     the sustained divergences the `compare` command reports.  The threshold is
-    finer than `compare`'s default (0.5 st / 100 ms): on Battle Garegga 02 the
-    4x variant only shows up at 0.25 st (0 -> 1 -> 44 runs for 1x/3x/4x).
+    finer than `compare`'s default (0.5 st / 100 ms), where a marginal variant
+    can still hide.
     """
     from vgm2151fur.diag import export_fur, pitch_runs
 
@@ -174,7 +174,7 @@ def _emit(
     """Write one Song to `out_path`, optionally normalizing. (bytes, peak, gain)."""
     # A track with no FM key-ons must not carry an empty YM2151: the chip adds a
     # second device to the export, and VGM players rescale the mix for it, which
-    # drops the sample chip's level (C352-only rips measured 4-10x quieter).
+    # drops the sample chip's level.
     use_fm = include_fm and bool(song.fm_patches)
     data = write_fur(song, include_pcm=pcm, include_fm=use_fm, stats=stats)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -258,6 +258,23 @@ def _optimised_dir(factor: float) -> str:
     return "default" if factor == 1 else f"x{factor:g} optimised"
 
 
+def default_factors(condense: float) -> tuple[float, ...]:
+    """The 1x..Nx ladder with the half steps kept: 1, 1.5, 2, 2.5, ... N.
+
+    A row is not a whole number of samples.  A unit that lands between two
+    whole steps would otherwise be skipped.
+    """
+    top = max(1.0, float(condense))
+    out: list[float] = []
+    step = 1
+    while step <= top:
+        out.append(float(step))
+        if step + 0.5 <= top:
+            out.append(step + 0.5)
+        step += 1
+    return tuple(out)
+
+
 def _place_dirs(results: list[dict], out_dir: Path, keep: set) -> None:
     """Move each kept factor into its subfolder; delete the ones that lost.
 
@@ -279,7 +296,7 @@ def _place_dirs(results: list[dict], out_dir: Path, keep: set) -> None:
 
 
 _MANIFEST = "condense.tsv"
-_MANIFEST_HEADER = "track\tfactor\tfile\tbpm\tloss\tdev\tdiv\tlossless\tpick\n"
+_MANIFEST_HEADER = "track\tfactor\tfile\tbpm\tloss\tdev\tdiv\tlossless\tpick\tgrid\n"
 
 
 def _manifest_line(src: Path, v: dict) -> str:
@@ -288,6 +305,7 @@ def _manifest_line(src: Path, v: dict) -> str:
         src.stem, f"{v['factor']:g}", Path(v["dst"]).name,
         f"{v['bpm']:.1f}", str(v["loss_total"]), str(v["dev_max"]), div,
         "1" if v.get("lossless") else "0", "1" if v.get("pick") else "0",
+        v.get("grid", ""),
     )) + "\n"
 
 
@@ -346,6 +364,7 @@ def convert_variants(
             "hz": song.hz,
             "bpm": furnace_bpm(song),
             "rows_per_s": song.hz / song.speed,
+            "grid": song.grid_note,
             "loss": dict(stats),
             "loss_total": loss_total(stats),
             "dev_max": dev_max(stats),
@@ -359,10 +378,9 @@ def convert_variants(
     # Structural counters that change content and that the rendered pitch
     # comparison cannot see: a dropped note, a swallowed note-off, an evicted
     # sample or a lost effect.  The sweep/fade counters describe the pitch
-    # model, which --verify measures directly, so under verify they are
-    # advisory (a factor whose render matches 1x should not be blocked by a
-    # clipped sweep step the render shows is inaudible - Hyper Duel "Buster
-    # Gear" 2x is 0 divergence over the 1x baseline and was still rejected).
+    # model, which --verify measures directly. Under verify they are advisory:
+    # a factor whose render matches 1x should not be blocked by a clipped
+    # sweep step the render shows is inaudible.
     hard_keys = (
         "note_collision", "off_swallowed", "pcm_evicted", "pcm_unplaced",
         "fx_dropped", "orders_truncated",
@@ -519,7 +537,7 @@ def convert_folder(
         if factors is not None:
             factor_list = tuple(float(f) for f in factors)
         elif variants:
-            factor_list = tuple(range(1, max(1, int(condense)) + 1))
+            factor_list = default_factors(condense)
         else:
             factor_list = (1,)
         manifest = (

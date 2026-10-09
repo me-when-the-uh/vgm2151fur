@@ -11,9 +11,6 @@ requires-python = ">=3.11"
 license = { text = "MIT" }
 keywords = ["vgm", "ym2151", "furnace", "chiptune", "arcade"]
 
-[project.urls]
-Source = "https://example.invalid/vgm2151fur"
-
 [project.scripts]
 vgm2151fur = "vgm2151fur.__main__:main"
 

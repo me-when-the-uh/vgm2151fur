@@ -1,7 +1,7 @@
 """Locate and run the reference VGM renderer (vgm2wav-mute).
 
-The renderer ships with the VGM tools and lives next to the project folder,
-not inside it. VGM2151FUR_VGM2WAV overrides the search.
+The renderer is a separate download. VGM2151FUR_VGM2WAV points at it, and
+the search also checks next to the project folder and PATH.
 """
 
 from __future__ import annotations
@@ -22,7 +22,6 @@ def find_vgm2wav() -> Path | None:
     candidates = [
         Path(env) if env else None,
         here.parent.parent / "vgm2wav-mute.exe",
-        here.parent.parent.parent / "vgm2wav-mute.exe",
         shutil.which("vgm2wav-mute"),
         shutil.which("vgm2wav"),
     ]

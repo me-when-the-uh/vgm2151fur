@@ -3,9 +3,9 @@
 Furnace is not vendored in the package. The tools look for the console
 build in this order: VGM2151FUR_FURNACE (an exe or a folder holding it), a
 `furnace` folder next to the project (an unpacked release or a source
-checkout with `build/furnace.exe`), the bundled headless build in
-`third_party/furnace-console/` (the patched C352-capable console, ~4 MB),
-a `third_party/furnace` drop-in, the same folders one level up, then PATH.
+checkout with `build/furnace.exe`), a `third_party/furnace-console/`
+drop-in, a `third_party/furnace` drop-in, the same folders one level up,
+then PATH.
 """
 
 from __future__ import annotations

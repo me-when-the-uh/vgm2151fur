@@ -1,32 +1,56 @@
-"""Reconvert the C140 packs (Namco System 2/21) with the current converter."""
+"""Batch-convert VGM packs into an output tree.
+
+    python tools/reconvert_c140.py PACK_DIR... [-o OUT]
+
+Each PACK_DIR is a folder of .vgz tracks. Tracks convert into
+OUT/<pack-slug>/fur (default OUT: output/ next to the repo root). Prints one
+line per track and a summary; failures do not stop the batch.
+"""
+
+from __future__ import annotations
+
+import argparse
+import re
 import subprocess
 import sys
 from pathlib import Path
 
-BASE = Path(r"C:\Users\User\Desktop\Pets\ripper\tools\arcade-vgm-rip")
-FUR_DIR = BASE / "vgm2151fur"
-PACKS = {
-    "assault": r"VGM_collection\newest\Assault_(Namco_System_2)",
-    "cyber-sled": r"VGM_collection\newest\Cyber_Sled_(Namco_System_21)",
-    "metal-hawk": r"VGM_collection\newest\Metal_Hawk_(Namco_System_2)",
-    "mirai-ninja": r"VGM_collection\newest\Mirai_Ninja_(Namco_System_2)",
-    "starblade": r"VGM_collection\newest\Starblade_(Namco_System_21)",
-    "valkyrie": r"VGM_collection\newest\Valkyrie_no_Densetsu_(Namco_System_2)",
-}
-failed = []
-ok = 0
-for slug, rel in PACKS.items():
-    outdir = BASE / "output" / slug / "fur"
-    outdir.mkdir(parents=True, exist_ok=True)
-    for vgz in sorted((BASE / rel).glob("*.vgz")):
-        proc = subprocess.run([sys.executable, "-m", "vgm2151fur", "convert",
-                               str(vgz), "-o", str(outdir)],
-                              cwd=str(FUR_DIR), capture_output=True, text=True)
-        fur = outdir / f"{vgz.stem}.fur"
-        if proc.returncode != 0 or not fur.is_file():
-            failed.append(vgz.name)
-            print(f"FAIL {vgz.name}: {(proc.stdout or '')[-160:]}")
-        else:
-            ok += 1
-            print(f"ok   {vgz.stem[:50]:50s} {fur.stat().st_size:8d} bytes", flush=True)
-print(f"done: {ok} ok, {len(failed)} failed")
+REPO = Path(__file__).resolve().parents[1]
+
+
+def slug(name: str) -> str:
+    """Folder name as an output slug: lowercase, non-alphanumerics to dashes."""
+    return re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-") or "pack"
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("packs", nargs="+", help="folders of .vgz tracks")
+    ap.add_argument("-o", "--out", default=None, help="output root (default: output/)")
+    args = ap.parse_args()
+    root = Path(args.out) if args.out else REPO / "output"
+
+    failed: list[str] = []
+    ok = 0
+    for pack in (Path(p) for p in args.packs):
+        outdir = root / slug(pack.name) / "fur"
+        outdir.mkdir(parents=True, exist_ok=True)
+        for vgz in sorted(pack.glob("*.vgz")):
+            proc = subprocess.run(
+                [sys.executable, "-m", "vgm2151fur", "convert", str(vgz), "-o", str(outdir)],
+                cwd=str(REPO), capture_output=True, text=True,
+            )
+            fur = outdir / f"{vgz.stem}.fur"
+            if proc.returncode != 0 or not fur.is_file():
+                failed.append(vgz.name)
+                print(f"FAIL {vgz.name}: {(proc.stdout or '')[-160:]}")
+            else:
+                ok += 1
+                print(f"ok   {vgz.stem[:50]:50s} {fur.stat().st_size:8d} bytes", flush=True)
+    print(f"done: {ok} ok, {len(failed)} failed")
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

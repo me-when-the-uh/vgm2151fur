@@ -12,8 +12,8 @@ Why this works: chroma discards timbre and mix. Wrong notes or missing
 layers lower the whole curve, while a *pitch scale* error (wrong chip clock,
 wrong sample rate) shows up as a clean peak away from 0. Beware it is
 octave-blind: +7 and -5 look identical, which is fine for hunting scale
-errors (the classic C140 bug fixed in 0.9.18 was 1.5x = +7.02 = -4.98) as
-long as the full table is read, not just the best bin.
+errors (a 1.5x clock error reads as 1.5x = +7.02 = -4.98) as long as the
+full table is read, not just the best bin.
 
 Typical use - fur_soundcheck.py wraps the whole source/.fur/export trio:
     python pitch_shift.py source.wav fur_render.wav      # Furnace playback

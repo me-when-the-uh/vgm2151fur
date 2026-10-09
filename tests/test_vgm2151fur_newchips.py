@@ -91,8 +91,8 @@ class TestVgmParsing(unittest.TestCase):
         self.assertEqual([(x.reg, x.val) for x in w], [(0x035, 0xD0)])
 
     def test_legacy_clock_selects_system_21_mapping(self):
-        # Starblade-style 1.51 file: no 1.61 type field, but the legacy
-        # 8MHz/374 rate in the clock slot means System 21.
+        # 1.51 file: no 1.61 type field, but the legacy 8MHz/374 rate in the
+        # clock slot means System 21.
         raw = bytearray(_raw_vgm(b"", [(0x8D, 0x80000, bytes(32))]))
         raw[8:12] = (0x151).to_bytes(4, "little")
         raw[0xA8:0xAC] = (21390).to_bytes(4, "little")
@@ -567,8 +567,7 @@ class TestC140FadesAndSlides(unittest.TestCase):
         self.assertIn(48, [r.vol for r in rows])
         self.assertTrue(any(c in (0x01, 0x02) for r in rows for c, _v in r.fx))
         # The note row keeps its own pitch: the pitch ramp must start on a
-        # later row, or the key-on write inherits part of the slide
-        # (measured 2 st attacks on Cyber Sled / Valkyrie).
+        # later row, or the key-on write inherits part of the slide.
         note_row = next(r for r in rows if 0 <= r.note < 180)
         self.assertFalse(any(c in (0x01, 0x02) for c, _v in note_row.fx))
         self.assertTrue(any(
@@ -585,8 +584,8 @@ class TestC140FadesAndSlides(unittest.TestCase):
 
     def test_big_jump_lands_as_quick_legato(self):
         # A move bigger than the slide can deliver inside a row must land as an
-        # instant E8xx/E9xx transpose instead of a rate-limited slur (measured
-        # on 0.6.8.3 through the C140 and YM2151 platforms).
+        # instant E8xx/E9xx transpose instead of a rate-limited slur, on the
+        # C140 and YM2151 platforms alike.
         body = TestC140()._body()
         rom = bytearray(0x200)
         rom[0x100:0x100 + len(body)] = body
@@ -1093,8 +1092,7 @@ class TestC352(unittest.TestCase):
     def test_high_bank_bits_fold_through_the_rom_window(self):
         # libvgm reads wave[pos & pow2_mask(size)], so a driver address with
         # bits above the window aliases its low bits: 0x8001:0x0000 in a 16 MB
-        # window is the byte at 0x10000. Tekken 2 keys its 0x80B1-style
-        # voices exactly like that (1037 triggers on 17 Mid Boss).
+        # window is the byte at 0x10000.
         body = self._body()
         writes = _lattice() + self._regs(
             60000, vol_f=0x4000, vol_r=0, freq=0x8000, flags=0x4000,
@@ -1121,8 +1119,8 @@ class TestC352(unittest.TestCase):
 
     def test_late_pitch_write_within_a_frame_is_the_note(self):
         # these drivers strobe first and write the note's own pitch inside the
-        # same 60 Hz frame (Ending BGM: 232 hits, up to +18.9 st); the key-on
-        # register is the previous note's value, not a slide start
+        # same 60 Hz frame; the key-on register is the previous note's value,
+        # not a slide start
         rom = bytearray(0x300)
         rom[0x100:0x1C8] = self._body()
         writes = _lattice() + self._oneshot_writes(60000, freq=0x4000) + [
@@ -1135,9 +1133,9 @@ class TestC352(unittest.TestCase):
         self.assertEqual(song.c352_samples[0].mode_freq(), 0x8000)
 
     def test_late_volume_write_within_a_frame_sets_the_attack(self):
-        # Ridge Racer 2 zeroes the volume when it stops a voice, so the strobe
-        # sees 0 and the real balance arrives 8 ms later; the note must start
-        # at the written balance or the attack plays silent
+        # A driver that zeroes the volume when it stops a voice leaves the
+        # strobe with 0; the real balance arrives a few ms later, and the note
+        # must start at the written balance or the attack plays silent.
         rom = bytearray(0x300)
         rom[0x100:0x1C8] = self._body()
         writes = _lattice() + self._oneshot_writes(60000, vol_f=0x0000) + [
@@ -1150,9 +1148,9 @@ class TestC352(unittest.TestCase):
         self.assertEqual(ev.pan, 0xF2)
 
     def test_loop_point_one_past_the_end_extends_the_body(self):
-        # Tekken Tag 05 writes wave_end 0x...8d and wave_loop 0x...8e: the chip
-        # jumps to the contiguous byte, plays a full bank there and repeats.
-        # The body has to carry that region or the sample plays its intro once.
+        # A loop point one past wave_end: the chip jumps to the contiguous
+        # byte, plays a full bank there and repeats. The body has to carry
+        # that region or the sample plays its intro once.
         rom = bytearray(0x20000)
         rom[0x100:0x1C8] = self._body()
         for i in range(len(rom)):
@@ -1172,11 +1170,10 @@ class TestC352(unittest.TestCase):
         self.assertEqual(smp.loop_mode, 0)
 
     def test_geometry_rewrite_before_the_crossing_moves_the_loop(self):
-        # Tekken Tag 05 pairs the key-on geometry (start=0x4cd4 / loop=0x009b)
-        # with a rewrite 8 ms later (start=0x009b / loop=0x928e) that points
-        # the LINK jump at the byte after the intro - the sample's real
-        # continuation. The chip reads the live registers at the crossing,
-        # so the body has to use the rewrite, not the key-on values.
+        # A geometry rewrite shortly after key-on can point the LINK jump at
+        # the byte after the intro, the sample's real continuation. The chip
+        # reads the live registers at the crossing, so the body has to use
+        # the rewrite, not the key-on values.
         rom = bytearray(0x40000)
         for i in range(len(rom)):
             rom[i] = (i * 7 + 3) & 0xFF

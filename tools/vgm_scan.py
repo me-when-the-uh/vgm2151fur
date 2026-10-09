@@ -2,9 +2,9 @@
 
     python vgm_scan.py [root ...] [--max-mb 2] [--files]
 
-Walks the tree (default: this repo, skipping output/, third_party/ and the
-like), reads the first --max-mb MB of every .vgm/.vgz, and groups the hits
-per pack directory:
+Walks the tree (default: the current folder, skipping output/, third_party/
+and the like), reads the first --max-mb MB of every .vgm/.vgz, and groups
+the hits per pack directory:
 
     segapcm  clock at header 0x38, extra-header clock id 0x04
     c140     clock at header 0xA8, type byte 0x96 (0 = System 2, 1 = System
@@ -15,11 +15,10 @@ per pack directory:
     c219     the C140-family ASIC (type byte 2). The converter does not
              support it; never batch-convert these into 0xCE.
 
-Detection is heuristic (header clocks plus the extra-header clock list) but
-reproduced this collection's 19 chip packs exactly (11 SegaPCM, 6 C140,
-2 C219-only). Run it before "convert every X rip" requests so the pack list
-is complete, and after adding packs. Reads .vgz through zlib; unreadable
-files are skipped silently.
+Detection is heuristic (header clocks plus the extra-header clock list).
+Run it before batch convert requests so the pack list is complete, and
+after adding packs. Reads .vgz through zlib; unreadable files are skipped
+silently.
 """
 
 from __future__ import annotations
@@ -34,7 +33,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from vgm2151fur.vgm import chips_in_head, head_bytes
 
 SKIP = {"output", "third_party", ".git", "__pycache__", ".commandcode",
-        "vgmtools", "node_modules", "soundcheck"}
+        "node_modules", "soundcheck"}
 
 CENSUS_KINDS = {"segapcm", "c140", "c219", "c352"}
 

@@ -5,16 +5,17 @@
 
 `vgmdiff.py` compares KC/KF registers, which cannot see LFO vibrato (PMS/AMS),
 macros, or anything a driver does with the sample chips.  This tool renders
-both files with the *same* renderer (vgm2wav-mute, so the gains match) and compares
-a 12-bin chroma profile per window.  The cosine similarity per window says how
-much of the sounding pitch content is shared:
+both files with the *same* renderer (vgm2wav-mute, which keeps the gains
+matched) and compares a 12-bin chroma profile per window.  The cosine
+similarity per window says how much of the sounding pitch content is shared:
 
     0.97+  healthy: the window sounds like the same music
     0.9    audible differences (a wrong note head, missing pitch motion)
     <0.8   something structural: dropped notes, wrong octave, missing channel
 
-It is a coarse instrument by design (a mix of 8 channels has no single pitch),
-so use it to *find* windows, then `vgmdiff.py` or a WAV render to explain them.
+It is a coarse instrument by design (a mix of 8 channels has no single
+pitch). Use it to *find* windows, then `vgmdiff.py` or a WAV render to
+explain them.
 
 The two renders land in --wavdir (default: next to the export) unless they are
 already there.

@@ -1,77 +1,67 @@
-"""Reconvert the C352 set: every C352 pack plus the cross-pack singles.
+"""Batch-convert VGM packs and report each module's grid.
 
-    python tools/reconvert_c352.py
+    python tools/reconvert_c352.py PACK_DIR... [-o OUT]
 
-Prints one line per track (speed, hz, orders). Watch for:
-- a warning line about link targets outside the dump (those notes play the
-  intro once; counts differ per track),
-- n_ord growth vs the figures in docs/testing-pipeline.md,
-- any "truncated to 256 orders" message (raise --speed or split the VGM).
+Each PACK_DIR is a folder of .vgz tracks. Tracks convert into
+OUT/<pack-slug>/fur (default OUT: output/ next to the repo root). Prints one
+line per track (speed, hz, orders) plus any warning the conversion logged.
+A "truncated to 256 orders" message means the track needs a later manual
+`speed` pin or the VGM needs splitting.
 """
 
+from __future__ import annotations
+
+import argparse
+import re
 import subprocess
 import sys
 from pathlib import Path
 
-BASE = Path(__file__).resolve().parents[2]
-FUR_DIR = BASE / "vgm2151fur"
-sys.path.insert(0, str(FUR_DIR))
+REPO = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO))
 
 from vgm2151fur.furio import load_fur_bytes, parse_fur
 
-PACKS: list[tuple[str, str]] = [
-    ("tekken-tag", r"VGM_collection\new\Tekken_Tag_Tournament_(Namco_System_12)"),
-    ("tekken", r"VGM_collection\new\Tekken_(Namco_System_11)"),
-    ("tekken-2", r"VGM_collection\new\Tekken_2_(Namco_System_11)"),
-    ("tekken-3", r"VGM_collection\new\Tekken_3_(Namco_System_12)"),
-    ("soulcalibur", r"VGM_collection\new\SoulCalibur_(Namco_System_12)"),
-    ("ace-driver", r"VGM_collection\new\Ace_Driver_-_Victory_Lap_(Namco_System_22)"),
-    ("cyber-commando", r"VGM_collection\newest\Cyber_Commando_(Namco_System_22)"),
-    ("outfoxies", r"VGM_collection\newest\The_Outfoxies_(Namco_NB-2)"),
-    ("ridge-racer", r"VGM_collection\old\Ridge_Racer_(Namco_System_22)"),
-    ("ridge-racer-2", r"VGM_collection\old\Ridge_Racer_2_(Namco_System_22)"),
-]
 
-JOBS: list[tuple[Path, Path]] = []
-for slug, rel in PACKS:
-    outdir = BASE / "output" / slug / "fur"
-    outdir.mkdir(parents=True, exist_ok=True)
-    for vgz in sorted((BASE / rel).glob("*.vgz")):
-        JOBS.append((vgz, outdir))
-
-for tag, vgz in (
-    ("S11", BASE / r"VGM_collection\new\Tekken_(Namco_System_11)\06 Windermere, UK.vgz"),
-    ("S12", BASE / r"VGM_collection\new\SoulCalibur_(Namco_System_12)\03 The New Legend (Kilik, Edge Master).vgz"),
-    ("S22", BASE / r"VGM_collection\old\Ridge_Racer_(Namco_System_22)\01 Welcome Racer.vgz"),
-):
-    outdir = BASE / "output" / "_c352test" / "fresh" / tag
-    outdir.mkdir(parents=True, exist_ok=True)
-    JOBS.append((vgz, outdir))
+def slug(name: str) -> str:
+    """Folder name as an output slug: lowercase, non-alphanumerics to dashes."""
+    return re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-") or "pack"
 
 
 def main() -> int:
-    failed = []
-    for vgz, outdir in JOBS:
-        proc = subprocess.run(
-            [sys.executable, "-m", "vgm2151fur", "convert", str(vgz), "-o", str(outdir)],
-            cwd=str(FUR_DIR), capture_output=True, text=True,
-        )
-        fur = outdir / f"{vgz.stem}.fur"
-        if proc.returncode != 0 or not fur.is_file():
-            failed.append(vgz.stem)
-            print(f"FAIL {vgz.stem}: rc={proc.returncode}")
-            print((proc.stdout or "")[-400:])
-            print((proc.stderr or "")[-400:])
-            continue
-        mod = parse_fur(load_fur_bytes(fur))
-        note = ""
-        for line in (proc.stdout or "").splitlines():
-            low = line.lower()
-            if "link" in low or "truncat" in low or "warn" in low:
-                note = " | " + line.strip()[:120]
-        print(f"ok   {vgz.stem[:44]:44s} speed={mod.speed} hz={mod.hz:7.2f} n_ord={mod.n_ord:3d}{note}",
-              flush=True)
-    print(f"done: {len(JOBS) - len(failed)} ok, {len(failed)} failed")
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("packs", nargs="+", help="folders of .vgz tracks")
+    ap.add_argument("-o", "--out", default=None, help="output root (default: output/)")
+    args = ap.parse_args()
+    root = Path(args.out) if args.out else REPO / "output"
+
+    failed: list[str] = []
+    ok = 0
+    for pack in (Path(p) for p in args.packs):
+        outdir = root / slug(pack.name) / "fur"
+        outdir.mkdir(parents=True, exist_ok=True)
+        for vgz in sorted(pack.glob("*.vgz")):
+            proc = subprocess.run(
+                [sys.executable, "-m", "vgm2151fur", "convert", str(vgz), "-o", str(outdir)],
+                cwd=str(REPO), capture_output=True, text=True,
+            )
+            fur = outdir / f"{vgz.stem}.fur"
+            if proc.returncode != 0 or not fur.is_file():
+                failed.append(vgz.stem)
+                print(f"FAIL {vgz.stem}: rc={proc.returncode}")
+                print((proc.stdout or "")[-400:])
+                print((proc.stderr or "")[-400:])
+                continue
+            ok += 1
+            mod = parse_fur(load_fur_bytes(fur))
+            note = ""
+            for line in (proc.stdout or "").splitlines():
+                if "warn" in line.lower() or "link" in line.lower():
+                    note = " | " + line.strip()[:120]
+            print(f"ok   {vgz.stem[:44]:44s} speed={mod.speed} hz={mod.hz:7.2f} "
+                  f"n_ord={mod.n_ord:3d}{note}", flush=True)
+    print(f"done: {ok} ok, {len(failed)} failed")
     return 1 if failed else 0
 
 

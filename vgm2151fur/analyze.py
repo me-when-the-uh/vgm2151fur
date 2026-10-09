@@ -94,11 +94,9 @@ def kf_to_e5(kf: int) -> int:
     """YM2151 KF register → Furnace E5xx fine tune.
 
     The key fraction is the *top* six bits of the register: ymfm's
-    ``ch_block_freq = (KC << 6) | (KF >> 2)``, so 0xFC means 63/64 of a
-    semitone, not 60/64.  One KF step is 1/64 semitone and Furnace's E5xx
-    is one unit per KF step (measured through the bundled 0.6.8.3 console
-    build: E5 0x80+f exports KF = f << 2; values above 0xBF saturate the
-    register's six-bit fraction).
+    ``ch_block_freq = (KC << 6) | (KF >> 2)``.  One KF step is 1/64 semitone
+    and Furnace's E5xx is one unit per KF step: E5 0x80+f exports KF = f << 2,
+    and values above 0xBF saturate the register's six-bit fraction.
     """
     return max(0, min(255, 0x80 + (kf >> 2)))
 
@@ -115,6 +113,10 @@ def kc_kf_units(kc: int, kf: int) -> int:
 # arcade.cpp), so the *registers* a rip's driver wrote sound sharper/lower than
 # their plain meaning whenever the board clock differs from this one.
 OPM_DEFAULT_CLOCK = 3579545
+
+# One sample-chip trigger is often a key-on plus its own pitch and volume
+# writes.  A real drum interval is hundreds of samples, never tens.
+_ONSET_MERGE_SAMPLES = 100
 
 
 def opm_pitch_offset(clock: int | None) -> int:
@@ -171,11 +173,8 @@ def vol15(raw: int, scale: float = 255.0) -> int:
     """K007232 volume register → Furnace 0-15.
 
     The chip mixes a voice as sample * (vol * 2) / 32768, so the register is
-    linear amplitude and 255 is full scale. Drivers on Twin16 mostly write
-    multiples of 0x11 up to 0x99, which is why the old 153-as-full-scale
-    table was used; that table compressed the steps (0x22 played 1.5x too
-    loud, 0x88 1.6x too quiet) and clamped everything above 0x99 together.
-    `scale` keeps a 0-15 driver preset working: pass 15 for those files.
+    linear amplitude and 255 is full scale.  A few drivers treat the register
+    as a 0-15 preset instead: pass 15 for those files.
     """
     if raw <= 0:
         return 0
@@ -213,11 +212,9 @@ class FMPatch:
     def identity(self) -> tuple:
         """Cluster key: full timbre including carrier TLs.
 
-        Carrier TL used to be stripped so the volume column could restore it.
-        Furnace applies volume with a log curve (VOL_SCALE_LOG_BROKEN), so
-        zeroing TL and putting 127-TL in the pattern does not reconstruct the
-        original operators: high carriers (MUL 14 bells, choir lead) become
-        piercing bleeps. Keep TL on the instrument; omit pattern volume.
+        Carrier TL is part of the identity: Furnace applies volume on a log
+        curve, so a stripped TL cannot be reconstructed from pattern volume.
+        Keep TL on the instrument and omit pattern volume.
         """
         op_keys = tuple(self.ops[i].as_tuple(include_tl=True) for i in range(4))
         return (self.alg & 7, self.fb & 7, op_keys)
@@ -241,10 +238,9 @@ class NoteEvent:
     # Key-off sample (0 = still playing at the end / unknown).
     end: int = 0
     # Mid-note pitch writes: (sample, 1/64-semitone delta from the note pitch).
-    # Non-empty for the percussion sweeps the Twin16 drivers write at 88 samples
-    # (Salamander, Block Hole) or ~190 samples (Surprise Attack) per step
-    # (encoders turn this into 01xx/02xx pitch ramps). C140 slides use the same
-    # shape.
+    # Non-empty for percussion sweeps some drivers write a step at a time
+    # (~88 or ~190 samples per step); encoders turn this into 01xx/02xx pitch
+    # ramps. C140 slides use the same shape.
     sweep: tuple[tuple[int, int], ...] = ()
     # Mid-note volume steps (sample, C140 8-bit level, Furnace 08xy balance or
     # None to leave it). Emitted as volume-column (and pan) updates on rows
@@ -439,10 +435,10 @@ def _flush_pms_ramp(
         if p == 0 and a == 0 and pms:
             # The reset is the vibrato switching off.  Keep it as the final
             # step so the macro returns to 0; without it the macro holds the
-            # last sensitivity for the rest of the song (Hyper Duel "Buster
-            # Gear" keeps a PMS 6 wobble running past every note).  Its length
-            # is irrelevant (a macro holds its last value), so reuse the
-            # previous step to keep the median step honest.
+            # last sensitivity for the rest of the song, running a wobble past
+            # every later note.  Its length is irrelevant (a macro holds its
+            # last value), so reuse the previous step to keep the median step
+            # honest.
             pms.append(0)
             ams.append(0)
             deltas.append(deltas[-1] if deltas else max(1, t - prev_t))
@@ -554,9 +550,9 @@ def _finalize_sweep(
     r0 = kc_kf_units(ref_kc, ref_kf)
     deltas = tuple((s, kc_kf_units(kc, kf) - r0) for s, kc, kf in merged)
     # The note's own pitch counts as a trajectory point: a single mid-note
-    # step (Block Hole's octave slams write one KC pair and hold it) has no
-    # internal spread at all, and the old range check dropped it whole: the
-    # note then stayed at its old pitch until the next key-on.
+    # step (one KC pair written and held) has no internal spread at all, and
+    # the old range check dropped it whole. The note then stayed at its old
+    # pitch until the next key-on.
     vals = [0] + [d for _s, d in deltas]
     if max(vals) - min(vals) >= 4:
         ev.sweep = deltas
@@ -621,8 +617,8 @@ def analyze(
         if mask != 0xF:
             # An operator the KON mask leaves un-keyed never starts its
             # envelope; the closest a static OPM instrument gets is maximum
-            # attenuation (TL 127, ~-95 dB) on that operator.  Driver usage:
-            # 3-operator percussion and brass patches (Gradius II/III).
+            # attenuation (TL 127, ~-95 dB) on that operator.  A common
+            # driver shape for 3-operator percussion and brass patches.
             snap.ops = tuple(
                 OpRegs(
                     dt_mul=op.dt_mul,
@@ -737,10 +733,10 @@ def analyze(
             held_ins[ch] = ins
             held_kon[ch] = w.sample
         elif mask:
-            # A redundant write or a per-operator change while the note sounds
-            # (Gradius II does both): every operator stays as it was, so this
-            # is not a note event: treating it as one retriggered the whole
-            # note and was audible on sustained leads.
+            # A redundant write or a per-operator change while the note sounds:
+            # every operator stays as it was, so this is not a note event.
+            # Treating it as one retriggered the whole note and was audible on
+            # sustained leads.
             pass
         elif ym.kon[ch]:
             pending_off[ch] = w.sample
@@ -774,9 +770,8 @@ def analyze(
         if w.chip != "ym2151":
             continue
         # A mid-note write that clears RL/FB/CON's output bits (regs 0x20-0x27,
-        # RL == 0) cuts the channel instantly - Cyber Sled's Silent Fight ends
-        # its siren that way with the voices still keyed and D1L at maximum, so
-        # without this the note rang for the rest of the track.
+        # RL == 0) cuts the channel instantly even with the voices still keyed.
+        # Without this the note rang for the rest of the track.
         forced_off = (
             w.reg != 0x08
             and 0x20 <= w.reg <= 0x27
@@ -821,30 +816,9 @@ def analyze(
     # Row 0 is the start of the VGM, not the first key-on. Loop points in the
     # header are sample offsets from t=0; shifting t0 would move Bxx.
     t0 = 0
-    # Prefer the measured key-on lattice: rows subdivide the measured 16th note
-    # and each row carries several ticks, so EDxx can place every event at its
-    # true (60 Hz-frame-quantized) write time. Manual --speed keeps the legacy
-    # 60 Hz behaviour.
+    # Chosen below, after every chip has been read.
     grid_note = ""
     row_subdiv = 1
-    if speed and speed >= 1:
-        hz = 60.0
-        use_speed = speed
-    else:
-        grid = estimate_grid(vgm, tick_samples=tick, min_row=row_floor)
-        if grid is not None:
-            hz = grid.hz
-            use_speed = grid.speed
-            row_subdiv = grid.subdiv
-            grid_note = (
-                f"{grid.source}, {grid.confidence * 100:.0f}% within 6%; "
-                f"row = 1/{grid.subdiv} of the measured 16th, "
-                f"{grid.speed} ticks/row"
-            )
-        else:
-            hz = 60.0
-            use_speed = suggest_speed(keyon_times, hz)
-            grid_note = "60 Hz fallback"
 
     rom, pcm_samples = build_pcm_bank(vgm)
     pcm_ins_base = len(patch_order)
@@ -1133,13 +1107,12 @@ def analyze(
                     if deltas and max(vals + [0]) - min(vals + [0]) >= 4:
                         sweep = deltas
                 # The driver strobes first and writes the note's own volume
-                # inside the same frame (Ridge Racer 2: 8694 of 9711 hits). The
-                # register at the strobe belongs to the previous note - often 0,
-                # since the driver zeroes it when it stops the voice - and the
-                # real write lands on the key-on's own row, where no volume step
-                # is placed. Take the first in-frame step as the note's own
-                # balance or the attack plays at the stale level (and each hit's
-                # loudness follows whatever the last note left behind).
+                # inside the same frame. The register at the strobe belongs to
+                # the previous note (often 0, since the driver zeroes it when
+                # it stops the voice), and the real write lands on the key-on's
+                # own row, where no volume step is placed. Take the first
+                # in-frame step as the note's own balance or the attack plays
+                # at the stale level.
                 init_l, init_r = h.vol_l, h.vol_r
                 for _t, a, b in h.vol_pts:
                     if _t - h.sample_time > C352_REFIT_SAMPLES:
@@ -1189,6 +1162,47 @@ def analyze(
         audible = []
 
     events.sort(key=lambda e: (e.sample, e.ch, 0 if e.on else 1))
+
+    # Prefer the measured key-on lattice: rows subdivide the measured 16th note
+    # and carry several ticks, which lets EDxx place every event at its true
+    # (60 Hz-frame-quantized) write time.  Manual --speed keeps the legacy 60 Hz
+    # behaviour.  A rip with no FM stream to measure (the C352-only boards) is
+    # measured from its sample-chip triggers instead.
+    pcm_onsets: dict[int, list[int]] = {}
+    for e in events:
+        if e.pcm and e.on:
+            pcm_onsets.setdefault(e.ch, []).append(e.sample)
+    for ch, times in pcm_onsets.items():
+        merged: list[int] = []
+        for t in times:
+            if merged and t - merged[-1] <= _ONSET_MERGE_SAMPLES:
+                continue
+            merged.append(t)
+        pcm_onsets[ch] = merged
+
+    if speed and speed >= 1:
+        hz = 60.0
+        use_speed = speed
+    else:
+        grid = estimate_grid(vgm, tick_samples=tick, min_row=row_floor)
+        if grid is None and pcm_onsets:
+            grid = estimate_grid(
+                vgm, tick_samples=tick, min_row=row_floor,
+                onsets=pcm_onsets, label="sample-trigger lattice",
+            )
+        if grid is not None:
+            hz = grid.hz
+            use_speed = grid.speed
+            row_subdiv = grid.subdiv
+            grid_note = (
+                f"{grid.source}, {grid.confidence * 100:.0f}% within 6%; "
+                f"row = 1/{grid.subdiv} of the measured 16th, "
+                f"{grid.speed} ticks/row"
+            )
+        else:
+            hz = 60.0
+            use_speed = suggest_speed(keyon_times, hz)
+            grid_note = "60 Hz fallback"
 
     pcm_gaps: list[int] = []
     if spcm_audible:

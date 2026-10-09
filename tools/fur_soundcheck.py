@@ -12,11 +12,10 @@ Prints the pitch-shift table (from pitch_shift.analyse) for 1-vs-2 and 1-vs-3.
 Both should sit at shift 0. It also echoes the renderer's Dev lines, so chip
 clocks can be compared directly.
 
-The failure this was built for (fixed in 0.9.18): C140 .furs exported clock
-18432000 where the source said 12288000, so the file played 1.5x high (+7.02
-semitones) in every conforming player. Register diffs cannot see it, because
-the register stream is clock-scale invariant. Only the clock field and the
-audible pitch can.
+The failure this was built for: a C140 .fur that exported clock 18432000
+where the source said 12288000, playing 1.5x high (+7.02 semitones) in every
+conforming player. Register diffs cannot see it: the register stream is
+clock-scale invariant. Only the clock field and the audible pitch can.
 
 Renders land in --wavdir (default: <fur folder>/soundcheck) and are kept for
 listening. Expect a few minutes on a long track.

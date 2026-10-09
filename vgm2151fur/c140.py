@@ -59,7 +59,7 @@ def c140_rate(clock: int, freq: int) -> float:
 
 
 def _decompress_table() -> tuple[int, ...]:
-    """MAME c140_device::device_start (verified against Starblade)."""
+    """MAME c140_device::device_start."""
     tbl = []
     for i in range(256):
         j = i - 256 if i >= 128 else i
@@ -106,12 +106,10 @@ def merge_step_writes(pts: list[tuple[int, int]], gap: int = 16) -> list[tuple[i
 
 
 # A frequency write this soon after key-on is the note's own pitch, not a
-# mid-note bend: some drivers key the voice on before setting its frequency,
-# so the key-on snapshot holds stale register contents.
-C140_REFIT_SAMPLES = 735  # one 60 Hz VGM frame, like the C352 refit: the C140
-# drivers write the note's own pitch inside the key-on's frame (Starblade's
-# Theme keys a voice with a stale 0x0d1a and writes 0x861a 40 semitones up a
-# few ms later), so the first in-frame write is the note, not a slide.
+# mid-note bend. Some drivers key the voice on before setting its frequency,
+# leaving a stale snapshot at key-on; their real pitch write lands inside the
+# frame (735 samples at 60 Hz), so the first in-frame write is the note.
+C140_REFIT_SAMPLES = 735
 
 
 def hit_played_freq(hit: "C140Hit") -> int:

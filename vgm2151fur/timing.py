@@ -164,6 +164,8 @@ def estimate_grid(
     vgm: VgmFile, *, min_confidence: float = 0.75,
     tick_samples: float = TARGET_TICK_SAMPLES,
     min_row: float = MIN_ROW_SAMPLES,
+    onsets: dict[int, list[int]] | None = None,
+    label: str = "key-on lattice",
 ) -> Grid | None:
     """Return the measured grid (a subdivided 16th note) or None.
 
@@ -174,8 +176,12 @@ def estimate_grid(
     candidates that explain ~equally well the *coarsest* unit wins, because
     finer note values still land exactly on the row grid via EDxx; this keeps
     patterns from growing needlessly dense.
+
+    `onsets` overrides the note times used, keyed by channel.  The default
+    reads the YM2151 key-on register.  A rip with no FM stream to measure
+    passes its sample-chip triggers here instead.
     """
-    by_ch = _keyons_by_channel(vgm)
+    by_ch = _keyons_by_channel(vgm) if onsets is None else onsets
     deltas: list[int] = []
     for ch, ons in by_ch.items():
         for a, b in zip(ons, ons[1:]):
@@ -205,12 +211,12 @@ def estimate_grid(
         if t < 800.0:
             continue
         # Out of band, too coarse.  A slow track's *fastest* note value can
-        # still be longer than a 16th note: Sega System 16C shop/ending themes
-        # run 9.5k-19k samples per melodic event.  Fold by halves back into
-        # the band so the rows can subdivide it (a 15 rows/s fallback cannot
-        # carry the driver's per-frame pitch writes).  Only used when no
-        # in-band candidate explains the stream, and only when the folded unit
-        # really fits the intervals, or noise would become a grid.
+        # still be longer than a 16th note: some drivers run 9.5k-19k samples
+        # per melodic event.  Fold by halves back into the band so the rows
+        # can subdivide it (a 15 rows/s fallback cannot carry the driver's
+        # per-frame pitch writes).  Only used when no in-band candidate
+        # explains the stream, and only when the folded unit really fits the
+        # intervals, or noise would become a grid.
         folded = t
         while folded > 8000.0:
             folded /= 2.0
@@ -223,13 +229,11 @@ def estimate_grid(
             # Half-folding fails when the mode/median sits on a *multiple* of
             # the row unit - a melody that moves in 8ths, quarters or whole
             # bars most of the time - so the unit is c/2, c/3, ... rather than
-            # c/2^n.  Ninja Spirit "Iza (Title)" and The Final Round "You Are
-            # Perfect" both did this and fell to the 60 Hz fallback with the
-            # notes misplaced.  Divide the raw candidate back down and demand
-            # a tight fit *and* that the unit is not far finer than the
-            # shortest gap seen: a divided noise unit fits the loose 0.8 bar
-            # (the estimator's pseudorandom fixture did) but describes a grid
-            # no note ever lands on.
+            # c/2^n.  Divide the raw candidate back down and demand a tight
+            # fit *and* that the unit is not far finer than the shortest gap
+            # seen: a divided noise unit fits the loose 0.8 bar (the
+            # estimator's pseudorandom fixture did) but describes a grid no
+            # note ever lands on.
             shortest = min(deltas)
             for div in (2, 3, 4, 5, 6, 7, 8):
                 sub = c / div
@@ -277,7 +281,7 @@ def estimate_grid(
     row = unit / subdiv
     hz, speed = hz_speed_for_row(row, tick_samples)
 
-    note = f"key-on lattice ({len(deltas)} intervals)"
+    note = f"{label} ({len(deltas)} intervals)"
     if best_conf < min_confidence:
         note += ", low confidence"
     note += low_note

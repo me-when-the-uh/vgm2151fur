@@ -4,19 +4,16 @@
 
 Renders both sides (cached next to the .fur in ./soundcheck/) and compares
 0.5 s windows over the first pass only. The reference player renders the
-source for ~2 passes and Furnace renders the module for ~1.9, with loop
-points that differ by a row - comparing beyond pass 1 produces false
-"missing content" spikes at the loop boundary (Tekken Tag 05: 76.0 s,
-09: 85.6 s). Do not chase those.
+source for ~2 passes and Furnace renders the module for ~1.9 with loop
+points that can differ by a row. Windows past pass 1 then show false
+"missing content" spikes at the loop boundary. Do not chase those.
 
-Band deltas are dB (fur minus source) per octave band, 20 Hz to 22 kHz.
-Healthy on track 05: no window above ~6 dB broadband except the known
-sustain family (see docs/testing-pipeline.md), and the level profile is
-roughly flat.
+Band deltas are dB (fur minus source) per octave band, 20 Hz to 22 kHz. A
+healthy pair stays under the threshold in every window and has a roughly
+flat level profile.
 """
 
 import argparse
-import math
 import sys
 from pathlib import Path
 

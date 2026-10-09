@@ -4,7 +4,7 @@ Furnace applies the song master volume linearly to the whole mix, in
 playback and in both file exporters, so the level of a module is one float
 and one render tells the truth about it. `normalize_module` renders the
 module once at a quarter volume (below any clipping), reads the peak, and
-writes the gain that puts the track's peak at -1.5 dBFS. A track that still
+writes the gain that puts the track's peak at -2.5 dBFS. A track that still
 clips at a quarter volume is probed again 24 dB lower.
 
 The module has to be one the build can load: a build without the module's
@@ -27,7 +27,7 @@ from pathlib import Path
 from vgm2151fur import furio
 from vgm2151fur.furnace import FurnaceError, render_wav
 
-TARGET_PEAK = 10 ** (-1.5 / 20)  # -1.5 dBFS: loudness first, 1.5 dB of headroom
+TARGET_PEAK = 10 ** (-2.5 / 20)  # -2.5 dBFS: loudness first, 1.5 dB of headroom
 MAX_GAIN = 10 ** (24 / 20)  # quieter than this is a broken render, not a track
 
 # Probe volumes, loudest first; step down when the render sits at the clamp.
@@ -89,7 +89,7 @@ def _render_raw_peak(fur: Path, wav: Path) -> float:
 
 
 def normalize_module(data: bytes, *, name: str = "module") -> Normalization | None:
-    """Render `data` and return it with the master volume set to -1.5 dBFS peak.
+    """Render `data` and return it with the master volume set to -2.5 dBFS peak.
 
     None when the render is silent, so callers keep the module untouched.
     """

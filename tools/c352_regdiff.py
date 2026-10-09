@@ -2,15 +2,14 @@
 
     python tools/c352_regdiff.py <source.vgz|vgm> <export.vgm>
 
-Both files are read through the converter's own C352 model (collect_c352),
-so the export is checked with exactly the reading the converter applies to
-the source. The .fur repacks sample bodies to fresh addresses and remaps
-voices, so hits are keyed by the body they play (content hash), then paired
-by time and compared for frequency, volume, flags and count.
+Both files are read through the converter's own C352 model: the export gets
+the same reading the converter applies to the source. The .fur repacks
+sample bodies to fresh addresses and remaps voices, so hits are keyed by
+the body they play (content hash), then paired by time and compared for
+frequency, volume, flags and count.
 
-Healthy (Tekken Tag 05, 2026-10): 1712/1712 hits, 0 unmatched, bodies
-byte-equal, frequency median +0.11% (max 0.15%), volume deltas inside the
-tracker column (<= 18/255), flags equal apart from LINK folded to LOOP.
+A healthy pair has 0 unmatched hits and tiny frequency deltas. Both
+arguments are required.
 """
 
 import hashlib
@@ -18,16 +17,13 @@ import sys
 from collections import Counter, defaultdict
 from pathlib import Path
 
-BASE = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(BASE / "vgm2151fur"))
+REPO = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO))
 
 from vgm2151fur.vgm import load_vgm
 from vgm2151fur.c352 import collect_c352, hit_played_freq
 
 FLAG_MASK = 0x0001 | 0x0002 | 0x0008 | 0x0020 | 0x0040  # rev, loop, mulaw, link, ldir
-
-DEFAULT_SRC = BASE / r"VGM_collection\new\Tekken_Tag_Tournament_(Namco_System_12)\05 Jin Stage BGM.vgz"
-DEFAULT_EXP = BASE / r"output\_c352test\exports\tt05f.vgm"
 
 
 def eff_vol(h):
@@ -55,8 +51,10 @@ def analyse(path: Path, label: str):
 
 
 def main() -> int:
-    src = Path(sys.argv[1]) if len(sys.argv) > 1 else DEFAULT_SRC
-    exp = Path(sys.argv[2]) if len(sys.argv) > 2 else DEFAULT_EXP
+    if len(sys.argv) != 3:
+        print("usage: c352_regdiff.py <source.vgz|vgm> <export.vgm>")
+        return 2
+    src, exp = Path(sys.argv[1]), Path(sys.argv[2])
     sh, sby = analyse(src, "src")
     eh, eby = analyse(exp, "exp")
 

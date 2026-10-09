@@ -74,11 +74,10 @@ _DEV_DEFAULT_VOLUME = {
     0x03: 0x100, 0x04: 0x180, 0x18: 0x100, 0x19: 0x1C0, 0x1C: 0x100, 0x27: 0x40,
 }
 _DEV_CORE_PATCH = {0x1C: lambda v: (v * 2 + 1) // 3}  # C140/C219 core scale
-# Furnace's cores against the player's: measured by rendering the source, the
-# .fur and per-chip-isolated mixes of both, over the C140/SegaPCM/OKI packs.
+# Furnace core output levels relative to the player's, from render comparisons.
 _FURNACE_VOLUME_SCALE = {0x03: 1.0, 0x04: 1.0, 0x18: 1.0, 0x1C: 0.7}
-# MSM6258 (0x19, the player default is 1.75) keeps unity: no converted pack
-# uses it. Its Furnace core has no calibration measurement yet.
+# MSM6258 (0x19, the player default is 1.75) keeps unity; its Furnace core is
+# uncalibrated.
 _CHIP_DEV = {CHIP_YM2151: 0x03, CHIP_SEGAPCM: 0x04, CHIP_MSM6295: 0x18,
              CHIP_C140: 0x1C, CHIP_C352: 0x27}
 
@@ -632,8 +631,7 @@ def _traj_at(pts: list[tuple[int, int]], t: int) -> int:
     semitone) relative to the note's own pitch; the driver holds each value
     until its next write, and the note sits at its own pitch before the first
     one.  Sampling this step function at row boundaries tracks the driver's
-    coarse steps exactly: fitting a window across them smeared a row-1047 jump
-    back into row 1046 and dragged the attack.
+    coarse steps exactly. Fitting a window across them smears the attack.
     """
     v = 0
     for s, d in pts:
@@ -664,20 +662,18 @@ def _emit_sweep(
     - a jump that lands on the row is absorbed by an E5 step (one fine-tune
       unit per 1/64 semitone, within +-64 of the note);
     - the residual drift becomes the row's ramp rate, computed from the row's
-      own boundary values so a fast step is not averaged away (which used to
-      leave whole sections sharp or flat) and a flat lead-in does not smear
-      into the next row (which used to drag the attack flat).
+      own boundary values so a fast step is not averaged away and a flat
+      lead-in does not smear into the next row.
 
     The ramp physically runs past the trajectory's end to the last row
     boundary, so that row is rated over its full span against the held final
-    value (rating it over the clipped part made dives overshoot several times
-    the remaining travel) and the stop lands on the following row, pinning the
-    final pitch with E5.  A stop on a later note's own row is safe (its key-on
-    still reads its own pitch), and when the trajectory runs into that note's
-    row the stop must go there, since the row still belongs to this ramp until
+    value, and the stop lands on the following row, pinning the final pitch
+    with E5.  A stop on a later note's own row is safe (its key-on still
+    reads its own pitch), and when the trajectory runs into that note's row
+    the stop must go there, since the row still belongs to this ramp until
     the later note's own k=0 rate takes it over.  The sweep never writes a
-    *rate* or E5 on a later note's row (two 01xx/02xx codes on one row make the
-    net slide column-order luck).
+    *rate* or E5 on a later note's row (two 01xx/02xx codes on one row make
+    the net slide column-order luck).
 
     E5 steps are recorded in ``e5_writes`` so the caller can replay all E5
     changes for the channel in row order.
@@ -733,9 +729,9 @@ def _emit_sweep(
 
     def e5_byte(offset: float) -> int:
         # E5xx is the note's fine tune.  One byte step is one KF step = 1/64 st
-        # on the FM platforms, but half that on PCM (measured on the C140:
-        # E5 0x40 sits exactly -0.5 st below 0x80), so trajectory offsets
-        # convert with a factor of two there.  Values above 0xBF saturate.
+        # on the FM platforms, half that on PCM (E5 0x40 sits exactly -0.5 st
+        # below 0x80), so trajectory offsets convert with a factor of two
+        # there.  Values above 0xBF saturate.
         scale = 2.0 if ev.pcm else 1.0
         return max(0x40, min(0xBF, int(round(ev.e5 + offset * scale))))
 
@@ -759,9 +755,8 @@ def _emit_sweep(
         if k == 0:
             # The note starts at its own pitch; the driver's first sweep step
             # (written ~2 ticks later) is covered by this row's ramp.  Snapping
-            # it with E5 instead was measured to be a wash at best: the early
-            # blip trades against the ramp's late lag, and dropping it keeps
-            # the attack exactly on the note's pitch.
+            # it with E5 instead trades an early blip for the ramp's late lag;
+            # dropping it keeps the attack exactly on the note's pitch.
             want = 0.0
         else:
             # Look one tick past the boundary for the step check: a driver jump
@@ -789,32 +784,26 @@ def _emit_sweep(
         if k == 0 and ev.pcm:
             # PCM note rows hold their pitch: Furnace applies a slice of the
             # row's 01xx/02xx travel inside the key-on write, and the attack
-            # landed ~rate/128 semitones off (measured +2 st at 0xFF on Cyber
-            # Sled 02, -2 st on Valkyrie "Prologue").  The ramp starts on the
-            # next row instead; the final E5 pin still absorbs the residue.
+            # lands ~rate/128 semitones off.  The ramp starts on the next row
+            # instead; the final E5 pin still absorbs the residue.
             want_end = 0.0
         else:
             want_end = float(_traj_at(pts, int(re_full if is_last else re)))
         rate = 0
         if span > 0:
             # FM: 01xx/02xx run 1 kc_kf unit per tick per unit of the
-            # parameter, linearly, all the way to 255 (measured through the
-            # bundled 0.6.8.3 build at 50/200/255 per tick).  The old +-96
-            # clamp silently halved the steepest driver slides: a 2000-unit
-            # row jump (Fantasy Zone II DX's ch0 risers) came out as a slow
-            # crawl.
+            # parameter, linearly, all the way to 255.  The old +-96 clamp
+            # silently halved the steepest driver slides: a 2000-unit row
+            # jump came out as a slow crawl.
             #
-            # PCM: one parameter unit moves 1/128 st per tick - half the FM
-            # rate (measured on Cyber Sled's two-writes-per-row glides: a
-            # 0x77 rate descended 60 units/row, and 0xFF attack offsets read
-            # as +-2 st).  The written parameter is doubled, and the ideal
-            # rate is capped at 127.5 units/tick = the engine's 255 maximum,
-            # so ``slide`` accumulates the movement the engine actually makes.
+            # PCM: one parameter unit moves 1/128 st per tick, half the FM
+            # rate.  The written parameter is doubled, and the ideal rate is
+            # capped at 127.5 units/tick = the engine's 255 maximum, so
+            # ``slide`` accumulates the movement the engine actually makes.
             limit = 127.5 if ev.pcm else 255.0
             # A move bigger than the slide can deliver inside this row lands
             # instantly as a quick-legato transpose (E8xx/E9xx, y semitones,
-            # persistent until the next note - measured on 0.6.8.3 through both
-            # the C140 and YM2151 platforms; the next key-on resets it).  This
+            # persistent until the next note; the next key-on resets it).  This
             # is what turns register jumps and dive attacks from a rate-limited
             # slur into the hardware's instant step; the slide then covers the
             # sub-semitone remainder.
@@ -837,8 +826,8 @@ def _emit_sweep(
                             cur = (e5w - ev.e5) / 2.0 + xpose
                     else:
                         # The FM platform adds the value to the note and stays
-                        # until the next note (measured: 2 then 3 then -1 reads
-                        # +2, +5, +4), so the overflow is a relative transpose.
+                        # until the next note, so the overflow is a relative
+                        # transpose.
                         short = need - (full if need > 0 else -full)
                         y = max(-15, min(15, int(round(short / 64.0))))
                         if y:
@@ -877,14 +866,13 @@ def _emit_sweep(
         # rounded and clamped parameter - not the ideal rate.  A glide that
         # wants 2.66 units/tick is written as 01 03, so the engine runs ~13%
         # faster than the model believes and the error compounds over long
-        # climbs: Hyper Duel's three +5 st ramps ended +31/+65/+111 units
-        # (1.7 st) sharp and held that for seconds, and every FM/C140 slide
-        # carries the same fraction-of-a-unit residue.
+        # climbs.  Every FM/C140 slide carries the same fraction-of-a-unit
+        # residue.
         engine_rate = (param / 2.0) if ev.pcm else float(param)
         # Fidelity: each row can only be a straight line, so sample the model
         # against the driver's own steps inside the row.  The deviation is the
         # audible error of condensing - a coarser grid packs more steps into one
-        # row and bends them into one line.  Measured in 1/64 semitones; 6 units
+        # row and bends them into one line.  Counted in 1/64 semitones; 6 units
         # is 0.1 st, the rough inaudibility floor.
         if stats is not None and span > 0:
             bad_here = False
@@ -912,9 +900,7 @@ def _emit_sweep(
     # already carries the ramp all the way to the row end: the pin only has to
     # correct the rounding residue.  Adding the tail's travel again (the old
     # `last_rate * (row_end - end) / tick` term) pulled the pitch down by that
-    # travel a second time, which a 4-semitone riser (Fantasy Zone II DX) could
-    # not express through E5 and left whole notes 1.3 st flat until the next
-    # key-on.
+    # travel a second time, leaving whole notes flat until the next key-on.
     #
     # A stop on a later note's own row is safe (the note's key-on still reads
     # its own pitch; the stop only kills the ramp) and it is the row that must
@@ -928,7 +914,7 @@ def _emit_sweep(
         # through the last row this sweep owns; the stop goes on the later
         # note's row (a later sweep's own k=0 rate clears it again when it
         # takes that row over).  Freezing on the last row instead loses a
-        # whole row of the tail's travel (Block Hole's 0.38 s dives).
+        # whole row of the tail's travel.
         cell = grid[ev.ch].get(stop_row)
         if cell is None:
             cell = _blank_row()
@@ -1055,8 +1041,8 @@ def _build_patterns(song: Song, n_ch: int, pat_len: int, fx_cols: int, ch_offset
         content_end = song.row_of(last_sample)
 
     # Walk pat_len-row chunks, but force an order boundary at the VGM loop so
-    # Bxx can jump there. A long intro (Old Stone Age, Ranking, …) must not
-    # become one giant order. Only `pat_len` rows would survive.
+    # Bxx can jump there. A long intro must not become one giant order; only
+    # `pat_len` rows would survive.
     bounds = [0]
     anchor = loop_row if 0 < loop_row < total_rows else None
     pos = 0
@@ -1479,8 +1465,8 @@ def write_fur(
     if include_fm:
         chips.append(CHIP_YM2151)
         fm_clock = song.vgm.ym2151_clock
-        # Furnace's YM2151 default is 3.579545 MHz. A 4 MHz OPM (System 16,
-        # Toaplan) plays flat unless the flag carries customClock.
+        # Furnace's YM2151 default is 3.579545 MHz. An OPM at another clock
+        # plays flat unless the flag carries customClock.
         flag_texts.append(
             f"customClock={fm_clock}" if fm_clock and fm_clock != 3579545 else ""
         )

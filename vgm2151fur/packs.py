@@ -18,7 +18,7 @@ VGM_SUFFIXES = (".vgm", ".vgz")
 
 SKIP_DIRS = {
     ".git", "__pycache__", "node_modules", "output", "third_party", "soundcheck",
-    "fur", "vgmtools", "mame", "workdir", "docs", "tests",
+    "fur", "docs", "tests",
 }
 
 # Display order and names for the header-visible chips.

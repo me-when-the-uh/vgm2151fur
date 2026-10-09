@@ -74,7 +74,7 @@ def note_song(key_on: int = 60000, key_off: int = 160000, *,
 
 def staircase(start: int, steps: int = 20, *, step_samples: int = 500,
               kc: int = 0x42, kf: int = 0x14) -> list[tuple[int, int, int]]:
-    """KC/KF writes of one 0.25 st step each, the Hyper Duel climb shape."""
+    """KC/KF writes of one 0.25 st step each."""
     out: list[tuple[int, int, int]] = []
     kc_v, kf_v = kc, kf
     for i in range(steps):
