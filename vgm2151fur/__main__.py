@@ -198,6 +198,26 @@ def _convert(args) -> int:
         return rc or 1
     pcm = not args.melody_only
     include_fm = not args.pcm_only
+    factor_list = None
+    if args.factors:
+        try:
+            factor_list = tuple(
+                float(x) for x in args.factors.split(",") if x.strip()
+            )
+        except ValueError:
+            print("ERROR: --factors takes a comma list of numbers", file=sys.stderr)
+            return 2
+    use_variants = (
+        args.variants or args.optimize != "none" or args.condense is not None
+        or factor_list is not None or args.verify or args.dirs
+    )
+    if args.optimize != "none":
+        optimize = args.optimize
+    elif args.variants or args.verify:
+        optimize = "lossless"
+    else:
+        optimize = "all"
+    condense = int(args.condense or 4)
     grand_done = grand_total = 0
     for files, dest in groups:
         done = 0
@@ -207,6 +227,12 @@ def _convert(args) -> int:
             speed=args.speed,
             pcm=pcm,
             min_row=_min_row_for_bpm(args.max_bpm),
+            variants=use_variants,
+            condense=condense,
+            factors=factor_list,
+            optimize=optimize,
+            verify=args.verify,
+            layout="dirs" if args.dirs else "flat",
             include_fm=include_fm,
             normalize=not args.no_normalize,
             loop_find=not args.no_loop_find,
@@ -217,6 +243,25 @@ def _convert(args) -> int:
                 rc = 1
                 continue
             done += 1
+            if info.get("variants"):
+                print(f"{src.name} -> {len(info['variants'])} variants")
+                for v in info["variants"]:
+                    mark = "  <= pick" if v["pick"] else ""
+                    dropped = "" if v.get("lossless", True) else "  (dropped)"
+                    dv = (
+                        f"  div {v['div_runs']}"
+                        if v.get("div_runs") is not None else ""
+                    )
+                    try:
+                        where = str(Path(v["dst"]).relative_to(dest))
+                    except ValueError:
+                        where = Path(v["dst"]).name
+                    print(
+                        f"    x{v['factor']:g}  BPM {v['bpm']:7.0f}  "
+                        f"{where}  loss {v['loss_total']}  "
+                        f"dev {v['dev_max']}{dv}{mark}{dropped}"
+                    )
+                continue
             extra = ""
             notes = [w for w in info["warnings"] if w != info.get("loop")]
             if notes:
@@ -370,6 +415,39 @@ def _add_convert_flags(parser: argparse.ArgumentParser, *, bare: bool) -> None:
              "coarsest row grid under the cap; halving it halves the row rate. "
              "Slides change rate at most once per row, so a lower cap trades "
              "slide detail for readability",
+    )
+    parser.add_argument(
+        "--variants", action="store_true",
+        help="write the 1x..4x row-condense set side by side "
+             "(<name>.fur plus '<name> xN.fur'); never replaces the 1x file",
+    )
+    parser.add_argument(
+        "--condense", type=int, default=None, metavar="N",
+        help="largest condense factor for the variants (default 4); "
+             "1x = today's grid, Nx = N times longer rows",
+    )
+    parser.add_argument(
+        "--optimize", choices=("none", "lossless", "all"), default="none",
+        help="which variant to pick: none (1x only), lossless (coarsest with "
+             "no added structural loss and <=0.1 st more pitch deviation, "
+             "else 1x), all (largest factor)",
+    )
+    parser.add_argument(
+        "--verify", action="store_true",
+        help="with lossless: render every variant through Furnace and reject "
+             "any that adds a sustained pitch divergence over 1x (0.25 st / "
+             "60 ms). Slower, but catches what the structural counters miss",
+    )
+    parser.add_argument(
+        "--factors", default=None, metavar="LIST",
+        help="explicit condense factors to write, e.g. 1,1.5,2,3,4 "
+             "(fractional factors allowed); overrides --condense",
+    )
+    parser.add_argument(
+        "--dirs", action="store_true",
+        help="write variants as default/ and xN optimised/ subfolders (only the "
+             "lossless factors) plus a condense.tsv manifest, instead of the "
+             "flat '<name> xN.fur' siblings",
     )
     parser.add_argument("--workers", type=int, default=None, help=_WORKERS_HELP)
     parser.add_argument("--melody-only", action="store_true", help="skip sample chips")

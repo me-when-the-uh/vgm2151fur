@@ -122,3 +122,50 @@ the staircase into per-row slides:
 The row grid (`hz` and `speed`) is estimated from key-on spacing and printed
 by `--report`. Finer pitch motion than the grid can express is approximated;
 row subdivision is the known lever if more fidelity is ever needed.
+
+## The row grid, the BPM, and condensing
+
+Furnace's displayed BPM is `60*hz/(hilight*speed)` (`furnace/src/gui/gui.cpp`,
+`calcBPM`), which is 15 x `hz/speed` at the default hilight 4. `hz/speed` is
+the row rate, so **only the row length moves the BPM** - changing `speed`
+while `hz` tracks it (the tick size) leaves rows/s, and the BPM, exactly where
+it was. `--max-bpm N` picks the coarsest row grid whose row rate is under
+`N/15`; `--condense N` (and `--variants`) lengthen the chosen grid's rows by N.
+
+`timing.condense_row` multiplies the row length and re-derives `hz`/`speed`
+with the same `hz_speed_for_row` helper `estimate_grid` uses, so the two never
+disagree. `row_subdiv` (rows per measured 16th) is cosmetic - only `Song.bpm`
+reads it - so a 3x factor, which does not land on the subdivision lattice, is
+fine.
+
+Condensing is not free. A row carries one note cell and one slide rate:
+
+- two notes in the merged row collide (`note_collision`; the later one wins),
+- a PCM restart loses its own row (`pcm_evicted` / `pcm_unplaced`),
+- the driver's steps inside a row collapse into one straight line, which
+  `dev_max` measures as the worst deviation in 1/64 semitone.
+
+`furwrite` counts all of these into the `stats` dict `write_fur` takes;
+`LOSS_KEYS`/`loss_total` sum the structural ones and `dev_max` reads the
+fidelity number. `convert_variants` writes the 1x..Nx set and, in `lossless`
+mode, marks the largest factor with no added structural loss and no more than
+6 units (0.1 st) more deviation than 1x, else falls back to 1x.
+
+`dev_max` saturates on sweep-heavy tracks - Battle Garegga 02 reads 47/52/54/56
+units for 1x/2x/3x/4x, so it cannot separate the good 3x from the bad 4x. With
+`verify` (CLI `--verify`, always on in the menu) `convert_variants` instead
+renders every candidate through Furnace and counts pitch runs against the
+source at 0.25 st / 60 ms, accepting a factor only up to `baseline + 1` runs.
+On Battle Garegga 02 that is 0/0/1/44 runs - 3x passes, 4x does not; on
+Salamander Starfield 4/6/9/23 and on FZ2DX Cholacoray 3/8/7/12, so both stay
+at 1x. A factor is a row-length multiplier, so it may be fractional
+(`--factors 1,1.5,2,2.5,3,4`). The counters are structural: sub-semitone
+shimmer that survives as amplitude or timbre is invisible to them, which is
+exactly what `--verify` exists to catch.
+
+`layout="dirs"` (menu default, CLI `--dirs`) moves each accepted factor to
+`<out_dir>/default/` or `<out_dir>/xN optimised/` and deletes the rest, and
+`convert_folder` appends a `condense.tsv` row per factor so the folder records
+which renditions were kept and why. The placement happens after the verdict,
+so the flat names are what get rendered for `--verify`, then moved.
+

@@ -25,6 +25,39 @@ pack lands in its own subfolder. `edit` and `render` accept the pack folder
 after that: they read the `.fur` files in `fur/`. A pasted path can be
 quoted, and a glob the shell did not expand (`*.vgz`) is expanded by the tool.
 
+### Condensed variants
+
+Furnace's BPM is `15 x rows/s`, so the way to make a track more readable is to
+lengthen its rows. `--variants` writes the 1x/2x/3x/4x set side by side
+(`<name>.fur` plus `<name> xN.fur`; the 1x file is never replaced), and
+`--optimize` says which one to mark:
+
+```
+python -m vgm2151fur convert "pack/02 Track.vgz" -o out --variants --optimize lossless
+```
+
+- `none` (default): write only the 1x file, as before.
+- `lossless`: pick the largest factor that adds no structural loss and no more
+  than 0.1 st of pitch-model deviation over 1x; fall back to 1x when condensing
+  is not safe (dense rips like FZ2DX "Cholacoray" are already lossy at 1x).
+- `all`: keep the largest factor.
+
+`--verify` makes `lossless` authoritative: every candidate is rendered through
+Furnace and rejected if it adds a sustained pitch divergence over 1x (0.25 st /
+60 ms, one run of slack). It costs a render per variant but is the only gate
+that catches what the structural counters miss; the menu entry `7` always
+verifies. `--condense N` sets the largest factor (default 4) and
+`--factors 1,1.5,2,2.5,3,4` writes an explicit ladder (fractional allowed).
+Before trusting a whole pack, run `compare` on the chosen variant.
+
+The TUI runs this by default: a plain `c convert` writes the 1x file to
+`default/` and each lossless factor to `x2 optimised/`, `x3 optimised/`, ...,
+drops the factors that would lose detail, and records every verdict in
+`condense.tsv`. The CLI keeps the flat `<name> xN.fur` siblings unless you pass
+`--dirs`. The verdict is re-derived from the source on every run, so a
+reconversion (`tools/reconvert_all.py --optimize lossless [--verify]`) reaches
+the same set with or without the manifest - the manifest just lets you read it.
+
 Conversion renders each finished track once through the Furnace console and
 fits the module's master volume to a -1.5 dBFS peak (one render, a few
 seconds; docs/mix-levels.md has the method). `--no-normalize` skips the

@@ -104,8 +104,8 @@ def inject_rows(song, plan: list[tuple[int, int, int]], key_on: int):
     row0, _delay = song.place(key_on)
     original = fw._emit_sweep
 
-    def hook(grid, song_arg, ev, fx_cols, total_rows, sweep_e5, note_rows, chan=None):
-        original(grid, song_arg, ev, fx_cols, total_rows, sweep_e5, note_rows, chan)
+    def hook(grid, song_arg, ev, fx_cols, total_rows, sweep_e5, note_rows, chan=None, stats=None):
+        original(grid, song_arg, ev, fx_cols, total_rows, sweep_e5, note_rows, chan, stats)
         if not ev.on or ev.ch >= 8:
             return
         for k, cmd, val in plan:

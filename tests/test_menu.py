@@ -269,9 +269,11 @@ class TestMenu(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             pack = _make_pack(root)
-            log = _run_menu(["1", str(root), "1", "c", "all", "", "b", "", "q"], root)
-            self.assertTrue((pack / "fur" / "01 Song 1.fur").is_file())
-            self.assertTrue((pack / "fur" / "03 Song 3.fur").is_file())
+            log = _run_menu(
+                ["1", str(root), "1", "c", "all", "", "", "n", "b", "", "q"], root
+            )
+            self.assertTrue((pack / "fur" / "default" / "01 Song 1.fur").is_file())
+            self.assertTrue((pack / "fur" / "default" / "03 Song 3.fur").is_file())
             self.assertIn("3/3 converted", log)
             state = json.loads((root / "state.json").read_text(encoding="utf-8"))
             self.assertEqual(state["browse_root"], str(root))
@@ -283,10 +285,12 @@ class TestMenu(unittest.TestCase):
             pack = _make_pack(root)
             # The playlist order is 3, 2, 1, so tracks 2-3 are "02 Song 2"
             # and "01 Song 1".
-            _run_menu(["1", str(root), "1", "c", "2-3", "", "b", "", "q"], root)
-            self.assertFalse((pack / "fur" / "03 Song 3.fur").exists())
-            self.assertTrue((pack / "fur" / "02 Song 2.fur").is_file())
-            self.assertTrue((pack / "fur" / "01 Song 1.fur").is_file())
+            _run_menu(
+                ["1", str(root), "1", "c", "2-3", "", "", "n", "b", "", "q"], root
+            )
+            self.assertFalse((pack / "fur" / "default" / "03 Song 3.fur").exists())
+            self.assertTrue((pack / "fur" / "default" / "02 Song 2.fur").is_file())
+            self.assertTrue((pack / "fur" / "default" / "01 Song 1.fur").is_file())
 
     def test_pack_volume_flow(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -322,7 +326,7 @@ class TestMenu(unittest.TestCase):
             src = root / "My Song.vgz"
             src.write_bytes(_music_vgm())
             log = _run_menu([f'"{src}"', "q"], root)
-            self.assertTrue((root / "fur" / "My Song.fur").is_file())
+            self.assertTrue((root / "fur" / "default" / "My Song.fur").is_file())
             self.assertIn("1/1 converted", log)
 
     def test_paste_pack_folder_opens_it(self):

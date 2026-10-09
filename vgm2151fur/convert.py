@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 from vgm2151fur.analyze import analyze, format_report
 from vgm2151fur.furnace import FurnaceError, restore_console
-from vgm2151fur.furwrite import write_fur
+from vgm2151fur.furwrite import dev_max, loss_total, write_fur
 from vgm2151fur.levels import normalize_module
 from vgm2151fur.loopfind import apply_loop
 from vgm2151fur.pcm import dump_pcm as dump_pcm_files
@@ -132,33 +132,53 @@ def dump_pcm(path: Path, out_dir: Path) -> dict:
     return dump_pcm_files(vgm, out_dir / path.stem)
 
 
-def convert_vgm(
-    path: Path,
-    out_path: Path,
-    *,
-    speed: int | None = None,
-    pcm: bool = True,
-    tick_samples: float | None = None,
-    min_row: float | None = None,
-    include_fm: bool = True,
-    normalize: bool = False,
-    loop_find: bool = True,
-) -> dict:
-    vgm = load_vgm(path)
-    song = analyze(vgm, speed=speed, pcm=pcm, tick_samples=tick_samples, min_row=min_row)
-    loop_note = None
-    if loop_find:
-        loop_note = apply_loop(song)
-    if not song.fm_patches:
-        # A track with no FM key-ons must not carry an empty YM2151: the chip
-        # adds a second device to the export, and VGM players rescale the mix
-        # for it, which drops the sample chip's level (C352-only rips measured
-        # 4-10x quieter). Sample-only modules are written without FM channels.
-        include_fm = False
-    data = write_fur(song, include_pcm=pcm, include_fm=include_fm)
+def furnace_bpm(song) -> float:
+    """The BPM Furnace displays: `calcBPM` with hilight 4 = 15 x rows/s."""
+    return 15.0 * song.hz / song.speed
+
+
+def _verify_runs(
+    src_vgm, fur_path: Path, channels: int = 8,
+    threshold_st: float = 0.25, min_run_ms: float = 60.0,
+) -> int:
+    """Pitch runs between the source and the .fur's Furnace export.
+
+    The structural counters cannot see everything (retrigger/envelope wobble
+    and sub-threshold drift), so `--verify` renders each candidate and counts
+    the sustained divergences the `compare` command reports.  The threshold is
+    finer than `compare`'s default (0.5 st / 100 ms): on Battle Garegga 02 the
+    4x variant only shows up at 0.25 st (0 -> 1 -> 44 runs for 1x/3x/4x).
+    """
+    from vgm2151fur.diag import export_fur, pitch_runs
+
+    exp = fur_path.with_suffix(".verify.vgm")
+    try:
+        export_fur(fur_path, exp)
+        other = load_vgm(exp)
+        return sum(
+            len(pitch_runs(src_vgm, other, ch, threshold_st=threshold_st,
+                           min_run_ms=min_run_ms))
+            for ch in range(channels)
+        )
+    finally:
+        try:
+            exp.unlink()
+        except OSError:
+            pass
+
+
+def _emit(
+    song, out_path: Path, *, pcm: bool, include_fm: bool, normalize: bool,
+    warnings: list, stats: dict,
+) -> tuple[bytes, float | None, float | None]:
+    """Write one Song to `out_path`, optionally normalizing. (bytes, peak, gain)."""
+    # A track with no FM key-ons must not carry an empty YM2151: the chip adds a
+    # second device to the export, and VGM players rescale the mix for it, which
+    # drops the sample chip's level (C352-only rips measured 4-10x quieter).
+    use_fm = include_fm and bool(song.fm_patches)
+    data = write_fur(song, include_pcm=pcm, include_fm=use_fm, stats=stats)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_bytes(data)
-    warnings = list(song.warnings)
     peak = gain = None
     if normalize:
         try:
@@ -177,12 +197,47 @@ def convert_vgm(
                 data = result.data
                 peak, gain = result.peak, result.gain
                 out_path.write_bytes(data)
+    return data, peak, gain
+
+
+def convert_vgm(
+    path: Path,
+    out_path: Path,
+    *,
+    speed: int | None = None,
+    pcm: bool = True,
+    tick_samples: float | None = None,
+    min_row: float | None = None,
+    condense: float = 1.0,
+    include_fm: bool = True,
+    normalize: bool = False,
+    loop_find: bool = True,
+) -> dict:
+    vgm = load_vgm(path)
+    song = analyze(vgm, speed=speed, pcm=pcm, tick_samples=tick_samples,
+                   min_row=min_row, condense=condense)
+    loop_note = None
+    if loop_find:
+        loop_note = apply_loop(song)
+    warnings = list(song.warnings)
+    stats: dict = {}
+    data, peak, gain = _emit(
+        song, Path(out_path), pcm=pcm, include_fm=include_fm,
+        normalize=normalize, warnings=warnings, stats=stats,
+    )
     return {
         "src": str(path),
         "dst": str(out_path),
         "bytes": len(data),
         "speed": song.speed,
-        "fm_patches": len(song.fm_patches) if include_fm else 0,
+        "hz": song.hz,
+        "bpm": furnace_bpm(song),
+        "rows_per_s": song.hz / song.speed,
+        "condense": condense,
+        "loss": dict(stats),
+        "loss_total": loss_total(stats),
+        "dev_max": dev_max(stats),
+        "fm_patches": len(song.fm_patches) if (include_fm and song.fm_patches) else 0,
         "pcm_samples": sum(1 for s in song.pcm_samples if s.length >= 8) if pcm else 0,
         "oki_samples": len(song.oki_samples) if pcm else 0,
         "msm6258_samples": len(song.msm6258_samples) if pcm else 0,
@@ -198,7 +253,161 @@ def convert_vgm(
     }
 
 
+def _optimised_dir(factor: float) -> str:
+    """The per-factor subfolder: `default/`, `x2 optimised/`, `x3 optimised/`."""
+    return "default" if factor == 1 else f"x{factor:g} optimised"
+
+
+def _place_dirs(results: list[dict], out_dir: Path, keep: set) -> None:
+    """Move each kept factor into its subfolder; delete the ones that lost.
+
+    The `keep` set is every factor the lossless gate accepted (always 1).
+    """
+    for r in results:
+        path = Path(r["dst"])
+        if r["factor"] in keep:
+            dest = out_dir / _optimised_dir(r["factor"]) / path.name
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            if path != dest:
+                path.replace(dest)
+            r["dst"] = str(dest)
+        elif path.exists():
+            try:
+                path.unlink()
+            except OSError:
+                pass
+
+
+_MANIFEST = "condense.tsv"
+_MANIFEST_HEADER = "track\tfactor\tfile\tbpm\tloss\tdev\tdiv\tlossless\tpick\n"
+
+
+def _manifest_line(src: Path, v: dict) -> str:
+    div = "" if v.get("div_runs") is None else str(v["div_runs"])
+    return "\t".join((
+        src.stem, f"{v['factor']:g}", Path(v["dst"]).name,
+        f"{v['bpm']:.1f}", str(v["loss_total"]), str(v["dev_max"]), div,
+        "1" if v.get("lossless") else "0", "1" if v.get("pick") else "0",
+    )) + "\n"
+
+
+def convert_variants(
+    path: Path,
+    out_dir: Path,
+    *,
+    factors: Sequence[float] = (1, 2, 3, 4),
+    mode: str = "all",
+    speed: int | None = None,
+    pcm: bool = True,
+    min_row: float | None = None,
+    include_fm: bool = True,
+    normalize: bool = False,
+    loop_find: bool = True,
+    verify: bool = False,
+    layout: str = "flat",
+) -> list[dict]:
+    """Write one .fur per condense factor, side by side, and pick one.
+
+    factor 1 is the canonical `<stem>.fur`; factor N is `<stem> xN.fur`, so the
+    canonical file is never overwritten by a condensed copy.  `mode` only
+    decides the reported `pick`:
+      none     -> 1x;
+      lossless -> the largest factor whose structural loss does not exceed the
+                  1x baseline (falls back to 1x);
+      all      -> the largest factor.
+    With `verify`, the lossless pick also renders each candidate and rejects
+    any that adds a sustained pitch divergence over 1x.
+
+    With `layout="dirs"` each accepted factor is moved to `<out_dir>/default/`
+    or `<out_dir>/xN optimised/` and the rejected factors are deleted, so a
+    finished folder holds only renditions that were judged lossless.
+    """
+    vgm = load_vgm(path)
+    src = Path(path)
+    out_dir = Path(out_dir)
+    results: list[dict] = []
+    for f in factors:
+        factor = float(f)
+        song = analyze(vgm, speed=speed, pcm=pcm, min_row=min_row, condense=factor)
+        loop_note = apply_loop(song) if loop_find else None
+        warnings = list(song.warnings)
+        stats: dict = {}
+        name = f"{src.stem}.fur" if factor == 1 else f"{src.stem} x{factor:g}.fur"
+        out_path = out_dir / name
+        data, peak, gain = _emit(
+            song, out_path, pcm=pcm, include_fm=include_fm,
+            normalize=normalize, warnings=warnings, stats=stats,
+        )
+        results.append({
+            "factor": factor,
+            "dst": str(out_path),
+            "bytes": len(data),
+            "speed": song.speed,
+            "hz": song.hz,
+            "bpm": furnace_bpm(song),
+            "rows_per_s": song.hz / song.speed,
+            "loss": dict(stats),
+            "loss_total": loss_total(stats),
+            "dev_max": dev_max(stats),
+            "warnings": warnings,
+            "loop": loop_note,
+            "peak": peak,
+            "gain": gain,
+            "div_runs": _verify_runs(vgm, out_path) if verify else None,
+        })
+    base = next((r for r in results if r["factor"] == 1), results[0])
+    # A factor is lossless when it adds no hard structural loss, does not bend
+    # the pitch model more than 0.1 st past the 1x baseline, and (when verifying
+    # acoustically) adds no sustained divergence over 1x.  The hard counters and
+    # dev_max saturate on sweep-heavy tracks, so under `verify` the rendered
+    # count is the authority and dev_max is only a fast pre-filter.
+    tol = 6
+    base_runs = base.get("div_runs")
+
+    def _lossless(r: dict) -> bool:
+        if r["loss_total"] > base["loss_total"]:
+            return False
+        if not verify and r["dev_max"] > base["dev_max"] + tol:
+            return False
+        if verify and base_runs is not None and r.get("div_runs") is not None:
+            if r["div_runs"] > base_runs + 1:
+                return False
+        return True
+
+    for r in results:
+        r["lossless"] = _lossless(r)
+    ok = [r for r in results if r["lossless"]]
+    if mode == "none":
+        pick = base
+    elif mode == "lossless":
+        pick = max(ok, key=lambda r: r["factor"])
+    else:
+        pick = max(results, key=lambda r: r["factor"])
+    for r in results:
+        r["pick"] = r is pick
+    if layout == "dirs":
+        keep = {r["factor"] for r in (results if mode == "all" else ok)}
+        _place_dirs(results, out_dir, keep=keep)
+    return results
+
+
 _CFG: dict = {}
+
+
+def _variant_info(
+    src: Path, out_dir: Path, *, factors, mode, speed, pcm, min_row,
+    include_fm, normalize, loop_find, verify, layout,
+) -> dict:
+    """Write the 1x/2x/3x/4x set and return the pick's info plus the set."""
+    results = convert_variants(
+        src, out_dir, factors=factors, mode=mode, speed=speed, pcm=pcm,
+        min_row=min_row, include_fm=include_fm, normalize=normalize,
+        loop_find=loop_find, verify=verify, layout=layout,
+    )
+    pick = next(r for r in results if r["pick"])
+    info = dict(pick)
+    info["variants"] = results
+    return info
 
 
 def _init_worker(cfg: dict) -> None:
@@ -209,6 +418,15 @@ def _init_worker(cfg: dict) -> None:
 
 def _worker(path_str: str) -> dict:
     src = Path(path_str)
+    if _CFG.get("variants"):
+        return _variant_info(
+            src, Path(_CFG["out_dir"]),
+            factors=_CFG["factors"], mode=_CFG["optimize"],
+            speed=_CFG["speed"], pcm=_CFG["pcm"], min_row=_CFG["min_row"],
+            include_fm=_CFG["include_fm"], normalize=_CFG["normalize"],
+            loop_find=_CFG["loop_find"], verify=_CFG["verify"],
+            layout=_CFG["layout"],
+        )
     return convert_vgm(
         src,
         Path(_CFG["out_dir"]) / (src.stem + ".fur"),
@@ -222,21 +440,30 @@ def _worker(path_str: str) -> dict:
     )
 
 
-def _convert_serial(files, out_dir, speed, pcm, tick_samples, min_row,
-                    include_fm, normalize, loop_find):
+def _convert_serial(files, out_dir, *, speed, pcm, tick_samples, min_row,
+                    variants, factors, optimize, include_fm, normalize, loop_find,
+                    verify, layout):
     for f in files:
         try:
-            info = convert_vgm(
-                f,
-                out_dir / (f.stem + ".fur"),
-                speed=speed,
-                pcm=pcm,
-                tick_samples=tick_samples,
-                min_row=min_row,
-                include_fm=include_fm,
-                normalize=normalize,
-                loop_find=loop_find,
-            )
+            if variants:
+                info = _variant_info(
+                    f, out_dir, factors=factors, mode=optimize,
+                    speed=speed, pcm=pcm, min_row=min_row,
+                    include_fm=include_fm, normalize=normalize, loop_find=loop_find,
+                    verify=verify, layout=layout,
+                )
+            else:
+                info = convert_vgm(
+                    f,
+                    out_dir / (f.stem + ".fur"),
+                    speed=speed,
+                    pcm=pcm,
+                    tick_samples=tick_samples,
+                    min_row=min_row,
+                    include_fm=include_fm,
+                    normalize=normalize,
+                    loop_find=loop_find,
+                )
         except Exception as exc:
             yield f, None, str(exc)
         else:
@@ -251,9 +478,15 @@ def convert_folder(
     pcm: bool = True,
     tick_samples: float | None = None,
     min_row: float | None = None,
+    variants: bool = False,
+    condense: int = 4,
+    factors: Sequence[float] | None = None,
+    optimize: str = "all",
     include_fm: bool = True,
     normalize: bool = False,
     loop_find: bool = True,
+    verify: bool = False,
+    layout: str = "flat",
     workers: int | None = None,
     log=print,
 ) -> Iterator[tuple[Path, dict | None, str | None]]:
@@ -262,19 +495,48 @@ def convert_folder(
     Yields (src, info, None) as each file finishes, or (src, None, error) for a
     file that raised. The rest still convert. One track per worker process,
     at low priority. The default count follows the logical CPUs.
+
+    With `variants` set, each file is written as the 1x..`condense`x set and
+    `info` carries the whole set in `info["variants"]` plus the pick.  With
+    `layout="dirs"` the accepted factors land in `default/` and `xN optimised/`
+    subfolders and a `condense.tsv` manifest records every verdict.
     """
     try:
         if not files:
             return
+        if factors is not None:
+            factor_list = tuple(float(f) for f in factors)
+        elif variants:
+            factor_list = tuple(range(1, max(1, int(condense)) + 1))
+        else:
+            factor_list = (1,)
+        manifest = (
+            Path(out_dir) / _MANIFEST
+            if variants and layout == "dirs" else None
+        )
+        if manifest is not None and not manifest.exists():
+            manifest.parent.mkdir(parents=True, exist_ok=True)
+            manifest.write_text(_MANIFEST_HEADER, encoding="utf-8")
+
+        def _note(src: Path, info: dict | None) -> None:
+            if manifest is None or not info or not info.get("variants"):
+                return
+            with manifest.open("a", encoding="utf-8") as fh:
+                for v in info["variants"]:
+                    fh.write(_manifest_line(src, v))
+
         n_workers, note = resolve_workers(workers, len(files))
         if n_workers <= 1:
             with low_priority():
-                yield from _convert_serial(
+                for result in _convert_serial(
                     files, out_dir, speed=speed, pcm=pcm,
                     tick_samples=tick_samples, min_row=min_row,
+                    variants=variants, factors=factor_list, optimize=optimize,
                     include_fm=include_fm, normalize=normalize,
-                    loop_find=loop_find,
-                )
+                    loop_find=loop_find, verify=verify, layout=layout,
+                ):
+                    _note(result[0], result[1])
+                    yield result
             return
         log(f"workers: {n_workers} ({note})")
         cfg = {
@@ -283,9 +545,14 @@ def convert_folder(
             "pcm": pcm,
             "tick_samples": tick_samples,
             "min_row": min_row,
+            "variants": variants,
+            "factors": factor_list,
+            "optimize": optimize,
             "include_fm": include_fm,
             "normalize": normalize,
             "loop_find": loop_find,
+            "verify": verify,
+            "layout": layout,
         }
         with ProcessPoolExecutor(
             max_workers=n_workers,
@@ -300,6 +567,7 @@ def convert_folder(
                 except Exception as exc:
                     yield f, None, str(exc)
                 else:
+                    _note(f, info)
                     yield f, info, None
     finally:
         restore_console()

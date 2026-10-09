@@ -2,6 +2,75 @@
 
 Cue the song "Take Me Baby" by Mickey B.
 
+## 0.9.39
+
+The TUI's default conversion now hands back the readable renditions too, and
+the folder says which ones survived.
+
+- **`default/` + `xN optimised/` (menu defaults, CLI `--dirs`).** A conversion
+  run with all defaults writes the 1x file to `default/` and every lossless
+  factor to its own `x2 optimised/`, `x3 optimised/`, ... subfolder; the
+  factors that would lose detail are deleted, so a folder only ever holds
+  renditions the detector vouched for. The flat `<name> xN.fur` siblings stay
+  the CLI default.
+- **`condense.tsv` manifest.** Every factor of every track is recorded
+  (`track, factor, file, bpm, loss, dev, div, lossless, pick`). Nothing
+  *needs* it - the verdict is re-derived from the source on every run, so a
+  reconversion reproduces the same set - but it makes "what was picked, and
+  was it lossless" a question you can ask of the disk instead of the console.
+- **`reconvert_all.py --optimize lossless`.** The corpus re-run can now
+  reproduce the optimised sets in place (`--verify` adds the acoustic gate),
+  and `plan()` understands a tree that already has `default/` folders.
+- **The Starfield "rogue voice" is a glide, not a lost note.** On
+  Salamander's Starfield the whole divergence is ch5: the source rewrites
+  KC/KF every ~88 samples (~2 ms), a portamento ~30x finer than a row. x1
+  already bends it slightly; x2 emits two pitch writes per row, which reads as
+  a slightly different voice, and x4 doubles the step again. The fix is
+  sub-row slide effects on the row (`0xx/1xx/2xx/3xx`), a separate feature;
+  until then the 0.25 st verify gate keeps Starfield at 1x (4 -> 6 -> 9 -> 23
+  runs for 1x/2x/3x/4x), which is why the shipped default is stable even
+  though the condensed file would not be.
+- **Garegga 02 stays correct**: with `--verify` it lands on x3 (x3 = 1 run vs
+  x4 = 44), matching what the ear reports.
+
+## 0.9.38
+
+A track's readability is set by its row rate, not its tick rate. Furnace's
+displayed BPM is `60*hz/(hilight*speed)` (`calcBPM`, hilight 4), which is
+**15 x rows/s** - so `--max-bpm` and the new condense factor work by
+lengthening rows, and changing the tick size alone can never move the BPM.
+
+- **Row condensing (`--variants`, `--condense N`, menu `7`).** Every file can
+  now be written as a 1x/2x/3x/4x set (`<name>.fur`, `<name> xN.fur`), the
+  canonical 1x file never overwritten. A row carries one note and one slide
+  rate, so coarsening trades note collisions and pitch-model fidelity for
+  readability.
+- **A structural loss detector.** `furwrite` counts what it could not place:
+  note collisions, swallowed note-offs, PCM evictions, fx-column overflow,
+  clipped sweeps, dropped fade/TL steps, skipped E5/legato steps and the ED
+  strip on the loop row. `loss_total` is the gate the modes compare against
+  the 1x baseline.
+- **A pitch-fidelity number.** `dev_max` samples each row's straight-line
+  slide against the driver's own steps and reports the worst deviation in
+  1/64 semitone. `--optimize lossless` picks the largest factor that adds no
+  structural loss and no more than 0.1 st more deviation, else falls back to
+  1x. `all` keeps the largest factor regardless.
+- **`--verify`, the authoritative gate.** The structural counters and `dev_max`
+  saturate on sweep-heavy tracks: on Battle Garegga 02 `dev_max` is 47/52/54/56
+  units for 1x/2x/3x/4x, so it cannot tell the good 3x from the bad 4x. Rendering
+  each candidate through Furnace and counting pitch runs at 0.25 st / 60 ms
+  separates them exactly (0/0/1/44 runs). `--verify` gates the lossless pick on
+  that (base + 1 run slack), and the menu action always verifies.
+- **Fractional factors.** `--factors 1,1.5,2,2.5,3,4` writes any ladder, since a
+  factor is just a row-length multiplier.
+
+Honest limits, measured on the corpus: without `--verify` the pick is a
+structural guess and roughly one in ten auto-condensed tracks can add a run
+(a first 29-track sample found 3). With `--verify` the pick cannot exceed the
+1x run count by more than one. Dense rips like FZ2DX "Cholacoray" (its ch7
+retriggers at a median 84 samples) are lossy at 1x already, so `lossless`
+correctly refuses to condense them.
+
 ## 0.9.37
 
 Namco System 86 (Genpei Toumaden) uses two operator tricks that the key-on

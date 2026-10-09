@@ -32,16 +32,37 @@ BASE = Path(__file__).resolve().parents[2]
 FUR_DIR = BASE / "vgm2151fur"
 sys.path.insert(0, str(FUR_DIR))
 
-from vgm2151fur.convert import convert_vgm
+from vgm2151fur.convert import (
+    _MANIFEST,
+    _MANIFEST_HEADER,
+    _manifest_line,
+    convert_variants,
+    convert_vgm,
+)
 from vgm2151fur.levels import peak_dbfs
 from vgm2151fur.packs import find_packs
 from vgm2151fur.priority import low_priority, resolve_workers, set_low_priority
 
 
-def job(src: str, dst: str, slug: str) -> tuple[str, dict | None, str | None]:
+def _fur_root(fur: Path) -> Path:
+    """The destination root: `fur/`, or `fur/default`'s parent in the dir layout."""
+    return fur.parent.parent if fur.parent.name == "default" else fur.parent
+
+
+def job(src: str, dst: str, slug: str, optimize: str = "none",
+        verify: bool = False) -> tuple[str, dict | None, str | None]:
     set_low_priority()
+    dst = Path(dst)
     try:
-        info = convert_vgm(Path(src), Path(dst), normalize=True)
+        if optimize != "none":
+            results = convert_variants(
+                Path(src), _fur_root(dst), factors=(1, 2, 3, 4), mode=optimize,
+                normalize=True, verify=verify, layout="dirs",
+            )
+            info = dict(next(r for r in results if r["pick"]))
+            info["variants"] = results
+        else:
+            info = convert_vgm(Path(src), dst, normalize=True)
     except Exception as exc:
         return slug, None, str(exc)
     return slug, info, None
@@ -61,6 +82,9 @@ def plan() -> list[tuple[str, Path, Path]]:
         if not fur_dir.is_dir():
             continue
         furs = sorted(fur_dir.glob("*.fur"))
+        if not furs:
+            # The dir layout keeps its canonical 1x files in default/.
+            furs = sorted((fur_dir / "default").glob("*.fur"))
         if not furs:
             continue
         best, best_score = None, 0
@@ -95,6 +119,16 @@ def main() -> int:
         ),
     )
     ap.add_argument("--dry-run", action="store_true", help="print the plan only")
+    ap.add_argument(
+        "--optimize", choices=("none", "lossless", "all"), default="none",
+        help="also write the 1x..4x set into default/ and xN optimised/ "
+             "(lossless keeps only the factors that add no loss); default none",
+    )
+    ap.add_argument(
+        "--verify", action="store_true",
+        help="with --optimize lossless: render each variant through Furnace and "
+             "reject any that adds a sustained pitch divergence over 1x",
+    )
     args = ap.parse_args()
 
     print("planning...", flush=True)
@@ -114,7 +148,7 @@ def main() -> int:
     n_workers, note = resolve_workers(args.workers, len(jobs))
     print(f"reconverting {len(jobs)} tracks, {n_workers} workers ({note})", flush=True)
     started = time.time()
-    ok, failed = _run_jobs(jobs, n_workers)
+    ok, failed = _run_jobs(jobs, n_workers, args.optimize, args.verify)
     print(f"done: {ok} ok, {failed} failed in {time.time() - started:.0f}s")
     return 1 if failed else 0
 
@@ -136,11 +170,22 @@ def _print_result(slug: str, dst: Path, info, error) -> bool:
     return True
 
 
-def _run_jobs(jobs, n_workers: int) -> tuple[int, int]:
+def _run_jobs(jobs, n_workers: int, optimize: str = "none",
+              verify: bool = False) -> tuple[int, int]:
     ok = failed = 0
+    seen: set[str] = set()
 
     def take(slug: str, dst: Path, info, error) -> None:
         nonlocal ok, failed
+        if optimize != "none" and info and info.get("variants"):
+            manifest = _fur_root(dst) / _MANIFEST
+            if str(manifest) not in seen:
+                seen.add(str(manifest))
+                manifest.parent.mkdir(parents=True, exist_ok=True)
+                manifest.write_text(_MANIFEST_HEADER, encoding="utf-8")
+            with manifest.open("a", encoding="utf-8") as fh:
+                for v in info["variants"]:
+                    fh.write(_manifest_line(dst, v))
         if _print_result(slug, dst, info, error):
             ok += 1
         else:
@@ -149,13 +194,13 @@ def _run_jobs(jobs, n_workers: int) -> tuple[int, int]:
     if n_workers <= 1:
         with low_priority():
             for slug, src, dst in jobs:
-                _slug, info, error = job(str(src), str(dst), slug)
+                _slug, info, error = job(str(src), str(dst), slug, optimize, verify)
                 take(slug, dst, info, error)
         return ok, failed
 
     with ProcessPoolExecutor(max_workers=n_workers, initializer=set_low_priority) as pool:
         futs = {
-            pool.submit(job, str(src), str(dst), slug): (slug, dst)
+            pool.submit(job, str(src), str(dst), slug, optimize, verify): (slug, dst)
             for slug, src, dst in jobs
         }
         for fut in as_completed(futs):

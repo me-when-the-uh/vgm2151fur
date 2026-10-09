@@ -133,6 +133,33 @@ def _lattice_coverage(deltas: list[int], t: float) -> float:
     return good / len(deltas) if deltas else 0.0
 
 
+def hz_speed_for_row(row: float, tick_samples: float) -> tuple[float, int]:
+    """Furnace hz/speed for a row of `row` samples at ~`tick_samples` per tick.
+
+    EDxx must stay below the row's tick count (strict delay policy), and the
+    tick rate has to stay a sane "song hz" for the tracker UI.
+    """
+    speed = max(1, min(255, int(round(row / tick_samples))))
+    while speed > 1 and row / speed < 40.0:
+        speed //= 2
+    return VGM_RATE * speed / row, speed
+
+
+def condense_row(
+    hz: float, speed: int, subdiv: int, factor: float, tick_samples: float,
+) -> tuple[float, int, float]:
+    """Lengthen every row by `factor` (rows/s and so BPM drop by `factor`).
+
+    `subdiv` (rows per measured 16th) is cosmetic - it only feeds Song.bpm - so
+    a non-integer result (3x) is fine.  Returns the new (hz, speed, subdiv).
+    """
+    if factor <= 1:
+        return hz, speed, subdiv
+    row = (VGM_RATE / hz) * speed * factor
+    nhz, nspeed = hz_speed_for_row(row, tick_samples)
+    return nhz, nspeed, subdiv / factor
+
+
 def estimate_grid(
     vgm: VgmFile, *, min_confidence: float = 0.75,
     tick_samples: float = TARGET_TICK_SAMPLES,
@@ -248,11 +275,7 @@ def estimate_grid(
             subdiv = n
             break
     row = unit / subdiv
-    speed = max(1, min(255, int(round(row / tick_samples))))
-    # EDxx must stay below the row's tick count (strict delay policy), and the
-    # tick rate has to stay a sane "song hz" for the tracker UI.
-    while speed > 1 and row / speed < 40.0:
-        speed //= 2
+    hz, speed = hz_speed_for_row(row, tick_samples)
 
     note = f"key-on lattice ({len(deltas)} intervals)"
     if best_conf < min_confidence:
@@ -260,7 +283,7 @@ def estimate_grid(
     note += low_note
     return Grid(
         row=row,
-        hz=VGM_RATE * speed / row,
+        hz=hz,
         speed=speed,
         confidence=best_conf,
         onsets=sum(len(v) for v in by_ch.values()),

@@ -31,6 +31,7 @@ from vgm2151fur.segapcm import SegapcmSample, collect_segapcm, segapcm_rate
 from vgm2151fur.timing import (
     MIN_ROW_SAMPLES,
     TARGET_TICK_SAMPLES,
+    condense_row,
     estimate_grid,
     refine_pcm_grid,
 )
@@ -306,14 +307,15 @@ class Song:
         """Nearest row (round half up)."""
         return max(0, int(math.floor((sample - self.t0) / self.samples_per_row + 0.5)))
 
-    def place(self, sample: int) -> tuple[int, int]:
+    def place(self, sample: int, stats: dict | None = None) -> tuple[int, int]:
         """Return (row, delay_ticks): the closest playable position.
 
         Furnace EDxx delays a channel's row by whole ticks (playback.cpp
         processRow/nextTick). At speed 1 there is no sub-row placement, so the
         nearest row is exact enough (the drivers' note unit matches the row
         within ~1%); at higher speeds floor + nearest tick keeps the error
-        under half a tick.
+        under half a tick.  `stats["ed_rolled"]` counts offsets too large for
+        the row's tick count (a sub-row position the condensed grid cannot hold).
         """
         if self.speed <= 1:
             return self.row_of(sample), 0
@@ -324,6 +326,8 @@ class Song:
         if d >= self.speed:
             row += 1
             d = 0
+            if stats is not None:
+                stats["ed_rolled"] = stats.get("ed_rolled", 0) + 1
         return row, max(0, d)
 
     def delay_ticks(self, sample: int, row: int) -> int:
@@ -553,6 +557,7 @@ def analyze(
     vgm: VgmFile, *, speed: int | None = None, pcm: bool = True,
     tick_samples: float | None = None,
     min_row: float | None = None,
+    condense: float = 1.0,
 ) -> Song:
     tick = TARGET_TICK_SAMPLES if tick_samples is None else float(tick_samples)
     row_floor = MIN_ROW_SAMPLES if min_row is None else float(min_row)
@@ -1201,6 +1206,16 @@ def analyze(
         if pcm_note:
             hz, use_speed, row_subdiv = new_hz, new_speed, new_sub
             grid_note = f"{grid_note}; {pcm_note}" if grid_note else pcm_note
+
+    # Condensing lengthens every row by `condense`, so the row rate (and the
+    # tracker BPM, 15 x rows/s) drops by that factor.  It runs last, after the
+    # PCM refinement, so PCM restarts that no longer fit their own row show up
+    # as loss in the writer rather than being silently re-refined away.
+    if condense > 1:
+        hz, use_speed, row_subdiv = condense_row(
+            hz, use_speed, row_subdiv, condense, tick,
+        )
+        grid_note = f"{grid_note}; condensed x{condense:g}" if grid_note else f"condensed x{condense:g}"
 
     loop_sample = vgm.loop_sample
     if loop_sample is not None and loop_sample < 0:

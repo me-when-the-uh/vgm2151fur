@@ -87,6 +87,7 @@ def _banner(state: dict) -> str:
         "  4  compare    a .fur against its source VGM",
         "  5  render     .fur to WAV",
         "  6  report     analysis, nothing written",
+        "  7  condense   write 1x..4x BPM-variant copies, pick the safe one",
         _TONE.dim("  paste a path, or a number.   m menu    q quit"),
     ]
     last = state.get("browse_root")
@@ -148,6 +149,9 @@ def _dispatch(read, out, state, state_path, raw: str, key: str):
         return None
     if key == "6":
         cmd_report(read, out)
+        return None
+    if key == "7":
+        cmd_condense(read, out, state, state_path)
         return None
     return _open_typed_path(read, out, state, state_path, raw)
 
@@ -377,6 +381,12 @@ def _fur_dir(pack: Pack, state: dict) -> Path:
     return Path(remembered) if remembered else pack.path / FUR_FOLDER
 
 
+def _fur_path(fur_dir: Path, stem: str) -> Path:
+    """The 1x .fur: `default/<stem>.fur` in the dir layout, else `<stem>.fur`."""
+    sub = fur_dir / "default" / (stem + ".fur")
+    return sub if sub.is_file() else fur_dir / (stem + ".fur")
+
+
 def _pack_view(read, out, pack: Pack, state: dict, state_path: Path) -> str:
     tracks, from_playlist = pack_tracks(pack)
     while True:
@@ -386,7 +396,7 @@ def _pack_view(read, out, pack: Pack, state: dict, state_path: Path) -> str:
         out(f"pack {pack.path}  ({len(tracks)} tracks{chips}, {order})")
         out(f"output  {fur_dir}")
         for i, track in enumerate(tracks, 1):
-            mark = "" if (fur_dir / (track.stem + ".fur")).is_file() else "  -"
+            mark = "" if _fur_path(fur_dir, track.stem).is_file() else "  -"
             out(f"  {i:3}. {track.stem}{mark}")
         answer = _ask(
             read, "c convert, e volumes, r render, b back (a '-' means no .fur yet)", "b"
@@ -407,7 +417,12 @@ def _pack_view(read, out, pack: Pack, state: dict, state_path: Path) -> str:
             out("  c, e, r or b")
 
 
-def _run_convert(out, files: list[Path], dest: Path, speed: int | None) -> int:
+def _run_convert(
+    out, files: list[Path], dest: Path, speed: int | None,
+    optimize: str = "lossless", verify: bool = True,
+) -> int:
+    if optimize != "none":
+        return _run_variants(out, files, dest, 4, optimize, verify)
     done = rc = 0
     for src, info, error in convert_folder(
         files, dest, speed=speed, normalize=True, log=lambda message: out(f"  {message}"),
@@ -435,6 +450,74 @@ def _run_convert(out, files: list[Path], dest: Path, speed: int | None) -> int:
     return rc
 
 
+def _run_variants(
+    out, files: list[Path], dest: Path, factor: int, mode: str,
+    verify: bool = True, layout: str = "dirs",
+) -> int:
+    done = rc = 0
+    if verify:
+        out("  verifying each variant through Furnace...")
+    for src, info, error in convert_folder(
+        files, dest, variants=True, condense=factor, optimize=mode,
+        verify=verify, layout=layout, normalize=True,
+        log=lambda message: out(f"  {message}"),
+    ):
+        if error is not None:
+            out(f"  ERROR {src.name}: {error}")
+            rc = 1
+            continue
+        done += 1
+        out(f"  {src.name}")
+        for v in info.get("variants", []):
+            mark = "  <= pick" if v["pick"] else ""
+            dropped = "" if v.get("lossless") else "  (dropped)"
+            dv = f"  div {v['div_runs']}" if v.get("div_runs") is not None else ""
+            try:
+                where = str(Path(v["dst"]).relative_to(dest))
+            except ValueError:
+                where = Path(v["dst"]).name
+            out(
+                f"     x{v['factor']:g}  BPM {v['bpm']:7.0f}  {where}  "
+                f"loss {v['loss_total']}  dev {v['dev_max']}{dv}{mark}{dropped}"
+            )
+    out(f"  {done}/{len(files)} converted to {dest}")
+    return rc
+
+
+def cmd_condense(read, out, state, state_path):
+    """Write the 1x..Nx row-condense set for a selection and report the pick."""
+    raw = _ask(read, "VGM/VGZ file, folder, or glob")
+    if not raw:
+        return None
+    existing = [p for p in expand_token(raw) if p.exists()]
+    if not existing:
+        out("  no match")
+        return None
+    dirs = [p for p in existing if p.is_dir()]
+    files = [p for p in existing if p.is_file()]
+    vgms = [p for p in files if p.suffix.lower() in VGM_SUFFIXES]
+    for folder in dirs:
+        vgms.extend(vgm_targets(folder)[0])
+    vgms = dedupe(vgms)
+    if not vgms:
+        out("  no .vgm/.vgz in that path")
+        return None
+    dst = Path(_ask(read, "output folder", str(vgms[0].parent / FUR_FOLDER)))
+    factor = _ask(read, "max condense factor (2-4)", "4")
+    mode = _ask(read, "pick (none, lossless, all)", "lossless").strip().lower()
+    if mode not in ("none", "lossless", "all"):
+        mode = "lossless"
+    verify = _ask(
+        read, "verify through Furnace? (Y/n)", "y"
+    ).lower() not in ("n", "no")
+    rc = _run_variants(
+        out, vgms, dst, int(factor) if factor.isdigit() else 4, mode, verify
+    )
+    state.setdefault("out_dirs", {})[str(vgms[0].parent)] = str(dst)
+    _save_state(state_path, state)
+    return rc
+
+
 def _pack_convert(read, out, pack, tracks, default_dir: Path, state, state_path) -> None:
     spec = _ask(read, "tracks (all, 3, 2-6, 1,4)", "all")
     try:
@@ -443,7 +526,15 @@ def _pack_convert(read, out, pack, tracks, default_dir: Path, state, state_path)
         out(f"  {exc}")
         return
     dst = Path(_ask(read, "output folder", str(default_dir)))
-    _run_convert(out, [tracks[i] for i in picks], dst, None)
+    optimize = _ask(read, "optimise (none, lossless, all)", "lossless").strip().lower()
+    if optimize not in ("none", "lossless", "all"):
+        optimize = "lossless"
+    verify = False
+    if optimize != "none":
+        verify = _ask(
+            read, "verify variants through Furnace? (Y/n)", "y"
+        ).lower() not in ("n", "no")
+    _run_convert(out, [tracks[i] for i in picks], dst, None, optimize, verify)
     state.setdefault("out_dirs", {})[str(pack.path)] = str(dst)
     state["pack"] = str(pack.path)
     _save_state(state_path, state)
@@ -456,7 +547,7 @@ def _pack_volumes(read, out, tracks, fur_dir: Path) -> None:
     except ValueError as exc:
         out(f"  {exc}")
         return
-    furs = [fur_dir / (tracks[i].stem + ".fur") for i in picks]
+    furs = [_fur_path(fur_dir, tracks[i].stem) for i in picks]
     missing = [f for f in furs if not f.is_file()]
     if missing:
         out(f"  convert these first (c): {', '.join(m.name for m in missing[:4])}")
@@ -493,7 +584,7 @@ def _pack_render(read, out, tracks, fur_dir: Path, *, spec: str | None = None) -
         out("  loops should be a number")
         return
     for i in picks:
-        fur = fur_dir / (tracks[i].stem + ".fur")
+        fur = _fur_path(fur_dir, tracks[i].stem)
         if not fur.is_file():
             out(f"  no .fur at {fur.name}, convert it first")
             continue
@@ -508,8 +599,11 @@ def _pack_render(read, out, tracks, fur_dir: Path, *, spec: str | None = None) -
 
 # ---------------------------------------------------------------- direct commands
 
-def _convert_now(out, files: list[Path], dest: Path, speed: int | None) -> int:
-    return _run_convert(out, files, dest, speed)
+def _convert_now(
+    out, files: list[Path], dest: Path, speed: int | None,
+    optimize: str = "lossless", verify: bool = True,
+) -> int:
+    return _run_convert(out, files, dest, speed, optimize, verify)
 
 
 def cmd_convert_file(read, out, state, state_path):
@@ -541,7 +635,17 @@ def cmd_convert_file(read, out, state, state_path):
     default_out = str(vgms[0].parent / FUR_FOLDER)
     dst = Path(_ask(read, "output folder", default_out))
     speed = _ask(read, "ticks per row (blank = auto)")
-    return _convert_now(out, vgms, dst, int(speed) if speed.isdigit() else None)
+    optimize = _ask(read, "optimise (none, lossless, all)", "lossless").strip().lower()
+    if optimize not in ("none", "lossless", "all"):
+        optimize = "lossless"
+    verify = False
+    if optimize != "none":
+        verify = _ask(
+            read, "verify variants through Furnace? (Y/n)", "y"
+        ).lower() not in ("n", "no")
+    return _convert_now(
+        out, vgms, dst, int(speed) if speed.isdigit() else None, optimize, verify
+    )
 
 
 def cmd_edit(read, out) -> None:

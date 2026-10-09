@@ -10,7 +10,7 @@ K007232 0xC6, SegaPCM 0x9B, C140 0xCE, C352 0xD0).
 from __future__ import annotations
 
 import struct
-from bisect import bisect_right
+from bisect import bisect_left, bisect_right
 from collections import Counter
 from dataclasses import dataclass, replace
 
@@ -446,7 +446,44 @@ def _blank_row() -> Row:
     return Row()
 
 
-def _add_fx(row: Row, cmd: int, val: int, fx_cols: int) -> None:
+def _bump(stats: dict | None, key: str, n: int = 1) -> None:
+    """Count a structural loss event (dropped/overwritten/retriggered content)."""
+    if stats is not None:
+        stats[key] = stats.get(key, 0) + n
+
+
+# Every counter the writer raises when content cannot be placed as written.
+# `loss_total` is the gate the condense modes compare against the 1x baseline.
+LOSS_KEYS = (
+    "note_collision",      # a second note landed on a cell that already had one
+    "off_swallowed",       # a note-off collided with a note
+    "pcm_evicted",         # _assign_pcm_rows dropped an earlier trigger
+    "pcm_unplaced",        # a PCM trigger got no row at all
+    "fx_dropped",          # more effects on a row than it has columns
+    "sweep_clipped",       # a pitch ramp was cut short by a later note
+    "vol_step_dropped",    # a fade/TL step lost to a note owning the row
+    "e5_skipped",          # a fine-tune step lost to a foreign note row
+    "legato_skipped",      # a quick-legato transpose lost to a foreign row
+    "ed_stripped_loop",    # an ED delay removed so Bxx could survive
+    "orders_truncated",    # >256 orders needed
+)
+
+
+def loss_total(stats: dict) -> int:
+    return sum(stats.get(k, 0) for k in LOSS_KEYS)
+
+
+def dev_max(stats: dict) -> int:
+    """Worst per-row pitch deviation from the driver's steps, in 1/64 st.
+
+    A row can only render a straight-line slide, so this grows as the grid
+    coarsens.  It is the fidelity number the condense pick compares (the
+    `sweep_dev_bad` count is dominated by sample count, not severity).
+    """
+    return int(stats.get("sweep_dev_max", 0))
+
+
+def _add_fx(row: Row, cmd: int, val: int, fx_cols: int, stats: dict | None = None) -> None:
     fx = row.fx
     if fx is None:
         fx = row.fx = [(EMPTY, EMPTY)] * fx_cols
@@ -460,6 +497,7 @@ def _add_fx(row: Row, cmd: int, val: int, fx_cols: int) -> None:
             return
     if fx:
         fx[-1] = (cmd, val)
+        _bump(stats, "fx_dropped")
     elif fx_cols:
         fx.append((cmd, val))
 
@@ -614,6 +652,7 @@ def _emit_sweep(
     e5_writes: dict[tuple[int, int], int],
     note_rows: dict[int, list[int]],
     chan: int | None = None,
+    stats: dict | None = None,
 ) -> None:
     """Encode a key-on pitch trajectory as per-row 01xx/02xx ramps + E5 steps.
 
@@ -648,6 +687,7 @@ def _emit_sweep(
     pts = list(ev.sweep)
     if not pts or ev.ch >= len(grid):
         return
+    step_times = [s for s, _d in pts]
     row_len = song.samples_per_row
     tick = row_len / max(1, song.speed)
     start = ev.sample
@@ -662,7 +702,7 @@ def _emit_sweep(
         final = float(_traj_at(pts, int(end)))
         y = max(-15, min(15, int(round(final / 64.0))))
         if abs(y) >= 1:
-            row0, _d = song.place(start)
+            row0, _d = song.place(start, stats)
             row1 = row0 + 1
             if row1 < total_rows:
                 cell = grid[ev.ch].get(row1)
@@ -670,9 +710,9 @@ def _emit_sweep(
                     if cell is None:
                         cell = _blank_row()
                         grid[ev.ch][row1] = cell
-                    _add_fx(cell, 0xE8 if y > 0 else 0xE9, abs(y), fx_cols)
+                    _add_fx(cell, 0xE8 if y > 0 else 0xE9, abs(y), fx_cols, stats)
         return
-    row0, _d0 = song.place(start)
+    row0, _d0 = song.place(start, stats)
     cell0 = grid[ev.ch].get(row0)
     if cell0 is None:
         return
@@ -689,6 +729,7 @@ def _emit_sweep(
         if limit < end:
             end = limit
             crossed = True
+            _bump(stats, "sweep_clipped")
 
     def e5_byte(offset: float) -> int:
         # E5xx is the note's fine tune.  One byte step is one KF step = 1/64 st
@@ -710,6 +751,10 @@ def _emit_sweep(
             break
         re_full = base + (k + 1) * row_len
         re = min(re_full, end)
+        # A row carries one slide rate, so the driver's pitch steps that fall in
+        # the same row collapse into it.  More merges per row = coarser grid.
+        _bump(stats, "sweep_rate_merged",
+              max(0, bisect_left(step_times, re_full) - bisect_left(step_times, rs) - 1))
         t_eff = start if k == 0 else rs
         if k == 0:
             # The note starts at its own pitch; the driver's first sweep step
@@ -725,14 +770,15 @@ def _emit_sweep(
             want = float(_traj_at(pts, int(rs + tick)))
         cur = (e5w - ev.e5) / (2.0 if ev.pcm else 1.0) + slide + xpose
         cell_k = grid[ev.ch].get(row0 + k)
-        if abs(want - cur) >= 6 and (
-            cell_k is None or not (0 <= cell_k.note < 180)
-        ):
-            # A step is only recorded for rows this sweep owns: on a later
-            # note's row the note's own E5 has to win (it sets the attack).
-            e5w = e5_byte(want - slide - xpose)
-            e5_writes[(ev.ch, row0 + k)] = e5w
-            cur = (e5w - ev.e5) / (2.0 if ev.pcm else 1.0) + slide + xpose
+        if abs(want - cur) >= 6:
+            if cell_k is None or not (0 <= cell_k.note < 180):
+                # A step is only recorded for rows this sweep owns: on a later
+                # note's row the note's own E5 has to win (it sets the attack).
+                e5w = e5_byte(want - slide - xpose)
+                e5_writes[(ev.ch, row0 + k)] = e5w
+                cur = (e5w - ev.e5) / (2.0 if ev.pcm else 1.0) + slide + xpose
+            else:
+                _bump(stats, "e5_skipped")
         # The physical rate runs the whole row even when the trajectory ends
         # inside it, so the last row must be rated over its full span against
         # the trajectory's held final value: rating it over the clipped span
@@ -785,7 +831,7 @@ def _emit_sweep(
                             if cell is None:
                                 cell = _blank_row()
                                 grid[ev.ch][row0 + k] = cell
-                            _add_fx(cell, 0xE8 if y > 0 else 0xE9, abs(y), fx_cols)
+                            _add_fx(cell, 0xE8 if y > 0 else 0xE9, abs(y), fx_cols, stats)
                             xpose += 64.0 * y
                             slide = 0.0
                             cur = (e5w - ev.e5) / 2.0 + xpose
@@ -799,9 +845,11 @@ def _emit_sweep(
                             if cell is None:
                                 cell = _blank_row()
                                 grid[ev.ch][row0 + k] = cell
-                            _add_fx(cell, 0xE8 if y > 0 else 0xE9, abs(y), fx_cols)
+                            _add_fx(cell, 0xE8 if y > 0 else 0xE9, abs(y), fx_cols, stats)
                             xpose += 64.0 * y
                             cur += 64.0 * y
+                else:
+                    _bump(stats, "legato_skipped")
             rate = max(-limit, min(limit, (want_end - cur) / span))
         param = int(round(rate * 2)) if ev.pcm else int(round(rate))
         param = max(-255, min(255, param))
@@ -821,9 +869,9 @@ def _emit_sweep(
             cell.fx = [(c, v) for c, v in (cell.fx or [(EMPTY, EMPTY)] * fx_cols)
                        if c not in (0x01, 0x02)]
             if param:
-                _add_fx(cell, 0x01 if param > 0 else 0x02, min(255, abs(param)), fx_cols)
+                _add_fx(cell, 0x01 if param > 0 else 0x02, min(255, abs(param)), fx_cols, stats)
             else:
-                _add_fx(cell, 0x01 if last_rate > 0 else 0x02, 0, fx_cols)
+                _add_fx(cell, 0x01 if last_rate > 0 else 0x02, 0, fx_cols, stats)
             last_rate = param
         # Accrue the movement the engine actually makes - from the written,
         # rounded and clamped parameter - not the ideal rate.  A glide that
@@ -833,6 +881,26 @@ def _emit_sweep(
         # (1.7 st) sharp and held that for seconds, and every FM/C140 slide
         # carries the same fraction-of-a-unit residue.
         engine_rate = (param / 2.0) if ev.pcm else float(param)
+        # Fidelity: each row can only be a straight line, so sample the model
+        # against the driver's own steps inside the row.  The deviation is the
+        # audible error of condensing - a coarser grid packs more steps into one
+        # row and bends them into one line.  Measured in 1/64 semitones; 6 units
+        # is 0.1 st, the rough inaudibility floor.
+        if stats is not None and span > 0:
+            bad_here = False
+            for j in range(4):
+                t = int(rs + (re_full - rs) * (2 * j + 1) / 8.0)
+                if t <= start:
+                    continue
+                model = cur + engine_rate * span * (2 * j + 1) / 8.0
+                dev = abs(model - _traj_at(pts, t))
+                if dev > 6:
+                    bad_here = True
+                    stats["sweep_dev_bad"] = stats.get("sweep_dev_bad", 0) + 1
+                if dev > stats.get("sweep_dev_max", 0):
+                    stats["sweep_dev_max"] = int(round(dev))
+            if bad_here:
+                stats["sweep_dev_rows"] = stats.get("sweep_dev_rows", 0) + 1
         slide += engine_rate * span
         last_k = k
         k += 1
@@ -866,7 +934,7 @@ def _emit_sweep(
             cell = _blank_row()
             grid[ev.ch][stop_row] = cell
         if last_rate and not any(c in (0x01, 0x02) for c, _v in (cell.fx or ())):
-            _add_fx(cell, 0x01 if last_rate > 0 else 0x02, 0, fx_cols)
+            _add_fx(cell, 0x01 if last_rate > 0 else 0x02, 0, fx_cols, stats)
         return
     if stop_row >= total_rows:
         return
@@ -881,13 +949,13 @@ def _emit_sweep(
     if last_rate:
         cell.fx = [(c, v) for c, v in (cell.fx or [(EMPTY, EMPTY)] * fx_cols)
                    if c not in (0x01, 0x02)]
-        _add_fx(cell, 0x01 if last_rate > 0 else 0x02, 0, fx_cols)
+        _add_fx(cell, 0x01 if last_rate > 0 else 0x02, 0, fx_cols, stats)
     if not foreign and pin != e5w:
         e5_writes[(ev.ch, stop_row)] = pin
 
 
 def _assign_pcm_rows(
-    song: Song, total_rows: int, last_sample: int,
+    song: Song, total_rows: int, last_sample: int, stats: dict | None = None,
 ) -> dict[int, tuple[int, int]]:
     """Row and delay for each PCM note-on that the pattern can play.
 
@@ -904,7 +972,7 @@ def _assign_pcm_rows(
     out: dict[int, tuple[int, int]] = {}
     for evs in by_ch.values():
         evs.sort(key=lambda e: e.sample)
-        ideals = [song.place(e.sample) for e in evs]
+        ideals = [song.place(e.sample, stats) for e in evs]
         placed: dict[int, int] = {}
         for i, ev in enumerate(evs):
             row, delay = ideals[i]
@@ -912,6 +980,7 @@ def _assign_pcm_rows(
                 continue
             if row in placed and evs[placed[row]].sample == ev.sample:
                 out.pop(id(evs[placed[row]]), None)
+                _bump(stats, "pcm_evicted")
                 placed[row] = i
                 out[id(ev)] = (row, delay)
                 continue
@@ -939,12 +1008,14 @@ def _assign_pcm_rows(
             victim = placed.get(row)
             if victim is not None:
                 out.pop(id(evs[victim]), None)
+                _bump(stats, "pcm_evicted")
             placed[row] = i
             out[id(ev)] = (row, delay)
     return out
 
 
-def _build_patterns(song: Song, n_ch: int, pat_len: int, fx_cols: int, ch_offset: int = 0) -> tuple[
+def _build_patterns(song: Song, n_ch: int, pat_len: int, fx_cols: int, ch_offset: int = 0,
+                    stats: dict | None = None) -> tuple[
     list[list[int]], list[tuple[int, int, list[Row | None]]], int
 ]:
     """Return (orders[ch][ord], patterns as (ch, idx, rows), loop_order).
@@ -1005,11 +1076,14 @@ def _build_patterns(song: Song, n_ch: int, pat_len: int, fx_cols: int, ch_offset
     n_ord = min(256, raw_n)
     bounds = bounds[: n_ord + 1]
     if raw_n > 256:
+        _bump(stats, "orders_truncated")
         song.warnings.append(
             f"truncated to 256 orders ({raw_n} needed); raise --speed or split the VGM"
         )
 
     grid: list[dict[int, Row]] = [dict() for _ in range(n_ch)]
+    if stats is not None:
+        stats["rows"] = max(stats.get("rows", 0), total_rows)
 
     for sample, cmd, val in getattr(song, "chip_fx", ()) or ():
         row = song.row_of(sample)
@@ -1019,7 +1093,7 @@ def _build_patterns(song: Song, n_ch: int, pat_len: int, fx_cols: int, ch_offset
         if cell is None:
             cell = _blank_row()
             grid[0][row] = cell
-        _add_fx(cell, cmd, val, fx_cols)
+        _add_fx(cell, cmd, val, fx_cols, stats)
 
     for sample, ch, cmd, val in getattr(song, "channel_fx", ()) or ():
         ch += ch_offset
@@ -1032,7 +1106,7 @@ def _build_patterns(song: Song, n_ch: int, pat_len: int, fx_cols: int, ch_offset
         if cell is None:
             cell = _blank_row()
             grid[ch][row] = cell
-        _add_fx(cell, cmd, val, fx_cols)
+        _add_fx(cell, cmd, val, fx_cols, stats)
 
     # E5 is a channel state and both notes and sweep steps change it, so the
     # desired value is collected per row first and replayed in row order.
@@ -1052,7 +1126,7 @@ def _build_patterns(song: Song, n_ch: int, pat_len: int, fx_cols: int, ch_offset
     # One cell holds one PCM note. A later trigger moves to the next free row
     # when that row is still before the following trigger. When it is not,
     # the later trigger keeps the row: it is the cursor the channel plays.
-    pcm_pos = _assign_pcm_rows(song, total_rows, last_sample)
+    pcm_pos = _assign_pcm_rows(song, total_rows, last_sample, stats)
     for ev in song.events:
         ev_ch = ev.ch + ch_offset
         if ev_ch < 0 or ev_ch >= n_ch:
@@ -1060,10 +1134,11 @@ def _build_patterns(song: Song, n_ch: int, pat_len: int, fx_cols: int, ch_offset
         if ev.on and ev.pcm:
             assigned = pcm_pos.get(id(ev))
             if assigned is None:
+                _bump(stats, "pcm_unplaced")
                 continue
             row, delay = assigned
         else:
-            row, delay = song.place(ev.sample)
+            row, delay = song.place(ev.sample, stats)
         if row < 0 or row >= total_rows:
             continue
         cell = grid[ev_ch].get(row)
@@ -1073,9 +1148,13 @@ def _build_patterns(song: Song, n_ch: int, pat_len: int, fx_cols: int, ch_offset
         if not ev.on:
             if cell.note < 0:
                 cell.note = NOTE_OFF
+            else:
+                _bump(stats, "off_swallowed")
             if delay:
-                _add_fx(cell, 0xED, delay, fx_cols)
+                _add_fx(cell, 0xED, delay, fx_cols, stats)
             continue
+        if 0 <= cell.note < 180:
+            _bump(stats, "note_collision")
         cell.note = ev.note if ev.note != 180 else NOTE_OFF
         if ev.ins >= 0:
             cell.ins = ev.ins
@@ -1084,12 +1163,12 @@ def _build_patterns(song: Song, n_ch: int, pat_len: int, fx_cols: int, ch_offset
         elif fm_tl and cell.vol == EMPTY:
             cell.vol = 127
         if delay:
-            _add_fx(cell, 0xED, delay, fx_cols)
+            _add_fx(cell, 0xED, delay, fx_cols, stats)
         note_e5[(ev_ch, row)] = ev.e5
         # PCM pan 0x00 is both channels off. Omitting it leaves Furnace's
         # default (both full). FM pan 0 still means "no 08xx on this row".
         if (ev.pcm or ev.pan) and not ev.no_pan:
-            _add_fx(cell, 0x08, ev.pan & 0xFF, fx_cols)
+            _add_fx(cell, 0x08, ev.pan & 0xFF, fx_cols, stats)
 
     # A held note's carrier fade steps land on their own rows (only when no
     # note owns the row, so a following note's own volume wins).
@@ -1103,7 +1182,7 @@ def _build_patterns(song: Song, n_ch: int, pat_len: int, fx_cols: int, ch_offset
             else:
                 t0 = 0x7F
             for sample, tl in ev.tl_pts:
-                row, _delay = song.place(sample)
+                row, _delay = song.place(sample, stats)
                 if row < 0 or row >= total_rows:
                     continue
                 cell = grid[ev_ch].get(row)
@@ -1111,6 +1190,7 @@ def _build_patterns(song: Song, n_ch: int, pat_len: int, fx_cols: int, ch_offset
                     cell = _blank_row()
                     grid[ev_ch][row] = cell
                 if cell.note >= 0:
+                    _bump(stats, "vol_step_dropped")
                     continue
                 cell.vol = max(0, min(127, 127 - (tl - t0)))
 
@@ -1129,10 +1209,10 @@ def _build_patterns(song: Song, n_ch: int, pat_len: int, fx_cols: int, ch_offset
             if ev.on and ev.sweep and 0 <= ev.ch + ch_offset < n_ch:
                 if ch_offset:
                     _emit_sweep(grid, song, ev, fx_cols, total_rows, sweep_e5,
-                                note_rows, ev.ch + ch_offset)
+                                note_rows, ev.ch + ch_offset, stats)
                 else:
                     _emit_sweep(grid, song, ev, fx_cols, total_rows, sweep_e5,
-                                note_rows)
+                                note_rows, stats=stats)
 
     # C140 volume trajectories (fades): the driver steps the voice's volume
     # registers and Furnace feeds the column into the chip gain live
@@ -1146,7 +1226,7 @@ def _build_patterns(song: Song, n_ch: int, pat_len: int, fx_cols: int, ch_offset
                 continue
             last_pan = None if ev.no_pan else ev.pan
             for sample, value, pan in ev.vol_pts:
-                row, _delay = song.place(sample)
+                row, _delay = song.place(sample, stats)
                 if row < 0 or row >= total_rows:
                     continue
                 cell = grid[ev_ch].get(row)
@@ -1154,10 +1234,11 @@ def _build_patterns(song: Song, n_ch: int, pat_len: int, fx_cols: int, ch_offset
                     cell = _blank_row()
                     grid[ev_ch][row] = cell
                 if cell.note >= 0:
+                    _bump(stats, "vol_step_dropped")
                     continue
                 cell.vol = value
                 if pan is not None and (last_pan is None or pan != last_pan):
-                    _add_fx(cell, 0x08, pan & 0xFF, fx_cols)
+                    _add_fx(cell, 0x08, pan & 0xFF, fx_cols, stats)
                     last_pan = pan
 
     for ch in range(n_ch):
@@ -1174,7 +1255,7 @@ def _build_patterns(song: Song, n_ch: int, pat_len: int, fx_cols: int, ch_offset
             if cell is None:
                 cell = _blank_row()
                 grid[ch][row] = cell
-            _add_fx(cell, 0xE5, val, fx_cols)
+            _add_fx(cell, 0xE5, val, fx_cols, stats)
             cur_e5 = val
 
     loop_order = 0
@@ -1201,7 +1282,7 @@ def _build_patterns(song: Song, n_ch: int, pat_len: int, fx_cols: int, ch_offset
                 cell = rows[span - 1]
                 if cell is None:
                     cell = rows[span - 1] = _blank_row()
-                _add_fx(cell, 0x0D, 0, fx_cols)
+                _add_fx(cell, 0x0D, 0, fx_cols, stats)
             # Loop jump on the last row that carries content, not on the last
             # row of the padded order: the final order is only as long as the
             # music, and a Bxx on the padded end would insert silence before
@@ -1217,9 +1298,11 @@ def _build_patterns(song: Song, n_ch: int, pat_len: int, fx_cols: int, ch_offset
                 cell = rows[jump_row]
                 if cell is None:
                     cell = rows[jump_row] = _blank_row()
+                if any(c == 0xED for c, _v in (cell.fx or ())):
+                    _bump(stats, "ed_stripped_loop")
                 cell.fx = [(c, v) for c, v in (cell.fx or [(EMPTY, EMPTY)] * fx_cols)
                            if c != 0xED]
-                _add_fx(cell, 0x0B, loop_order, fx_cols)
+                _add_fx(cell, 0x0B, loop_order, fx_cols, stats)
             orders[ch].append(oi)
             patterns.append((ch, oi, rows))
 
@@ -1258,7 +1341,10 @@ def _grouped(samples):
     return ids, groups
 
 
-def write_fur(song: Song, *, include_pcm: bool = True, include_fm: bool = True) -> bytes:
+def write_fur(
+    song: Song, *, include_pcm: bool = True, include_fm: bool = True,
+    stats: dict | None = None,
+) -> bytes:
     gd3 = song.vgm.gd3
     fm_ins = song.fm_patches if include_fm else []
     pcm_smps = [s for s in song.pcm_samples if s.length >= 8] if include_pcm else []
@@ -1312,7 +1398,7 @@ def write_fur(song: Song, *, include_pcm: bool = True, include_fm: bool = True) 
     # Analysis numbers sample-chip channels after the 8-channel FM block. With
     # no FM those channels shift down so they still land inside n_ch.
     orders, patterns, _loop_ord = _build_patterns(
-        song, n_ch, pat_len, fx_cols, 0 if include_fm else -8
+        song, n_ch, pat_len, fx_cols, 0 if include_fm else -8, stats=stats
     )
     effect_cols = _fit_fx_cols(patterns, n_ch)
     n_ord = len(orders[0]) if orders else 1
