@@ -19,7 +19,9 @@ import sys
 from pathlib import Path
 
 from vgm2151fur import __version__
-from vgm2151fur.convert import VGM_SUFFIXES, convert_folder, report_files
+from vgm2151fur.convert import (
+    VGM_SUFFIXES, convert_folder, format_variant_lines, report_files,
+)
 from vgm2151fur.edit import FurEditError, read_chips_file, set_chip_volume_file
 from vgm2151fur.furnace import FurnaceError, render_wav
 from vgm2151fur.packs import pack_tracks
@@ -245,22 +247,8 @@ def _convert(args) -> int:
             done += 1
             if info.get("variants"):
                 print(f"{src.name} -> {len(info['variants'])} variants")
-                for v in info["variants"]:
-                    mark = "  <= pick" if v["pick"] else ""
-                    dropped = "" if v.get("lossless", True) else "  (dropped)"
-                    dv = (
-                        f"  div {v['div_runs']}"
-                        if v.get("div_runs") is not None else ""
-                    )
-                    try:
-                        where = str(Path(v["dst"]).relative_to(dest))
-                    except ValueError:
-                        where = Path(v["dst"]).name
-                    print(
-                        f"    x{v['factor']:g}  BPM {v['bpm']:7.0f}  "
-                        f"{where}  loss {v['loss_total']}  "
-                        f"dev {v['dev_max']}{dv}{mark}{dropped}"
-                    )
+                for line in format_variant_lines(info["variants"], dest):
+                    print(f"    {line}")
                 continue
             extra = ""
             notes = [w for w in info["warnings"] if w != info.get("loop")]

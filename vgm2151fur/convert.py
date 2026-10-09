@@ -148,6 +148,11 @@ def _verify_runs(
     the sustained divergences the `compare` command reports.  The threshold is
     finer than `compare`'s default (0.5 st / 100 ms), where a marginal variant
     can still hide.
+
+    `min_run_ms` has to stay under the candidate's own row length. A note
+    pushed one row late diverges for exactly one row, and at 60 ms against a
+    55 ms row (Genpei Toumaden "03 Small Mode" x4) that run is discarded
+    before it is counted.
     """
     from vgm2151fur.diag import export_fur, pitch_runs
 
@@ -356,6 +361,7 @@ def convert_variants(
             song, out_path, pcm=pcm, include_fm=include_fm,
             normalize=normalize, warnings=warnings, stats=stats,
         )
+        row_ms = song.samples_per_row / 44.1
         results.append({
             "factor": factor,
             "dst": str(out_path),
@@ -372,7 +378,11 @@ def convert_variants(
             "loop": loop_note,
             "peak": peak,
             "gain": gain,
-            "div_runs": _verify_runs(vgm, out_path) if verify else None,
+            "div_runs": (
+                _verify_runs(
+                    vgm, out_path, min_run_ms=max(4.0, min(60.0, row_ms * 0.75)),
+                ) if verify else None
+            ),
         })
     base = next((r for r in results if r["factor"] == 1), results[0])
     # Structural counters that change content and that the rendered pitch
@@ -419,6 +429,37 @@ def convert_variants(
         keep = {r["factor"] for r in (results if mode == "all" else ok)}
         _place_dirs(results, out_dir, keep=keep)
     return results
+
+
+def format_variant_lines(variants: list[dict], dest: Path) -> list[str]:
+    """Aligned one-line summaries of one `convert_variants` result set.
+
+    Factor and path pads to the widest row in the set, the counters are
+    right-aligned, so the columns end together within a set.
+    """
+    if not variants:
+        return []
+    factors: list[str] = []
+    wheres: list[str] = []
+    for v in variants:
+        try:
+            where = str(Path(v["dst"]).relative_to(dest))
+        except ValueError:
+            where = Path(v["dst"]).name
+        factors.append(f"x{v['factor']:g}")
+        wheres.append(where)
+    factor_w = max(len(f) for f in factors)
+    where_w = max(len(w) for w in wheres)
+    lines: list[str] = []
+    for factor, where, v in zip(factors, wheres, variants):
+        mark = "  <= pick" if v["pick"] else ""
+        dropped = "" if v.get("lossless", True) else "  (dropped)"
+        div = f"  div {v['div_runs']:>4}" if v.get("div_runs") is not None else ""
+        lines.append(
+            f"{factor:<{factor_w}}  BPM {v['bpm']:7.0f}  {where:<{where_w}}  "
+            f"loss {v['loss_total']:>4}  dev {v['dev_max']:>4}{div}{mark}{dropped}"
+        )
+    return lines
 
 
 _CFG: dict = {}
