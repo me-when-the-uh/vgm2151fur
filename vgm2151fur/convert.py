@@ -356,22 +356,34 @@ def convert_variants(
             "div_runs": _verify_runs(vgm, out_path) if verify else None,
         })
     base = next((r for r in results if r["factor"] == 1), results[0])
-    # A factor is lossless when it adds no hard structural loss, does not bend
-    # the pitch model more than 0.1 st past the 1x baseline, and (when verifying
-    # acoustically) adds no sustained divergence over 1x.  The hard counters and
-    # dev_max saturate on sweep-heavy tracks, so under `verify` the rendered
-    # count is the authority and dev_max is only a fast pre-filter.
+    # Structural counters that change content and that the rendered pitch
+    # comparison cannot see: a dropped note, a swallowed note-off, an evicted
+    # sample or a lost effect.  The sweep/fade counters describe the pitch
+    # model, which --verify measures directly, so under verify they are
+    # advisory (a factor whose render matches 1x should not be blocked by a
+    # clipped sweep step the render shows is inaudible - Hyper Duel "Buster
+    # Gear" 2x is 0 divergence over the 1x baseline and was still rejected).
+    hard_keys = (
+        "note_collision", "off_swallowed", "pcm_evicted", "pcm_unplaced",
+        "fx_dropped", "orders_truncated",
+    )
     tol = 6
     base_runs = base.get("div_runs")
+    base_hard = sum(base["loss"].get(k, 0) for k in hard_keys)
 
     def _lossless(r: dict) -> bool:
+        if verify:
+            if sum(r["loss"].get(k, 0) for k in hard_keys) > base_hard:
+                return False
+            if base_runs is not None and r.get("div_runs") is not None:
+                if r["div_runs"] > base_runs + 1:
+                    return False
+            return True
+        # Without a render the analytic counters are all there is.
         if r["loss_total"] > base["loss_total"]:
             return False
-        if not verify and r["dev_max"] > base["dev_max"] + tol:
+        if r["dev_max"] > base["dev_max"] + tol:
             return False
-        if verify and base_runs is not None and r.get("div_runs") is not None:
-            if r["div_runs"] > base_runs + 1:
-                return False
         return True
 
     for r in results:

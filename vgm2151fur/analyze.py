@@ -434,10 +434,19 @@ def _flush_pms_ramp(
     deltas: list[int] = []
     prev_t = kon_sample
     for t, p, a in ramp:
-        if p == 0 and a == 0 and pms:
-            break  # driver resets PMS before the next key-on
         if pms and p == pms[-1] and a == ams[-1]:
             continue
+        if p == 0 and a == 0 and pms:
+            # The reset is the vibrato switching off.  Keep it as the final
+            # step so the macro returns to 0; without it the macro holds the
+            # last sensitivity for the rest of the song (Hyper Duel "Buster
+            # Gear" keeps a PMS 6 wobble running past every note).  Its length
+            # is irrelevant (a macro holds its last value), so reuse the
+            # previous step to keep the median step honest.
+            pms.append(0)
+            ams.append(0)
+            deltas.append(deltas[-1] if deltas else max(1, t - prev_t))
+            break
         pms.append(p)
         ams.append(a)
         deltas.append(max(1, t - prev_t))

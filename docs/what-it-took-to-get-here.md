@@ -2,6 +2,32 @@
 
 Cue the song "Take Me Baby" by Mickey B.
 
+## 0.9.40
+
+The vibrato macro was a one-way door: it turned on and never off.
+
+- **The driver's PMS reset is now kept.** `_flush_pms_ramp` used to drop the
+  trailing `0` ("the driver resets PMS before the next key-on"), but a Furnace
+  macro holds its last value, so an instrument that enabled PMS mid-song kept
+  the wobble for the rest of the track. Hyper Duel "Buster Gear / Cyber Fleet"
+  is the witness: the source writes PMS 6 for ~1.1 s on channels 1/6/8 and
+  then 0, and the export never wrote the 0. The reset is now the macro's final
+  step, so the vibrato stops with the source (23.9 s of source vibrato vs
+  20.5 s in the export instead of running to the end of the song).
+- **Known limit.** A macro step cannot exceed 255 ticks, and the ramp speed is
+  one value for the whole macro, so a single hold longer than 255 ticks (Hyper
+  Duel's is ~1150 ticks at 510 Hz) is still shortened. Repetition was tried and
+  overshot, so the clamp stays.
+- **Known limit.** PMS/AMS is a per-instrument macro and `FMPatch.identity()`
+  clusters by timbre only, so a channel that shares a patch with a vibrato lead
+  but never enables PMS still gets the macro (Hyper Duel ch4 shows 2.0 s the
+  source does not have). Splitting the patch by vibrato behaviour is the fix;
+  it has not been done.
+- **`--verify` is now authoritative, not the heuristic.** Under verify a factor
+  is blocked only by the counters the render cannot see (dropped note, swallowed
+  note-off, evicted sample, lost effect) or by an added render divergence; the
+  sweep/fade counters become advisory because the render already measures them.
+
 ## 0.9.39
 
 The TUI's default conversion now hands back the readable renditions too, and
@@ -21,17 +47,6 @@ the folder says which ones survived.
 - **`reconvert_all.py --optimize lossless`.** The corpus re-run can now
   reproduce the optimised sets in place (`--verify` adds the acoustic gate),
   and `plan()` understands a tree that already has `default/` folders.
-- **The Starfield "rogue voice" is a glide, not a lost note.** On
-  Salamander's Starfield the whole divergence is ch5: the source rewrites
-  KC/KF every ~88 samples (~2 ms), a portamento ~30x finer than a row. x1
-  already bends it slightly; x2 emits two pitch writes per row, which reads as
-  a slightly different voice, and x4 doubles the step again. The fix is
-  sub-row slide effects on the row (`0xx/1xx/2xx/3xx`), a separate feature;
-  until then the 0.25 st verify gate keeps Starfield at 1x (4 -> 6 -> 9 -> 23
-  runs for 1x/2x/3x/4x), which is why the shipped default is stable even
-  though the condensed file would not be.
-- **Garegga 02 stays correct**: with `--verify` it lands on x3 (x3 = 1 run vs
-  x4 = 44), matching what the ear reports.
 
 ## 0.9.38
 
