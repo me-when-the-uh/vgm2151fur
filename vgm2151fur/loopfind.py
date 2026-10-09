@@ -33,7 +33,7 @@ from __future__ import annotations
 
 import math
 from collections import Counter, defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 NOTE_OFF = 180
 PERIODS = (4, 8, 12, 16)
@@ -458,6 +458,7 @@ def _phase_loop(
     last_row = max(row for row, _ch, _pitch in notes)
     if end < start or end > max(end_row, last_row) or start > max(end_row, last_row):
         return None
+    start, end = _seat_seam(_exact_rows(notes), start, end, 0, max(end_row, last_row), end_row)
     if start == loop_row and end == end_row:
         return None
     return LoopFix(
@@ -569,6 +570,64 @@ def _attack_agrees(by, command: int, ret: int, pedals: set[int]) -> int:
             if ch not in pedals:
                 right[ch].add(pc)
     return sum(1 for ch, pcs in left.items() if pcs & right.get(ch, frozenset()))
+
+
+# The cut may move this many rows either way when a different seat makes the
+# rows across the seam agree exactly. The end moves with the start, so the
+# played length never changes.
+SEAT_SHIFT = 2
+# Rows after the seam the seat compares. The attack is what the ear follows,
+# and the window must fit inside the log: the tail past the jump is the copy
+# the comparison needs, and comparing against the log's end proves nothing.
+SEAT_SPAN = 16
+
+
+def _exact_rows(notes: list[tuple[int, int, int]]) -> dict[int, set[tuple[int, int]]]:
+    """`row -> {(channel, pitch)}` at full pitch, for the seat comparison."""
+    by: dict[int, set[tuple[int, int]]] = defaultdict(set)
+    for row, ch, pitch in notes:
+        by[row].add((ch, pitch))
+    return by
+
+
+def _seat_cost(exact, start: int, end: int) -> int:
+    """Voices that play on one side of the seam but not the other.
+
+    The jump sits on `end`, so the row after it must be the loop's first
+    row. The rows have to agree at the row here, not a couple of rows off:
+    this measures what the module plays, while the fuzzy match only finds
+    the seam.
+    """
+    cost = 0
+    for offset in range(SEAT_SPAN):
+        left = exact.get(start + offset, frozenset())
+        right = exact.get(end + 1 + offset, frozenset())
+        cost += len(left ^ right)
+    return cost
+
+
+def _seat_seam(exact, start: int, end: int, lo: int, hi: int, content_end: int) -> tuple[int, int]:
+    """The seat whose rows agree exactly across the seam, when one exists.
+
+    Only a nearby seat that removes every disagreement wins, nearest first:
+    a thin improvement means the tail itself is not a row-exact copy, and
+    moving the cut on that evidence only trades one wobble for another. The
+    window must fit inside the log, so a tail that runs out at the jump
+    cannot pass on emptiness. A track whose rows already agree never moves.
+    """
+    if end + SEAT_SPAN > content_end:
+        return start, end
+    if _seat_cost(exact, start, end) == 0:
+        return start, end
+    for distance in range(1, SEAT_SHIFT + 1):
+        for moved in (distance, -distance):
+            if start + moved < lo or end + moved > hi:
+                continue
+            if end + moved + SEAT_SPAN > content_end:
+                continue
+            if _seat_cost(exact, start + moved, end + moved) == 0:
+                return start + moved, end + moved
+    return start, end
 
 
 def _phrase_seam(
@@ -692,6 +751,7 @@ def _phrase_seam(
     end = start + (ret - command) - 1
     if end <= start or end > end_row or start > end_row:
         return None
+    start, end = _seat_seam(_exact_rows(notes), start, end, 0, end_row, end_row)
     if start == loop_row and end == end_row:
         return None
     return LoopFix(
@@ -751,6 +811,24 @@ def row_to_sample(song, row: int) -> int:
     return song.t0 + int(math.floor(row * song.samples_per_row + 1e-6))
 
 
+def _declared_end_row(song, start_row: int) -> int | None:
+    """The jump row the declared loop length puts the wrap on.
+
+    The VGM header's loop length is the one iteration length the rip
+    vouches for, so the wrap sits exactly that many rows after the start
+    the fix chose, whatever the recorded content does around it. The
+    recording usually runs a little past it (the next iteration's head),
+    and those rows must stay outside the loop: a jump row carrying the
+    copy's notes plays them, and the seam strikes the head twice.
+    """
+    if not song.vgm.loop_samples or song.samples_per_row <= 0:
+        return None
+    length = int(round(song.vgm.loop_samples / song.samples_per_row))
+    if length < 2:
+        return None
+    return start_row + length - 1
+
+
 def apply_loop(song) -> str | None:
     """Move `song`'s loop onto the downbeat. None when the VGM has no loop.
 
@@ -779,6 +857,9 @@ def apply_loop(song) -> str | None:
     )
     if fix is None:
         return "loop kept"
+    declared = _declared_end_row(song, fix.start_row)
+    if declared is not None and declared != fix.end_row:
+        fix = replace(fix, end_row=declared)
     song.loop_sample = row_to_sample(song, fix.start_row)
     song.loop_end_sample = row_to_sample(song, fix.end_row)
     text = describe_fix(fix, loop_row)

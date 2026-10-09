@@ -31,6 +31,12 @@ from vgm2151fur.vgm import VGM_RATE, VgmFile
 # stay small and the tick rate stays sane for every driver unit we have seen.
 TARGET_TICK_SAMPLES = 90.0
 
+# Shortest row the grid will subdivide the measured 16th into.  Rows shorter
+# than this are what drive the row rate (and so the tracker's BPM: Furnace
+# shows 15 x rows/s) up to 2000+; lengthening the rows trades slide-rate-change
+# granularity for readability.  See `estimate_grid(min_row=...)`.
+MIN_ROW_SAMPLES = 280.0
+
 
 @dataclass
 class Grid:
@@ -127,7 +133,11 @@ def _lattice_coverage(deltas: list[int], t: float) -> float:
     return good / len(deltas) if deltas else 0.0
 
 
-def estimate_grid(vgm: VgmFile, *, min_confidence: float = 0.75) -> Grid | None:
+def estimate_grid(
+    vgm: VgmFile, *, min_confidence: float = 0.75,
+    tick_samples: float = TARGET_TICK_SAMPLES,
+    min_row: float = MIN_ROW_SAMPLES,
+) -> Grid | None:
     """Return the measured grid (a subdivided 16th note) or None.
 
     Drivers differ in which note value dominates (16ths, 8ths, swung pairs,
@@ -162,24 +172,52 @@ def estimate_grid(vgm: VgmFile, *, min_confidence: float = 0.75) -> Grid | None:
     folded_scored: list[tuple[float, float]] = []
     for c in candidates:
         t = _refine_unit(deltas, c)
-        if not (800.0 <= t <= 8000.0):
-            # A slow track's *fastest* note value can still be longer than a
-            # 16th note: Sega System 16C shop/ending themes run 9.5k-19k
-            # samples per melodic event.  Fold by halves back into the band so
-            # the rows can subdivide it (a 15 rows/s fallback cannot carry the
-            # driver's per-frame pitch writes).  Only used when no in-band
-            # candidate explains the stream, and only when the folded unit
-            # really fits the intervals, or noise would become a grid.
-            folded = t
-            while folded > 8000.0:
-                folded /= 2.0
-            if folded < 800.0:
-                continue
+        if 800.0 <= t <= 8000.0:
+            scored.append((t, _lattice_coverage(deltas, t)))
+            continue
+        if t < 800.0:
+            continue
+        # Out of band, too coarse.  A slow track's *fastest* note value can
+        # still be longer than a 16th note: Sega System 16C shop/ending themes
+        # run 9.5k-19k samples per melodic event.  Fold by halves back into
+        # the band so the rows can subdivide it (a 15 rows/s fallback cannot
+        # carry the driver's per-frame pitch writes).  Only used when no
+        # in-band candidate explains the stream, and only when the folded unit
+        # really fits the intervals, or noise would become a grid.
+        folded = t
+        while folded > 8000.0:
+            folded /= 2.0
+        recovered: list[tuple[float, float]] = []
+        if folded >= 800.0:
             cov = _lattice_coverage(deltas, folded)
             if cov >= 0.8:
-                folded_scored.append((folded, cov))
-            continue
-        scored.append((t, _lattice_coverage(deltas, t)))
+                recovered.append((folded, cov))
+        if not recovered:
+            # Half-folding fails when the mode/median sits on a *multiple* of
+            # the row unit - a melody that moves in 8ths, quarters or whole
+            # bars most of the time - so the unit is c/2, c/3, ... rather than
+            # c/2^n.  Ninja Spirit "Iza (Title)" and The Final Round "You Are
+            # Perfect" both did this and fell to the 60 Hz fallback with the
+            # notes misplaced.  Divide the raw candidate back down and demand
+            # a tight fit *and* that the unit is not far finer than the
+            # shortest gap seen: a divided noise unit fits the loose 0.8 bar
+            # (the estimator's pseudorandom fixture did) but describes a grid
+            # no note ever lands on.
+            shortest = min(deltas)
+            for div in (2, 3, 4, 5, 6, 7, 8):
+                sub = c / div
+                if sub < 800.0:
+                    continue
+                ts = _refine_unit(deltas, sub)
+                if not (800.0 <= ts <= 8000.0):
+                    continue
+                if shortest > 2.0 * ts:
+                    continue
+                cov = _lattice_coverage(deltas, ts)
+                if cov >= 0.9:
+                    recovered.append((ts, cov))
+        if recovered:
+            folded_scored.append(max(recovered))
     if not scored:
         scored = folded_scored
     if not scored:
@@ -206,11 +244,11 @@ def estimate_grid(vgm: VgmFile, *, min_confidence: float = 0.75) -> Grid | None:
         unit, best_conf = max(near)
     subdiv = 1
     for n in (8, 4, 2):
-        if unit / n >= 280.0:
+        if unit / n >= min_row:
             subdiv = n
             break
     row = unit / subdiv
-    speed = max(1, min(255, int(round(row / TARGET_TICK_SAMPLES))))
+    speed = max(1, min(255, int(round(row / tick_samples))))
     # EDxx must stay below the row's tick count (strict delay policy), and the
     # tick rate has to stay a sane "song hz" for the tracker UI.
     while speed > 1 and row / speed < 40.0:
@@ -242,6 +280,7 @@ def refine_pcm_grid(
     subdiv: int,
     extent: int,
     gaps: list[int],
+    tick_samples: float = TARGET_TICK_SAMPLES,
 ) -> tuple[float, int, int, str]:
     """Shrink the row so each same-voice restart the order budget can hold
     lands on its own row.
@@ -262,7 +301,7 @@ def refine_pcm_grid(
     if need >= row - 0.5:
         return hz, speed, subdiv, ""
     target = max(finest, need - 1.0)
-    new_speed = max(1, min(255, int(round(target / TARGET_TICK_SAMPLES))))
+    new_speed = max(1, min(255, int(round(target / tick_samples))))
     while new_speed > 1 and target / new_speed < 40.0:
         new_speed //= 2
     new_hz = VGM_RATE * new_speed / target

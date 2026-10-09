@@ -17,7 +17,14 @@ if str(ROOT) not in sys.path:
 from vgm2151fur.analyze import NoteEvent, Song, analyze  # noqa: E402
 from vgm2151fur.furio import parse_fur  # noqa: E402
 from vgm2151fur.furwrite import write_fur  # noqa: E402
-from vgm2151fur.loopfind import apply_loop, find_loop, row_to_sample  # noqa: E402
+from vgm2151fur.loopfind import (  # noqa: E402
+    _exact_rows,
+    _seat_cost,
+    _seat_seam,
+    apply_loop,
+    find_loop,
+    row_to_sample,
+)
 from vgm2151fur.vgm import VgmFile, load_vgm  # noqa: E402
 
 RIP = Path(__file__).resolve().parents[2]
@@ -162,6 +169,53 @@ class TestFindLoop(unittest.TestCase):
         self.assertEqual(fix.end_row - fix.start_row, end_row - loop_row)
 
 
+class TestSeatSeam(unittest.TestCase):
+    """The cut moves only to a neighbour whose rows across the seam match.
+
+    The rows pair up `loop length` apart whatever the seat is, so a move
+    never changes which rows face each other - it changes which pairs sit
+    right after the jump. Only an exact window earns that move.
+    """
+
+    @staticmethod
+    def _content(strays: int = 0, span: int = 40):
+        # Content repeating every `span` rows: row x copies to x + span.
+        # `strays` extra notes at the window start have no copy in the tail.
+        notes = [(row, 0, 48 + (row % span) // 4) for row in range(100, 180) if row % 4 == 0]
+        notes += [(row, 1, 60 + row) for row in range(100, 100 + strays)]
+        return _exact_rows(notes)
+
+    def test_the_cost_counts_voices_that_miss_across_the_seam(self):
+        exact = self._content()
+        self.assertEqual(_seat_cost(exact, 100, 139), 0)
+        strayed = self._content(strays=1)
+        self.assertEqual(_seat_cost(strayed, 100, 139), 1)
+
+    def test_a_seat_with_an_exact_window_moves_with_its_end(self):
+        # Pairs (100, 140) and (101, 141) miss; two rows later every pair
+        # in the window is exact, so the cut moves and the end follows.
+        exact = self._content(strays=2)
+        self.assertEqual(_seat_seam(exact, 100, 139, 0, 10_000, 176), (102, 141))
+
+    def test_a_thin_improvement_leaves_the_seat_alone(self):
+        # One stray still faces the window from two rows later. A thinner
+        # mismatch is the tail itself, not the seat, and moving would only
+        # drag the wobble along.
+        exact = self._content(strays=3)
+        self.assertEqual(_seat_seam(exact, 100, 139, 0, 10_000, 176), (100, 139))
+
+    def test_no_tail_past_the_jump_leaves_the_seat_alone(self):
+        # The window has to fit inside the log. Comparing against the end
+        # of the track proves nothing, so no move is made on it.
+        exact = self._content(strays=2)
+        self.assertEqual(_seat_seam(exact, 100, 139, 0, 10_000, 150), (100, 139))
+
+    def test_the_end_never_leaves_the_log(self):
+        # The winning seat would put the jump past the last content row.
+        exact = self._content(strays=2)
+        self.assertEqual(_seat_seam(exact, 100, 139, 0, 140, 176), (100, 139))
+
+
 class TestApplyAndWrite(unittest.TestCase):
     def test_adjusted_end_is_where_bxx_sits(self):
         # speed 1 at 60 Hz is 735 samples/row. Rows 0, 16 and 40 carry notes.
@@ -240,7 +294,10 @@ class TestFixtureLoops(unittest.TestCase):
         song, text = self._loop(QUARTH)
         self.assertEqual(text, "loop -1/8 (-17 rows)")
         self.assertEqual(song.row_of(song.loop_sample), 33)
-        self.assertEqual(song.row_of(song.loop_end_sample), 3626)
+        # The wrap sits one declared loop length after the new start. The
+        # shorter last-content end restarted the loop two rows early and
+        # put the copy of the head's chord on the jump row.
+        self.assertEqual(song.row_of(song.loop_end_sample), 3627)
 
     def test_game_bgm1_opens_on_the_sample_chord(self):
         # The VGM marker sits inside the first loop phrase. The phrase's own

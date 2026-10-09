@@ -66,14 +66,23 @@ def select_tracks(files: list[Path], single_track: str | int | None) -> list[Pat
     return hit
 
 
-def report_vgm(path: Path, *, speed: int | None = None, pcm: bool = True) -> str:
+def report_vgm(
+    path: Path, *, speed: int | None = None, pcm: bool = True,
+    tick_samples: float | None = None, min_row: float | None = None,
+) -> str:
     vgm = load_vgm(path)
-    song = analyze(vgm, speed=speed, pcm=pcm)
+    song = analyze(vgm, speed=speed, pcm=pcm, tick_samples=tick_samples, min_row=min_row)
     return format_report(song)
 
 
-def _report_one(path_str: str, speed: int | None, pcm: bool) -> str:
-    return report_vgm(Path(path_str), speed=speed, pcm=pcm)
+def _report_one(
+    path_str: str, speed: int | None, pcm: bool,
+    tick_samples: float | None, min_row: float | None,
+) -> str:
+    return report_vgm(
+        Path(path_str), speed=speed, pcm=pcm,
+        tick_samples=tick_samples, min_row=min_row,
+    )
 
 
 def report_files(
@@ -81,6 +90,8 @@ def report_files(
     *,
     speed: int | None = None,
     pcm: bool = True,
+    tick_samples: float | None = None,
+    min_row: float | None = None,
     workers: int | None = None,
     log=print,
 ) -> Iterator[tuple[Path, str | None, str | None]]:
@@ -96,13 +107,19 @@ def report_files(
         with low_priority():
             for f in files:
                 try:
-                    yield f, report_vgm(f, speed=speed, pcm=pcm), None
+                    yield f, report_vgm(
+                        f, speed=speed, pcm=pcm,
+                        tick_samples=tick_samples, min_row=min_row,
+                    ), None
                 except Exception as exc:
                     yield f, None, str(exc)
         return
     log(f"workers: {n_workers} ({note})")
     with ProcessPoolExecutor(max_workers=n_workers, initializer=set_low_priority) as pool:
-        futs = [pool.submit(_report_one, str(f), speed, pcm) for f in files]
+        futs = [
+            pool.submit(_report_one, str(f), speed, pcm, tick_samples, min_row)
+            for f in files
+        ]
         for f, fut in zip(files, futs):
             try:
                 yield f, fut.result(), None
@@ -121,12 +138,14 @@ def convert_vgm(
     *,
     speed: int | None = None,
     pcm: bool = True,
+    tick_samples: float | None = None,
+    min_row: float | None = None,
     include_fm: bool = True,
     normalize: bool = False,
     loop_find: bool = True,
 ) -> dict:
     vgm = load_vgm(path)
-    song = analyze(vgm, speed=speed, pcm=pcm)
+    song = analyze(vgm, speed=speed, pcm=pcm, tick_samples=tick_samples, min_row=min_row)
     loop_note = None
     if loop_find:
         loop_note = apply_loop(song)
@@ -195,13 +214,16 @@ def _worker(path_str: str) -> dict:
         Path(_CFG["out_dir"]) / (src.stem + ".fur"),
         speed=_CFG["speed"],
         pcm=_CFG["pcm"],
+        tick_samples=_CFG["tick_samples"],
+        min_row=_CFG["min_row"],
         include_fm=_CFG["include_fm"],
         normalize=_CFG["normalize"],
         loop_find=_CFG["loop_find"],
     )
 
 
-def _convert_serial(files, out_dir, speed, pcm, include_fm, normalize, loop_find):
+def _convert_serial(files, out_dir, speed, pcm, tick_samples, min_row,
+                    include_fm, normalize, loop_find):
     for f in files:
         try:
             info = convert_vgm(
@@ -209,6 +231,8 @@ def _convert_serial(files, out_dir, speed, pcm, include_fm, normalize, loop_find
                 out_dir / (f.stem + ".fur"),
                 speed=speed,
                 pcm=pcm,
+                tick_samples=tick_samples,
+                min_row=min_row,
                 include_fm=include_fm,
                 normalize=normalize,
                 loop_find=loop_find,
@@ -225,6 +249,8 @@ def convert_folder(
     *,
     speed: int | None = None,
     pcm: bool = True,
+    tick_samples: float | None = None,
+    min_row: float | None = None,
     include_fm: bool = True,
     normalize: bool = False,
     loop_find: bool = True,
@@ -245,6 +271,7 @@ def convert_folder(
             with low_priority():
                 yield from _convert_serial(
                     files, out_dir, speed=speed, pcm=pcm,
+                    tick_samples=tick_samples, min_row=min_row,
                     include_fm=include_fm, normalize=normalize,
                     loop_find=loop_find,
                 )
@@ -254,6 +281,8 @@ def convert_folder(
             "out_dir": str(out_dir),
             "speed": speed,
             "pcm": pcm,
+            "tick_samples": tick_samples,
+            "min_row": min_row,
             "include_fm": include_fm,
             "normalize": normalize,
             "loop_find": loop_find,

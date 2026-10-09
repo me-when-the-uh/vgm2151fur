@@ -34,6 +34,32 @@ RMS): Genpei "14 Game Over" now tracks the source within ~1 dB from onset to
 release. Before, the export sat ~55 dB low through the rip's fade-in, was offset
 1.5 s, and held ~50 dB loud through the fade-out.
 
+- **A seat for the loop cut, chosen on the written rows.** Rows across a
+  loop's seam pair up one loop length apart whatever the cut row is, so the
+  seat only decides which pairs sit right after the jump. The finder now
+  compares the rows after the jump against the loop's first rows at the row
+  (full pitch, no tolerance) and moves the cut one or two rows - the end
+  moving with it - only when a neighbour makes the whole window exact. The
+  comparison window has to fit inside the log, so a tail that runs out at the
+  jump cannot pass on emptiness, and a tail that is not a row-exact copy
+  keeps the seat its copy was verified on. Every fixture loop keeps its seat;
+  the pass only catches cuts that sat beside an exact one.
+
+- **The wrap sits one declared loop length after the new start.** The order
+  cut moved both ends and the end came from the last row of the log, which
+  is not always the loop's own end: Salamander "05 Starfield" and Quarth
+  "03 BGM 1" record one iteration plus the head of the next, so the last
+  rows are the copy of the loop's own head. Starfield's jump row carried
+  the copy of the downbeat chord (the seam struck it twice) and Quarth
+  restarted two rows early. The jump now sits exactly the header's declared
+  loop length after the fixed start, so the recording's overshoot stays
+  outside the loop; the last-content end only applies when the stream
+  declares no length. Starfield: jump 2555 -> 2554, the copy chord at 2555
+  never plays, loop 2049 rows; Quarth: 3626 -> 3627, the wrap on the
+  declared 3595 rows with the final release playing. HAWK (199/7405), Map
+  Mode A (102/2405), Genpei 03 and every kept marker are unchanged; Genpei
+  06 and 07 wrap 7 and 4 rows later, onto their declared boundary.
+
 ## 0.9.36
 
 Loop finding keeps the loop length the VGM header gave the track. The seam

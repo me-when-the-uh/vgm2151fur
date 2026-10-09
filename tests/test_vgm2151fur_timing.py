@@ -116,6 +116,22 @@ class TestEstimateGrid(unittest.TestCase):
             onsets.append((t, k % 4))
         self.assertIsNone(estimate_grid(_vgm_with_keyons(onsets)))
 
+    def test_multiple_dominated_lattice_recovers_the_unit(self):
+        # A melody that mostly walks in 3-unit steps makes the mode 3x the row
+        # unit (8400 = 3 x 2800), past the 16th-note band.  Halving cannot fit
+        # it (5600 and 11200 are not halves), so the estimator has to divide
+        # the candidate back down instead of giving up and letting the caller
+        # fall back to the 60 Hz grid (Iza (Title), You Are Perfect).
+        gaps = [8400, 8400, 5600, 11200, 8400, 2800]
+        onsets = []
+        t = 0
+        for k in range(60):
+            onsets.append((t, 0))
+            t += gaps[k % len(gaps)]
+        grid = estimate_grid(_vgm_with_keyons(onsets))
+        self.assertIsNotNone(grid)
+        self.assertAlmostEqual(grid.unit, 2800.0, delta=60.0)
+
     def test_slow_unit_is_folded_not_dropped(self):
         # Sega System 16C shop/ending themes: the fastest melodic event on a
         # channel is 9560 samples (and often 2x that), well past the 16th-note

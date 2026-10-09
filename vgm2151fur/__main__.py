@@ -176,6 +176,17 @@ def _merge_groups(groups: list[tuple[list[Path], Path]]) -> list[tuple[list[Path
     return [(merged[str(dest).lower()], dest) for dest in order]
 
 
+def _min_row_for_bpm(max_bpm: float | None) -> float | None:
+    """Row length (samples) whose row rate makes Furnace show `max_bpm`.
+
+    Furnace's BPM is 60*hz/(hilight*speed) with hilight 4, which is
+    15 * rows/s = 15 * (44100 / row).  So row = 661500 / bpm.
+    """
+    if not max_bpm or max_bpm <= 0:
+        return None
+    return 15.0 * 44100.0 / max_bpm
+
+
 def _convert(args) -> int:
     paths, rc = _resolve(_tokens(args.input))
     if not paths:
@@ -195,6 +206,7 @@ def _convert(args) -> int:
             dest,
             speed=args.speed,
             pcm=pcm,
+            min_row=_min_row_for_bpm(args.max_bpm),
             include_fm=include_fm,
             normalize=not args.no_normalize,
             loop_find=not args.no_loop_find,
@@ -248,6 +260,7 @@ def _report(args) -> int:
     if direct_all:
         for src, text, error in report_files(
             dedupe(direct_all), speed=args.speed, workers=args.workers,
+            min_row=_min_row_for_bpm(args.max_bpm),
         ):
             if error is not None:
                 print(f"ERROR {src.name}: {error}", file=sys.stderr)
@@ -351,6 +364,13 @@ def _render(args) -> int:
 def _add_convert_flags(parser: argparse.ArgumentParser, *, bare: bool) -> None:
     parser.add_argument("-o", "--out", help="output folder (default: <input>/fur)")
     parser.add_argument("--speed", type=int, default=None, help="ticks per row (default: auto)")
+    parser.add_argument(
+        "--max-bpm", type=float, default=None,
+        help="cap the tracker BPM (Furnace shows 15 x rows/s) by using the "
+             "coarsest row grid under the cap; halving it halves the row rate. "
+             "Slides change rate at most once per row, so a lower cap trades "
+             "slide detail for readability",
+    )
     parser.add_argument("--workers", type=int, default=None, help=_WORKERS_HELP)
     parser.add_argument("--melody-only", action="store_true", help="skip sample chips")
     parser.add_argument("--pcm-only", action="store_true", help="skip the YM2151")
@@ -396,6 +416,7 @@ def build_parser() -> argparse.ArgumentParser:
     report = sub.add_parser("report", help="print the analysis of a VGM without writing")
     report.add_argument("input", nargs="+", metavar="PATH", help="VGM/VGZ file or folder")
     report.add_argument("--speed", type=int, default=None)
+    report.add_argument("--max-bpm", type=float, default=None)
     report.add_argument("--workers", type=int, default=None, help=_WORKERS_HELP)
 
     edit = sub.add_parser("edit", help="list or change .fur chip volumes")

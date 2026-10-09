@@ -28,7 +28,12 @@ from vgm2151fur.oki import (
 )
 from vgm2151fur.pcm import PcmSample, build_pcm_bank, pitch_to_note, rate_to_note
 from vgm2151fur.segapcm import SegapcmSample, collect_segapcm, segapcm_rate
-from vgm2151fur.timing import estimate_grid, refine_pcm_grid
+from vgm2151fur.timing import (
+    MIN_ROW_SAMPLES,
+    TARGET_TICK_SAMPLES,
+    estimate_grid,
+    refine_pcm_grid,
+)
 from vgm2151fur.vgm import VGM_RATE, VgmFile
 
 
@@ -544,7 +549,13 @@ def _finalize_sweep(
         ev.sweep = deltas
 
 
-def analyze(vgm: VgmFile, *, speed: int | None = None, pcm: bool = True) -> Song:
+def analyze(
+    vgm: VgmFile, *, speed: int | None = None, pcm: bool = True,
+    tick_samples: float | None = None,
+    min_row: float | None = None,
+) -> Song:
+    tick = TARGET_TICK_SAMPLES if tick_samples is None else float(tick_samples)
+    row_floor = MIN_ROW_SAMPLES if min_row is None else float(min_row)
     ym = YM2151State()
     patches: dict[tuple, FMPatch] = {}
     patch_order: list[tuple] = []
@@ -806,7 +817,7 @@ def analyze(vgm: VgmFile, *, speed: int | None = None, pcm: bool = True) -> Song
         hz = 60.0
         use_speed = speed
     else:
-        grid = estimate_grid(vgm)
+        grid = estimate_grid(vgm, tick_samples=tick, min_row=row_floor)
         if grid is not None:
             hz = grid.hz
             use_speed = grid.speed
@@ -1185,7 +1196,7 @@ def analyze(vgm: VgmFile, *, speed: int | None = None, pcm: bool = True) -> Song
     if pcm_gaps:
         extent = vgm.total_samples or max((e.sample for e in events), default=0)
         new_hz, new_speed, new_sub, pcm_note = refine_pcm_grid(
-            hz, use_speed, row_subdiv, extent, pcm_gaps,
+            hz, use_speed, row_subdiv, extent, pcm_gaps, tick_samples=tick,
         )
         if pcm_note:
             hz, use_speed, row_subdiv = new_hz, new_speed, new_sub
