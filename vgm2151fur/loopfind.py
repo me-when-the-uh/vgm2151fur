@@ -32,6 +32,7 @@ same distance before the returned copy.
 from __future__ import annotations
 
 import math
+from bisect import bisect_left
 from collections import Counter, defaultdict
 from dataclasses import dataclass, replace
 
@@ -811,6 +812,199 @@ def row_to_sample(song, row: int) -> int:
     return song.t0 + int(math.floor(row * song.samples_per_row + 1e-6))
 
 
+# A seat for the wrap, checked against the recording's own copy of the loop
+# head. The last pass drifts a row or two, and a whole figure can land late.
+# A note's copy is searched within _COPY_DRIFT rows. _COPY_DRIFT_WIDE is the
+# drift that still counts as the same music when a start is judged on its
+# own: a pick that fails at this width is not a copy of anything.
+_COPY_DRIFT = 3
+_COPY_DRIFT_WIDE = 8
+# The copy window in rows, the share of each side that has to agree, and the
+# thin-window floor: a handful of notes is not evidence. The wide drift is
+# used when a start is judged on its own, where a note or two of the drift
+# can still go missing.
+_COPY_SPAN = 96
+_COPY_SHARE = 0.95
+_COPY_SHARE_WIDE = 0.90
+_COPY_MIN_EVENTS = 4
+# A pick this far past the last recorded copy row has no copy of its own.
+# A few rows of overshoot still reads the stretch behind it.
+_COPY_EDGE = 3
+
+
+def _copy_index(notes) -> dict[tuple[int, int], list[int]]:
+    """(channel, pitch) -> rows, for the copy comparison."""
+    by: dict[tuple[int, int], list[int]] = defaultdict(list)
+    for row, ch, pitch in notes:
+        by[(ch, pitch)].append(row)
+    for rows in by.values():
+        rows.sort()
+    return by
+
+
+def _copy_shares(by, start: int, length: int, end_row: int, drift: int):
+    """Matched and total notes each way over the recorded copy.
+
+    Forward counts the start's own notes that come back one loop length
+    later. Backward counts the copy's notes that the start accounts for. The
+    comparison stops where the recording does: past the declared end there is
+    no copy to check against.
+    """
+    head_end = min(start + _COPY_SPAN, end_row - length + 1)
+    copy_end = min(start + length + _COPY_SPAN, end_row + 1)
+    fwd = total_fwd = 0
+    for rows in by.values():
+        i = bisect_left(rows, start)
+        while i < len(rows) and rows[i] < head_end:
+            total_fwd += 1
+            target = rows[i] + length
+            j = bisect_left(rows, target - drift)
+            if j < len(rows) and rows[j] <= target + drift:
+                fwd += 1
+            i += 1
+    back = total_back = 0
+    for rows in by.values():
+        i = bisect_left(rows, start + length)
+        while i < len(rows) and rows[i] < copy_end:
+            total_back += 1
+            target = rows[i] - length
+            j = bisect_left(rows, target - drift)
+            if j < len(rows) and rows[j] <= target + drift:
+                back += 1
+            i += 1
+    return fwd, total_fwd, back, total_back
+
+
+def _copy_faithful(by, start: int, length: int, end_row: int, drift: int,
+                   share: float = _COPY_SHARE) -> bool:
+    fwd, total_fwd, back, total_back = _copy_shares(by, start, length, end_row, drift)
+    if total_fwd < _COPY_MIN_EVENTS or total_back < _COPY_MIN_EVENTS:
+        return False
+    return fwd >= total_fwd * share and back >= total_back * share
+
+
+def _copy_period(by, start: int, length: int, end_row: int,
+                 drift: int) -> int | None:
+    """The row displacement the recording's copy of the head measures.
+
+    Every matched pair contributes its own displacement. The copy's period is
+    the one most pairs agree on. None when there are too few pairs to tell
+    """
+    counts: dict[int, int] = defaultdict(int)
+    head_end = min(start + _COPY_SPAN, end_row - length + 1)
+    for rows in by.values():
+        i = bisect_left(rows, start)
+        while i < len(rows) and rows[i] < head_end:
+            target = rows[i] + length
+            j = bisect_left(rows, target - drift)
+            if j < len(rows) and rows[j] <= target + drift:
+                counts[rows[j] - rows[i]] += 1
+            i += 1
+    if not counts:
+        return None
+    period, pairs = max(sorted(counts.items()), key=lambda kv: kv[1])
+    return period if pairs >= _COPY_MIN_EVENTS else None
+
+
+def _copy_head_start(by, samples_at, chan_at, start: int, length: int,
+                     drift: int, span: int = 8) -> tuple[int, int | None]:
+    """The row in front of `start` the recording's copy replays, plus the
+    first sample of that copy.
+
+    Rows ahead of the VGM marker are intro material only while nothing brings
+    them back. When the copy at the tail sounds a row again, one loop later,
+    the loop opens on it, and the copy's own first sample pins the wrap.
+    Empty rows do not end the walk (a pickup can be followed by rests); a row
+    the copy does not answer does. Slides move their carriers' pitches while
+    the copy runs, so a row also counts as answered when most of its channels
+    sound inside the copy's window.
+    """
+    first: int | None = None
+    moved = False
+    chan_rows: dict[int, list[int]] = defaultdict(list)
+    for (ch, _pitch), rows in by.items():
+        chan_rows[ch].extend(rows)
+    for rows in chan_rows.values():
+        rows.sort()
+    for row in range(start - 1, max(-1, start - 1 - span), -1):
+        cells = [key for key, rows in by.items() if row in rows]
+        if not cells:
+            continue
+        target = row + length
+        hits = 0
+        chans: set[int] = set()
+        chan_hits = 0
+        for key in cells:
+            rows = by[key]
+            i = bisect_left(rows, target - drift)
+            ok = i < len(rows) and rows[i] <= target + drift
+            ch = key[0]
+            if ok:
+                sample = samples_at.get((rows[i], ch, key[1]))
+                if sample is None:
+                    sample = chan_at.get((rows[i], ch))
+                if sample is not None and (first is None or sample < first):
+                    first = sample
+            hits += int(ok)
+            if ch not in chans:
+                chans.add(ch)
+                rowsi = chan_rows[ch]
+                j = bisect_left(rowsi, target - drift)
+                if j < len(rowsi) and rowsi[j] <= target + drift:
+                    chan_hits += 1
+        if hits * 3 >= len(cells) * 2 or (
+            len(chans) >= 4 and chan_hits * 4 >= len(chans) * 3
+        ):
+            start = row
+            moved = True
+        else:
+            break
+    return start, (first if moved else None)
+
+
+def _copy_aligned(notes, picked: int, end_row: int, length: int | None,
+                  window: int) -> int:
+    """The start the recording's own copy puts the wrap on.
+
+    The rows past the declared loop end are the copy of the loop's first
+    rows. The wrap belongs where that copy lines up. A pick below the
+    verified stretch wraps into rows the copy does not answer, and the notes
+    after the loop point are then not the ones the source plays there. A pick
+    a few rows past the last recorded copy row still reads the stretch
+    behind it; further out there is no evidence either way and the pick
+    stands.
+    """
+    if length is None or length < 16:
+        return picked
+    by = _copy_index(notes)
+    top = end_row - length
+    stretch = None
+    for start in range(top, max(-1, top - window), -1):
+        if start < 0:
+            break
+        if _copy_faithful(by, start, length, end_row, _COPY_DRIFT):
+            stretch = start
+    if stretch is None:
+        return picked
+    if picked <= top:
+        if picked < stretch and not _copy_faithful(
+            by, picked, length, end_row, _COPY_DRIFT_WIDE, _COPY_SHARE_WIDE
+        ):
+            return stretch
+        return picked
+    if picked <= top + _COPY_EDGE:
+        return stretch
+    return picked
+
+
+def _declared_length(song) -> int | None:
+    """The VGM header's loop length in rows."""
+    if not song.vgm.loop_samples or song.samples_per_row <= 0:
+        return None
+    length = int(round(song.vgm.loop_samples / song.samples_per_row))
+    return length if length >= 2 else None
+
+
 def _declared_end_row(song, start_row: int) -> int | None:
     """The jump row the declared loop length puts the wrap on.
 
@@ -821,10 +1015,8 @@ def _declared_end_row(song, start_row: int) -> int | None:
     and those rows must stay outside the loop: a jump row carrying the
     copy's notes plays them, and the seam strikes the head twice.
     """
-    if not song.vgm.loop_samples or song.samples_per_row <= 0:
-        return None
-    length = int(round(song.vgm.loop_samples / song.samples_per_row))
-    if length < 2:
+    length = _declared_length(song)
+    if length is None:
         return None
     return start_row + length - 1
 
@@ -855,13 +1047,74 @@ def apply_loop(song) -> str | None:
     fix = find_loop(
         notes, loop_row=loop_row, end_row=end_row, forward_rows=forward,
     )
+    picked = fix.start_row if fix is not None else loop_row
+    start_row = _copy_aligned(
+        notes, picked, end_row, _declared_length(song), forward,
+    )
+    head_sample: int | None = None
     if fix is None:
-        return "loop kept"
+        # Rows ahead of the marker are intro material only while nothing
+        # brings them back; the copy settles where the loop opens even when
+        # no other pick was found. (A pick the copy already settled is past
+        # this point and keeps its seat.)
+        length = _declared_length(song)
+        if length is not None:
+            samples_at: dict[tuple[int, int, int], int] = {}
+            chan_at: dict[tuple[int, int], int] = {}
+            for ev in song.events:
+                if ev.on and 0 <= ev.note < NOTE_OFF:
+                    key = (song.row_of(ev.sample), ev.ch, ev.note)
+                    prev = samples_at.get(key)
+                    if prev is None or ev.sample < prev:
+                        samples_at[key] = ev.sample
+                    ckey = (key[0], ev.ch)
+                    prev = chan_at.get(ckey)
+                    if prev is None or ev.sample < prev:
+                        chan_at[ckey] = ev.sample
+            start_row, head_sample = _copy_head_start(
+                _copy_index(notes), samples_at, chan_at, start_row, length,
+                _COPY_DRIFT,
+            )
+        if start_row == loop_row:
+            return "loop kept"
+        fix = LoopFix(
+            start_row=start_row, end_row=start_row, period=0, shift_pulses=0,
+            step_rows=1,
+        )
+    elif start_row != fix.start_row:
+        fix = replace(fix, start_row=start_row)
     declared = _declared_end_row(song, fix.start_row)
-    if declared is not None and declared != fix.end_row:
-        fix = replace(fix, end_row=declared)
-    song.loop_sample = row_to_sample(song, fix.start_row)
-    song.loop_end_sample = row_to_sample(song, fix.end_row)
+    if declared is not None:
+        wrap_row = declared
+        # The recording's own copy of the head measures the period. When it
+        # puts the wrap earlier than the header does, the header runs past
+        # the copy and the copy's first row would sound at the seam.
+        length = _declared_length(song)
+        by = _copy_index(notes)
+        if _copy_faithful(by, fix.start_row, length, end_row, _COPY_DRIFT):
+            period = _copy_period(by, fix.start_row, length, end_row, _COPY_DRIFT)
+            if period is not None and period < length:
+                wrap_row = fix.start_row + period - 1
+        elif head_sample is not None:
+            # The copy's own first sample says where the wrap belongs: the
+            # row before it.
+            wrap_row = max(fix.start_row, int(head_sample / song.samples_per_row) - 1)
+        if wrap_row != fix.end_row:
+            fix = replace(fix, end_row=wrap_row)
+    # A tenth of a row inside the row: every row rate reads the point as the
+    # row the loop opens on, not the row below.
+    nudge = int(song.samples_per_row / 10)
+    song.loop_sample = row_to_sample(song, fix.start_row) + nudge
+    song.loop_end_sample = row_to_sample(song, fix.end_row) + nudge
+    # The wrap sample: content at or past it is the copy of the head and
+    # stays unwritten at every row rate. The tighter of the last row's end
+    # and the header's own one-period point. A copy that drifts a hair early
+    # still lands past this point, so the sliver of its first row that a
+    # condensed grid would fold back stays out.
+    cut = row_to_sample(song, fix.end_row + 1)
+    if song.vgm.loop_samples:
+        cut = min(cut, song.loop_sample + song.vgm.loop_samples)
+    song.loop_cut_sample = cut
     text = describe_fix(fix, loop_row)
     song.warnings.append(text)
     return text

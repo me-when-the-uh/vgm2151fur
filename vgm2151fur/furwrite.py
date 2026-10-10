@@ -1022,7 +1022,16 @@ def _build_patterns(song: Song, n_ch: int, pat_len: int, fx_cols: int, ch_offset
             last_sample = max(last_sample, ev.vol_pts[-1][0])
     for entry in (getattr(song, "channel_fx", ()) or ()):
         last_sample = max(last_sample, entry[0])
-    loop_row = song.row_of(song.loop_sample) if song.loop_sample is not None else 0
+    # An adjusted loop carries crafted sample points, read with the writer's
+    # own cell placement so every row rate opens on the same row. A raw VGM
+    # marker keeps the nearest-row reading.
+    adjusted = song.loop_sample is not None and song.loop_end_sample is not None
+    if song.loop_sample is None:
+        loop_row = 0
+    elif adjusted:
+        loop_row = song.place(song.loop_sample)[0]
+    else:
+        loop_row = song.row_of(song.loop_sample)
     if loop_row < 0:
         loop_row = 0
     # An adjusted loop ends on loop_end_sample. Content past that row is the
@@ -1030,10 +1039,16 @@ def _build_patterns(song: Song, n_ch: int, pat_len: int, fx_cols: int, ch_offset
     # absolute row Bxx sits on. The order walk below reuses the name end_row
     # for each order's bound, so the jump must keep this one.
     content_end = None
-    if song.loop_sample is not None and song.loop_end_sample is not None:
-        content_end = song.row_of(song.loop_end_sample)
+    content_cut = None
+    if adjusted:
+        content_end = song.place(song.loop_end_sample)[0]
         if content_end < loop_row:
             content_end = None
+        else:
+            # Notes at or past the wrap sample belong to the copy of the head
+            # that follows the loop in the recording, however a condensed
+            # grid would fold them back onto the wrap row.
+            content_cut = song.loop_cut_sample
     if content_end is not None:
         total_rows = content_end + 1
     else:
@@ -1072,6 +1087,8 @@ def _build_patterns(song: Song, n_ch: int, pat_len: int, fx_cols: int, ch_offset
         stats["rows"] = max(stats.get("rows", 0), total_rows)
 
     for sample, cmd, val in getattr(song, "chip_fx", ()) or ():
+        if content_cut is not None and sample >= content_cut:
+            continue
         row = song.row_of(sample)
         if row < 0 or row >= total_rows:
             continue
@@ -1084,6 +1101,8 @@ def _build_patterns(song: Song, n_ch: int, pat_len: int, fx_cols: int, ch_offset
     for sample, ch, cmd, val in getattr(song, "channel_fx", ()) or ():
         ch += ch_offset
         if ch < 0 or ch >= n_ch:
+            continue
+        if content_cut is not None and sample >= content_cut:
             continue
         row = song.row_of(sample)
         if row < 0 or row >= total_rows:
@@ -1116,6 +1135,8 @@ def _build_patterns(song: Song, n_ch: int, pat_len: int, fx_cols: int, ch_offset
     for ev in song.events:
         ev_ch = ev.ch + ch_offset
         if ev_ch < 0 or ev_ch >= n_ch:
+            continue
+        if content_cut is not None and ev.sample >= content_cut:
             continue
         if ev.on and ev.pcm:
             assigned = pcm_pos.get(id(ev))
@@ -1168,6 +1189,8 @@ def _build_patterns(song: Song, n_ch: int, pat_len: int, fx_cols: int, ch_offset
             else:
                 t0 = 0x7F
             for sample, tl in ev.tl_pts:
+                if content_cut is not None and sample >= content_cut:
+                    continue
                 row, _delay = song.place(sample, stats)
                 if row < 0 or row >= total_rows:
                     continue
@@ -1192,7 +1215,12 @@ def _build_patterns(song: Song, n_ch: int, pat_len: int, fx_cols: int, ch_offset
     sweep_e5: dict[tuple[int, int], int] = {}
     if song.events:
         for ev in song.events:
-            if ev.on and ev.sweep and 0 <= ev.ch + ch_offset < n_ch:
+            if (
+                ev.on
+                and ev.sweep
+                and 0 <= ev.ch + ch_offset < n_ch
+                and (content_cut is None or ev.sample < content_cut)
+            ):
                 if ch_offset:
                     _emit_sweep(grid, song, ev, fx_cols, total_rows, sweep_e5,
                                 note_rows, ev.ch + ch_offset, stats)
@@ -1212,6 +1240,8 @@ def _build_patterns(song: Song, n_ch: int, pat_len: int, fx_cols: int, ch_offset
                 continue
             last_pan = None if ev.no_pan else ev.pan
             for sample, value, pan in ev.vol_pts:
+                if content_cut is not None and sample >= content_cut:
+                    continue
                 row, _delay = song.place(sample, stats)
                 if row < 0 or row >= total_rows:
                     continue

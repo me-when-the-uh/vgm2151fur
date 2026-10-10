@@ -289,6 +289,10 @@ class Song:
     # Set by loop finding. The row `Bxx` jumps from. None keeps the jump on
     # the last content row, which is the VGM loop length.
     loop_end_sample: int | None = None
+    # The sample where the loop wraps, set with loop_end_sample. Notes at or
+    # past it are the recording's copy of the head and stay unwritten, at
+    # whichever row rate a rendition reads them.
+    loop_cut_sample: int | None = None
 
     @property
     def samples_per_row(self) -> float:
@@ -563,7 +567,16 @@ def analyze(
     tick_samples: float | None = None,
     min_row: float | None = None,
     condense: float = 1.0,
+    grid_cache: dict | None = None,
 ) -> Song:
+    """Build the Song for one rendition of `vgm`.
+
+    `grid_cache` memoises the grid estimate, which is the expensive part of
+    the call and does not depend on `condense` (the factor is applied to the
+    estimated grid afterwards). A caller that converts one track to several
+    factors passes the same dict every time and measures the track once. The
+    caller owns the dict, so it must not outlive the `vgm` it was built for.
+    """
     tick = TARGET_TICK_SAMPLES if tick_samples is None else float(tick_samples)
     row_floor = MIN_ROW_SAMPLES if min_row is None else float(min_row)
     ym = YM2151State()
@@ -1184,12 +1197,19 @@ def analyze(
         hz = 60.0
         use_speed = speed
     else:
-        grid = estimate_grid(vgm, tick_samples=tick, min_row=row_floor)
+        def _grid(kind: str, **kw):
+            """The grid estimate for the track, memoised across factors"""
+            key = (kind, tick, row_floor)
+            if grid_cache is None or key not in grid_cache:
+                found = estimate_grid(vgm, tick_samples=tick, min_row=row_floor, **kw)
+                if grid_cache is not None:
+                    grid_cache[key] = found
+                return found
+            return grid_cache[key]
+
+        grid = _grid("fm")
         if grid is None and pcm_onsets:
-            grid = estimate_grid(
-                vgm, tick_samples=tick, min_row=row_floor,
-                onsets=pcm_onsets, label="sample-trigger lattice",
-            )
+            grid = _grid("pcm", onsets=pcm_onsets, label="sample-trigger lattice")
         if grid is not None:
             hz = grid.hz
             use_speed = grid.speed

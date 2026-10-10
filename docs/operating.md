@@ -83,10 +83,13 @@ bars, moves it onto the downbeat. It also searches a window on either side of
 the marker (four seconds, or the whole loop when that is shorter) for the
 phrase start whose copy sits one loop length later, and moves the loop there:
 a marker that fell inside the phrase lands on the phrase's own head, and the
-loop keeps the length the VGM header declares. The jump sits exactly that many
-rows after the new start, so the recording's overshoot, the next iteration's
-own head, stays outside the loop; a jump row carrying notes would play them
-and strike the head twice at the seam. The loop opens one row before the first
+loop keeps the length the VGM header declares, unless the copy measures a
+shorter period, and then the wrap moves onto the copy's own row. The jump sits
+exactly one period after the new start, so the recording's overshoot, the next
+iteration's own head, stays outside the loop; a jump row carrying notes would
+play them and strike the head twice at the seam. Content at or past the wrap
+sample stays unwritten at every row rate, so a condensed grid cannot fold the
+copy's first row back onto the wrap row. The loop opens one row before the first
 commands, because a wider cut lands the seam on rows the log does not repeat
 exactly and the loop wobbles there. The cut is then seated: it moves a row or
 two only when a neighbouring seat lines the rows after the jump up exactly,
@@ -95,6 +98,12 @@ pairs sit right after it. A grid that does not repeat, or a loop with no
 phrase start in that window, keeps the VGM offset. `--no-loop-find` keeps it
 on every track. The convert line says `loop kept` or how far the marker moved
 (`loop -1/8`, `loop 30 rows late`, `loop 120 rows early`).
+
+The recording's own copy settles the phase. The rows past the declared loop
+end repeat the loop's first rows, and a start whose copy does not line up
+there moves onto the copy's first row. A start already faithful to the copy
+keeps its seat, and a loop whose copy the recording cuts off early keeps the
+VGM offset.
 
 Each track runs in its own worker process. The default count is pinned to
 the logical CPUs: one thread stays free below six, two at six or more, and

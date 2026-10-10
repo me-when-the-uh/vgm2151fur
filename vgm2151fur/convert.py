@@ -369,6 +369,11 @@ def convert_variants(
     With `verify`, the lossless pick also renders each candidate and rejects
     any that adds a sustained pitch divergence over 1x.
 
+    The loop is one musical decision, not one per grid. It is found once on
+    the 1x rows - the densest grid, and the same loop the default file
+    carries - and the sample points are shared, which each rendition reads at
+    its own row rate.
+
     With `layout="dirs"` each accepted factor is moved to `<out_dir>/default/`
     or `<out_dir>/xN optimised/` and the rejected factors are deleted, so a
     finished folder holds only renditions that were judged lossless.
@@ -378,10 +383,22 @@ def convert_variants(
     out_dir = Path(out_dir)
     results: list[dict] = []
     shared_gain: float | None = None
+    grid_cache: dict = {}
+    base = analyze(vgm, speed=speed, pcm=pcm, min_row=min_row, condense=1.0,
+                   grid_cache=grid_cache)
+    loop_note = apply_loop(base) if loop_find else None
+    loop_pair = (base.loop_sample, base.loop_end_sample, base.loop_cut_sample)
     for f in factors:
         factor = float(f)
-        song = analyze(vgm, speed=speed, pcm=pcm, min_row=min_row, condense=factor)
-        loop_note = apply_loop(song) if loop_find else None
+        if factor == 1:
+            song = base
+        else:
+            song = analyze(vgm, speed=speed, pcm=pcm, min_row=min_row,
+                           condense=factor, grid_cache=grid_cache)
+            if loop_find:
+                song.loop_sample, song.loop_end_sample, song.loop_cut_sample = loop_pair
+                if loop_note and loop_note != "loop kept":
+                    song.warnings.append(loop_note)
         warnings = list(song.warnings)
         stats: dict = {}
         name = f"{src.stem}.fur" if factor == 1 else f"{src.stem} x{factor:g}.fur"

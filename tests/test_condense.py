@@ -155,5 +155,78 @@ class TestConvertVariants(unittest.TestCase):
             self.assertIn("lossless", r)
 
 
+class TestVariantsShareTheLoop(unittest.TestCase):
+
+    @staticmethod
+    def _fur_loop(module) -> tuple[int, int] | None:
+        pat_len = module.pat_len
+
+        def span(oi):
+            widths = []
+            for ch in range(module.n_ch):
+                rows = module.patterns.get((ch, module.orders[ch][oi]), [])
+                width = len(rows) if rows else pat_len
+                for i, row in enumerate(rows):
+                    if any(c == 0x0D for c, _v in row.fx):
+                        width = min(width, i + 1)
+                widths.append(width if rows else 0)
+            return max(widths) if widths else pat_len
+
+        bases, total, spans = [], 0, []
+        for oi in range(module.n_ord):
+            bases.append(total)
+            w = span(oi)
+            spans.append(w)
+            total += w
+        end = target = None
+        for oi in range(module.n_ord):
+            for ch in range(module.n_ch):
+                rows = module.patterns.get((ch, module.orders[ch][oi]), [])
+                for i, row in enumerate(rows[: spans[oi]]):
+                    for cmd, val in row.fx:
+                        if cmd == 0x0B:
+                            end, target = bases[oi] + i, val
+        if end is None:
+            return None
+        return bases[target], end
+
+    def test_the_loop_is_found_once_on_the_1x_grid(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        out_dir = Path(tmp)
+        calls = []
+        real_apply = convert.apply_loop
+
+        def spy(song):
+            calls.append(song)
+            return real_apply(song)
+
+        song = note_song()
+        song.loop_sample = 120000
+        song.loop_samples = 100000
+        with mock.patch.object(convert, "load_vgm", return_value=song), \
+                mock.patch.object(convert, "apply_loop", side_effect=spy):
+            res = convert.convert_variants(
+                Path("synthetic.vgz"), out_dir,
+                factors=(1, 2, 4), mode="all", pcm=False, layout="dirs",
+            )
+        # One find for the whole set, on the 1x song
+        self.assertEqual(len(calls), 1)
+        loop_sample = calls[0].loop_sample
+        self.assertIsNotNone(loop_sample)
+        for r in res:
+            module = parse_fur(Path(r["dst"]).read_bytes())
+            loop = self._fur_loop(module)
+            self.assertIsNotNone(loop, f"x{r['factor']:g}: no Bxx")
+            row_samples = 44100.0 * module.speed / module.hz
+            expected = round(loop_sample / row_samples)
+            start, _end = loop
+            self.assertLessEqual(
+                abs(start - expected), 1,
+                f"x{r['factor']:g}: loop starts at {start}, "
+                f"the shared point sits at {expected}",
+            )
+
+
 if __name__ == "__main__":
     unittest.main()
