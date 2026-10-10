@@ -141,6 +141,25 @@ def _mix(vol_f: int, vol_r: int, mute_rear: bool) -> tuple[int, int]:
     return left, right
 
 
+def _sides(word: int) -> tuple[int, int]:
+    """The two 8-bit sides of a C352 volume register: high is left, low is right."""
+    return (word >> 8) & 0xFF, word & 0xFF
+
+
+def _quad(vol_f: int, vol_r: int, mute_rear: bool) -> tuple[int, int, int, int]:
+    """The four registers the chip holds: front L/R then rear L/R.
+
+    This is the same pair `_mix` sums into stereo, kept apart instead, so a
+    Furnace system with ``quadOutput`` set can drive the rear pair on its own
+    outputs. A muted rear pair reads as silence.
+    """
+    front_l, front_r = _sides(vol_f)
+    if mute_rear:
+        return front_l, front_r, 0, 0
+    rear_l, rear_r = _sides(vol_r)
+    return front_l, front_r, rear_l, rear_r
+
+
 @dataclass
 class C352Hit:
     sample_time: int
@@ -156,6 +175,15 @@ class C352Hit:
     vol_r: int
     off_sample: int = 0
     vol_pts: list[tuple[int, int, int]] = field(default_factory=list)
+    # The rear pair kept apart from the front, for a quad-output module.
+    # `vol_l`/`vol_r` above stay the folded stereo mix; these are what the
+    # chip's own four registers hold, and `quad_pts` records every change to
+    # them while the voice is held.
+    front_l: int = 0
+    front_r: int = 0
+    rear_l: int = 0
+    rear_r: int = 0
+    quad_pts: list[tuple[int, int, int, int, int]] = field(default_factory=list)
     freq_pts: list[tuple[int, int]] = field(default_factory=list)
     # The live (wave_start, wave_loop) the chip reads when the running
     # address reaches wave_end, recorded when the driver rewrites them
@@ -265,6 +293,7 @@ def _blank_state() -> dict:
         "keyed": [False] * C352_VOICES,
         "active": [None] * C352_VOICES,
         "vol": [(0, 0)] * C352_VOICES,
+        "quad": [(0, 0, 0, 0)] * C352_VOICES,
         "freq": [0] * C352_VOICES,
         "played": [0.0] * C352_VOICES,  # frames played since key-on, integrated
         "anchor": [0] * C352_VOICES,    # sample time the integration is up to date to
@@ -541,6 +570,8 @@ def _flush(acc: dict[str, int], warnings: list[str]) -> None:
 
 def collect_c352(
     vgm: VgmFile,
+    *,
+    quad: bool = False,
 ) -> tuple[bytes, list[C352Sample], list[C352Off], list[str]]:
     roms = {
         cid: assemble_rom(vgm, "c352", cid)
@@ -667,6 +698,9 @@ def collect_c352(
                         vol_l, vol_r = _mix(
                             reg[voice][REG_VOL_F], reg[voice][REG_VOL_R], mute_rear,
                         )
+                        quad_vol = _quad(
+                            reg[voice][REG_VOL_F], reg[voice][REG_VOL_R], mute_rear,
+                        )
                         hit = C352Hit(
                             sample_time=w.sample,
                             chip_id=w.chip_id,
@@ -679,11 +713,16 @@ def collect_c352(
                             freq=reg[voice][REG_FREQ] & 0xFFFF,
                             vol_l=vol_l,
                             vol_r=vol_r,
+                            front_l=quad_vol[0],
+                            front_r=quad_vol[1],
+                            rear_l=quad_vol[2],
+                            rear_r=quad_vol[3],
                         )
                         hits.append(hit)
                         st["active"][voice] = hit
                         st["keyed"][voice] = True
                         st["vol"][voice] = (vol_l, vol_r)
+                        st["quad"][voice] = quad_vol
                         st["freq"][voice] = hit.freq
                     reg[voice][REG_FLAGS] = (flags | FLG_BUSY) & ~(FLG_KEYON | FLG_LOOPHIST)
                 elif flags & FLG_KEYOFF:
@@ -722,6 +761,11 @@ def collect_c352(
             if pair != st["vol"][voice]:
                 hit.vol_pts.append((w.sample, pair[0], pair[1]))
                 st["vol"][voice] = pair
+            if quad:
+                four = _quad(reg[voice][REG_VOL_F], reg[voice][REG_VOL_R], mute_rear)
+                if four != st["quad"][voice]:
+                    hit.quad_pts.append((w.sample, *four))
+                    st["quad"][voice] = four
         elif r == REG_FREQ:
             f = val & 0xFFFF
             if f != st["freq"][voice]:

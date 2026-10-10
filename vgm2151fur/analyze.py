@@ -256,6 +256,13 @@ class NoteEvent:
     # PCM pan 0x00 is a real "both off". OKI/MSM6258 are mono and must not
     # write 08xx (that effect is the K007232/YM2151 split pan).
     no_pan: bool = False
+    # C352 quad output: the four volume registers the chip holds, as
+    # (front L, front R, rear L, rear R), each 0-255. When this is set the
+    # volume column is pinned and the four values carry the level, so the
+    # rear survives into its own outputs. None means the ordinary stereo mix.
+    quad: tuple[int, int, int, int] | None = None
+    # Mid-note changes to those four, as (sample, fl, fr, rl, rr).
+    quad_pts: tuple[tuple[int, int, int, int, int], ...] = ()
 
 
 @dataclass
@@ -293,6 +300,9 @@ class Song:
     # past it are the recording's copy of the head and stay unwritten, at
     # whichever row rate a rendition reads them.
     loop_cut_sample: int | None = None
+    # The source drove the C352 rear pair and the events carry it, so the
+    # module's C352 systems are written with `quadOutput` set.
+    c352_quad: bool = False
 
     @property
     def samples_per_row(self) -> float:
@@ -568,6 +578,7 @@ def analyze(
     min_row: float | None = None,
     condense: float = 1.0,
     grid_cache: dict | None = None,
+    c352_quad: bool = False,
 ) -> Song:
     """Build the Song for one rendition of `vgm`.
 
@@ -576,6 +587,12 @@ def analyze(
     estimated grid afterwards). A caller that converts one track to several
     factors passes the same dict every time and measures the track once. The
     caller owns the dict, so it must not outlive the `vgm` it was built for.
+
+    `c352_quad` keeps the C352's rear pair on its own outputs instead of
+    folding it into the front, and flags the chip `quadOutput` so the core
+    feeds four channels. A stereo mixdown of such a module sums the pairs
+    again, which is the level the fold produced, except where the fold
+    saturated at 255 and the sum does not.
     """
     tick = TARGET_TICK_SAMPLES if tick_samples is None else float(tick_samples)
     row_floor = MIN_ROW_SAMPLES if min_row is None else float(min_row)
@@ -876,6 +893,8 @@ def analyze(
     spcm_audible: list[SegapcmSample] = []
     c140_audible: list[C140Sample] = []
     c352_audible: list[C352Sample] = []
+    # Set where the C352 runs and the source drives its rear pair.
+    c352_quad_events = False
     channel_fx: list[tuple[int, int, int, int]] = []
     if pcm:
         oki_samples, oki_warn = collect_oki(vgm)
@@ -1086,9 +1105,18 @@ def analyze(
         # Namco C352: 32 voices per instance. Rate is clock*freq/(288*65536).
         # The pattern stores the target volume registers; the chip slews there.
         c352_clock = vgm.c352_clock or C352_DEFAULT_CLOCK
-        _c352_rom, c352_samples, c352_offs, c352_warn = collect_c352(vgm)
+        _c352_rom, c352_samples, c352_offs, c352_warn = collect_c352(
+            vgm, quad=c352_quad,
+        )
         warnings.extend(c352_warn)
         c352_audible = [s for s in c352_samples if s.length >= 8]
+        # The quad representation only earns its keep where the source drives
+        # the rear pair. A track that leaves register 1 silent keeps the plain
+        # stereo fold it has always had, byte for byte.
+        c352_quad_events = c352_quad and any(
+            h.rear_l or h.rear_r or any(pt[3] or pt[4] for pt in h.quad_pts)
+            for s in c352_audible for h in s.hits
+        )
         c352_ids: list[int] = []
         for smp in c352_audible:
             for h in smp.hits:
@@ -1141,6 +1169,25 @@ def analyze(
                     for t, a, b in h.vol_pts
                 )
                 fade_in = vol == 0 and any(v > 0 for _t, v, _p in pts)
+                quad = None
+                quad_pts: tuple[tuple[int, int, int, int, int], ...] = ()
+                if c352_quad_events:
+                    # The same refit, on the four registers instead of the
+                    # folded pair: the note's own balance is the first write
+                    # inside its frame, not the stale one at the strobe.
+                    four = (h.front_l, h.front_r, h.rear_l, h.rear_r)
+                    for pt in h.quad_pts:
+                        if pt[0] - h.sample_time > C352_REFIT_SAMPLES:
+                            break
+                        four = pt[1:]
+                    quad = four
+                    quad_pts = tuple(h.quad_pts)
+                    # The level rides on the four registers, so the volume
+                    # column is held wide open and every later step is one of
+                    # the four pans, not a column change.
+                    vol = 255
+                    pts = ()
+                    fade_in = False
                 events.append(NoteEvent(
                     sample=h.sample_time,
                     ch=c352_at.get(h.chip_id, c352_base) + h.voice,
@@ -1155,6 +1202,8 @@ def analyze(
                     sweep=sweep,
                     vol_pts=pts,
                     no_pan=fade_in,
+                    quad=quad,
+                    quad_pts=quad_pts,
                 ))
         for off in c352_offs:
             base = c352_at.get(off.chip_id)
@@ -1308,6 +1357,7 @@ def analyze(
         c352_samples=c352_audible,
         channel_fx=channel_fx,
         k007232_volume=k007232_volume,
+        c352_quad=c352_quad_events,
     )
 
 

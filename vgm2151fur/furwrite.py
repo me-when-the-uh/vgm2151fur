@@ -398,14 +398,22 @@ def c140_flag_text(clock: int, c140_type: int) -> str:
     return "\n".join(parts)
 
 
-def c352_flag_text(clock: int) -> str:
+def c352_flag_text(clock: int, quad: bool = False) -> str:
     """Crystal for a C352 core that divides by 288.
 
     Furnace has no C352 default, so the flag is always written. A port copied
     from c140.cpp ticks at clock/192 and would need the C140 2/3 scale; the
     value here is the real crystal, not that scaled clock.
+
+    `quad` sets the system's four-output mode: the core always computes front
+    and rear pairs, and without the flag it sums them into stereo. A module
+    whose events carry the rear pair needs the flag or the rear never reaches
+    an output of its own.
     """
-    return f"customClock={clock or C352_DEFAULT_CLOCK}"
+    parts = [f"customClock={clock or C352_DEFAULT_CLOCK}"]
+    if quad:
+        parts.append("quadOutput=true")
+    return "\n".join(parts)
 
 
 def _write_flag(b: Buf, text: str) -> int:
@@ -499,6 +507,28 @@ def _add_fx(row: Row, cmd: int, val: int, fx_cols: int, stats: dict | None = Non
         _bump(stats, "fx_dropped")
     elif fx_cols:
         fx.append((cmd, val))
+
+
+# The C352's four pan slots. The front pair is Furnace's ordinary panning and
+# the rear pair is the surround pair, each side split out to an exact 8-bit
+# effect (0x81/0x82 front, 0x89/0x8A rear). The platform scales a voice's
+# volume into all four, so a quad module holds the volume column wide open and
+# carries the level here.
+QUAD_FX = (0x81, 0x82, 0x89, 0x8A)
+
+
+def _add_quad_fx(
+    row: Row,
+    quad: tuple[int, int, int, int],
+    fx_cols: int,
+    stats: dict | None = None,
+    prev: tuple[int, int, int, int] | None = None,
+) -> None:
+    """Write the four C352 pan slots, skipping any already in force."""
+    for i, (cmd, val) in enumerate(zip(QUAD_FX, quad)):
+        if prev is not None and prev[i] == val:
+            continue
+        _add_fx(row, cmd, val & 0xFF, fx_cols, stats)
 
 
 def _encode_patn_row(row: Row, fx_cols: int) -> bytes:
@@ -1020,6 +1050,8 @@ def _build_patterns(song: Song, n_ch: int, pat_len: int, fx_cols: int, ch_offset
     for ev in song.events:
         if ev.vol_pts:
             last_sample = max(last_sample, ev.vol_pts[-1][0])
+        if ev.quad_pts:
+            last_sample = max(last_sample, ev.quad_pts[-1][0])
     for entry in (getattr(song, "channel_fx", ()) or ()):
         last_sample = max(last_sample, entry[0])
     # An adjusted loop carries crafted sample points, read with the writer's
@@ -1174,7 +1206,9 @@ def _build_patterns(song: Song, n_ch: int, pat_len: int, fx_cols: int, ch_offset
         note_e5[(ev_ch, row)] = ev.e5
         # PCM pan 0x00 is both channels off. Omitting it leaves Furnace's
         # default (both full). FM pan 0 still means "no 08xx on this row".
-        if (ev.pcm or ev.pan) and not ev.no_pan:
+        if ev.quad is not None:
+            _add_quad_fx(cell, ev.quad, fx_cols, stats)
+        elif (ev.pcm or ev.pan) and not ev.no_pan:
             _add_fx(cell, 0x08, ev.pan & 0xFF, fx_cols, stats)
 
     # A held note's carrier fade steps land on their own rows (only when no
@@ -1256,6 +1290,33 @@ def _build_patterns(song: Song, n_ch: int, pat_len: int, fx_cols: int, ch_offset
                 if pan is not None and (last_pan is None or pan != last_pan):
                     _add_fx(cell, 0x08, pan & 0xFF, fx_cols, stats)
                     last_pan = pan
+
+    # A quad C352 voice carries its level on the four pan slots, so a mid-note
+    # step is one of those effects and never a volume-column change. Effects
+    # are written only where the four differ from the note's own values, and
+    # only on cells without a note, so a note always wins on its own row.
+    if song.events:
+        for ev in song.events:
+            ev_ch = ev.ch + ch_offset
+            if not (ev.on and ev.quad_pts) or ev_ch < 0 or ev_ch >= n_ch:
+                continue
+            prev = ev.quad
+            for sample, fl, fr, rl, rr in ev.quad_pts:
+                if content_cut is not None and sample >= content_cut:
+                    continue
+                row, _delay = song.place(sample, stats)
+                if row < 0 or row >= total_rows:
+                    continue
+                cell = grid[ev_ch].get(row)
+                if cell is None:
+                    cell = _blank_row()
+                    grid[ev_ch][row] = cell
+                if cell.note >= 0:
+                    _bump(stats, "vol_step_dropped")
+                    continue
+                four = (fl, fr, rl, rr)
+                _add_quad_fx(cell, four, fx_cols, stats, prev)
+                prev = four
 
     for ch in range(n_ch):
         cur_e5 = 0x80
@@ -1527,7 +1588,9 @@ def write_fur(
         flag_texts.append(c140_flag_text(song.vgm.c140_clock, song.vgm.c140_type))
     for cid in c352_ids:
         chips.append(CHIP_C352)
-        flag_texts.append(c352_flag_text(song.vgm.c352_clock))
+        flag_texts.append(
+            c352_flag_text(song.vgm.c352_clock, getattr(song, "c352_quad", False))
+        )
     n_chips = len(chips)
 
     info_size_off, info_start = b.begin_block(b"INFO")

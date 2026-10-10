@@ -845,6 +845,64 @@ class TestC352(unittest.TestCase):
         )
         self.assertEqual(len(again.c352_samples[0].hits), 1)
 
+    def _quad_song(self, writes, rom, **kw):
+        return analyze(
+            _vgm(_lattice() + list(writes), [RomSlice(0, len(rom), 0, bytes(rom), "c352")],
+                 c352_clock=24192000, c352_divider=72),
+            pcm=True, c352_quad=True, **kw,
+        )
+
+    def test_rear_pair_kept_apart_for_quad_output(self):
+        rom = bytearray(0x300)
+        rom[0x100:0x1C8] = self._body()
+        writes = self._oneshot_writes(50000) + [self._strobe(60000)]
+
+        stereo = self._song(writes, rom)
+        self.assertFalse(stereo.c352_quad)
+        self.assertIsNone([e for e in stereo.events if e.on and e.pcm][0].quad)
+        # vol_f 0x4000, vol_r 0x0010: the stereo rendition carries the sum.
+        hit = stereo.c352_samples[0].hits[0]
+        self.assertEqual((hit.vol_l, hit.vol_r), (0x40, 0x10))
+
+        quad = self._quad_song(writes, rom)
+        self.assertTrue(quad.c352_quad)
+        hit = quad.c352_samples[0].hits[0]
+        self.assertEqual((hit.front_l, hit.front_r, hit.rear_l, hit.rear_r),
+                         (0x40, 0x00, 0x00, 0x10))
+        ev = [e for e in quad.events if e.on and e.pcm][0]
+        self.assertEqual(ev.quad, (0x40, 0x00, 0x00, 0x10))
+        # the four registers carry the level, so the column is held wide open
+        self.assertEqual(ev.vol, 255)
+        self.assertEqual(ev.vol_pts, ())
+
+        data = write_fur(quad, include_pcm=True, include_fm=True, stats={})
+        flags = [
+            payload.split(b"\x00")[0].decode()
+            for _pos, mag, _size, payload in iter_blocks(data) if mag == b"FLAG"
+        ]
+        self.assertIn("quadOutput=true", "\n".join(flags))
+        mod = parse_fur(data)
+        c352_ch = range(mod.n_ch - 32, mod.n_ch)
+        fx = {
+            c for (ch, _idx), rows in mod.patterns.items() if ch in c352_ch
+            for r in rows for c, _v in r.fx
+        }
+        self.assertLessEqual({0x81, 0x82, 0x89, 0x8A}, fx)
+        # the folded 4-bit pan never appears on a quad channel
+        self.assertNotIn(0x08, fx)
+
+    def test_quad_records_mid_note_rear_changes(self):
+        rom = bytearray(0x300)
+        rom[0x100:0x1C8] = self._body()
+        writes = (
+            self._oneshot_writes(50000)
+            + [self._strobe(60000)]
+            + self._regs(60100, vol_r=0x0020)
+        )
+        song = self._quad_song(writes, rom)
+        ev = [e for e in song.events if e.on and e.pcm][0]
+        self.assertEqual(ev.quad_pts, ((60100, 0x40, 0x00, 0x00, 0x20),))
+
     def test_loop_includes_the_end_byte(self):
         rom = bytearray(0x300)
         rom[0x100:0x1C8] = self._body()

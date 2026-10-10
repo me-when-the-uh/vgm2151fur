@@ -239,6 +239,7 @@ def _convert(args) -> int:
             normalize=not args.no_normalize,
             loop_find=not args.no_loop_find,
             workers=args.workers,
+            c352_quad=args.c352_quad,
         ):
             if error is not None:
                 print(f"ERROR {src.name}: {error}", file=sys.stderr)
@@ -440,6 +441,13 @@ def _add_convert_flags(parser: argparse.ArgumentParser, *, bare: bool) -> None:
              "flat '<name> xN.fur' siblings",
     )
     parser.add_argument("--workers", type=int, default=None, help=_WORKERS_HELP)
+    parser.add_argument(
+        "--c352-quad", action="store_true",
+        help="keep a Namco C352 source's rear pair on its own outputs instead "
+             "of folding it into the front pair, and set the chip's quadOutput "
+             "flag. Only tracks whose source drives the rear registers change; "
+             "a stereo mixdown of the result sums the pairs back together",
+    )
     parser.add_argument("--melody-only", action="store_true", help="skip sample chips")
     parser.add_argument("--pcm-only", action="store_true", help="skip the YM2151")
     parser.add_argument(

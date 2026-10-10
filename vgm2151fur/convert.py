@@ -245,10 +245,11 @@ def convert_vgm(
     include_fm: bool = True,
     normalize: bool = False,
     loop_find: bool = True,
+    c352_quad: bool = False,
 ) -> dict:
     vgm = load_vgm(path)
     song = analyze(vgm, speed=speed, pcm=pcm, tick_samples=tick_samples,
-                   min_row=min_row, condense=condense)
+                   min_row=min_row, condense=condense, c352_quad=c352_quad)
     loop_note = None
     if loop_find:
         loop_note = apply_loop(song)
@@ -356,6 +357,7 @@ def convert_variants(
     loop_find: bool = True,
     verify: bool = False,
     layout: str = "flat",
+    c352_quad: bool = False,
 ) -> list[dict]:
     """Write one .fur per condense factor, side by side, and pick one.
 
@@ -385,7 +387,7 @@ def convert_variants(
     shared_gain: float | None = None
     grid_cache: dict = {}
     base = analyze(vgm, speed=speed, pcm=pcm, min_row=min_row, condense=1.0,
-                   grid_cache=grid_cache)
+                   grid_cache=grid_cache, c352_quad=c352_quad)
     loop_note = apply_loop(base) if loop_find else None
     loop_pair = (base.loop_sample, base.loop_end_sample, base.loop_cut_sample)
     for f in factors:
@@ -394,7 +396,8 @@ def convert_variants(
             song = base
         else:
             song = analyze(vgm, speed=speed, pcm=pcm, min_row=min_row,
-                           condense=factor, grid_cache=grid_cache)
+                           condense=factor, grid_cache=grid_cache,
+                           c352_quad=c352_quad)
             if loop_find:
                 song.loop_sample, song.loop_end_sample, song.loop_cut_sample = loop_pair
                 if loop_note and loop_note != "loop kept":
@@ -541,13 +544,14 @@ _CFG: dict = {}
 
 def _variant_info(
     src: Path, out_dir: Path, *, factors, mode, speed, pcm, min_row,
-    include_fm, normalize, loop_find, verify, layout,
+    include_fm, normalize, loop_find, verify, layout, c352_quad=False,
 ) -> dict:
     """Write the 1x/2x/3x/4x set and return the pick's info plus the set."""
     results = convert_variants(
         src, out_dir, factors=factors, mode=mode, speed=speed, pcm=pcm,
         min_row=min_row, include_fm=include_fm, normalize=normalize,
         loop_find=loop_find, verify=verify, layout=layout,
+        c352_quad=c352_quad,
     )
     pick = next(r for r in results if r["pick"])
     info = dict(pick)
@@ -570,7 +574,7 @@ def _worker(path_str: str) -> dict:
             speed=_CFG["speed"], pcm=_CFG["pcm"], min_row=_CFG["min_row"],
             include_fm=_CFG["include_fm"], normalize=_CFG["normalize"],
             loop_find=_CFG["loop_find"], verify=_CFG["verify"],
-            layout=_CFG["layout"],
+            layout=_CFG["layout"], c352_quad=_CFG.get("c352_quad", False),
         )
     return convert_vgm(
         src,
@@ -582,12 +586,13 @@ def _worker(path_str: str) -> dict:
         include_fm=_CFG["include_fm"],
         normalize=_CFG["normalize"],
         loop_find=_CFG["loop_find"],
+        c352_quad=_CFG.get("c352_quad", False),
     )
 
 
 def _convert_serial(files, out_dir, *, speed, pcm, tick_samples, min_row,
                     variants, factors, optimize, include_fm, normalize, loop_find,
-                    verify, layout):
+                    verify, layout, c352_quad=False):
     for f in files:
         try:
             if variants:
@@ -595,7 +600,7 @@ def _convert_serial(files, out_dir, *, speed, pcm, tick_samples, min_row,
                     f, out_dir, factors=factors, mode=optimize,
                     speed=speed, pcm=pcm, min_row=min_row,
                     include_fm=include_fm, normalize=normalize, loop_find=loop_find,
-                    verify=verify, layout=layout,
+                    verify=verify, layout=layout, c352_quad=c352_quad,
                 )
             else:
                 info = convert_vgm(
@@ -608,6 +613,7 @@ def _convert_serial(files, out_dir, *, speed, pcm, tick_samples, min_row,
                     include_fm=include_fm,
                     normalize=normalize,
                     loop_find=loop_find,
+                    c352_quad=c352_quad,
                 )
         except Exception as exc:
             yield f, None, str(exc)
@@ -633,6 +639,7 @@ def convert_folder(
     verify: bool = False,
     layout: str = "flat",
     workers: int | None = None,
+    c352_quad: bool = False,
     log=print,
 ) -> Iterator[tuple[Path, dict | None, str | None]]:
     """Convert every VGM/VGZ to `out_dir/<name>.fur`.
@@ -679,6 +686,7 @@ def convert_folder(
                     variants=variants, factors=factor_list, optimize=optimize,
                     include_fm=include_fm, normalize=normalize,
                     loop_find=loop_find, verify=verify, layout=layout,
+                    c352_quad=c352_quad,
                 ):
                     _note(result[0], result[1])
                     yield result
@@ -698,6 +706,7 @@ def convert_folder(
             "loop_find": loop_find,
             "verify": verify,
             "layout": layout,
+            "c352_quad": c352_quad,
         }
         pool = ProcessPoolExecutor(
             max_workers=n_workers,
