@@ -14,24 +14,24 @@ register (level + envelope bit) and the mixer's audio bits.
 
 ## What the AY layer still gets wrong
 
-1. **A drum's pitch glide is flattened.** The source writes the tone period in
-   steps inside a note (1024 -> 1152 -> 1280 -> back), which is what makes an
-   AY drum sound like a drum rather than a tone. The export holds 1024. The
-   collector records those writes (`freq_pts`), so the loss is in the macro
-   path: either the steps land inside a note the collector never opened, or
-   the macro's values are not reaching the platform. Reading the register
-   trail of one such note next to its `ToneIns` is the way to settle it.
+1. **A drum's pitch glide is the pitch macro.** The source writes the tone
+   period in steps inside one gate (1024 -> 1152 -> 1280, and the tom
+   1104 -> 1024 -> 1536 -> 1792 -> 2048). The steps are about one frame
+   apart. The old 735-sample merge collapsed a whole frame-to-frame chain
+   into its last period, and a hit whose tone bit was off at the end never
+   reached the segmenter, so the export held the first period. The AY
+   timeline now merges a 16-sample byte pair. A step held for two frames is
+   a cell. A shorter step stays in the pitch macro. The 58.2 % figure is the
+   measurement from before that change.
 
 2. **The period is also a gate.** Drivers mute a channel by writing a period
    the chip cannot sound (period 1) and bring it back by writing a real one,
-   without touching the volume. `_audible` already treats the inaudible period
-   as silence, but notes only open on volume/mixer writes, so the note that
-   starts on the "un-mute" period write is never opened. Re-checking the gate
-   on period writes was tried and made the volume timeline *worse* (98.6 % ->
-   91.0 %), because the opened note writes its own volume over the source's
-   envelope-armed register before the envelope effect lands. Doing it right
-   means opening the note and emitting the envelope mode/period/shape effects
-   in the same cell, then re-measuring.
+   without touching the volume. `_audible` treats the inaudible period as
+   silence, and a period write re-checks the gate, so the un-mute opens a
+   note. An earlier experiment that opened on the period write also let the
+   note's volume replace an envelope-armed register before the envelope
+   effect landed (volume match 98.6 % -> 91.0 %). The gate cell now carries
+   the envelope mode, period and shape with the note.
 
 3. **Per-tick volume steps cost fidelity at any row rate.** The optimizer's
    own loss counters on this track: 116 dropped volume steps at 1x, 616 at 4x

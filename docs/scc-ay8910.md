@@ -50,13 +50,16 @@ Furnace's own clock defaults to COLOR_NTSC/2 = 1789772.727…; a rip whose
 header clock is within a hertz of it is written without `customClock`, and
 the analyzer computes the same clock, so the table matches the module.
 
-Mid-note pitch changes do not become a note per step (that was faithful but
-needlessly dense) and do not use `01xx`/`02xx` slides either (their rates are
-FM/PCM-calibrated and drift on a 12-bit period). They become the instrument's
-**pitch macro**: one value per tick, in the engine's pitch unit (1/128
-semitone), which the platform adds straight to the period. One instrument per
-distinct trajectory, so a driver's recurring bend or vibrato is written once
-and any note can play it.
+A period step of about a semitone (0.75) that is still sounding a frame later
+is a new pattern note. SCC and AY drivers retune a voice by writing the
+period and leaving the gate up, so treating every step as one cell's pitch
+macro plays the phrase from inside the instrument: several notes switching
+over the life of a single pattern cell. Smaller steps are vibrato or a slide
+and stay the instrument's **pitch macro** (one value per tick, in 1/128
+semitone). A macro that only settles on a constant detune is folded into the
+note's own `E5` instead, so straight notes share an instrument. Slides do not
+use `01xx`/`02xx`; those rates are FM/PCM-calibrated and drift on a 12-bit
+period.
 
 A 12-bit period is two register writes and drivers can be a frame apart about
 the pair, so the intermediate combination is treated as a write-order
@@ -64,12 +67,15 @@ transient: writes inside a row are merged (last one wins, which is also what
 makes a step *back* to the note's own pitch survive), and the first frame
 after the gate belongs to the note's own pitch.
 
-A macro holds at most 256 values. A series that fits is stored whole; a
+A macro holds at most 255 values. A series that fits is stored whole; a
 repeating one is stored as one cycle that loops; a longer non-repeating one is
 thinned by whole ticks (values, then a speed that says how many ticks each
-value lasts). A non-looping macro drops its trailing run of one value, since
-the engine holds the last value anyway - which is what lets two notes whose
-bend differs only in how long it lasts share an instrument.
+value lasts). A volume saw that moves one level per frame keeps every level.
+Past 255 ticks, when that saw is not one repeating tooth, the pattern plays
+it with `FA01` (one level down per tick) and a volume anchor where it jumps
+or holds. A non-looping macro drops its trailing run of one value, since the
+engine holds the last value anyway, which is what lets two notes whose bend
+differs only in how long it lasts share an instrument.
 
 ## Waveform motion
 
@@ -82,8 +88,14 @@ added to the module for every image the morph visits (deduplicated by
 content). A whole-image rewrite is a burst of 32 byte writes; the collector
 keeps only the state each burst settles on.
 
-The result is that such a note is one pattern cell playing an instrument whose
-wave macro walks the morph - no per-step cells, and the motion is back.
+The result is one pattern cell whose instrument walks the morph.
+
+A driver that rewrites the volume register is scaling the wave it already
+loaded. Yie Ar Kung-Fu II does this once per frame (13, 12, 11, … and then
+back to the peak). The wave RAM stays as it was loaded. Those steps are the
+volume macro, one register level per tick, with the column at 15. Once a
+song has more than 160 tone instruments, other volume shapes are rounded to
+steps of 2 (and of 4 past 208). A one-level saw stays at every level.
 
 ## Gates
 
@@ -136,9 +148,13 @@ Channel mode (tone/noise/envelope), noise frequency and the hardware envelope
 | `22xy` | envelope shape `x`, enable this channel when `y` is non-zero |
 | `23xx` / `24xx` | envelope period low / high |
 
-A pure-noise AY voice has no audible pitch, so its period writes are not
-re-articulated (they would only bloat the module); a tone or tone+noise voice
-is.
+A pure-noise AY voice has no audible pitch, and its period writes stay off
+the pattern. A tone voice keeps every period written while the tone bit was
+set, including a glide that finishes with the tone bit off. A step held for
+two frames is its own cell. A shorter step is that note's pitch macro. The
+low and high bytes of one period are one update. A later cell from a pitch
+split writes the envelope shape only when register 13 was written in that
+cell; mode, noise and envelope period still follow their registers.
 
 ## Volumes
 
@@ -150,34 +166,49 @@ single-chip test files are not a valid level reference.
 
 ## Row rate
 
-These rips drive everything off a ~60 Hz tick, and their notes carry no
-tie to a coarser musical unit the way an FM key-on lattice does, so the row
-grid matters more here than for the arcade packs:
+Furnace's BPM is `60*hz/(highlight*speed)`. With highlight 4 that is 15 times
+the row rate, so a row per 60 Hz frame reads as 900 BPM.
 
-- When the estimator can measure a lattice from the notes, the row is that
-  subdivision and the tempo is whatever it implies (100–225 BPM on the Space
-  Manbow, Snatcher, Contra and SD Snatcher tracks).
-- When it cannot (a sparse boss theme whose only regular pulse is the
-  percussion tick), the fallback is one row per tick: the most faithful
-  rendering, with a tracker tempo far above anything a human would write.
-  `--speed N` sets the row explicitly (8 gives a 16th-note row and a ~112 BPM
-  tempo for these rips).
+On an SCC/AY track with no FM and no sample rhythm, the tick stays one driver
+frame (~735 samples) and the measured 16th is the starting row. On the SCC a
+period step of at least 0.75 semitone that is still sounding one frame later
+is its own cell. A smaller step stays in the pitch macro. A step that is gone
+by the next frame is dropped. On the AY the same step is its own cell when it
+holds for two frames. A one-frame attack sweep stays in the pitch macro, at
+this same tick.
 
-The fallback is deliberately the faithful one: the AY's volume steps are a
-pattern column, so a coarser row quantizes drum decays. Measured on
-Space Manbow's "Hydra", one row per tick scores 0.742 against the source's
-render and a 7-tick row 0.688 - the decay loss is real. Moving the per-tick
-volume steps into a volume macro (the AY platform reads `std.vol`) is what
-would make a musical row safe, and is the next step if that trade-off needs
-to flip.
+When two cells would share a row, the fit lowers the ticks per row and leaves
+the tick length alone. `row_subdiv` is the 16th's tick count divided by the
+written row's tick count. Highlight A and B are `round(4 * row_subdiv)` and
+`round(16 * row_subdiv)`, so the BPM on the status bar stays near the
+quarter-note tempo of the measured 16th. One tick per row is the finest split.
+
+A long rip whose sections do not share one tempo keeps the fastest note value
+that still occurs as its 16th. The pattern-order budget lengthens an FM row
+so the module stays inside 256 orders. An SCC/AY 16th stays that note value.
+On a 16-minute medley the fastest value is a few frames; `song_length / 1920`
+is only the FM order budget.
+
+Vibrato, wave morphs, and the AY noise, channel mode and envelope period are
+instrument macros built at that tick rate. Volume is a macro as well, except
+the long one-level saw described above, which uses `FA01` when it will not
+fit in 255 ticks. The driver rewrites the register once per frame, so the
+tick stays one frame. A frame-long row is the fallback when the notes have
+no lattice.
+
+Condensing lengthens the tick with the row. The macros are built from the
+final tick rate, so each macro step is one tick of the module that was
+written. A factor that stacks two notes on one cell shows up as
+`note_collision` and the lossless pick leaves it.
 
 ## Validation
 
 The MSX2 packs were checked three ways per track: the register stream of a
 Furnace `-vgmout` export against the source, the note registers at every gate
 (`tools/fur_soundcheck.py`), and the rendered audio (chroma pitch alignment,
-median over the track's windows). The note counts are the source's own gates:
-one cell per gate, plus one instrument per distinct pitch trajectory or morph.
+median over the track's windows). The table is that gate-level check. A held
+period change is now its own cell, so a module has more notes than gates; the
+pitch at each gate is the same note the table counted.
 
 | track | SCC notes exact | AY notes exact | notes | chroma, .fur | chroma, export |
 | --- | --- | --- | --- | --- | --- |

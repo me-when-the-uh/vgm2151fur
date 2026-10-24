@@ -26,6 +26,7 @@ SKIP_DIRS = {
 # the more specific one only.
 CHIP_LABELS = (
     ("ym2151", "YM2151"),
+    ("ym2203", "YM2203"),
     ("k007232", "K007232"),
     ("segapcm", "SegaPCM"),
     ("c140", "C140"),

@@ -13,6 +13,7 @@ if str(ROOT) not in sys.path:
 
 from vgm2151fur.analyze import (
     Song,
+    _musical_row,
     _shift_note_e5,
     analyze,
     FMPatch,
@@ -101,6 +102,26 @@ class TestEstimateGrid(unittest.TestCase):
         self.assertAlmostEqual(grid.hz, 44100.0 * grid.speed / grid.row, places=6)
         self.assertAlmostEqual(grid.tick, grid.row / grid.speed, places=6)
         self.assertGreaterEqual(grid.confidence, 0.9)
+
+    def test_order_floor_leaves_the_pulse(self):
+        # Two tempos, and a file long enough that song_length/1920 is coarser
+        # than either. The FM unit absorbs that floor. The pulse stays the
+        # fastest note value, and the SCC/AY row is built from the pulse.
+        onsets = {
+            0: [i * 4000 for i in range(48)],
+            1: [i * 6100 for i in range(30)],
+        }
+        vgm = _vgm_with_keyons([(0, 0)])
+        vgm.total_samples = 20_000_000
+        grid = estimate_grid(vgm, onsets=onsets, label="medley")
+        self.assertIsNotNone(grid)
+        self.assertIn("sections change unit", grid.source)
+        self.assertAlmostEqual(grid.pulse, 4000.0, delta=80.0)
+        self.assertAlmostEqual(grid.unit, 20_000_000 / 1920.0, delta=1.0)
+        self.assertGreater(grid.unit, grid.pulse)
+        hz, speed, _sub, _note = _musical_row(grid)
+        self.assertEqual(speed, round(grid.pulse / (44100 / 60)))
+        self.assertAlmostEqual(44100.0 * speed / hz, grid.pulse, delta=1.0)
 
     def test_irregular_returns_none(self):
         # Pseudo-random spacing must not be accepted as a lattice.

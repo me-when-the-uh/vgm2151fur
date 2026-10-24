@@ -216,15 +216,20 @@ def collect_scc(
             if st["test"] & (TEST_ROTATE if bank == 0x0 else 0):
                 acc["wave_locked"] += 1
                 continue
-            if bank == 0x4:
-                if not plus:
-                    # On the K051649 the port-4 bank is not wired; libvgm
-                    # treats it as another write to the same wave RAM.
-                    addr = 0x60 | (addr & 0x1F)
-                else:
-                    addr = 0x80 | (addr & 0x1F)
-            if addr >= _SHARED_WAVE_LO:
-                voices = (3, 4) if not plus else (addr >> 5,)
+            if bank == 0x4 and not plus:
+                # On the K051649 the port-4 bank is not wired; libvgm treats
+                # it as another write to the same wave RAM.
+                addr = 0x60 | (addr & 0x1F)
+            elif plus and addr >= 0xA0:
+                # Past voice 4's wave the K052539 window repeats the register
+                # page. Frequency, volume and enable are taken from banks 1-3.
+                continue
+            if plus and 0x80 <= addr <= 0x9F:
+                # SCC+ gives voice 4 its own 32 bytes. The K051649 does not:
+                # there, voices 3 and 4 share 0x60-0x7F.
+                voices = (4,)
+            elif not plus and addr >= _SHARED_WAVE_LO:
+                voices = (3, 4)
             else:
                 voices = (addr >> 5,)
             for voice in voices:

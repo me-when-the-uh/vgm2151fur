@@ -23,6 +23,7 @@ from vgm2151fur.furwrite import (
 
 CHIP_NAMES = {
     0x82: "YM2151",
+    0x8D: "YM2203",
     CHIP_MSM6295: "MSM6295",
     CHIP_MSM6258: "MSM6258",
     CHIP_K007232: "K007232",

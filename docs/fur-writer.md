@@ -52,15 +52,18 @@ triples start 31 bytes plus 12 per chip before the first ADIR pointer.
 
 ## Chip IDs and flags
 
-- `0x82` YM2151, `0xC6` K007232, `0xAA` MSM6295, `0xAB` MSM6258, `0x9B`
-  SegaPCM, `0xCE` C140, `0xD0` C352, `0xA1` Konami SCC (K051649), `0xB4`
-  Konami SCC+ (K052539), `0x80` AY-3-8910. A module lists the chips the
-  source had usable samples for: a melody-only track opens with the YM2151
-  alone, with no K007232 pair and no PCM channels it never plays. The SCC and
-  AY are tone chips, not sample players: they are written whenever the source
-  keys a voice, even under `--melody-only`.
+- `0x82` YM2151, `0x8D` YM2203, `0xC6` K007232, `0xAA` MSM6295, `0xAB`
+  MSM6258, `0x9B` SegaPCM, `0xCE` C140, `0xD0` C352, `0xA1` Konami SCC
+  (K051649), `0xB4` Konami SCC+ (K052539), `0x80` AY-3-8910. A module lists
+  the chips the source had usable samples for: a melody-only track opens with
+  the YM2151 alone, with no K007232 pair and no PCM channels it never plays.
+  The SCC and AY are tone chips, not sample players: they are written whenever
+  the source keys a voice, even under `--melody-only`. A YM2203 is one system
+  of six channels (FM 1-3 then PSG 1-3); a dual source writes two systems in
+  chip order.
 - The YM2151 flag carries `customClock=` when the source clock is not
-  3579545: a 4 MHz OPM plays flat otherwise.
+  3579545: a 4 MHz OPM plays flat otherwise. Each YM2203 system carries the
+  same flag for its own clock (default 3579545).
 - The K007232 flag carries `stereo=true` and a clock when it differs from the
   default.
 - The OKI flag encodes pin 7 and banking; the C140 flag carries the clock and
@@ -82,10 +85,16 @@ triples start 31 bytes plus 12 per chip before the first ADIR pointer.
 
 ## Instruments
 
-FM instruments use the INS2 `FM` feature with four operators in YM2151
-register order (0x40, 0x48, 0x50, 0x58), which is also Furnace's internal
-order. The `MA` feature carries FMS/AMS macros for driver-scripted vibrato
-(PMS/AMS steps recorded while the note sustains).
+YM2151 FM instruments use type 33 (OPM) and the INS2 `FM` feature with four
+operators in YM2151 register order (0x40, 0x48, 0x50, 0x58), which is also
+Furnace's internal order. The `MA` feature carries FMS/AMS macros for
+driver-scripted vibrato (PMS/AMS steps recorded while the note sustains).
+
+YM2203 FM instruments use type 1 (`INS_FM`, OPN) and the same feature with
+operators in OPN register order (0x30, 0x34, 0x38, 0x3c). The feature carries
+the OPN sustain rate (0x70) and SSG-EG (0x90) instead of DT2. A per-note pitch
+macro (code 4) on an instrument copy reproduces later f-num writes; the note's
+E5 carries the key-on remainder.
 
 PCM instruments bind one sample each: K007232 two channels, MSM6295 four
 voices per chip, MSM6258 one, SegaPCM sixteen, C140 twenty-four, C352
@@ -107,13 +116,17 @@ envelope state - plus the pitch macro when the note's driver wrote one.
 
 ## Pitch units
 
-Everything pitch-related in the converter works in kc/kf units: 1/64
-semitone. One key-code step is 64 units, and the YM2151 KF register
-contributes its top six bits (`kf >> 2`).
+The YM2151 and the per-row sweep model work in kc/kf units: 1/64 semitone.
+One key-code step is 64 units, and the YM2151 KF register contributes its top
+six bits (`kf >> 2`). The YM2203 is the exception: Furnace's OPN platform
+runs in **linear pitch** mode, so a pattern note is 128 units per semitone,
+E5 is 1/128 semitone, and the per-tick pitch macro uses the same units. The
+YM2203 note is chosen by inverting Furnace's linear note -> block/f-num
+conversion; it does not use the per-row sweep model.
 
 Two effects move pitch, and their scales differ per platform:
 
-| Effect | YM2151 | PCM (C140, SegaPCM) |
+| Effect | YM2151 | PCM / YM2203 / period table |
 |---|---|---|
 | E5 fine tune, per byte step | 1/64 st | 1/128 st |
 | 01xx/02xx slide, per parameter unit per tick | 1 kc/kf unit (1/64 st) | 1/128 st |
@@ -122,17 +135,22 @@ E8xx/E9xx quick legato adds semitones to the playing note in one write. It is
 cumulative (`note += y`), applies one tick after the row, and resets at the
 next note. Checked against Furnace 0.6.8.3 on both platforms.
 
-The SCC and AY do not use the slide effects. Their register is a 12-bit
-period, and a mid-note pitch change becomes the instrument's **pitch macro**
-(code 4): one value per tick in the engine's pitch unit, which the platform
-adds straight to the period. A mid-note waveform morph becomes the **wave
-macro** (code 3), a per-tick list of wavetable indices. Both are 16-bit signed
-where they can exceed a byte, both carry their own speed and loop, and both
-are deduplicated per trajectory, so a recurring bend or morph is one
-instrument rather than a cell per step. `pitch.py` ports Furnace's period-mode
-`DivPitchTable` and inverts it (including the offset search the macros need),
-so a source period is reproduced exactly up to one register step where the
-table's octave shift loses resolution.
+A held period step of about a semitone is a new note. Vibrato and pitch
+slides are the instrument's **pitch macro** (code 4), one value per tick in
+1/128 semitone. A waveform morph on a held note is the **wave macro** (code
+3). Volume that moves during the note is the **volume macro** (code 0) with
+the column at 15. A one-level saw longer than 255 ticks, when it is not one
+repeating tooth, is **FAxy** on the pattern instead: `FA01` steps the column
+down one level per tick, and that cell's volume is written one higher so the
+same-tick slide lands on the source level. A tooth that peaks at 15 plays one
+level low, because the column cannot go to 16. `FA00` holds the column. AY
+noise, channel mode, envelope shape and envelope period that move during the
+note are macros too (codes 2, 3, 6 and 16); the 20xx–24xx effects carry the
+state at the note start. Macros are built at the module's final tick rate.
+`pitch.py` ports
+Furnace's period-mode `DivPitchTable` and inverts it, so a source period is
+reproduced exactly up to one register step where the octave shift loses
+resolution.
 
 ## The sweep model
 
@@ -171,10 +189,13 @@ it was. `--max-bpm N` picks the coarsest row grid whose row rate is under
 `N/15`; `--condense N` (and `--variants`) lengthen the chosen grid's rows by N.
 
 `timing.condense_row` multiplies the row length and re-derives `hz`/`speed`
-with the same `hz_speed_for_row` helper `estimate_grid` uses, so the two never
-disagree. `row_subdiv` (rows per measured 16th) is cosmetic - only `Song.bpm`
-reads it - so a 3x factor, which does not land on the subdivision lattice, is
-fine.
+with the same `hz_speed_for_row` helper `estimate_grid` uses. `row_subdiv`
+records rows per measured 16th and only feeds `Song.bpm`. A 3x condense
+divides it, and a fractional result is fine. On an SCC/AY module the tick
+stays one driver frame. When two notes share a cell the fit drops ticks per
+row. `row_subdiv` is then the 16th's tick count over the written row's tick
+count. Highlight A/B are `round(4 * row_subdiv)` and `round(16 * row_subdiv)`,
+and Furnace's status-bar BPM stays the quarter-note tempo.
 
 `estimate_grid` reads its lattice from `vgm.writes` by default (the YM2151
 key-on register, reg 0x08). `analyze` can hand it an `onsets` mapping instead,

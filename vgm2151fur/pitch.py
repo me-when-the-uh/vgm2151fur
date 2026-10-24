@@ -130,7 +130,7 @@ class PeriodPitchTable:
             if best is None or cand < best:
                 best = cand
         assert best is not None
-        _OFFSETS[key] = best[2]
+        self._offsets[key] = best[2]
         return best[2]
 
     def _value_offset(self, offset: int) -> int:
@@ -149,7 +149,6 @@ class PeriodPitchTable:
 
 _TABLES: dict[tuple, PeriodPitchTable] = {}
 _NOTES: dict[tuple, tuple[int, int]] = {}
-_OFFSETS: dict[tuple[int, int], int] = {}
 
 
 def pitch_table(clock: float, divider: float, maximum: int = 0xFFF) -> PeriodPitchTable:

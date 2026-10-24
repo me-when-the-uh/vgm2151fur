@@ -14,13 +14,16 @@ comparison here starts with it.
 
 from __future__ import annotations
 
+import math
 from bisect import bisect_right
 from dataclasses import dataclass
 from pathlib import Path
 
 from vgm2151fur.analyze import kc_kf_units
+from vgm2151fur.ay8910 import ay_min_period
 from vgm2151fur.furnace import export_vgm
 from vgm2151fur.vgm import load_vgm
+from vgm2151fur.ym2203 import opn_pitch_units
 
 
 @dataclass
@@ -54,9 +57,170 @@ def kc_kf_stream(vgm, ch: int) -> list[tuple[int, int]]:
     return out
 
 
+def _opn_chip_ids(vgm) -> list[int]:
+    return sorted({
+        w.chip_id for w in vgm.writes if w.chip in ("ym2203", "ym2203_ssg")
+    })
+
+
+def opn_ssg_units(period: int) -> float:
+    """Pitch for an AY/SSG tone period; larger is higher, differences are
+    meaningful (the clock/divider constant cancels between two logs)."""
+    return -768.0 * math.log2(max(1, period))
+
+
+def opn_pitch_stream(vgm, ch: int) -> list[tuple[int, int]]:
+    """(sample, pitch units) for one YM2203 voice.
+
+    A YM2203 owns six Furnace channels: three FM then three SSG.  The FM
+    stream uses f-num/block units; the SSG stream uses the tone period.
+    """
+    ids = _opn_chip_ids(vgm)
+    cidx, voice = divmod(ch, 6)
+    if cidx >= len(ids):
+        return []
+    cid = ids[cidx]
+    out: list[tuple[int, int]] = []
+    if voice >= 3:
+        ssg = voice - 3
+        lo = hi = None
+        min_period = ay_min_period(vgm.ym2203_clock or 3579545, 16)
+        for w in vgm.writes:
+            if w.chip != "ym2203_ssg" or w.chip_id != cid:
+                continue
+            if w.reg == ssg * 2:
+                lo = w.val
+            elif w.reg == ssg * 2 + 1:
+                hi = w.val
+            else:
+                continue
+            if lo is not None and hi is not None:
+                period = (lo & 0xFF) | ((hi & 0x0F) << 8)
+                if period >= min_period:
+                    out.append((w.sample, round(opn_ssg_units(period))))
+        return out
+    lo = hi = None
+    special = False
+    slo = [0, 0, 0]
+    shi = [0, 0, 0]
+    sset = [False, False, False]
+    for w in vgm.writes:
+        if w.chip != "ym2203" or w.chip_id != cid:
+            continue
+        emit = False
+        if w.reg == 0x27:
+            special = bool(w.val & 0xC0)
+            emit = True
+        elif 0xA0 <= w.reg <= 0xA2:
+            if (w.reg & 3) != voice:
+                continue
+            lo = w.val
+            emit = True
+        elif 0xA4 <= w.reg <= 0xA6:
+            if (w.reg & 3) != voice:
+                continue
+            hi = w.val
+            emit = True
+        elif 0xA8 <= w.reg <= 0xAE and voice == 2:
+            idx = w.reg & 3
+            if idx >= 3:
+                continue
+            if w.reg <= 0xAA:
+                slo[idx] = w.val
+            else:
+                shi[idx] = w.val
+            sset[idx] = True
+            emit = True
+        else:
+            continue
+        if not emit:
+            continue
+        if voice == 2 and special and any(sset):
+            idx = next(i for i in range(3) if sset[i])
+            block = (shi[idx] >> 3) & 7
+            fnum = slo[idx] | ((shi[idx] & 7) << 8)
+        else:
+            if lo is None or hi is None:
+                continue
+            block = (hi >> 3) & 7
+            fnum = lo | ((hi & 7) << 8)
+        out.append((w.sample, opn_pitch_units(block, fnum)))
+    return out
+
+
 def state_at(stream: list[tuple[int, int]], t: int) -> int | None:
     i = bisect_right([s for s, _v in stream], t) - 1
     return stream[i][1] if i >= 0 else None
+
+
+def opn_keyed_intervals(vgm, ch: int) -> list[tuple[int, int]]:
+    """Samples where one YM2203 voice is sounding.
+
+    `ch` uses the module layout: six channels per chip, three FM then three
+    SSG.  FM uses the 0x28 operator mask; SSG uses its mixer tone bit and
+    level register.  Chips the log does not contain return an empty list.
+    """
+    ids = _opn_chip_ids(vgm)
+    chip, voice = divmod(ch, 6)
+    if chip >= len(ids):
+        return []
+    cid = ids[chip]
+    out: list[tuple[int, int]] = []
+    on = False
+    start = 0
+    if voice >= 3:
+        ssg = voice - 3
+        mixer = 0
+        vol = [0, 0, 0]
+        lo = hi = 0
+        min_period = ay_min_period(vgm.ym2203_clock or 3579545, 16)
+        for w in vgm.writes:
+            if w.chip != "ym2203_ssg" or w.chip_id != cid:
+                continue
+            if w.reg == 7:
+                mixer = w.val
+            elif w.reg in (8, 9, 10):
+                vol[w.reg - 8] = w.val
+            elif w.reg == ssg * 2:
+                lo = w.val
+            elif w.reg == ssg * 2 + 1:
+                hi = w.val
+            else:
+                continue
+            level = vol[ssg]
+            period = (lo & 0xFF) | ((hi & 0x0F) << 8)
+            # Noise-only/noise-mixed percussion has no meaningful tone period;
+            # comparing the stale period register would report false pitch
+            # changes, so only tone-only gates count. Periods below the
+            # module's representable range are the driver's silence gate.
+            now = (not (mixer & (1 << ssg))
+                   and (mixer & (1 << (ssg + 3)))
+                   and ((level & 0x10) or (level & 0x0F))
+                   and period >= min_period)
+            if now and not on:
+                start = w.sample
+                on = True
+            elif not now and on:
+                out.append((start, w.sample))
+                on = False
+    else:
+        for w in vgm.writes:
+            if (w.chip != "ym2203" or w.chip_id != cid or w.reg != 0x28
+                    or (w.val & 3) != voice):
+                continue
+            now = bool((w.val >> 4) & 0xF)
+            if now and not on:
+                start = w.sample
+                on = True
+            elif not now and on:
+                out.append((start, w.sample))
+                on = False
+    if on:
+        end = vgm.total_samples or (
+            max((w.sample for w in vgm.writes), default=start) + 1
+        )
+        out.append((start, end))
+    return out
 
 
 def pitch_runs(
@@ -71,11 +235,24 @@ def pitch_runs(
 
     The comparison walks every write time of the two streams in order and
     samples both states. A short mismatch inside a glide is ignored while a
-    held wrong pitch is reported with its full span.
+    held wrong pitch is reported with its full span.  For YM2203 chips the
+    driver keeps writing f-num during the gaps between notes, so the
+    comparison only counts samples where the source has a keyed operator.
     """
-    a = kc_kf_stream(src_vgm, ch)
-    b = kc_kf_stream(other_vgm, ch)
-    times = sorted({s for s, _v in a} | {s for s, _v in b})
+    opn = any(w.chip == "ym2203" for w in src_vgm.writes)
+    stream = opn_pitch_stream if opn else kc_kf_stream
+    a = stream(src_vgm, ch)
+    b = stream(other_vgm, ch)
+    times = {s for s, _v in a} | {s for s, _v in b}
+    keyed_at = None
+    if opn:
+        intervals = opn_keyed_intervals(src_vgm, ch)
+        times |= {s for s, _e in intervals}
+        times |= {e for _s, e in intervals}
+
+        def keyed_at(t: int) -> bool:
+            return any(s <= t < e for s, e in intervals)
+    times = sorted(times)
     threshold = threshold_st * 64
     min_run = int(min_run_ms * 44.1)
 
@@ -83,6 +260,13 @@ def pitch_runs(
     cur: PitchRun | None = None
     ia = ib = 0
     for t in times:
+        if keyed_at is not None and not keyed_at(t):
+            if cur is not None:
+                cur.t1 = t
+                if cur.t1 - cur.t0 >= min_run:
+                    runs.append(cur)
+                cur = None
+            continue
         while ia < len(a) and a[ia][0] <= t:
             ia += 1
         while ib < len(b) and b[ib][0] <= t:

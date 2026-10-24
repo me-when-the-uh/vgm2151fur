@@ -92,7 +92,7 @@ def _banner(state: dict) -> str:
         "  4  compare    a .fur against its source VGM",
         "  5  render     .fur to WAV",
         "  6  report     analysis, nothing written",
-        "  7  condense   write 1x..4x BPM-variant copies, pick the safe one",
+        "  7  condense   write copies of tracks with 1x..4x lower BPM",
         _TONE.dim("  paste a path, or a number.  m menu, q quit, Ctrl+C quit"),
     ]
     last = state.get("browse_root")

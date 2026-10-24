@@ -17,6 +17,7 @@ the hits per pack directory:
     k051649  Konami SCC at header 0x9C; bit 31 of that field selects the
              K052539 "SCC+" variant (listed as its own kind, scc_plus)
     ay8910   AY-3-8910/YM2149 at header 0x74 (VGM 1.51+), type byte 0x78
+    ym2203   YM2203 at header 0x44; bit 30 marks a second chip (0xA5 writes)
 
 Detection is heuristic (header clocks plus the extra-header clock list).
 Run it before batch convert requests so the pack list is complete, and
@@ -38,7 +39,8 @@ from vgm2151fur.vgm import chips_in_head, head_bytes
 SKIP = {"output", "third_party", ".git", "__pycache__", ".commandcode",
         "node_modules", "soundcheck"}
 
-CENSUS_KINDS = {"segapcm", "c140", "c219", "c352", "k051649", "scc_plus", "ay8910"}
+CENSUS_KINDS = {"segapcm", "c140", "c219", "c352", "k051649", "scc_plus",
+                "ay8910", "ym2203"}
 
 
 def detect(p: Path, want: int) -> set[str] | None:

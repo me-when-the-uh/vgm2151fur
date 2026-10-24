@@ -143,8 +143,14 @@ def dump_pcm(path: Path, out_dir: Path) -> dict:
 
 
 def furnace_bpm(song) -> float:
-    """The BPM Furnace displays: `calcBPM` with hilight 4 = 15 x rows/s."""
-    return 15.0 * song.hz / song.speed
+    """The BPM Furnace displays (`calcBPM`: ``60*hz/(hilightA*speed)``).
+
+    Highlight 4 makes this 15 times the row rate. An SCC/AY module whose row
+    is a fraction of the measured 16th scales highlight A with that fraction,
+    so the number stays the quarter-note tempo.
+    """
+    hl = song.hilight_a or 4
+    return 60.0 * song.hz / (hl * max(1, song.speed))
 
 
 def _verify_runs(
@@ -164,6 +170,15 @@ def _verify_runs(
     """
     from vgm2151fur.diag import export_fur, pitch_runs
 
+    # A YM2203 module has six channels per chip (3 FM + 3 SSG): the FM
+    # channels compare f-num/block and the SSG channels compare tone period.
+    ym_ids = {
+        w.chip_id for w in src_vgm.writes
+        if w.chip in ("ym2203", "ym2203_ssg")
+    }
+    has_opm = any(w.chip == "ym2151" for w in src_vgm.writes)
+    if ym_ids and not has_opm:
+        channels = 6 * len(ym_ids)
     exp = fur_path.with_suffix(".verify.vgm")
     try:
         export_fur(fur_path, exp)
@@ -193,8 +208,11 @@ def _emit(
     """
     # A track with no FM key-ons must not carry an empty YM2151: the chip adds a
     # second device to the export, and VGM players rescale the mix for it, which
-    # drops the sample chip's level.
-    use_fm = include_fm and bool(song.fm_patches)
+    # drops the sample chip's level. The YM2203 is different: its SSG voices
+    # belong to the same system, so an SSG-only track still needs the chip.
+    use_fm = include_fm and (
+        bool(song.fm_patches) or bool(getattr(song, "ym2203_ids", ()) or ())
+    )
     data = write_fur(song, include_pcm=pcm, include_fm=use_fm, stats=stats)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_bytes(data)
@@ -270,6 +288,8 @@ def convert_vgm(
         "c352_samples": len(song.c352_samples) if pcm else 0,
         "scc_notes": song.scc_count,
         "ay_notes": song.ay_count,
+        "ym2203_chips": len(song.ym2203_ids),
+        "ym2203_ssg_notes": song.ym2203_ssg_count,
         "events": sum(1 for e in song.events if e.on),
         "warnings": warnings,
         "name": vgm.name,

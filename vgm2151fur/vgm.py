@@ -1,7 +1,7 @@
 """VGM / VGZ loader and command walker.
 
-Chips: YM2151, K007232, MSM6295, MSM6258, SegaPCM, C140, C352, AY-3-8910,
-K051649/K052539 (SCC).
+Chips: YM2151, YM2203, K007232, MSM6295, MSM6258, SegaPCM, C140, C352,
+AY-3-8910, K051649/K052539 (SCC).
 """
 
 from __future__ import annotations
@@ -14,6 +14,11 @@ from pathlib import Path
 
 VGM_RATE = 44100
 CMD_YM2151 = 0x54
+# 0x55 is the first YM2203's register port; 0xA5 is the second instance in a
+# dual-chip log.  Registers 0x00-0x0F are the built-in SSG, everything above
+# is FM.
+CMD_YM2203 = 0x55
+CMD_YM2203_2 = 0xA5
 CMD_K007232 = 0x41
 CMD_AY8910 = 0xA0
 CMD_MSM6258 = 0xB7
@@ -34,6 +39,7 @@ K007232_TRIGGER_REG = 0x1F
 # Extra-header chip ids (libvgm device index). 0x2A is K007232.
 EXTRA_MSM6258 = 0x16
 EXTRA_MSM6295 = 0x17
+EXTRA_YM2203 = 0x06
 EXTRA_SEGAPCM = 0x04
 EXTRA_AY8910 = 0x12
 EXTRA_K051649 = 0x19
@@ -48,6 +54,11 @@ EXTRA_K007232 = 0x2A
 SEGAPCM_CLOCK_OFF = 0x38
 SEGAPCM_INTF_OFF = 0x3C  # bank shift; mask is the byte at 0x3E (0 → 0x70)
 SEGAPCM_MASK_OFF = 0x3E
+# YM2203 clock at 0x44.  Bit 30 is the "cheat mode" flag for a second
+# instance, which then answers on command 0xA5; the clock itself is the same.
+YM2203_CLOCK_OFF = 0x44
+YM2203_DUAL_BIT = 0x40000000
+YM2203_DEFAULT_CLOCK = 3579545
 AY8910_CLOCK_OFF = 0x74
 AY8910_TYPE_OFF = 0x78
 AY8910_FLAGS_OFF = 0x79
@@ -180,6 +191,11 @@ class VgmFile:
     roms: list[RomSlice] = field(default_factory=list)
     writes: list[ChipWrite] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    # YM2203 header 0x44.  A dual-chip log carries bit 30 in the clock field;
+    # both instances share the clock.  0x55 targets the first chip, 0xA5 the
+    # second.  Registers 0x00-0x0F are the SSG.
+    ym2203_clock: int = 0
+    ym2203_dual: bool = False
     # MSM6295 header 0x98 (VGM 1.61+). Bit 31 of the raw field is pin 7,
     # bit 30 marks a second chip (the player halves each instance's volume).
     msm6295_clock: int = 0
@@ -416,6 +432,12 @@ def chips_in_head(buf: bytes) -> set[str]:
     version = _header_raw(buf, 8)
     if _header_clock(buf, 0x30):
         kinds.add("ym2151")
+    if version >= 0x131 and _field_in_header(buf, YM2203_CLOCK_OFF, 4):
+        ym2203_raw = _header_raw(buf, YM2203_CLOCK_OFF)
+        if 100_000 <= (ym2203_raw & 0x3FFFFFFF) <= 40_000_000:
+            kinds.add("ym2203")
+            if ym2203_raw & YM2203_DUAL_BIT:
+                kinds.add("ym2203_dual")
     if version >= 0x151 and 100_000 <= _header_clock(buf, SEGAPCM_CLOCK_OFF) <= 40_000_000:
         kinds.add("segapcm")
     if version >= 0x151 and 100_000 <= _header_clock(buf, AY8910_CLOCK_OFF) <= 40_000_000:
@@ -441,6 +463,8 @@ def chips_in_head(buf: bytes) -> set[str]:
         kinds.add("k007232")
     if len(buf) >= 0xC0:
         clocks, _volumes = _extra_chip_lists(buf)
+        if clocks.get(EXTRA_YM2203, 0):
+            kinds.add("ym2203")
         if clocks.get(EXTRA_SEGAPCM, 0):
             kinds.add("segapcm")
         if clocks.get(EXTRA_AY8910, 0):
@@ -488,6 +512,12 @@ def load_vgm(path: Path | str) -> VgmFile:
     extra = _extra_chip_lists(buf)
     clocks, volumes = extra
     ym_clock = _header_clock(buf, 0x30) or 3579545
+    # YM2203: the clock field also carries the dual-instance flag in bit 30.
+    ym2203_raw = _header_raw(buf, YM2203_CLOCK_OFF)
+    ym2203_dual = bool(ym2203_raw & YM2203_DUAL_BIT)
+    ym2203_clock = _sane_clock(ym2203_raw)
+    if not ym2203_clock:
+        ym2203_clock = _sane_clock(clocks.get(EXTRA_YM2203, 0))
     k_clock = _k007232_clock(buf, clocks, ym_clock, ver)
     oki_raw = _header_raw(buf, 0x98) if ver >= 0x161 else 0
     adpcm_raw = _header_raw(buf, 0x90) if ver >= 0x161 else 0
@@ -554,6 +584,8 @@ def load_vgm(path: Path | str) -> VgmFile:
         ym2151_clock=ym_clock,
         k007232_clock=k_clock,
         gd3=parse_gd3(buf),
+        ym2203_clock=ym2203_clock,
+        ym2203_dual=ym2203_dual,
         msm6295_clock=oki_raw & 0x3FFFFFFF,
         msm6295_pin7=bool(oki_raw & 0x80000000),
         msm6295_dual=bool(oki_raw & 0x40000000),
@@ -581,6 +613,7 @@ def load_vgm(path: Path | str) -> VgmFile:
     sample = 0
     loop_sample: int | None = None
     skipped_sample_cmds: set[int] = set()
+    stray_ym2203_second = False
     while pos < n:
         if loop_pos is not None and loop_sample is None and pos >= loop_pos:
             loop_sample = sample
@@ -626,6 +659,22 @@ def load_vgm(path: Path | str) -> VgmFile:
             continue
         if cmd == CMD_YM2151 and pos + 3 <= n:
             vgm.writes.append(ChipWrite(sample, "ym2151", 0, buf[pos + 1], buf[pos + 2]))
+            pos += 3
+            continue
+        if cmd in (CMD_YM2203, CMD_YM2203_2) and pos + 3 <= n:
+            # 0x55 is the first instance; 0xA5 is the second, only valid when
+            # the header carries the dual bit.  Registers 0x00-0x0F belong to
+            # the built-in SSG, the rest are FM.
+            cid = 0
+            if cmd == CMD_YM2203_2:
+                if ym2203_dual:
+                    cid = 1
+                else:
+                    stray_ym2203_second = True
+            reg = buf[pos + 1]
+            val = buf[pos + 2]
+            name = "ym2203_ssg" if reg < 0x20 else "ym2203"
+            vgm.writes.append(ChipWrite(sample, name, cid, reg, val))
             pos += 3
             continue
         if cmd == CMD_K007232 and pos + 3 <= n:
@@ -714,6 +763,13 @@ def load_vgm(path: Path | str) -> VgmFile:
         vgm.warnings.append("AY-3-8910 clock is missing or out of range; using 1789772")
     if any(w.chip == "k051649" for w in vgm.writes) and not vgm.k051649_clock:
         vgm.warnings.append("K051649 clock is missing or out of range; using 1789772")
+    if any(w.chip in ("ym2203", "ym2203_ssg") for w in vgm.writes) and not vgm.ym2203_clock:
+        vgm.warnings.append("YM2203 clock is missing or out of range; using 3579545")
+    if stray_ym2203_second:
+        vgm.warnings.append(
+            "0xA5 YM2203 writes without the dual-instance header bit; "
+            "they were treated as the first chip"
+        )
     return vgm
 
 

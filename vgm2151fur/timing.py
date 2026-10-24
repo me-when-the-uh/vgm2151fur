@@ -38,6 +38,10 @@ class Grid:
     source: str
     unit: float = 0.0  # samples per 16th note (the measured unit)
     subdiv: int = 1  # rows per 16th note
+    # The note value before the order-budget floor. A long rip with no single
+    # tempo would otherwise report song_length/1920 as its 16th. SCC/AY rows
+    # are measured from this pulse; `unit` still carries the floor for FM.
+    pulse: float = 0.0
 
     @property
     def tick(self) -> float:
@@ -60,6 +64,10 @@ def _keyons_by_channel(vgm: VgmFile) -> dict[int, list[int]]:
     for w in vgm.writes:
         if w.chip == "ym2151" and w.reg == 0x08 and (w.val & 0x78):
             out.setdefault(w.val & 7, []).append(w.sample)
+        elif w.chip == "ym2203" and w.reg == 0x28 and (w.val & 0xF0):
+            # Per-operator key masks; any 0->1 start is an onset. Keep chip
+            # instances apart without colliding with the YM2151's 0-7.
+            out.setdefault(1000 + w.chip_id * 3 + (w.val & 3), []).append(w.sample)
     for v in out.values():
         v.sort()
     return out
@@ -136,7 +144,7 @@ def hz_speed_for_row(row: float, tick_samples: float) -> tuple[float, int]:
 
 
 def condense_row(
-    hz: float, speed: int, subdiv: int, factor: float, tick_samples: float,
+    hz: float, speed: int, subdiv: float, factor: float, tick_samples: float,
 ) -> tuple[float, int, float]:
     """Lengthen every row by `factor` (rows/s and so BPM drop by `factor`).
 
@@ -251,7 +259,12 @@ def estimate_grid(
         smalls = sorted(c for c in candidates if c >= 800.0)
         if not smalls:
             return None
-        unit = smalls[0]
+        # `pulse` stays the fastest real note value. The floor below only
+        # lengthens the FM row so a long rip still fits in about 240 orders
+        # of 64-row patterns. Coverage is scored on the floored unit, which
+        # is why a medley can report 0% here.
+        pulse = smalls[0]
+        unit = pulse
         if vgm.total_samples:
             unit = max(unit, vgm.total_samples / 1920.0)  # <= ~240 orders
         best_conf = _lattice_coverage(deltas, unit)
@@ -261,6 +274,7 @@ def estimate_grid(
         best_cov = max(cov for _t, cov in ok)
         near = [(t, cov) for t, cov in ok if cov >= best_cov - 0.15]
         unit, best_conf = max(near)
+        pulse = unit
     subdiv = 1
     for n in (8, 4, 2):
         if unit / n >= min_row:
@@ -282,6 +296,7 @@ def estimate_grid(
         source=note,
         unit=unit,
         subdiv=subdiv,
+        pulse=pulse,
     )
 
 

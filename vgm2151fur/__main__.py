@@ -449,7 +449,8 @@ def _add_convert_flags(parser: argparse.ArgumentParser, *, bare: bool) -> None:
              "a stereo mixdown of the result sums the pairs back together",
     )
     parser.add_argument("--melody-only", action="store_true", help="skip sample chips")
-    parser.add_argument("--pcm-only", action="store_true", help="skip the YM2151")
+    parser.add_argument("--pcm-only", action="store_true",
+                        help="skip the YM2151/YM2203")
     parser.add_argument(
         "--no-normalize",
         action="store_true",
@@ -466,15 +467,17 @@ def _add_convert_flags(parser: argparse.ArgumentParser, *, bare: bool) -> None:
         parser.add_argument("--factor", type=float, default=None, help="with a .fur: multiply volume")
         parser.add_argument("--value", type=float, default=None, help="with a .fur: set volume")
         parser.add_argument("--loops", type=int, default=None, help="with a .fur: render loops")
-        parser.add_argument("--channel", type=int, default=None, help="compare: YM2151 channel")
+        parser.add_argument("--channel", type=int, default=None,
+                            help="compare: module channel (0-based)")
 
 
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
         prog="vgm2151fur",
         description=(
-            "Transcribe YM2151 + sample-chip (K007232, MSM6295, MSM6258, "
-            "SegaPCM, C140, C352) VGMs into Furnace .fur files, and edit the result."
+            "Transcribe YM2151 (OPM) and YM2203 (OPN) + sample-chip (K007232, "
+            "MSM6295, MSM6258, SegaPCM, C140, C352) VGMs into Furnace .fur "
+            "files, and edit the result."
         ),
         epilog=EPILOG,
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -505,7 +508,8 @@ def build_parser() -> argparse.ArgumentParser:
     compare = sub.add_parser("compare", help="pitch-check a .fur against its source VGM")
     compare.add_argument("source", help="source .vgm/.vgz")
     compare.add_argument("fur", help="converted .fur")
-    compare.add_argument("--channel", type=int, default=0, help="YM2151 channel (default 0)")
+    compare.add_argument("--channel", type=int, default=0,
+                         help="module channel (default 0)")
 
     render = sub.add_parser("render", help="render .fur files to WAV with Furnace")
     render.add_argument("input", nargs="+", metavar="PATH", help=".fur file, folder, or pack folder")

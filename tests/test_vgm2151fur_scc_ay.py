@@ -7,7 +7,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from vgm2151fur.analyze import analyze
+from vgm2151fur.analyze import _fold_saw, _saw_anchors, _unit_saw, analyze
 from vgm2151fur.ay8910 import ay_note, ay_rate, collect_ay8910
 from vgm2151fur.furio import CHIP_CHANNELS, iter_blocks, parse_fur
 from vgm2151fur.furwrite import (
@@ -183,6 +183,39 @@ class TestSccCollect(unittest.TestCase):
         self.assertEqual(len(notes), 1)
         self.assertEqual(notes[0].hit.voice, 4)
         self.assertEqual(notes[0].hit.wave, SINE)
+
+    def test_plus_bank4_is_wave_ram(self):
+        # Yie Ar Kung-Fu II writes the waveforms through bank 4 and never
+        # touches bank 0. On SCC+ voice 4 has its own image at 0x80-0x9F.
+        # 0x60 is voice 3 only. Addresses at 0xA0 and above are the shadow
+        # register page.
+        voice4 = bytes((b + 3) & 0xFF for b in SINE)
+        writes = (
+            _scc_wave(0x400, SINE)
+            + _scc_wave(0x460, bytes(reversed(SINE)))
+            + _scc_wave(0x480, voice4)
+        )
+        writes += [
+            ChipWrite(0, "k051649", 0, 0x4A0, 0xFF),  # shadow, ignored
+            ChipWrite(0, "k051649", 0, 0x100, 253 & 0xFF),
+            ChipWrite(0, "k051649", 0, 0x101, 0),
+            ChipWrite(0, "k051649", 0, 0x106, 253 & 0xFF),
+            ChipWrite(0, "k051649", 0, 0x107, 0),
+            ChipWrite(0, "k051649", 0, 0x108, 253 & 0xFF),
+            ChipWrite(0, "k051649", 0, 0x109, 0),
+            ChipWrite(0, "k051649", 0, 0x200, 15),
+            ChipWrite(0, "k051649", 0, 0x203, 15),
+            ChipWrite(0, "k051649", 0, 0x204, 15),
+            ChipWrite(100, "k051649", 0, 0x300, 0x19),  # voices 0, 3 and 4
+        ]
+        vgm = _vgm(writes, k051649_clock=1789772, k051649_plus=True)
+        notes, _offs, _waves, _warn = collect_scc(vgm)
+        by_voice = {n.hit.voice: n.hit.wave for n in notes}
+        self.assertEqual(set(by_voice), {0, 3, 4})
+        self.assertEqual(by_voice[0], SINE)
+        self.assertEqual(by_voice[3], bytes(reversed(SINE)))
+        self.assertEqual(by_voice[4], voice4)
+        self.assertNotIn(0xFF, by_voice[4])
 
 
 class TestAyCollect(unittest.TestCase):
@@ -378,17 +411,191 @@ class TestToneMacros(unittest.TestCase):
         writes.append(ChipWrite(132300, "k051649", 0, 0x300, 0x00))
         return _vgm(writes, k051649_clock=1789772, k051649_plus=True)
 
-    def test_pitch_bend_macro(self):
+    def test_held_pitch_change_is_a_new_note(self):
+        # A semitone-or-more period that holds is a new pattern note. Stuffing
+        # it into the pitch macro makes one cell play several notes.
         song = analyze(self._bend_song())
-        note = [e for e in song.events if e.on and e.tone_chip == 1][0]
-        self.assertEqual(len(song.scc_ins), 1)
-        spec = song.scc_ins[0]
-        self.assertTrue(spec.pitch)
-        self.assertEqual(spec.pitch[0], 0)  # starts on the note's own pitch
-        self.assertEqual(spec.pitch[-1], 0)  # and comes back to it
-        self.assertLess(min(spec.pitch), -100)  # the bend is in there
-        # the collector keeps a step back to the note's own period
-        self.assertEqual(note.tone_pitch_pts[-1][1], 3008)
+        notes = [e for e in song.events if e.on and e.tone_chip == 1]
+        self.assertEqual(len(notes), 3)
+        self.assertEqual([n.tone_pitch_pts for n in notes], [(), (), ()])
+        for spec in song.scc_ins:
+            self.assertFalse(spec.pitch)
+        # the bend and the return each land on their own cell
+        self.assertEqual(notes[1].sample, 44100)
+        self.assertEqual(notes[2].sample, 88200)
+
+    def test_vibrato_stays_on_the_note(self):
+        writes = _scc_wave(0, SINE)
+        writes += [
+            ChipWrite(0, "k051649", 0, 0x100, 3008 & 0xFF),
+            ChipWrite(0, "k051649", 0, 0x101, 3008 >> 8),
+            ChipWrite(0, "k051649", 0, 0x200, 12),
+            ChipWrite(100, "k051649", 0, 0x300, 0x01),
+        ]
+        for t, per in ((22050, 3040), (44100, 2976), (66150, 3008)):
+            writes += [
+                ChipWrite(t, "k051649", 0, 0x100, per & 0xFF),
+                ChipWrite(t, "k051649", 0, 0x101, per >> 8),
+            ]
+        writes.append(ChipWrite(88200, "k051649", 0, 0x300, 0x00))
+        song = analyze(_vgm(writes, k051649_clock=1789772, k051649_plus=True))
+        notes = [e for e in song.events if e.on and e.tone_chip == 1]
+        self.assertEqual(len(notes), 1)
+        self.assertTrue(song.scc_ins[0].pitch)
+        self.assertEqual(song.scc_ins[0].pitch[0], 0)
+        self.assertLess(max(song.scc_ins[0].pitch) - min(song.scc_ins[0].pitch), 128)
+
+    def test_melody_uses_the_measured_tempo(self):
+        # One gate, a new period every 8 frames: the phrase is notes on the
+        # 16th, and Furnace's BPM is that tempo rather than the 900 BPM
+        # one-row-per-frame fallback.
+        writes = _scc_wave(0, SINE)
+        writes += [
+            ChipWrite(0, "k051649", 0, 0x200, 12),
+            ChipWrite(0, "k051649", 0, 0x300, 0x01),
+        ]
+        for i in range(32):
+            per = 253 if i % 2 == 0 else 400
+            t = i * 5880
+            writes += [
+                ChipWrite(t, "k051649", 0, 0x100, per & 0xFF),
+                ChipWrite(t, "k051649", 0, 0x101, per >> 8),
+            ]
+        writes.append(ChipWrite(32 * 5880, "k051649", 0, 0x300, 0x00))
+        song = analyze(_vgm(writes, k051649_clock=1789772, k051649_plus=True))
+        notes = [e for e in song.events if e.on and e.tone_chip == 1]
+        self.assertGreaterEqual(len(notes), 30)
+        bpm = 15.0 * song.hz / song.speed
+        self.assertGreater(bpm, 80)
+        self.assertLess(bpm, 160)
+        self.assertNotIn("60 Hz fallback", song.grid_note)
+        self.assertEqual(song.row_subdiv, 1)
+        self.assertEqual(song.hilight_a, 4)
+        for spec in song.scc_ins:
+            if spec.pitch:
+                self.assertLess(max(spec.pitch) - min(spec.pitch), 256)
+
+    def test_short_held_steps_are_notes(self):
+        # A semitone-sized leap every 1000 samples holds past one frame, so
+        # each step is a cell. The tick stays one driver frame.
+        writes = _scc_wave(0, SINE)
+        writes += [
+            ChipWrite(0, "k051649", 0, 0x200, 12),
+            ChipWrite(0, "k051649", 0, 0x300, 0x01),
+        ]
+        for i in range(8):
+            per = 3008 if i % 2 == 0 else 3400
+            t = i * 1000
+            writes += [
+                ChipWrite(t, "k051649", 0, 0x100, per & 0xFF),
+                ChipWrite(t, "k051649", 0, 0x101, per >> 8),
+            ]
+        writes.append(ChipWrite(8 * 1000, "k051649", 0, 0x300, 0x00))
+        song = analyze(_vgm(writes, k051649_clock=1789772, k051649_plus=True))
+        notes = [e for e in song.events if e.on and e.tone_chip == 1]
+        self.assertEqual(len(notes), 8)
+        for spec in song.scc_ins:
+            if spec.pitch:
+                self.assertLess(max(spec.pitch) - min(spec.pitch), 128)
+
+    def test_opening_pitch_keeps_its_cell(self):
+        writes = _scc_wave(0, SINE)
+        writes += [
+            ChipWrite(0, "k051649", 0, 0x200, 12),
+            ChipWrite(0, "k051649", 0, 0x300, 0x01),
+            ChipWrite(0, "k051649", 0, 0x100, 3400 & 0xFF),
+            ChipWrite(0, "k051649", 0, 0x101, 3400 >> 8),
+            ChipWrite(1000, "k051649", 0, 0x100, 3008 & 0xFF),
+            ChipWrite(1000, "k051649", 0, 0x101, 3008 >> 8),
+            ChipWrite(40000, "k051649", 0, 0x300, 0x00),
+        ]
+        song = analyze(_vgm(writes, k051649_clock=1789772, k051649_plus=True))
+        notes = [e for e in song.events if e.on and e.tone_chip == 1]
+        self.assertEqual(len(notes), 2)
+        self.assertEqual(notes[0].sample, 0)
+        self.assertEqual(notes[0].note, scc_note(1789772, 3400)[0])
+        self.assertEqual(notes[1].sample, 1000)
+        self.assertEqual(notes[1].note, scc_note(1789772, 3008)[0])
+
+    def test_close_melody_notes_keep_the_quarter_tempo(self):
+        # The lattice is an 8-frame 16th. Two extra notes sit 3 frames after
+        # a beat and hold until the next beat, so they need their own cells.
+        # The fit drops ticks per row and leaves the tick at one frame.
+        # Highlight scales, and Furnace's BPM stays the quarter-note tempo.
+        writes = _scc_wave(0, SINE)
+        writes += [
+            ChipWrite(0, "k051649", 0, 0x200, 12),
+            ChipWrite(0, "k051649", 0, 0x300, 0x01),
+        ]
+        step = 5880
+        for i in range(32):
+            per = 253 if i % 2 == 0 else 400
+            t = i * step
+            writes += [
+                ChipWrite(t, "k051649", 0, 0x100, per & 0xFF),
+                ChipWrite(t, "k051649", 0, 0x101, per >> 8),
+            ]
+            if i in (4, 12):
+                # A third pitch, so the ornament is not the same note as the
+                # beat it leads into.
+                ornament = 180
+                at = t + 2205
+                writes += [
+                    ChipWrite(at, "k051649", 0, 0x100, ornament & 0xFF),
+                    ChipWrite(at, "k051649", 0, 0x101, ornament >> 8),
+                ]
+        writes.append(ChipWrite(32 * step, "k051649", 0, 0x300, 0x00))
+        song = analyze(_vgm(writes, k051649_clock=1789772, k051649_plus=True))
+        notes = [e for e in song.events if e.on and e.tone_chip == 1]
+        self.assertGreaterEqual(len(notes), 34)
+        self.assertGreater(song.row_subdiv, 1)
+        self.assertEqual(song.hilight_a, int(round(4 * song.row_subdiv)))
+        self.assertEqual(song.hilight_b, int(round(16 * song.row_subdiv)))
+        # The fit drops ticks per row. The tick itself stays one driver frame.
+        tick = 44100.0 / song.hz
+        self.assertGreater(tick, 700)
+        self.assertLess(tick, 780)
+        quarter = 60.0 * song.hz / (song.hilight_a * song.speed)
+        self.assertGreater(quarter, 80)
+        self.assertLess(quarter, 160)
+        self.assertGreater(song.bpm, 80)
+        self.assertLess(song.bpm, 160)
+        stats: dict = {}
+        data = write_fur(song, include_pcm=True, include_fm=False, stats=stats)
+        self.assertEqual(stats.get("note_collision", 0), 0)
+        info = next(block for _o, mag, _s, block in iter_blocks(data) if mag == b"INFO")
+        self.assertEqual(info[12], song.hilight_a)
+        self.assertEqual(info[13], song.hilight_b)
+
+    def test_volume_macro_tracks_real_time_when_condensed(self):
+        writes = _scc_wave(0, SINE)
+        writes += [
+            ChipWrite(0, "k051649", 0, 0x100, 253 & 0xFF),
+            ChipWrite(0, "k051649", 0, 0x101, 253 >> 8),
+            ChipWrite(0, "k051649", 0, 0x200, 15),
+            ChipWrite(100, "k051649", 0, 0x300, 0x01),
+            ChipWrite(100 + 735, "k051649", 0, 0x200, 10),
+            ChipWrite(100 + 1470, "k051649", 0, 0x200, 5),
+            ChipWrite(8000, "k051649", 0, 0x300, 0x00),
+        ]
+        vgm = _vgm(writes, k051649_clock=1789772, k051649_plus=True)
+
+        def change_at(song, level):
+            spec = song.scc_ins[0]
+            self.assertTrue(spec.vol)
+            tick = 44100.0 / song.hz
+            for i, value in enumerate(spec.vol):
+                if value == level:
+                    return i * spec.vol_speed * tick
+            self.fail(f"level {level} missing from {spec.vol}")
+
+        for factor in (1, 4):
+            song = analyze(vgm, condense=factor)
+            # the drop to 10 is one frame after the gate
+            self.assertAlmostEqual(change_at(song, 10), 735, delta=44100.0 / song.hz)
+            note = [e for e in song.events if e.on and e.tone_chip == 1][0]
+            self.assertEqual(note.vol, 15)
+            self.assertEqual(note.vol_pts, ())
 
     def test_wave_morph_macro(self):
         writes = _scc_wave(0, SINE)
@@ -418,6 +625,129 @@ class TestToneMacros(unittest.TestCase):
         ins = [b for _o, m, _s, b in iter_blocks(data) if m == b"INS2"]
         self.assertTrue(any(b"\x03" in block for block in ins))
 
+    def test_ay_period_change_is_a_new_note(self):
+        writes = [
+            ChipWrite(0, "ay8910", 0, 7, 0xFE),
+            ChipWrite(0, "ay8910", 0, 0, 254 & 0xFF),
+            ChipWrite(0, "ay8910", 0, 1, 0),
+            ChipWrite(100, "ay8910", 0, 8, 12),
+            ChipWrite(5880, "ay8910", 0, 0, 400 & 0xFF),
+            ChipWrite(5880, "ay8910", 0, 1, 400 >> 8),
+            ChipWrite(12000, "ay8910", 0, 8, 0),
+        ]
+        song = analyze(_vgm(writes, ay8910_clock=1789772))
+        notes = [e for e in song.events if e.on and e.tone_chip == 2]
+        self.assertEqual(len(notes), 2)
+        self.assertEqual(notes[1].sample, 5880)
+        for spec in song.ay_ins:
+            self.assertFalse(spec.pitch)
+
+    def test_ay_attack_sweep_stays_on_the_note(self):
+        # The PSG tom walks 1104, 1024, 1536, 1792, 2048 across four frames.
+        # The 2-sample jump is the same tick as the next period. The rest is
+        # one note, and the pitch macro covers the multi-semitone dive.
+        gate = 100
+        periods = (1104, 1024, 1536, 1792, 2048)
+        gaps = (521, 2, 734, 736)
+        writes = [
+            ChipWrite(0, "ay8910", 0, 7, 0xFE),
+            ChipWrite(0, "ay8910", 0, 0, periods[0] & 0xFF),
+            ChipWrite(0, "ay8910", 0, 1, periods[0] >> 8),
+            ChipWrite(0, "ay8910", 0, 11, 160),
+            ChipWrite(0, "ay8910", 0, 12, 0),
+            ChipWrite(0, "ay8910", 0, 13, 9),
+            ChipWrite(gate, "ay8910", 0, 8, 0x10),
+        ]
+        t = gate
+        for gap, per in zip(gaps, periods[1:]):
+            t += gap
+            writes += [
+                ChipWrite(t, "ay8910", 0, 0, per & 0xFF),
+                ChipWrite(t, "ay8910", 0, 1, per >> 8),
+            ]
+        writes.append(ChipWrite(gate + 2716, "ay8910", 0, 8, 0))
+        song = analyze(_vgm(writes, ay8910_clock=1789772))
+        notes = [e for e in song.events if e.on and e.tone_chip == 2]
+        self.assertEqual(len(notes), 1)
+        pitched = [spec for spec in song.ay_ins if spec.pitch]
+        self.assertEqual(len(pitched), 1)
+        span = max(pitched[0].pitch) - min(pitched[0].pitch)
+        self.assertGreater(span, 128 * 3)
+
+    def test_ay_glide_kept_when_the_tone_bit_ends_off(self):
+        # The glide is tone, then the mixer drops the tone bit and leaves
+        # noise. The periods written while the tone was on stay a macro.
+        writes = [
+            ChipWrite(0, "ay8910", 0, 7, 0xFE),
+            ChipWrite(0, "ay8910", 0, 0, 1024 & 0xFF),
+            ChipWrite(0, "ay8910", 0, 1, 1024 >> 8),
+            ChipWrite(100, "ay8910", 0, 8, 12),
+            ChipWrite(849, "ay8910", 0, 0, 1152 & 0xFF),
+            ChipWrite(849, "ay8910", 0, 1, 1152 >> 8),
+            ChipWrite(1577, "ay8910", 0, 0, 1280 & 0xFF),
+            ChipWrite(1577, "ay8910", 0, 1, 1280 >> 8),
+            ChipWrite(2300, "ay8910", 0, 7, 0xF7),
+            ChipWrite(3000, "ay8910", 0, 8, 0),
+        ]
+        song = analyze(_vgm(writes, ay8910_clock=1789772))
+        notes = [e for e in song.events if e.on and e.tone_chip == 2]
+        self.assertEqual(len(notes), 1)
+        pitched = [spec for spec in song.ay_ins if spec.pitch]
+        self.assertEqual(len(pitched), 1)
+        span = max(pitched[0].pitch) - min(pitched[0].pitch)
+        self.assertGreater(span, 256)
+
+    def test_ay_pitch_split_writes_the_envelope_once(self):
+        # A held period change is a second cell. Register 13 was written at
+        # the gate, and the second cell leaves it alone.
+        writes = [
+            ChipWrite(0, "ay8910", 0, 7, 0xFE),
+            ChipWrite(0, "ay8910", 0, 0, 254),
+            ChipWrite(0, "ay8910", 0, 1, 0),
+            ChipWrite(0, "ay8910", 0, 11, 66),
+            ChipWrite(0, "ay8910", 0, 12, 0),
+            ChipWrite(0, "ay8910", 0, 13, 9),
+            ChipWrite(100, "ay8910", 0, 8, 0x10),
+            ChipWrite(5880, "ay8910", 0, 0, 400 & 0xFF),
+            ChipWrite(5880, "ay8910", 0, 1, 400 >> 8),
+            ChipWrite(12000, "ay8910", 0, 8, 0),
+        ]
+        song = analyze(_vgm(writes, ay8910_clock=1789772))
+        notes = [e for e in song.events if e.on and e.tone_chip == 2]
+        self.assertEqual(len(notes), 2)
+        shapes = [
+            sample for sample, _ch, cmd, _val in song.channel_fx if cmd == 0x22
+        ]
+        self.assertEqual(shapes, [notes[0].sample])
+
+    def test_ay_envelope_sweep_is_a_macro(self):
+        writes = [
+            ChipWrite(0, "ay8910", 0, 7, 0xFE),
+            ChipWrite(0, "ay8910", 0, 0, 254),
+            ChipWrite(0, "ay8910", 0, 1, 0),
+            ChipWrite(0, "ay8910", 0, 11, 40),
+            ChipWrite(0, "ay8910", 0, 12, 0),
+            ChipWrite(0, "ay8910", 0, 13, 9),
+            ChipWrite(100, "ay8910", 0, 8, 0x10),
+        ]
+        for i, period in enumerate((80, 120, 200)):
+            t = 100 + (i + 1) * 735
+            writes += [
+                ChipWrite(t, "ay8910", 0, 11, period & 0xFF),
+                ChipWrite(t, "ay8910", 0, 12, period >> 8),
+            ]
+        writes.append(ChipWrite(8000, "ay8910", 0, 8, 0))
+        song = analyze(_vgm(writes, ay8910_clock=1789772))
+        self.assertEqual(song.ay_count, 1)
+        spec = song.ay_ins[0]
+        self.assertGreaterEqual(len(spec.env_period), 2)
+        self.assertIn(40, spec.env_period)
+        self.assertIn(200, spec.env_period)
+        data = write_fur(song, include_pcm=True, include_fm=False)
+        ins = [b for _o, m, _s, b in iter_blocks(data) if m == b"INS2"][0]
+        # file code 16 is the envelope-period macro
+        self.assertIn(bytes([16]), ins)
+
     def test_ay_silence_gate_has_no_note(self):
         # A driver mutes a voice with an inaudible tone period; that is not a
         # note (and it must not become a high blip).
@@ -437,6 +767,119 @@ class TestToneMacros(unittest.TestCase):
         self.assertGreater(lo, 1)
         self.assertEqual([h.sample_time for h in hits], [100])
         self.assertEqual([o.sample_time for o in offs], [2000])
+
+
+def _levels_vgm(levels: list[int], *, wave: bytes = SINE, origin: int = 0) -> VgmFile:
+    """One SCC+ note whose volume register follows ``levels``, one frame apart."""
+    t0 = origin
+    writes = [
+        ChipWrite(t0, "k051649", 0, i, b) for i, b in enumerate(wave)
+    ]
+    writes += [
+        ChipWrite(t0, "k051649", 0, 0x100, 253 & 0xFF),
+        ChipWrite(t0, "k051649", 0, 0x101, 0),
+        ChipWrite(t0, "k051649", 0, 0x200, levels[0] & 0x0F),
+        ChipWrite(t0 + 100, "k051649", 0, 0x300, 0x01),
+    ]
+    for i, level in enumerate(levels[1:], start=1):
+        writes.append(ChipWrite(t0 + 100 + 735 * i, "k051649", 0, 0x200, level & 0x0F))
+    off = t0 + 100 + 735 * (len(levels) - 1) + 1
+    writes.append(ChipWrite(off, "k051649", 0, 0x300, 0x00))
+    return _vgm(writes, k051649_clock=1789772, k051649_plus=True)
+
+
+class TestVolumeSaw(unittest.TestCase):
+    def test_fold_saw_phase_and_partial_tooth(self):
+        tooth = (13, 12, 11, 10, 9, 8, 7)
+        folded = _fold_saw(list(tooth) * 3)
+        self.assertEqual(folded, (tooth, 1, 0))
+        # The note opened in the middle of a tooth.
+        mid = [4, 3, 2, 1, 6, 5, 4, 3, 2, 1, 6, 5]
+        self.assertEqual(_fold_saw(mid), ((4, 3, 2, 1, 6, 5), 1, 0))
+        # The last tooth stops early. One extra frame of the final level still folds.
+        self.assertEqual(_fold_saw(list(tooth) + [13, 12, 11]), (tooth, 1, 0))
+        self.assertEqual(_fold_saw(list(tooth) * 2 + [7]), (tooth, 1, 0))
+        # A real rest at the bottom is not a loop, or the ramp would restart.
+        self.assertIsNone(_fold_saw(list(tooth) * 2 + [7, 7, 7]))
+        self.assertIsNone(_fold_saw(list(tooth)))
+        self.assertFalse(_unit_saw([15, 10, 5]))
+        self.assertTrue(_unit_saw(list(tooth) * 2))
+
+    def test_anchors_skip_the_running_slide(self):
+        series = [6, 5, 4, 4, 4, 3, 2, 8]
+        anchors = _saw_anchors(series, start=100, tick_samples=735)
+        # tick 0 is the note. The hold at 4 stops the slide; 3 re-arms it; 8 jumps.
+        self.assertEqual(
+            anchors,
+            (
+                (100 + 735 * 3, 4, 0),
+                (100 + 735 * 5, 3, 1),
+                (100 + 735 * 7, 8, 1),
+            ),
+        )
+
+    def test_repeating_tooth_is_a_looping_macro(self):
+        tooth = [13, 12, 11, 10, 9, 8, 7]
+        song = analyze(_levels_vgm(tooth * 4), speed=1)
+        note = [e for e in song.events if e.on and e.tone_chip == 1][0]
+        spec = song.scc_ins[note.ins]
+        self.assertEqual(spec.vol, tuple(tooth))
+        self.assertEqual(spec.vol_loop, 0)
+        self.assertEqual(spec.vol_speed, 1)
+        self.assertEqual(note.vol, 15)
+        self.assertEqual(note.vol_pts, ())
+        self.assertEqual(note.vol_slide, 0)
+
+    def test_unit_saw_survives_the_coarse_instrument_list(self):
+        # Past 160 tone instruments a non-saw volume macro is rounded to
+        # steps of 2. A one-level saw on a later note stays at every level.
+        writes: list[ChipWrite] = []
+        for i in range(165):
+            origin = i * 20000
+            raw = bytearray(SINE)
+            raw[0] = (i + 1) & 0xFF
+            raw[1] = 0x40
+            writes.extend(_levels_vgm([15, 10, 5], wave=bytes(raw), origin=origin).writes)
+        tooth = [13, 12, 11, 10, 9, 8, 7]
+        origin = 165 * 20000
+        raw = bytearray(SINE)
+        raw[0] = 200
+        raw[1] = 0x41
+        writes.extend(_levels_vgm(tooth * 3, wave=bytes(raw), origin=origin).writes)
+        song = analyze(_vgm(writes, k051649_clock=1789772, k051649_plus=True), speed=1)
+        note = [e for e in song.events if e.on and e.tone_chip == 1][-1]
+        spec = song.scc_ins[note.ins]
+        self.assertGreater(len(song.scc_ins), 160)
+        self.assertEqual(spec.vol, tuple(tooth))
+        self.assertEqual(spec.vol_loop, 0)
+        self.assertEqual(note.vol, 15)
+        self.assertEqual(note.vol_slide, 0)
+
+    def test_overlong_irregular_saw_is_a_fast_slide(self):
+        levels: list[int] = []
+        peak = 12
+        for k in range(40):
+            levels.extend(range(peak, 0, -1))
+            levels.extend([1] * k)
+            peak = 6 + ((peak + 3) % 7)
+        levels = levels[:320]
+        self.assertGreater(len(levels), 255)
+        song = analyze(_levels_vgm(levels), speed=1)
+        note = [e for e in song.events if e.on and e.tone_chip == 1][0]
+        spec = song.scc_ins[note.ins]
+        self.assertEqual(spec.vol, ())
+        self.assertEqual(note.vol_slide, 1)
+        self.assertEqual(note.vol, levels[0])
+        self.assertTrue(note.vol_pts)
+        data = write_fur(song, include_pcm=True, include_fm=False)
+        mod = parse_fur(data)
+        fx = [
+            pair
+            for rows in mod.patterns.values()
+            for row in rows
+            for pair in (row.fx or ())
+        ]
+        self.assertIn((0xFA, 0x01), fx)
 
 
 def _scc_wave_at(sample: int, offset: int, data: bytes) -> list[ChipWrite]:

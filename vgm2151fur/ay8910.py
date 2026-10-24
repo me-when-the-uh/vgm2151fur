@@ -16,10 +16,10 @@ A tone channel sounds at ``clock / (16 * period)`` (period 0 reads as 1).
 There is no key-on register: the gate is the volume (0 = off) or the mixer
 (tone and noise both disabled = off).  MSX and Spectrum drivers use the volume
 as the gate for percussion and retrigger the hardware envelope for drum
-decays, so a new note starts when the voice becomes audible, when the envelope
-is re-armed, or when the period changes while the voice sounds; the analyzer
-turns each pitch change into its own note because these chips survive a
-retrigger unchanged.
+decays, so a new note starts when the voice becomes audible or the envelope
+is re-armed.  A period change of a semitone or more that holds for a frame
+is its own note; a smaller change stays on the note as vibrato or a slide.
+A period below the pitch table's range mutes the voice.
 
 Furnace's AY platform writes the pitch table's value straight into the period
 registers, so a source period round-trips through ``pitch.furnace_period_note``.
@@ -65,11 +65,15 @@ def ay_rate(clock: int, period: int) -> float:
     return (clock or AY_DEFAULT_CLOCK) / (16.0 * max(1, period))
 
 
-def ay_note(clock: int, period: int) -> tuple[int, int]:
-    """Period register -> (Furnace note, E5 fine tune)."""
+def ay_note(clock: int, period: int, divider: int = 8) -> tuple[int, int]:
+    """Period register -> (Furnace note, E5 fine tune).
+
+    ``divider`` is the Furnace pitch-table divider: 8 for a stand-alone
+    AY-8910, 16 for the YM2203's SSG (Furnace runs that core with extDiv 16).
+    """
     return furnace_period_note(
         clock=module_clock(clock),
-        divider=8,
+        divider=divider,
         value=max(1, period),
     )
 
@@ -87,7 +91,8 @@ class AyHit:
     period: int  # 12-bit tone period at the gate
     vol: int  # volume register low nibble
     env: bool  # volume register bit 4: the envelope drives this channel
-    tone: bool  # mixer: tone enabled
+    tone: bool  # mixer: tone enabled (follows later mixer writes)
+    opened_tone: bool  # tone bit at the gate; later mixer writes leave this
     noise: bool  # mixer: noise enabled
     noise_period: int  # register 6 (5-bit)
     env_shape: int  # register 13
@@ -123,7 +128,7 @@ def _noise_on(reg: list[int], voice: int) -> bool:
     return not (reg[REG_MIXER] & (1 << (voice + 3)))
 
 
-def ay_min_period(clock: int) -> int:
+def ay_min_period(clock: int, divider: int = 8) -> int:
     """Smallest period the module can express for this clock.
 
     The pitch table tops out at B-9, and drivers mute a channel by writing a
@@ -131,7 +136,7 @@ def ay_min_period(clock: int) -> int:
     Treating it as silence keeps those housekeeping writes from becoming
     notes with a pitch nothing can represent.
     """
-    tbl = pitch_table(module_clock(clock or AY_DEFAULT_CLOCK), 8)
+    tbl = pitch_table(module_clock(clock or AY_DEFAULT_CLOCK), divider)
     return max(2, tbl.value(NOTE_MAX, 127))
 
 
@@ -150,22 +155,28 @@ def _audible(reg: list[int], voice: int, min_period: int = 0) -> bool:
 
 def collect_ay8910(
     vgm: VgmFile,
+    *,
+    chip: str = "ay8910",
+    clock: int | None = None,
+    divider: int = 8,
 ) -> tuple[list[AyHit], list[AyOff], list[str]]:
-    """Walk the AY register stream into notes.
+    """Walk an AY-compatible register stream into notes.
 
-    Returns (hits, key-offs, warnings).  Each hit is one gate interval of one
-    voice with everything the writer needs to emit it as a note.
+    ``chip`` selects the write stream (the YM2203's SSG uses ``ym2203_ssg``),
+    and ``divider`` is the Furnace pitch-table divider (8 for an AY-8910,
+    16 for the YM2203 SSG).  Returns (hits, key-offs, warnings); each hit is
+    one gate interval of one voice with everything the writer needs.
     """
     warnings: list[str] = []
     hits: list[AyHit] = []
     offs: list[AyOff] = []
-    chips = sorted({w.chip_id for w in vgm.writes if w.chip == "ay8910"})
+    chips = sorted({w.chip_id for w in vgm.writes if w.chip == chip})
     if not chips:
         return [], [], warnings
     state: dict[int, dict] = {cid: _blank_chip() for cid in chips}
     acc: Counter = Counter()
-    clock = vgm.ay8910_clock or AY_DEFAULT_CLOCK
-    min_period = ay_min_period(clock)
+    clock = clock or vgm.ay8910_clock or AY_DEFAULT_CLOCK
+    min_period = ay_min_period(clock, divider)
 
     def current_period(reg: list[int], voice: int) -> int:
         return reg[REG_TONE_LO[voice]] | ((reg[REG_TONE_HI[voice]] & 0x0F) << 8)
@@ -196,6 +207,7 @@ def collect_ay8910(
             vol=reg[REG_VOL[voice]] & 0x0F,
             env=env,
             tone=_tone_on(reg, voice),
+            opened_tone=_tone_on(reg, voice),
             noise=_noise_on(reg, voice),
             noise_period=reg[REG_NOISE] & 0x1F,
             env_shape=reg[REG_ENV_SHAPE] & 0x0F,
@@ -228,7 +240,7 @@ def collect_ay8910(
             close_hit(st, cid, voice, t)
 
     for w in vgm.writes:
-        if w.chip != "ay8910":
+        if w.chip != chip:
             continue
         cid = w.chip_id
         st = state.setdefault(cid, _blank_chip())
@@ -245,17 +257,19 @@ def collect_ay8910(
                 break
         if voice is not None:
             hit = st["active"][voice]
-            if hit is not None:
-                new = current_period(reg, voice)
+            new = current_period(reg, voice)
+            audible = _audible(reg, voice, min_period)
+            if hit is not None and audible and _tone_on(reg, voice):
                 # Compare with what the voice was last seen playing, so a step
-                # back to the note's own pitch is recorded too; the pair of
-                # period writes is one value, which the analyzer merges.
+                # back to the note's own pitch is recorded too. Period writes
+                # while the tone is disabled are the noise channel's leftover
+                # register, not a pitch.
                 cur = hit.freq_pts[-1][1] if hit.freq_pts else hit.period
                 if new != cur:
-                    # A period rewrite inside a note is a pitch change:
-                    # drivers glide drums and vibrato the tone voice. It
-                    # becomes the note's pitch macro.
                     hit.freq_pts.append((w.sample, new))
+            # A period below the music range is how drivers mute a channel
+            # while leaving the volume up. That is a gate-off, not a pitch.
+            update_gate(st, cid, voice, w.sample)
             continue
         if r in REG_VOL:
             voice = REG_VOL.index(r)
@@ -332,5 +346,6 @@ def collect_ay8910(
                 st["active"][voice] = None
 
     if acc.get("io_ports"):
-        warnings.append(f"{acc['io_ports']} AY-8910 I/O port writes are not converted")
+        label = "YM2203 SSG" if chip == "ym2203_ssg" else "AY-8910"
+        warnings.append(f"{acc['io_ports']} {label} I/O port writes are not converted")
     return hits, offs, warnings

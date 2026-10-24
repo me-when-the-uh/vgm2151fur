@@ -56,12 +56,15 @@ steps would otherwise be skipped. `--factors 1,1.5,2,2.5,3,4` writes an
 explicit ladder instead (fractional allowed). Before trusting a whole pack,
 run `compare` on the chosen variant.
 
-The grid is measured from a lattice of note starts. The YM2151 key-on register
-supplies it when the rip has a usable FM stream. When it does not - the C352
-and SegaPCM-only board rips have no YM2151 at all - the sample-chip trigger
-times are measured the same way, which keeps those rips off the 60 Hz frame
-fallback. That fallback reads as exactly 900 BPM (60 rows/s) and carries no
-musical information. A rip whose FM lattice already measures uses it alone.
+The grid is measured from a lattice of note starts. The YM2151 or YM2203
+key-on register supplies it when the rip has a usable FM stream. When it
+does not - the C352 and SegaPCM-only board rips have no FM chip at all - the
+sample-chip trigger times are measured the same way, which keeps those rips
+off the 60 Hz frame fallback. That fallback reads as exactly 900 BPM
+(60 rows/s) and carries no musical information. A rip whose FM lattice
+already measures uses it alone. A YM2203 whose SSG driver writes periods
+faster than the resulting tick gets `hz` and `speed` raised together (same
+row length and BPM), so the pitch macro still sees each write.
 
 The TUI runs this by default: a plain `c convert` writes the 1x file to
 `default/` and each lossless factor to `x2 optimised/`, `x3 optimised/`, ...,
@@ -183,10 +186,11 @@ they can be run from anywhere.
 - `tools/pitch_shift.py <a.wav> <b.wav>`: the chroma-rotation table one pair
   of renders at a time, used by the soundcheck.
 - `tools/vgm_scan.py [root ...]`: which VGM packs use SegaPCM, C140, C352,
-  C219, SCC/SCC+ or AY-8910 and at which clock. C219 is a C140-family part the
-  converter does not support; never batch-convert those into the C140 target.
-  C352 converts as chip 0xD0; a Furnace build with a C352 core can play it.
-  See docs/c352.md and docs/scc-ay8910.md.
+  C219, SCC/SCC+, AY-8910 or YM2203 and at which clock. C219 is a C140-family
+  part the converter does not support; never batch-convert those into the
+  C140 target. C352 converts as chip 0xD0; a Furnace build with a C352 core
+  can play it. YM2203 converts as chip 0x8D (3 FM + 3 SSG voices per chip).
+  See docs/c352.md, docs/scc-ay8910.md and docs/ym2203.md.
 
 ## Environment
 
