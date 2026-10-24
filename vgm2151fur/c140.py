@@ -1,6 +1,6 @@
 """Namco C140 ROM → signed samples → Furnace.
 
-Register model follows libvgm c140.c (the core VGM rips are logged against):
+Register model follows libvgm c140.c:
 
     register = voice << 4 | reg     (24 voices, 9-bit address space)
     0x00 volume R   0x01 volume L   0x02/0x03 frequency MSB/LSB   0x04 bank
@@ -8,22 +8,18 @@ Register model follows libvgm c140.c (the core VGM rips are logged against):
 
 Mode bits: 7 = key on (6 = retrigger when already keyed), 4 = looping,
 3 = mulaw. Each address step is one sample and one ROM byte. The ROM
-address is find_sample:
+address is libvgm's find_sample:
 
     adrs = (bank << 16) | start
     System 2:  ((adrs & 0x200000) >> 2) | (adrs & 0x7ffff)
     System 21: ((adrs & 0x300000) >> 1) + (adrs & 0x7ffff)
 
-Linear bodies are the raw signed bytes. Mulaw is expanded with the full
-16-bit table and stored as linear int16 so Furnace does not decode it
-again. End and loop registers are address differences (sample counts).
-A key-off (mode bit 7 clear while the voice plays) is collected as C140Off
-so the .fur can emit note-offs. Without them a looping voice never releases.
-
-C-4 rate uses the reference step rate from c140_rate (freq * clock / 18874368)
-and the Furnace clock flag carries 2/3 of the crystal. Both Furnace's
-playback and its VGM export reproduce the chip exactly. Sign-flip (bit 6)
-and sign-magnitude (bit 0) are not applied.
+Mulaw bodies are expanded with the full 16-bit table and stored as linear
+int16 so Furnace does not decode them again. A key-off (mode bit 7 clear
+while the voice plays) becomes a C140Off, or a looping voice never releases.
+The C-4 rate uses the reference step rate (freq * clock / 18874368) and the
+flag carries 2/3 of the crystal. Sign-flip and sign-magnitude are not
+applied.
 """
 
 from __future__ import annotations
@@ -35,16 +31,13 @@ from dataclasses import dataclass, field
 from vgm2151fur.vgm import VgmFile, assemble_rom
 
 C140_VOICES = 24
-# Reference step rate, straight from the chip model both MAME and libvgm use
-# (libvgm c140.c: sample_rate = clock/288 with a .16 fixed-point position, so
-# a voice steps freq * clock / (288 * 65536) address words per second).
+# Reference step rate both MAME and libvgm use: sample_rate = clock/288 with
+# a .16 fixed-point position, so freq * clock / (288 * 65536) words a second.
 C140_RATE_DIVISOR = 288 * 65536
-# Furnace runs its own C140 core at clock/192 ticks with a plain 16-bit
-# fraction, i.e. freq * clock / (192 * 65536) words per second - exactly 1.5x
-# the reference. Feeding it a clock scaled by 2/3 (12288000 -> 8192000, which
-# is its default) makes its playback, and the clock it writes back out on VGM
-# export, land on the reference rate. The register stream is unaffected:
-# BASE * rate / clock is scale-invariant.
+# Furnace's C140 core ticks at clock/192 with a plain 16-bit fraction, 1.5x
+# the reference. A clock scaled by 2/3 (12288000 -> 8192000, its default)
+# lands its playback and VGM export on the reference rate; the register
+# stream is scale-invariant either way.
 C140_FURNACE_CLOCK_SCALE = (2, 3)
 
 
@@ -115,11 +108,9 @@ C140_REFIT_SAMPLES = 735
 def hit_played_freq(hit: "C140Hit") -> int:
     """The frequency a hit actually plays at (0 when the driver never set one).
 
-    Key-on first, unless the driver rewrote the frequency right after keying
-    on - the key-on value is the previous note's leftover then.  A late write
-    still wins when the key-on value was zero: nothing was playing yet, so the
-    first real frequency is the note's pitch (a stale nonzero key-on keeps
-    playing until the write, so it stays the base of a bend instead).
+    A frequency write just after key-on is the note's own pitch and replaces
+    the stale key-on value; a later write only wins when the key-on value was
+    zero (nothing was playing yet).
     """
     steps = merge_step_writes(hit.freq_pts)
     if steps and steps[0][1] and (
@@ -143,12 +134,10 @@ class C140Hit:
     freq: int
     vol_l: int
     vol_r: int
-    # Key-off sample (0 = still playing at the end of the VGM). Lets a pitch
-    # sweep stop at the note's end instead of running past it.
+    # Key-off sample (0 = still playing at the end of the VGM).
     off_sample: int = 0
-    # Mid-note register writes while the voice is keyed: volume as the (L, R)
-    # register pair (the balance is part of the write), frequency as the
-    # combined 12-bit register. Recorded only when the value changes.
+    # Mid-note register writes while keyed: volume as the (L, R) pair (the
+    # balance is part of the write), frequency as the combined 12-bit value.
     vol_pts: list[tuple[int, int, int]] = field(default_factory=list)
     freq_pts: list[tuple[int, int]] = field(default_factory=list)
 

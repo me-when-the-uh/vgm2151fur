@@ -1,18 +1,13 @@
 """Measure a converted module and normalise it to a fixed peak headroom.
 
-Furnace applies the song master volume linearly to the whole mix, in
-playback and in both file exporters, so the level of a module is one float
-and one render tells the truth about it. `normalize_module` renders the
-module once at a quarter volume (below any clipping), reads the peak, and
-writes the gain that puts the track's peak at -2.5 dBFS. A track that still
-clips at a quarter volume is probed again 24 dB lower.
+Furnace applies the song master volume linearly to the whole mix, so the
+level is one float and one render tells the truth: `normalize_module`
+renders at a quarter volume (below any clipping), reads the peak, and writes
+the gain that lands the track at -2.5 dBFS, probing 24 dB lower if the
+render still clips.
 
-The module has to be one the build can load: a build without the module's
-chips refuses it ("unrecognized system ID") and the callers skip the fit
-with a warning rather than measure silence. The probe volume protects the
-measurement: the render clamps at full scale, so a loud module rendered at
-unity would report a peak of exactly 1.0 and no gain could be derived from
-it.
+A build without the module's chips refuses it ("unrecognized system ID"),
+which callers report as a skipped fit rather than measure silence.
 """
 
 from __future__ import annotations
@@ -74,9 +69,8 @@ def wav_peak(path: Path) -> float:
 def _render_raw_peak(fur: Path, wav: Path) -> float:
     """Render `fur` at its own volume and scan the peak, retrying once.
 
-    A batch of concurrent Furnace consoles occasionally loses a race on the
-    shared config file and exits without rendering; the retry is for that
-    transient, not for a module problem.
+    Concurrent Furnace consoles occasionally lose a race on the shared
+    config file and exit without rendering; the retry is for that transient.
     """
     try:
         render_wav(fur, wav, loops=0, outformat="f32")
@@ -100,9 +94,8 @@ def normalize_module(data: bytes, *, name: str = "module") -> Normalization | No
         peak = 0.0
         for probe in _PROBES:
             probe_fur.write_bytes(furio.set_master_volume(data, probe))
-            # -loops 0 renders one pass: intro plus one loop body, i.e. every
-            # piece of content once. A second pass only repeats, and the peak
-            # of a repeated signal is the same peak.
+            # -loops 0 renders one pass: intro plus one loop body. A second
+            # pass only repeats, and the peak of a repeat is the same peak.
             raw = _render_raw_peak(probe_fur, probe_wav)
             peak = raw / probe
             if raw < _CLIPPED:

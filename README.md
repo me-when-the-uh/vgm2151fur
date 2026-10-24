@@ -1,34 +1,60 @@
 # vgm2151fur
 
 Transcribes arcade VGMs into Furnace Tracker modules. It reads YM2151 (OPM)
-register streams and the sample chips that sit next to them on the boards it
-was built against: K007232, MSM6295, MSM6258, SegaPCM, Namco C140 and Namco
-C352. The output is a `.fur` sequence file that Furnace plays and a human can
-finish by hand.
+register streams plus the chips next to them: the sample players K007232,
+MSM6295, MSM6258, SegaPCM, Namco C140 and Namco C352, and the pitched Konami
+SCC / SCC+ (K051649 / K052539) and AY-3-8910. The output is a `.fur` sequence
+file that Furnace plays and a human can finish by hand.
 
-It runs on Windows and Linux, Python 3.11 or later.
+uPD7759 voice ROMs are not converted (Furnace has no core for the chip), but
+the stand-alone ROM can be decoded outside the .fur path:
+`python tools/upd7759_dump.py <rom.bin or mame.zip>` writes one WAV per
+phrase plus an index (`--help` lists the options). The decode matches MAME's
+state machine including the 36 clocks a block header costs.
 
-## Requirements
+Non-track sound codes (SFX, one-shots, speech) come from the ripper's
+stop-first records: `python tools/sfx_extract.py --wav-dir output/<game>/wav
+--out output/other/<game>/sfx --target-peak 21000` finds each code's sound in
+its recording, trims it, mixes to mono and peak-matches it. 21000 (-3.9 dBFS)
+is the delivered level: a whole code is a dense mix whose crest factor is much
+lower than one building-block sample's, so a full-scale peak plays back about
+a third too loud next to the existing sets. `upd7759_dump.py --peak 21000`
+renders the uPD7759 voice set to the same level. The full recipe, including
+the Gradius III plan, is docs/sfx-code-rip.md in the ripper root.
 
-- Python 3.11 or later.
-- A Furnace console build for the render/export checks (the volume fit,
-  `render`, `compare`, `--verify`). Furnace is not vendored: keep a checkout
-  or an unpacked release next to the project as `furnace/`, or set
-  `VGM2151FUR_FURNACE` to the binary.
-- Optional: `vgm2wav-mute.exe` (the reference VGM renderer) for
-  `tools/fur_soundcheck.py` and `tools/vgmchroma.py`. Set
-  `VGM2151FUR_VGM2WAV` to point at it.
+Windows, Linux and macOS, Python 3.11 or later. No install; run it from the
+checkout.
 
-## Quick start
+## Getting started
 
 ```
 cd vgm2151fur
 python -m vgm2151fur
 ```
 
-With no arguments the tool opens a short menu. Numbered commands, and a path
-pasted at the prompt. Quotes from Explorer's Copy as path are fine. `q` or
-Ctrl+C quits.
+That opens the menu, which is the everyday way to use this. Type a number,
+or paste a path to a VGM, a pack folder, or a folder of packs. A quoted path
+is fine. `q` or Ctrl+C quits.
+
+`1 packs` is the one to start from: it scans a folder (remembered for next
+time) and lists the packs with track counts and chips. Open one to see its
+tracks, then `c` converts them (all, or a selection like `2-6`), `e` raises
+or cuts a chip volume, and `r` renders a track to WAV so you can hear it.
+The menu keeps its state (last folder, pack and output) in
+`~/.vgm2151fur.json`.
+
+## What you need
+
+- Python 3.11 or later.
+- A Furnace console build for the per-track volume fit, `render`, `compare`
+  and variant verification: put a checkout or release next to the project as
+  `furnace/`, or set `VGM2151FUR_FURNACE` to the binary. Conversion still
+  runs without it (`--no-normalize --optimize none`), just unnormalized.
+- Optional: `vgm2wav-mute.exe`, the reference renderer for
+  `tools/fur_soundcheck.py` and `tools/vgmchroma.py`
+  (`VGM2151FUR_VGM2WAV`).
+
+## The menu
 
 ```
  1  packs      scan a folder, then convert, volumes, render
@@ -40,61 +66,35 @@ Ctrl+C quits.
  7  condense   write 1x..4x BPM-variant copies, pick the safe one
 ```
 
-A pasted file converts. A pasted pack opens so you can pick tracks. A pasted
-folder of packs lists them.
+A pasted file converts directly, a pack opens, a folder of packs lists them.
+`m` reprints the menu. Ctrl+C cancels a running command, and quits at the
+prompt.
 
-`packs` is the one to start from. It scans a folder (the last one is
-remembered), lists what it found with track counts and chips, and a pack view
-lists the tracks in playlist order, with a dash next to the ones that have no
-`.fur` yet. `c` converts all tracks or a selection (`2-6`, `1,4`, or a single
-number), `e` raises or cuts a chip volume on the converted tracks, and `r`
-renders one to WAV so you can hear it. The menu writes its state to
-`~/.vgm2151fur.json` (last folder, last pack, last output folder).
+## Command line
 
-## Commands
-
-The same actions are available as commands for scripts and agents:
+Everything the menu does is also a command, for scripts and agents:
 
 ```
 python -m vgm2151fur convert "01 Track.vgz" -o out
-python -m vgm2151fur convert "My Gamepack" -o out --workers 6
 python -m vgm2151fur report "01 Track.vgz"
-python -m vgm2151fur edit out/01.Track.fur --list
 python -m vgm2151fur edit out/01.Track.fur --chip C140 --factor 0.9
 python -m vgm2151fur compare "01 Track.vgz" out/01.Track.fur --channel 4
 python -m vgm2151fur render out/01.Track.fur --loops 2
 ```
 
-`convert` runs the analyzer (notes, row grid, pitch trajectories, samples)
-and writes one `.fur` per input. `-o` sets the output folder (default: a
-`fur/` folder beside the input). `--speed N` pins ticks per row when the
-automatic grid estimate is not what you want, `--workers N` sets how many
-tracks run at once (default: close to the logical CPU count, low priority),
-and `--melody-only` / `--pcm-only` restrict the chips. A folder of packs
-writes each pack to its own `fur/` folder, or to `-o/<pack>` when `-o` is
-set. Every file reports its size, grid speed, instrument and sample counts,
-and any warnings.
+- `convert` writes one `.fur` per input (default: a `fur/` folder beside it).
+  `--speed N` pins ticks per row, `--workers N` sets parallel tracks,
+  `--melody-only` / `--pcm-only` restrict the chips.
+- `report` prints the analysis without writing anything.
+- `edit` lists, scales or sets chip volumes. `--chip` takes a number, a
+  name, or `all`; `--factor 1.1` raises by 10%, `--value 0.9` sets outright.
+- `compare` exports the `.fur` and reports where its pitch stream leaves the
+  source VGM's. A run is worth a listen; none means the registers agree.
+- `render` writes a WAV so you can hear the conversion.
 
-`report` prints the same analysis without writing anything. Use it to see
-which chips a VGM uses, how the grid was estimated and what was skipped.
-
-`edit` reads a `.fur`, lists its chips, and scales or sets their volumes.
-`--chip` takes a number, a chip name, or `all`; `--factor 1.1` raises the
-volume by 10%, `--value 0.9` sets it outright. A pack folder is accepted:
-the `.fur` files in `fur/` are the ones edited.
-
-`compare` reads the source VGM, exports the `.fur` to VGM with the local
-Furnace build, and reports stretches where the two pitch streams sit apart
-by more than half a semitone for at least 100 ms. A run is worth
-investigating: a held wrong pitch is worse than a missed note. No runs means
-the two register streams agree where it matters.
-
-`render` writes a WAV of a `.fur` so you can hear the conversion.
-
-`--variants` writes the 1x/2x/3x/4x row-condensing ladder side by side and
-`--optimize lossless` marks the largest factor that adds no structural loss;
-`--verify` renders each candidate through Furnace and rejects sustained
-pitch divergence. docs/operating.md has the workflow.
+`--variants` with `--optimize lossless` writes the 1x..4x row-condensing
+ladder and picks the safest factor; `--verify` renders each candidate to
+judge it. docs/operating.md has the workflow.
 
 ## Tests
 
@@ -103,15 +103,16 @@ cd vgm2151fur
 python -m pytest tests -q
 ```
 
-The suite runs without game packs. Round-trip tests that need the Furnace
-console build skip when it is missing.
+No game packs needed. Tests that want the Furnace console build skip when it
+is missing.
 
 ## Project layout
 
 ```
 vgm2151fur/          the package: analyze, furwrite, convert, edit, diag
 tools/               thin CLIs over the package: fur2wav, fur2vgm,
-                     fur_soundcheck, vgmdiff, vgmchroma, pitch_shift, vgm_scan
+                     fur_soundcheck, vgmdiff, vgmchroma, pitch_shift,
+                     vgm_scan, upd7759_dump, sfx_extract
 tests/               pytest suite
 docs/                operating guide, format notes, chip notes
 ```
@@ -120,8 +121,9 @@ docs/                operating guide, format notes, chip notes
 
 - The YM2151 model covers the OPM register set the arcade drivers use. Other
   chips (YM2612, YM3812, ...) are not supported.
-- Furnace has no C352 core in the 0.6.8.3 release that this was built
-  against; a ported core can play the modules (docs/c352.md).
+- Furnace 0.6.8.3 has no C352 core; a ported core can play those modules
+  (docs/c352.md).
 - Chip volumes above unity only exist in INF2 files.
-- Patterns are 256 rows; the row grid is estimated per track and very fine
-  pitch motion is approximated with per-row ramps (docs/fur-writer.md).
+- The pattern window follows the track (last content row + 10, capped at
+  Furnace's 256); the row grid is estimated per track and very fine pitch
+  motion is approximated with per-row ramps (docs/fur-writer.md).

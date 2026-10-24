@@ -13,8 +13,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from vgm2151fur.furwrite import (
-    CHIP_C140, CHIP_C352, CHIP_K007232, CHIP_MSM6258, CHIP_MSM6295, CHIP_SEGAPCM,
-    FUR_MAGIC,
+    CHIP_AY8910, CHIP_C140, CHIP_C352, CHIP_K007232, CHIP_K051649, CHIP_K052539,
+    CHIP_MSM6258, CHIP_MSM6295, CHIP_SEGAPCM, FUR_MAGIC,
 )
 
 
@@ -26,6 +26,9 @@ CHIP_CHANNELS = {
     CHIP_SEGAPCM: 16,  # SegaPCM
     CHIP_C140: 24,  # Namco C140
     CHIP_C352: 32,  # Namco C352
+    CHIP_K051649: 5,  # Konami SCC
+    CHIP_K052539: 5,  # Konami SCC+
+    CHIP_AY8910: 3,  # AY-3-8910
     0xBB: 8,  # Namco C30 WSG
     0xCF: 16,  # Namco C219
 }
@@ -274,6 +277,12 @@ def _n_ch_from_chips(chips: list[int]) -> int:
 
 
 def _pcm_channels(chips: list[int]) -> list[int]:
+    """Module channels of the chips that carry playable sample bodies.
+
+    A module with no such chip (a YM2151-only transcription, or one whose
+    sample chip is a VOX one) has no PCM channels: the old "last two" guess
+    read the FM tail as PCM on every melody-only file.
+    """
     ch = 0
     pcm: list[int] = []
     for c in chips:
@@ -283,10 +292,6 @@ def _pcm_channels(chips: list[int]) -> list[int]:
         if c in _PCM_BODY_CHIPS:
             pcm.extend(range(ch, ch + n))
         ch += n
-    if not pcm and chips:
-        # PCM-only files still list K007232; if chips were stripped, last 2.
-        n_ch = _n_ch_from_chips(chips)
-        pcm = list(range(max(0, n_ch - 2), n_ch))
     return pcm
 
 
@@ -459,7 +464,7 @@ def _parse_inf2(
         n_ord=n_ord,
         n_ch=n_ch or _n_ch_from_chips(chips),
         chips=chips,
-        pcm_channels=_pcm_channels(chips) or list(range(max(0, n_ch - 2), n_ch)),
+        pcm_channels=_pcm_channels(chips),
         orders=orders,
         samples=samples,
         ins_sample=ins_sample,

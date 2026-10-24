@@ -1,4 +1,4 @@
-"""Turn YM2151, K007232, MSM6295, MSM6258, SegaPCM, C140 and C352 writes into notes and a row grid."""
+"""Turn YM2151, sample chips and SCC/AY-8910 writes into notes and a row grid."""
 
 from __future__ import annotations
 
@@ -6,6 +6,12 @@ import math
 from collections import Counter
 from dataclasses import dataclass, field
 
+from vgm2151fur.ay8910 import (
+    AY_DEFAULT_CLOCK,
+    AY_VOICES,
+    ay_note,
+    collect_ay8910,
+)
 from vgm2151fur.c140 import (
     C140Sample, c140_rate, collect_c140, hit_played_freq, merge_step_writes,
 )
@@ -27,6 +33,15 @@ from vgm2151fur.oki import (
     msm6258_div_fx,
 )
 from vgm2151fur.pcm import PcmSample, build_pcm_bank, pitch_to_note, rate_to_note
+from vgm2151fur.pitch import E5_CENTER, module_clock, pitch_table
+from vgm2151fur.scc import (
+    SCC_DEFAULT_CLOCK,
+    SCC_MIN_PERIOD,
+    SCC_REFIT_SAMPLES,
+    SCC_VOICES,
+    collect_scc,
+    scc_note,
+)
 from vgm2151fur.segapcm import SegapcmSample, collect_segapcm, segapcm_rate
 from vgm2151fur.timing import (
     MIN_ROW_SAMPLES,
@@ -54,7 +69,6 @@ CARRIERS = {
 # Official YM2151 KC note nibble → semitone from C of this octave.
 # Valid codes: C#=0, D=1, D#=2, E=4, F=5, F#=6, G=8, G#=9, A=10, A#=12, B=13,
 # C(next octave)=14.  3/7/11/15 are unused and alias 4/8/12/14.
-# A linear 0=C# … 12=C map is wrong: Konami writes 0x4E for C-5, not D-5.
 _KC_SEMI = {
     0: 1,   # C#
     1: 2,   # D
@@ -93,10 +107,8 @@ def furnace_note_name(n: int) -> str:
 def kf_to_e5(kf: int) -> int:
     """YM2151 KF register → Furnace E5xx fine tune.
 
-    The key fraction is the *top* six bits of the register: ymfm's
-    ``ch_block_freq = (KC << 6) | (KF >> 2)``.  One KF step is 1/64 semitone
-    and Furnace's E5xx is one unit per KF step: E5 0x80+f exports KF = f << 2,
-    and values above 0xBF saturate the register's six-bit fraction.
+    The fraction is the top six bits (`ch_block_freq = (KC << 6) | (KF >> 2)`),
+    one E5 unit per KF step; values above 0xBF saturate.
     """
     return max(0, min(255, 0x80 + (kf >> 2)))
 
@@ -108,10 +120,8 @@ def kc_kf_units(kc: int, kf: int) -> int:
     )
 
 
-# Furnace's default YM2151 clock.  A chip clock is not a pitch in a .fur:
-# Furnace keeps notes at their musical frequency at any clock (baseFreqOff in
-# arcade.cpp), so the *registers* a rip's driver wrote sound sharper/lower than
-# their plain meaning whenever the board clock differs from this one.
+# Furnace's default YM2151 clock. Furnace keeps notes at their musical pitch
+# at any clock, so this is the reference the transposition is measured from.
 OPM_DEFAULT_CLOCK = 3579545
 
 # One sample-chip trigger is often a key-on plus its own pitch and volume
@@ -122,9 +132,8 @@ _ONSET_MERGE_SAMPLES = 100
 def opm_pitch_offset(clock: int | None) -> int:
     """Clock → note transposition in 1/64 semitone units.
 
-    Playback is a ratio: KC/KF registers the driver wrote for a 4 MHz OPM
-    (Sega System 16C) sound 12·log2(clock/default) = +1.92 semitones above
-    what the same registers mean at 3.579545 MHz.
+    Playback is a ratio: registers written for a 4 MHz OPM sound
+    12·log2(clock/default) = +1.92 st above their meaning at 3.579545 MHz.
     """
     if not clock or clock == OPM_DEFAULT_CLOCK:
         return 0
@@ -212,9 +221,8 @@ class FMPatch:
     def identity(self) -> tuple:
         """Cluster key: full timbre including carrier TLs.
 
-        Carrier TL is part of the identity: Furnace applies volume on a log
-        curve, so a stripped TL cannot be reconstructed from pattern volume.
-        Keep TL on the instrument and omit pattern volume.
+        Furnace applies volume on a log curve, so a stripped TL cannot be
+        reconstructed from pattern volume. Keep TL on the instrument.
         """
         op_keys = tuple(self.ops[i].as_tuple(include_tl=True) for i in range(4))
         return (self.alg & 7, self.fb & 7, op_keys)
@@ -238,31 +246,59 @@ class NoteEvent:
     # Key-off sample (0 = still playing at the end / unknown).
     end: int = 0
     # Mid-note pitch writes: (sample, 1/64-semitone delta from the note pitch).
-    # Non-empty for percussion sweeps some drivers write a step at a time
-    # (~88 or ~190 samples per step); encoders turn this into 01xx/02xx pitch
-    # ramps. C140 slides use the same shape.
+    # Percussion sweeps and C140 slides share the shape; encoders turn it into
+    # 01xx/02xx pitch ramps.
     sweep: tuple[tuple[int, int], ...] = ()
-    # Mid-note volume steps (sample, C140 8-bit level, Furnace 08xy balance or
-    # None to leave it). Emitted as volume-column (and pan) updates on rows
-    # without a note, so software fades survive.
+    # Mid-note volume steps (sample, chip 8-bit level, Furnace 08xy balance or
+    # None to leave it), emitted on rows without a note so fades survive.
     vol_pts: tuple[tuple[int, int, int | None], ...] = ()
-    # Mid-note *carrier* TL steps (sample, absolute YM2151 carrier TL).  Some
-    # drivers implement a note's volume envelope by rewriting the carrier TL
-    # while the voice is held (Namco System 86 fades a held note out with
-    # 0x60+ writes that never retrigger); the key-on snapshot cannot carry
-    # them, so the writer maps them onto the Furnace volume column relative to
-    # the instrument's own carrier TL.
+    # Mid-note *carrier* TL steps (sample, absolute YM2151 carrier TL): some
+    # drivers fade a held note by rewriting the carrier TL without a
+    # retrigger. The key-on snapshot cannot carry them, so the writer maps
+    # them onto the volume column relative to the instrument's own carrier TL.
     tl_pts: tuple[tuple[int, int], ...] = ()
-    # PCM pan 0x00 is a real "both off". OKI/MSM6258 are mono and must not
-    # write 08xx (that effect is the K007232/YM2151 split pan).
+    # PCM pan 0x00 is a real "both off"; OKI/MSM6258 are mono and must not
+    # write 08xx.
     no_pan: bool = False
-    # C352 quad output: the four volume registers the chip holds, as
-    # (front L, front R, rear L, rear R), each 0-255. When this is set the
-    # volume column is pinned and the four values carry the level, so the
-    # rear survives into its own outputs. None means the ordinary stereo mix.
+    # C352 quad output: the four volume registers (front L/R, rear L/R), each
+    # 0-255. When set, the volume column is pinned and the four carry the
+    # level, so the rear survives into its own outputs.
     quad: tuple[int, int, int, int] | None = None
     # Mid-note changes to those four, as (sample, fl, fr, rl, rr).
     quad_pts: tuple[tuple[int, int, int, int, int], ...] = ()
+    # SCC/AY only: the note's own pitch and waveform motion, as the raw
+    # (sample, register) writes the driver made. A phase-2 pass turns them
+    # into the instrument macros, once the tick rate is known.
+    tone_pitch_pts: tuple[tuple[int, int], ...] = ()
+    # SCC only: (sample, 32 raw wave-RAM bytes) whenever the image changed.
+    tone_wave_pts: tuple[tuple[int, bytes], ...] = ()
+    # SCC only: the wavetable index the note itself starts on (-1 = no wave).
+    tone_wave: int = -1
+    tone_period_offset: int = 0
+    # 0 = not a tone-chip note, 1 = SCC, 2 = AY. The phase-2 pass finds the
+    # instrument for these once the tick rate is known.
+    tone_chip: int = 0
+
+
+@dataclass(frozen=True)
+class ToneIns:
+    """One SCC/AY instrument: a starting wave plus per-tick macro values.
+
+    ``pitch`` is the engine's ``pitch`` unit (1/128 semitone) and lands on the
+    platform's ``std.pitch``, which for a period table adds straight to the
+    register, so a driver's own pitch trajectory plays back exactly. ``waves``
+    is the wave macro's wavetable list, which is how a driver's mid-note
+    waveform morph survives. Each macro has its own step rate, because the
+    format stores one speed per macro.
+    """
+
+    wave: int = 0
+    pitch: tuple[int, ...] = ()
+    pitch_speed: int = 1
+    pitch_loop: int = 255
+    waves: tuple[int, ...] = ()
+    wave_speed: int = 1
+    wave_loop: int = 255
 
 
 @dataclass
@@ -303,6 +339,20 @@ class Song:
     # The source drove the C352 rear pair and the events carry it, so the
     # module's C352 systems are written with `quadOutput` set.
     c352_quad: bool = False
+    # K051649/K052539 channels: `scc_ids` per chip instance, `scc_waves` the
+    # wavetable list its instruments address, `scc_ins` one entry per distinct
+    # (wave, pitch macro, wave macro) combination the notes ask for, and
+    # `scc_count` the number of notes.
+    scc_ids: list[int] = field(default_factory=list)
+    scc_waves: list[bytes] = field(default_factory=list)
+    scc_ins: list[ToneIns] = field(default_factory=list)
+    scc_count: int = 0
+    # AY-8910 channels: one instance per chip id, `ay_count` notes, and one
+    # instrument per distinct pitch macro. The hardware envelope, noise
+    # frequency and channel mode ride on channel_fx.
+    ay_ids: list[int] = field(default_factory=list)
+    ay_ins: list[ToneIns] = field(default_factory=list)
+    ay_count: int = 0
 
     @property
     def samples_per_row(self) -> float:
@@ -320,12 +370,10 @@ class Song:
     def place(self, sample: int, stats: dict | None = None) -> tuple[int, int]:
         """Return (row, delay_ticks): the closest playable position.
 
-        Furnace EDxx delays a channel's row by whole ticks (playback.cpp
-        processRow/nextTick). At speed 1 there is no sub-row placement, so the
-        nearest row is exact enough (the drivers' note unit matches the row
-        within ~1%); at higher speeds floor + nearest tick keeps the error
-        under half a tick.  `stats["ed_rolled"]` counts offsets too large for
-        the row's tick count (a sub-row position the condensed grid cannot hold).
+        EDxx delays a channel's row by whole ticks. At speed 1 the nearest row
+        is exact enough; at higher speeds floor + nearest tick keeps the error
+        under half a tick. `stats["ed_rolled"]` counts offsets too large for
+        the row's tick count.
         """
         if self.speed <= 1:
             return self.row_of(sample), 0
@@ -430,6 +478,85 @@ FX_LFO_AMD = 0x1E
 FX_LFO_PMD = 0x1F
 
 
+def _tone_steps(
+    freq_pts: list[tuple[int, int]], gate: int, refit: int,
+) -> list[tuple[int, int]]:
+    """Pitch changes inside a tone-chip note, as (sample, period).
+
+    A 12-bit period is two register writes and drivers can be slow about the
+    pair (up to a frame apart), so the intermediate combination is a write
+    order transient, not music: merge writes inside a row and keep only what
+    happens after the note's own pitch was settled. A step *back* to the
+    note's pitch stays - a driver that bends away and returns needs it.
+    """
+    return [
+        p for p in merge_step_writes(freq_pts, gap=600)
+        if p[1] and p[0] > gate + refit
+    ]
+
+
+# The format stores a macro length in one byte.
+MACRO_MAX = 256
+
+
+def _tick_values(
+    pts: list[tuple[int, int]], start: int, ticks: int, tick_samples: float,
+) -> list[int]:
+    """Value in force at each tick from `start` (each write holds until the
+    next one)."""
+    out: list[int] = []
+    i = 0
+    cur = pts[0][1] if pts else 0
+    for k in range(ticks):
+        t = start + k * tick_samples
+        while i < len(pts) and pts[i][0] <= t:
+            cur = pts[i][1]
+            i += 1
+        out.append(cur)
+    return out
+
+
+def _cycle(values: list[int], limit: int = 128) -> int | None:
+    """Length of the shortest exact repeating cycle of a series (2 or more).
+
+    A series that only rarely changes must not pass as a one-step cycle, so
+    the repeat has to be exact.
+    """
+    n = len(values)
+    for p in range(2, min(limit, n // 2) + 1):
+        if all(values[i] == values[i - p] for i in range(p, n)):
+            return p
+    return None
+
+
+def _macro_series(series: list[int]) -> tuple[tuple[int, ...], int, int]:
+    """(values, speed, loop) for one tone macro from a per-tick series.
+
+    A constant series needs no macro at all; a periodic one becomes a single
+    cycle that loops; anything else is stored whole, thinned by whole ticks
+    only when it does not fit the format's one-byte length. A macro that does
+    not loop drops its trailing run of one value, since the engine holds the
+    last value anyway - that is what lets two notes whose morph differs only
+    in how long it lasts share one instrument.
+    """
+    if not series or len(set(series)) == 1:
+        return (), 1, 255
+    speed = 1
+    loop = 255
+    if len(series) > MACRO_MAX:
+        p = _cycle(series)
+        if p is not None:
+            return tuple(series[:p]), 1, 0
+        speed = (len(series) + MACRO_MAX - 1) // MACRO_MAX
+        series = series[::speed]
+    p = _cycle(series)
+    if p is not None and p < len(series):
+        return tuple(series[:p]), speed, 0
+    while len(series) > 1 and series[-1] == series[-2]:
+        series = series[:-1]
+    return tuple(series), speed, loop
+
+
 def _flush_pms_ramp(
     acc: dict[int, list],
     ins: int,
@@ -447,12 +574,10 @@ def _flush_pms_ramp(
         if pms and p == pms[-1] and a == ams[-1]:
             continue
         if p == 0 and a == 0 and pms:
-            # The reset is the vibrato switching off.  Keep it as the final
-            # step so the macro returns to 0; without it the macro holds the
-            # last sensitivity for the rest of the song, running a wobble past
-            # every later note.  Its length is irrelevant (a macro holds its
-            # last value), so reuse the previous step to keep the median step
-            # honest.
+            # The reset is the vibrato switching off. Keep it as the final
+            # step so the macro returns to 0, or it holds the last sensitivity
+            # for the rest of the song. Its length is irrelevant (macros hold
+            # the last value), so reuse the previous step.
             pms.append(0)
             ams.append(0)
             deltas.append(deltas[-1] if deltas else max(1, t - prev_t))
@@ -477,10 +602,9 @@ def _pick_lfo_macros(
 ) -> tuple[tuple[int, ...], tuple[int, ...], int]:
     """Driver-scripted vibrato: PMS/AMS step up as the note is held.
 
-    The Konami drivers increment the sensitivity every ~0.1 s of sustain, so a
-    held note starts steady and drifts "drunk" over ~1 s.  The macro holds each
-    value for `speed` ticks, so the step duration must be converted with the
-    song's real tick rate (44100/hz), not a fixed 60 Hz frame.
+    The drivers increment the sensitivity about every 0.1 s of sustain, and
+    the macro holds each value for `speed` ticks, so the step duration is
+    converted with the song's real tick rate (44100/hz), not a fixed frame.
     """
     if not ramps:
         return (), (), 1
@@ -540,11 +664,10 @@ def _finalize_sweep(
 ) -> None:
     """Attach a note's mid-note pitch writes to it.
 
-    Drivers write KC/KF as a pair a few samples apart. Merge those pairs, or the
-    write-order transient does not enter the trajectory.  The note pitch comes
-    from the first pair when it lands right after the key-on (the drivers set
-    the sweep start *after* keying on), otherwise from the pre-key-on registers
-    (the note really started at the old pitch and the sweep begins later).
+    Drivers write KC/KF as a pair a few samples apart; merge those pairs, or
+    the write-order transient enters the trajectory. The note pitch comes from
+    the first pair when it lands right after the key-on, otherwise from the
+    pre-key-on registers (the note really started at the old pitch).
     """
     if not pts:
         return
@@ -582,17 +705,13 @@ def analyze(
 ) -> Song:
     """Build the Song for one rendition of `vgm`.
 
-    `grid_cache` memoises the grid estimate, which is the expensive part of
-    the call and does not depend on `condense` (the factor is applied to the
-    estimated grid afterwards). A caller that converts one track to several
-    factors passes the same dict every time and measures the track once. The
-    caller owns the dict, so it must not outlive the `vgm` it was built for.
+    `grid_cache` memoises the grid estimate, the expensive part, which does
+    not depend on `condense`; a caller converting one track to several
+    factors passes the same dict every time. The caller owns the dict, which
+    must not outlive the `vgm` it was built for.
 
-    `c352_quad` keeps the C352's rear pair on its own outputs instead of
-    folding it into the front, and flags the chip `quadOutput` so the core
-    feeds four channels. A stereo mixdown of such a module sums the pairs
-    again, which is the level the fold produced, except where the fold
-    saturated at 255 and the sum does not.
+    `c352_quad` keeps the C352's rear pair on its own outputs (chip flagged
+    `quadOutput`) instead of folding it into the front.
     """
     tick = TARGET_TICK_SAMPLES if tick_samples is None else float(tick_samples)
     row_floor = MIN_ROW_SAMPLES if min_row is None else float(min_row)
@@ -605,12 +724,10 @@ def analyze(
     pending_off = [None] * 8  # type: list[int | None]
     chip_fx: list[tuple[int, int, int]] = []
     last_lfrq = last_wave = -1
-    # The OPM resets its LFO depth register (0x19) to 0, but Furnace's arcade
-    # core defaults PMD and AMD to 0x7f (arcade.cpp reset).  A driver that
-    # never writes 0x19 - Namco System 86 does not - but still loads PMS/AMS
-    # into its instruments would otherwise play the maximum vibrato/tremolo
-    # the rip never had, because the depth is a chip-wide register the score
-    # does not carry.  Send the hardware reset depth explicitly.
+    # The OPM resets its LFO depth register (0x19) to 0, Furnace's arcade
+    # core defaults PMD/AMD to 0x7f. A driver that never writes 0x19 but
+    # loads PMS/AMS into its instruments would otherwise play vibrato the rip
+    # never had, so send the reset depth explicitly.
     last_amd = last_pmd = 0
     pms_acc: dict[int, list] = {}
     held_ins = [-1] * 8
@@ -763,10 +880,9 @@ def analyze(
             held_ins[ch] = ins
             held_kon[ch] = w.sample
         elif mask:
-            # A redundant write or a per-operator change while the note sounds:
-            # every operator stays as it was, so this is not a note event.
-            # Treating it as one retriggered the whole note and was audible on
-            # sustained leads.
+            # A redundant write or a per-operator change while the note
+            # sounds: every operator stays as it was, so this is not a note
+            # event. Treating it as one retriggered the whole note.
             pass
         elif ym.kon[ch]:
             pending_off[ch] = w.sample
@@ -782,9 +898,8 @@ def analyze(
         close_sweep(ch)
         close_tl(ch)
 
-    # Flush key-offs that were not a same-sample retrigger.
-    # We recorded only key-ons above; add offs that sit > 1 sample after last on
-    # and before the next on. Re-walk for offs.
+    # Key-offs were not recorded above; re-walk for offs that sit after the
+    # last key-on and before the next one.
     ym2 = YM2151State()
     last_on = [-10**9] * 8
     next_on_at: list[list[int]] = [[] for _ in range(8)]
@@ -800,7 +915,7 @@ def analyze(
         if w.chip != "ym2151":
             continue
         # A mid-note write that clears RL/FB/CON's output bits (regs 0x20-0x27,
-        # RL == 0) cuts the channel instantly even with the voices still keyed.
+        # RL == 0) cuts the channel instantly even with the voices keyed.
         # Without this the note rang for the rest of the track.
         forced_off = (
             w.reg != 0x08
@@ -901,9 +1016,10 @@ def analyze(
         warnings.extend(oki_warn)
         adpcm_samples, adpcm_warn = collect_msm6258(vgm)
         warnings.extend(adpcm_warn)
-        # Sample chips sit after the 8 YM2151 channels: K007232, then each
-        # MSM6295 (4 voices), then each MSM6258.
-        sample_base = 8 + (2 if audible else 0) if pcm else 8
+        # Sample chips sit after the 8 YM2151 channels, and after the two
+        # K007232 channels when the bank has audible samples: K007232, then
+        # each MSM6295 (4 voices), then each MSM6258.
+        sample_base = 8 + (2 if audible else 0)
         oki_ids: list[int] = []
         for smp in oki_samples:
             if smp.chip_id not in oki_ids:
@@ -1036,9 +1152,6 @@ def analyze(
             ins = ins3 + i
             ref = c140_rate(c140_clock, smp.mode_freq())
             for h in smp.hits:
-                # A frequency write right after key-on is the driver's real
-                # note pitch (same refit as the FM sweep); otherwise the
-                # key-on register value is the note's pitch.
                 base_f = hit_played_freq(h)
                 steps = merge_step_writes(h.freq_pts)
                 note, e5 = rate_to_note(c140_rate(c140_clock, base_f), ref)
@@ -1147,13 +1260,10 @@ def analyze(
                     vals = [d for _t, d in deltas]
                     if deltas and max(vals + [0]) - min(vals + [0]) >= 4:
                         sweep = deltas
-                # The driver strobes first and writes the note's own volume
-                # inside the same frame. The register at the strobe belongs to
-                # the previous note (often 0, since the driver zeroes it when
-                # it stops the voice), and the real write lands on the key-on's
-                # own row, where no volume step is placed. Take the first
-                # in-frame step as the note's own balance or the attack plays
-                # at the stale level.
+                # The driver strobes first and writes the note's own volume in
+                # the same frame; the register at the strobe belongs to the
+                # previous note. Take the first in-frame step as the note's
+                # balance or the attack plays at the stale level.
                 init_l, init_r = h.vol_l, h.vol_r
                 for _t, a, b in h.vol_pts:
                     if _t - h.sample_time > C352_REFIT_SAMPLES:
@@ -1223,16 +1333,145 @@ def analyze(
     else:
         audible = []
 
+    # K051649/K052539 (SCC) and AY-8910 are pitched chips, not sample players:
+    # they convert whether or not the sample chips do (`--melody-only` keeps
+    # them like the FM). Their channels sit after the 8 FM channels and every
+    # sample chip, and an SCC note's waveform is its instrument.
+    tone_base = (
+        8 + (2 if audible else 0) + 4 * len(oki_samples) + len(adpcm_samples)
+        + (16 if spcm_audible else 0) + 24 * len(c140_audible) + 32 * len(c352_audible)
+    )
+    tone_ins_base = (
+        len(patch_order) + (len(audible) if pcm else 0) + len(oki_samples)
+        + len(adpcm_samples) + len(spcm_audible) + len(c140_audible) + len(c352_audible)
+    )
+    scc_ids: list[int] = []
+    scc_waves: list[bytes] = []
+    scc_ins: list[ToneIns] = []
+    ay_ids: list[int] = []
+    ay_ins: list[ToneIns] = []
+    scc_count = 0
+    ay_count = 0
+    scc_notes, scc_offs, scc_wave_list, scc_warn = collect_scc(vgm)
+    warnings.extend(scc_warn)
+    if scc_notes:
+        for cid in sorted({n.hit.chip_id for n in scc_notes}):
+            scc_ids.append(cid)
+        scc_waves = list(scc_wave_list)
+        scc_wave_index = {img: i for i, img in enumerate(scc_waves)}
+        scc_at = {cid: tone_base + SCC_VOICES * i for i, cid in enumerate(scc_ids)}
+        scc_clock = vgm.k051649_clock or SCC_DEFAULT_CLOCK
+        for n in scc_notes:
+            h = n.hit
+            ch = scc_at.get(h.chip_id)
+            if ch is None:
+                continue
+            if h.period <= SCC_MIN_PERIOD or not any(h.wave):
+                # The chip halts a voice below period 9, and a waveform that
+                # was never written is silence: no note. The key-off list
+                # below carries the gate's close.
+                continue
+            note, e5 = scc_note(scc_clock, h.period)
+            steps = _tone_steps(
+                h.freq_pts, h.sample_time, SCC_REFIT_SAMPLES,
+            )
+            vol_pts = tuple((t, v, None) for t, v in h.vol_pts)
+            # The waveform the driver morphed the note into is another image in
+            # the module's wavetable; a phase-2 pass turns the trail into the
+            # instrument's wave macro. A burst of byte writes is one image, so
+            # the trail keeps the state each burst settles on.
+            wave_steps: list[tuple[int, int]] = []
+            for t, img in merge_step_writes(list(h.wave_pts), gap=64):
+                idx = scc_wave_index.get(img)
+                if idx is None:
+                    idx = len(scc_waves)
+                    scc_wave_index[img] = idx
+                    scc_waves.append(img)
+                if wave_steps and wave_steps[-1][1] == idx:
+                    continue
+                wave_steps.append((t, idx))
+            events.append(NoteEvent(
+                sample=h.sample_time,
+                ch=ch + h.voice,
+                on=True,
+                note=note,
+                ins=tone_ins_base,
+                vol=h.vol,
+                e5=e5,
+                pan=0,
+                end=h.off_sample,
+                vol_pts=vol_pts,
+                tone_pitch_pts=tuple(steps),
+                tone_wave_pts=tuple(wave_steps),
+                tone_wave=n.wave_index,
+                tone_period_offset=1,
+                tone_chip=1,
+            ))
+            scc_count += 1
+        for off in scc_offs:
+            base = scc_at.get(off.chip_id)
+            if base is None:
+                continue
+            events.append(NoteEvent(
+                sample=off.sample_time, ch=base + off.voice, on=False, note=180,
+                ins=-1, vol=-1, e5=0x80, pan=0,
+            ))
+
+    ay_hits, ay_offs, ay_warn = collect_ay8910(vgm)
+    warnings.extend(ay_warn)
+    if ay_hits:
+        for cid in sorted({h.chip_id for h in ay_hits}):
+            ay_ids.append(cid)
+        ay_at = {cid: tone_base + SCC_VOICES * len(scc_ids) + AY_VOICES * i
+                 for i, cid in enumerate(ay_ids)}
+        ay_ins_base = tone_ins_base + len(scc_ins)
+        ay_clock = vgm.ay8910_clock or AY_DEFAULT_CLOCK
+        for h in ay_hits:
+            base = ay_at.get(h.chip_id)
+            if base is None:
+                continue
+            ch = base + h.voice
+            note, e5 = ay_note(ay_clock, h.period)
+            # A pure-noise voice has no audible pitch: its period writes are
+            # just register housekeeping, so they are not turned into a macro.
+            steps = _tone_steps(h.freq_pts, h.sample_time, 0) if h.tone else []
+            for sample, fx, val in h.fx_pts:
+                channel_fx.append((sample, ch, fx, val))
+            events.append(NoteEvent(
+                sample=h.sample_time,
+                ch=ch,
+                on=True,
+                note=note,
+                ins=ay_ins_base,
+                vol=h.vol,
+                e5=e5,
+                pan=0,
+                end=h.off_sample,
+                vol_pts=tuple((t, v, None) for t, v in h.vol_pts),
+                tone_pitch_pts=tuple(steps),
+                tone_chip=2,
+            ))
+            ay_count += 1
+        for off in ay_offs:
+            base = ay_at.get(off.chip_id)
+            if base is None:
+                continue
+            events.append(NoteEvent(
+                sample=off.sample_time, ch=base + off.voice, on=False, note=180,
+                ins=-1, vol=-1, e5=0x80, pan=0,
+            ))
+
     events.sort(key=lambda e: (e.sample, e.ch, 0 if e.on else 1))
 
-    # Prefer the measured key-on lattice: rows subdivide the measured 16th note
-    # and carry several ticks, which lets EDxx place every event at its true
-    # (60 Hz-frame-quantized) write time.  Manual --speed keeps the legacy 60 Hz
-    # behaviour.  A rip with no FM stream to measure (the C352-only boards) is
+    # Prefer the measured lattice: rows subdivide the measured 16th and carry
+    # several ticks, so EDxx places every event at its true write time. Manual
+    # --speed keeps the legacy 60 Hz behaviour. A rip with no FM stream is
     # measured from its sample-chip triggers instead.
     pcm_onsets: dict[int, list[int]] = {}
     for e in events:
-        if e.pcm and e.on:
+        # Every non-FM note-on counts as a rhythm marker, sample chips and the
+        # SCC/AY tone channels alike, so a rip without FM still gets a grid.
+        if e.on and (e.pcm or e.ch >= 8):
             pcm_onsets.setdefault(e.ch, []).append(e.sample)
     for ch, times in pcm_onsets.items():
         merged: list[int] = []
@@ -1273,6 +1512,64 @@ def analyze(
             use_speed = suggest_speed(keyon_times, hz)
             grid_note = "60 Hz fallback"
 
+    # Tone-chip instruments, phase two: the driver's own pitch and waveform
+    # motion becomes the instrument's macros, now that the tick rate is known.
+    # One instrument per distinct combination keeps a morphing or bending note
+    # from costing a pattern cell per step.
+    tone_clock = {
+        1: (vgm.k051649_clock or SCC_DEFAULT_CLOCK, 16),
+        2: (vgm.ay8910_clock or AY_DEFAULT_CLOCK, 8),
+    }
+    if any(e.tone_chip for e in events):
+        tick_samples = VGM_RATE / hz
+        track_end = vgm.total_samples or max((e.sample for e in events), default=0)
+        scc_map: dict[ToneIns, int] = {}
+        ay_map: dict[ToneIns, int] = {}
+        for e in events:
+            if not e.on or not e.tone_chip:
+                continue
+            end = e.end or track_end
+            ticks = int((end - e.sample) / tick_samples) + 1
+            ticks = max(1, min(ticks, 4096))
+            clock, divider = tone_clock[e.tone_chip]
+            tbl = pitch_table(module_clock(clock), divider)
+            base_off = (e.note << 7) + (e.e5 - E5_CENTER)
+            pitch: tuple[int, ...] = ()
+            pitch_speed, pitch_loop = 1, 255
+            if e.tone_pitch_pts:
+                pts = [(e.sample, 0)] + [
+                    (t, tbl.offset_for(e.note, per + e.tone_period_offset) - base_off)
+                    for t, per in e.tone_pitch_pts
+                ]
+                series = _tick_values(pts, e.sample, ticks, tick_samples)
+                if any(v for v in series):
+                    pitch, pitch_speed, pitch_loop = _macro_series(series)
+            wave_vals: tuple[int, ...] = ()
+            wave_speed, wave_loop = 1, 255
+            if e.tone_wave_pts:
+                pts = [(e.sample, max(0, e.tone_wave))] + list(e.tone_wave_pts)
+                series = _tick_values(pts, e.sample, ticks, tick_samples)
+                wave_vals, wave_speed, wave_loop = _macro_series(series)
+            spec = ToneIns(
+                wave=max(0, e.tone_wave), pitch=pitch,
+                pitch_speed=pitch_speed, pitch_loop=pitch_loop,
+                waves=wave_vals, wave_speed=wave_speed, wave_loop=wave_loop,
+            )
+            if e.tone_chip == 1:
+                idx = scc_map.get(spec)
+                if idx is None:
+                    idx = len(scc_ins)
+                    scc_map[spec] = idx
+                    scc_ins.append(spec)
+                e.ins = tone_ins_base + idx
+            else:
+                idx = ay_map.get(spec)
+                if idx is None:
+                    idx = len(ay_ins)
+                    ay_map[spec] = idx
+                    ay_ins.append(spec)
+                e.ins = tone_ins_base + len(scc_ins) + idx
+
     pcm_gaps: list[int] = []
     if spcm_audible:
         by_voice: dict[int, list[int]] = {}
@@ -1299,10 +1596,10 @@ def analyze(
             hz, use_speed, row_subdiv = new_hz, new_speed, new_sub
             grid_note = f"{grid_note}; {pcm_note}" if grid_note else pcm_note
 
-    # Condensing lengthens every row by `condense`, so the row rate (and the
-    # tracker BPM, 15 x rows/s) drops by that factor.  It runs last, after the
-    # PCM refinement, so PCM restarts that no longer fit their own row show up
-    # as loss in the writer rather than being silently re-refined away.
+    # Condensing lengthens every row by `condense`, dropping the row rate (and
+    # the tracker BPM) by that factor. It runs last, so PCM restarts that no
+    # longer fit their own row show up as writer loss instead of being
+    # silently re-refined away.
     if condense > 1:
         hz, use_speed, row_subdiv = condense_row(
             hz, use_speed, row_subdiv, condense, tick,
@@ -1317,6 +1614,7 @@ def analyze(
     has_sample_ins = bool(
         oki_samples or adpcm_samples or spcm_audible or c140_audible
         or c352_audible or any(s.length >= 8 for s in pcm_samples)
+        or scc_waves or ay_count
     )
     if not fm_list:
         warnings.append("no YM2151 key-ons found")
@@ -1358,6 +1656,13 @@ def analyze(
         channel_fx=channel_fx,
         k007232_volume=k007232_volume,
         c352_quad=c352_quad_events,
+        scc_ids=scc_ids,
+        scc_waves=scc_waves,
+        scc_ins=scc_ins,
+        scc_count=scc_count,
+        ay_ids=ay_ids,
+        ay_ins=ay_ins,
+        ay_count=ay_count,
     )
 
 
@@ -1390,7 +1695,7 @@ def format_report(song: Song) -> str:
     if song.chip_fx:
         lfo_n = sum(1 for _s, c, _v in song.chip_fx if c in (0x17, 0x18, 0x1E, 0x1F))
         lines.append(f"LFO fx      {lfo_n} chip writes (17/18/1E/1F)")
-    fm_ons = sum(1 for e in song.events if e.on and not e.pcm)
+    fm_ons = sum(1 for e in song.events if e.on and not e.pcm and e.ch < 8)
     pcm_ons = sum(1 for e in song.events if e.on and e.pcm)
     lines.append(f"FM notes    {fm_ons}")
     n_regions = (
@@ -1398,6 +1703,18 @@ def format_report(song: Song) -> str:
         + len(song.c352_samples)
     )
     lines.append(f"PCM notes   {pcm_ons}  ({n_regions} sample regions)")
+    if song.scc_ids:
+        lines.append(
+            f"SCC notes   {song.scc_count}  ({len(song.scc_ids)} chip"
+            f"{'s' if len(song.scc_ids) > 1 else ''}, "
+            f"{len(song.scc_waves)} waveforms, {song.vgm.k051649_clock} Hz"
+            f"{', SCC+' if song.vgm.k051649_plus else ''})"
+        )
+    if song.ay_ids:
+        lines.append(
+            f"AY notes    {song.ay_count}  ({len(song.ay_ids)} chip"
+            f"{'s' if len(song.ay_ids) > 1 else ''}, {song.vgm.ay8910_clock} Hz)"
+        )
     if song.pcm_samples:
         lines.append(f"PCM level   {song.k007232_volume:.4g}x of the YM2151 (rip mix)")
     for i, s in enumerate(song.pcm_samples):

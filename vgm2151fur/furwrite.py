@@ -14,11 +14,12 @@ from bisect import bisect_left, bisect_right
 from collections import Counter
 from dataclasses import dataclass, replace
 
-from vgm2151fur.analyze import CARRIERS, Song
+from vgm2151fur.analyze import CARRIERS, Song, ToneIns
 from vgm2151fur.c140 import c140_furnace_clock
 from vgm2151fur.c352 import C352_DEFAULT_CLOCK
 from vgm2151fur.oki import msm6258_flag_text, oki_flag_text, oki_needs_banked
 from vgm2151fur.pcm import pcm7_to_s8, scale_pcm7
+from vgm2151fur.pitch import FURNACE_CLOCK_DEFAULT, module_clock
 
 # Furnace arcade.cpp: rWrite(DT, dtTable[op.dt]<<4). Inverse of
 # dtTable = (7, 6, 5, 0, 1, 2, 3, 4) so YM2151 register DT survives the
@@ -46,6 +47,11 @@ CHIP_C140 = 0xCE
 # Furnace format.md reserves 0xD0 for Namco C352, 32 channels, and marks it
 # unavailable. 0.6.8.3 has no C352 core and no C352 instrument type.
 CHIP_C352 = 0xD0
+# Konami SCC (K051649, voices 3/4 share wave RAM) and SCC+ (K052539,
+# independent voice 4 waveform). AY-8910 is the three-channel PSG.
+CHIP_K051649 = 0xA1
+CHIP_K052539 = 0xB4
+CHIP_AY8910 = 0x80
 INS_OPM = 33
 INS_MSM6258 = 35
 INS_MSM6295 = 36
@@ -55,6 +61,10 @@ INS_C140 = 53
 # DIV_INS_AMIGA. C140 channels already accept this sample type, so a future
 # C352 core copied from c140.cpp can play the bodies. There is no DIV_INS_C352.
 INS_C352 = 4
+# DIV_INS_AY (volume/noise/envelope macros) and DIV_INS_SCC (32-byte wavetable
+# through the wave synth).
+INS_AY = 6
+INS_SCC = 18
 SMP_DEPTH_8BIT = 8
 SMP_DEPTH_16BIT = 16
 SMP_DEPTH_VOX = 10
@@ -64,22 +74,34 @@ SEGAPCM_CLOCK_Y = 4026987
 C140_FURNACE_DEFAULT_CLOCK = 8192000
 NOTE_OFF = 180
 EMPTY = 0xFFFF
+# Furnace's pattern length ceiling (engine `defines.h` DIV_MAX_ROWS) and the
+# empty rows a pattern keeps past its last content row.
+PAT_LEN_MAX = 256
+PAT_TAIL_ROWS = 10
 # Chip output levels, modelled on the reference player (libvgm VGMPlayer):
-# _CHIP_VOLUME defaults in 8.8 fixed point with 0x100 = the YM2151's unity,
-# the per-chip core patches, and the file's extra-header mix entries. An entry
-# selects its instance in bit 0 of the flags byte; bit 15 of the value means
-# "relative" (default * value), otherwise the value replaces the default.
-# Multiple instances of a chip each carry default / instance count.
+# 8.8 fixed-point defaults with 0x100 = the YM2151's unity, per-chip core
+# patches, and the extra-header mix entries (bit 15 of a value means
+# "relative", otherwise it replaces the default).
 _DEV_DEFAULT_VOLUME = {
-    0x03: 0x100, 0x04: 0x180, 0x18: 0x100, 0x19: 0x1C0, 0x1C: 0x100, 0x27: 0x40,
+    0x03: 0x100, 0x04: 0x180, 0x12: 0x100, 0x18: 0x100, 0x19: 0xA0,
+    0x1C: 0x100, 0x27: 0x40,
 }
-_DEV_CORE_PATCH = {0x1C: lambda v: (v * 2 + 1) // 3}  # C140/C219 core scale
-# Furnace core output levels relative to the player's, from render comparisons.
-_FURNACE_VOLUME_SCALE = {0x03: 1.0, 0x04: 1.0, 0x18: 1.0, 0x1C: 0.7}
-# MSM6258 (0x19, the player default is 1.75) keeps unity; its Furnace core is
-# uncalibrated.
+_DEV_CORE_PATCH = {
+    0x19: lambda v: v * 8 // 5,  # K051649 SCC core scale
+    0x1C: lambda v: (v * 2 + 1) // 3,  # C140/C219 core scale
+}
+# Furnace core output levels relative to the player's, from render comparisons
+# (measured on two-chip modules: the player's overall-volume normalizer scales
+# a lone chip, and Furnace has no such step).
+_FURNACE_VOLUME_SCALE = {
+    0x03: 1.0, 0x04: 1.0, 0x12: 1.46, 0x18: 1.0, 0x1C: 0.7,
+    0x19: 1.04,
+}
+# MSM6258 (0x17, the player default is 0x11E) keeps unity; its Furnace core is
+# uncalibrated. The MSM6295 (0x18) is unity as measured.
 _CHIP_DEV = {CHIP_YM2151: 0x03, CHIP_SEGAPCM: 0x04, CHIP_MSM6295: 0x18,
-             CHIP_C140: 0x1C, CHIP_C352: 0x27}
+             CHIP_C140: 0x1C, CHIP_C352: 0x27,
+             CHIP_K051649: 0x19, CHIP_K052539: 0x19, CHIP_AY8910: 0x12}
 
 
 def _player_chip_volume(vgm, dev: int, instances: int) -> float:
@@ -101,7 +123,7 @@ def _player_chip_volume(vgm, dev: int, instances: int) -> float:
 
 
 def _sample_chip_volume(song: "Song", chip: int, instances: int) -> float:
-    """Output volume for a .fur sample chip, calibrated to the player."""
+    """Output volume for a .fur chip, calibrated to the reference player."""
     dev = _CHIP_DEV.get(chip)
     if dev is None:
         return 1.0
@@ -168,14 +190,9 @@ class Buf:
 
 
 def _write_fm_feature(b: Buf, patch) -> None:
-    """INS2 'FM' feature.
-
-    Operators are stored in YM2151 register order (0x40, 0x48, 0x50, 0x58).
-    That is also Furnace's internal order: readFeatureFM reads the four ops
-    with a straight loop and arcade.cpp writes op[j] to ADDR + opOffs[j] with
-    opOffs = {0x00, 0x08, 0x10, 0x18}. (arcade.cpp's orderedOps = {0,2,1,3}
-    is only for per-operator effect dispatch, not for the instrument/file.)
-    """
+    """INS2 'FM' feature: operators in YM2151 register order (0x40, 0x48,
+    0x50, 0x58), which is also Furnace's internal order (readFeatureFM reads
+    them with a straight loop; opOffs = {0x00, 0x08, 0x10, 0x18})."""
     b.raw(b"FM")
     size_off = len(b.b)
     b.u16(0)
@@ -213,7 +230,11 @@ def _write_macro(
     loop: int = 255,
     release: int = 255,
     delay: int = 0,
+    width: int = 0,
 ) -> None:
+    """One macro inside a ``MA`` feature. `width` picks the value encoding the
+    format calls wordSize: 0 = 8-bit unsigned, 1 = 8-bit signed, 2 = 16-bit
+    signed, 3 = 32-bit."""
     if not values:
         return
     b.u8(code)
@@ -221,11 +242,21 @@ def _write_macro(
     b.u8(loop & 0xFF)
     b.u8(release & 0xFF)
     b.u8(0)  # mode: sequence
-    b.u8(1)  # open, 8-bit unsigned
+    b.u8(1 | (width << 6))  # open, 8-bit unsigned
     b.u8(delay & 0xFF)
     b.u8(max(1, speed) & 0xFF)
-    for v in values:
-        b.u8(v & 0xFF)
+    if width == 0:
+        for v in values:
+            b.u8(v & 0xFF)
+    elif width == 1:
+        for v in values:
+            b.u8(v & 0xFF)
+    elif width == 2:
+        for v in values:
+            b.u16(v & 0xFFFF)
+    else:
+        for v in values:
+            b.u32(v & 0xFFFFFFFF)
 
 
 def _write_ma(b: Buf, patch=None) -> None:
@@ -282,6 +313,140 @@ def _write_ins_pcm(b: Buf, name: str, sample_index: int, ins_type: int = INS_K00
     _write_ma(b)
     b.raw(b"EN")
     b.end_block(size_off, start)
+
+
+def _wave_label(wave: bytes) -> str:
+    """Short stable id for an SCC waveform, for instrument names."""
+    h = 0
+    for val in wave:
+        h = (h * 31 + val) & 0xFFFF
+    return f"{h:04x}"
+
+
+def _write_ins_scc(b: Buf, name: str, ins) -> None:
+    """DIV_INS_SCC: the note starts on wavetable ``ins.wave``.
+
+    ``WS`` points the wave synth at one 32-byte wave and disables every
+    modifier, so the SCC platform loads exactly the source's waveform on
+    note-on (``updateWave`` writes ``output[i] - 128`` into the wave RAM).
+
+    ``ins.waves`` and ``ins.pitch`` are the per-tick trajectories the source's
+    driver wrote while the note held: the wave macro (code 3) walks the
+    wavetable list, the pitch macro (code 4) is a pitch offset in 1/128
+    semitone. Both are what the platform's ``std.wave``/``std.pitch`` read,
+    so a morphed or bending note keeps its motion without a cell per step.
+    """
+    size_off, start = b.begin_block(b"INS2")
+    b.u16(FUR_VERSION)
+    b.u16(INS_SCC)
+    b.raw(b"NA")
+    na_size = len(b.b)
+    b.u16(0)
+    na_start = len(b.b)
+    b.strz(name)
+    b.b[na_size:na_size + 2] = int(len(b.b) - na_start).to_bytes(2, "little")
+    b.raw(b"WS")
+    ws_size = len(b.b)
+    b.u16(0)
+    ws_start = len(b.b)
+    b.u32(ins.wave)  # wave1
+    b.u32(ins.wave)  # wave2, only used by the dual-wave effects
+    b.u8(1)  # rateDivider
+    b.u8(0)  # effect: none
+    b.u8(1)  # enabled
+    b.u8(0)  # global: restart the wave on every note
+    b.u8(0)  # speed
+    b.u8(0)  # param1
+    b.u8(0)  # param2
+    b.u8(0)  # param3
+    b.u8(0)  # param4
+    b.b[ws_size:ws_size + 2] = int(len(b.b) - ws_start).to_bytes(2, "little")
+    _write_tone_macros(b, ins, wave=True)
+    b.raw(b"EN")
+    b.end_block(size_off, start)
+
+
+def _write_tone_macros(b: Buf, ins, *, wave: bool, reset: bool = False) -> None:
+    """MA feature for an SCC/AY instrument: pitch, wave and phase reset."""
+    if not ins.pitch and not (wave and ins.waves) and not reset:
+        _write_ma(b)
+        return
+    b.raw(b"MA")
+    ma_size = len(b.b)
+    b.u16(0)
+    ma_start = len(b.b)
+    b.u16(8)  # macro header length (Furnace always writes 8)
+    if wave and ins.waves:
+        _write_macro(
+            b, 3, ins.waves, speed=ins.wave_speed, loop=ins.wave_loop,
+            width=2 if max(ins.waves) > 127 else 1,
+        )
+    if ins.pitch:
+        _write_macro(
+            b, 4, ins.pitch, speed=ins.pitch_speed, loop=ins.pitch_loop, width=2,
+        )
+    if reset:
+        # The AY restarts its envelope only when the shape register is
+        # written, and Furnace skips a write whose value did not change; the
+        # phase reset clears the platform's write cache so the next envelope
+        # effect goes through.
+        _write_macro(b, 14, [1, 0], speed=1)
+    b.u8(255)  # stop
+    b.b[ma_size:ma_size + 2] = int(len(b.b) - ma_start).to_bytes(2, "little")
+
+
+def _write_ins_ay(b: Buf, name: str, ins=None) -> None:
+    """DIV_INS_AY with a phase-reset macro and an optional pitch macro.
+
+    Channel mode (tone/noise/envelope), noise frequency and the hardware
+    envelope are pattern effects (20xx/21xx/22xy/23xx/24xx), so one plain
+    instrument covers every voice: the volume column is the 4-bit register.
+    ``ins.pitch`` carries the source's own pitch trajectory as a per-tick
+    offset (1/128 semitone), which the platform's ``std.pitch`` reads.
+
+    The phase-reset macro (file code 14) clears the platform's write cache for
+    the volume and shape registers, so the next 22xy goes through even when
+    the shape did not change; the chip restarts its envelope on that write.
+    """
+    size_off, start = b.begin_block(b"INS2")
+    b.u16(FUR_VERSION)
+    b.u16(INS_AY)
+    b.raw(b"NA")
+    na_size = len(b.b)
+    b.u16(0)
+    na_start = len(b.b)
+    b.strz(name)
+    b.b[na_size:na_size + 2] = int(len(b.b) - na_start).to_bytes(2, "little")
+    if ins is None:
+        ins = ToneIns()
+    _write_tone_macros(b, ins, wave=False, reset=True)
+    b.raw(b"EN")
+    b.end_block(size_off, start)
+
+
+def _write_wave(b: Buf, name: str, data: bytes) -> int:
+    """DivWavetable::putWaveData: the 32-byte waveform an SCC instrument plays."""
+    ptr = len(b)
+    size_off, start = b.begin_block(b"WAVE")
+    b.strz(name)
+    b.u32(len(data))
+    b.u32(0)  # min
+    b.u32(255)  # max
+    for val in data:
+        b.u32(val)
+    b.end_block(size_off, start)
+    return ptr
+
+
+def _write_adir_list(b: Buf, ptrs: list[int]) -> int:
+    """An ADIR asset directory over the given block pointers (0 = empty)."""
+    ptr = len(b)
+    size_off, start = b.begin_block(b"ADIR")
+    b.u32(len(ptrs))
+    for p in ptrs:
+        b.u32(p)
+    b.end_block(size_off, start)
+    return ptr
 
 
 def _pcm_label(smp, index: int) -> str:
@@ -398,6 +563,31 @@ def c140_flag_text(clock: int, c140_type: int) -> str:
     return "\n".join(parts)
 
 
+def ay8910_flag_text(clock: int, chip_type: int) -> str:
+    """AY-8910 system flags: chip type and clock.
+
+    Furnace's default clock is COLOR_NTSC/2, the MSX and ZX Spectrum PSG
+    clock; anything else goes in as a custom clock. The VGM type byte
+    0x10/0x11 (YM2149 family) selects Furnace's YM2149 core; the rest of the
+    AY family is played as an AY-8910.
+    """
+    parts = [f"chipType={1 if chip_type in (0x10, 0x11) else 0}"]
+    if module_clock(clock) != FURNACE_CLOCK_DEFAULT:
+        parts.append(f"customClock={clock}")
+    return "\n".join(parts)
+
+
+def k051649_flag_text(clock: int) -> str:
+    """SCC system clock: the VGM header value is the clock both cores run at.
+
+    Furnace's default is COLOR_NTSC/2, the MSX SCC clock, so only a rip with
+    another value needs the custom clock.
+    """
+    if module_clock(clock) != FURNACE_CLOCK_DEFAULT:
+        return f"customClock={clock}"
+    return ""
+
+
 def c352_flag_text(clock: int, quad: bool = False) -> str:
     """Crystal for a C352 core that divides by 288.
 
@@ -483,9 +673,8 @@ def loss_total(stats: dict) -> int:
 def dev_max(stats: dict) -> int:
     """Worst per-row pitch deviation from the driver's steps, in 1/64 st.
 
-    A row can only render a straight-line slide, so this grows as the grid
-    coarsens.  It is the fidelity number the condense pick compares (the
-    `sweep_dev_bad` count is dominated by sample count, not severity).
+    The fidelity number the condense pick compares; it grows as the grid
+    coarsens because a row can only render a straight-line slide.
     """
     return int(stats.get("sweep_dev_max", 0))
 
@@ -657,11 +846,9 @@ def _compat_phase2(b: Buf) -> None:
 def _traj_at(pts: list[tuple[int, int]], t: int) -> int:
     """Pitch offset of the step-function trajectory at time ``t``.
 
-    ``pts`` are the source's merged register writes in ``kc_kf_units`` (1/64
-    semitone) relative to the note's own pitch; the driver holds each value
-    until its next write, and the note sits at its own pitch before the first
-    one.  Sampling this step function at row boundaries tracks the driver's
-    coarse steps exactly. Fitting a window across them smears the attack.
+    ``pts`` are merged register writes in ``kc_kf_units`` relative to the
+    note's own pitch; the driver holds each value until its next write.
+    Sampling at row boundaries tracks the steps exactly
     """
     v = 0
     for s, d in pts:
@@ -684,29 +871,13 @@ def _emit_sweep(
 ) -> None:
     """Encode a key-on pitch trajectory as per-row 01xx/02xx ramps + E5 steps.
 
-    Furnace can only ramp pitch at a fixed rate per tick and step fine tune
-    (E5) at a row start, while the source writes coarse KC/KF pairs (a jump and
-    then a slowing drift, typically).  Each row is matched by sampling the
-    trajectory at its boundaries:
-
-    - a jump that lands on the row is absorbed by an E5 step (one fine-tune
-      unit per 1/64 semitone, within +-64 of the note);
-    - the residual drift becomes the row's ramp rate, computed from the row's
-      own boundary values so a fast step is not averaged away and a flat
-      lead-in does not smear into the next row.
-
-    The ramp physically runs past the trajectory's end to the last row
-    boundary, so that row is rated over its full span against the held final
-    value, and the stop lands on the following row, pinning the final pitch
-    with E5.  A stop on a later note's own row is safe (its key-on still
-    reads its own pitch), and when the trajectory runs into that note's row
-    the stop must go there, since the row still belongs to this ramp until
-    the later note's own k=0 rate takes it over.  The sweep never writes a
-    *rate* or E5 on a later note's row (two 01xx/02xx codes on one row make
-    the net slide column-order luck).
-
-    E5 steps are recorded in ``e5_writes`` so the caller can replay all E5
-    changes for the channel in row order.
+    Boundary sampling, not a smoothed fit: a jump that lands on a row is
+    absorbed by an E5 step and the residual drift becomes the row's rate,
+    computed from the row's own boundary values. The last row is rated over
+    its full span against the held final value, and the stop lands on the
+    following row, pinning the final pitch with E5. The sweep never writes
+    a rate or E5 on a later note's row, and its E5 steps are recorded in
+    ``e5_writes`` for the row-order replay.
     """
     if chan is not None and chan != ev.ch:
         ev = replace(ev, ch=chan)
@@ -721,10 +892,9 @@ def _emit_sweep(
     if ev.end and ev.end < end:
         end = ev.end
     if end - start < tick:
-        # Shorter than a tick: no room to ramp, but a jump inside it still has
-        # to land - the driver changes the register (usually within a few ms of
-        # the key-on), so an instant transpose on the next row is the closest
-        # the engine can get.
+        # Shorter than a tick: no room to ramp, but the driver's jump still
+        # has to land, so an instant transpose on the next row is the
+        # closest the engine can get.
         final = float(_traj_at(pts, int(end)))
         y = max(-15, min(15, int(round(final / 64.0))))
         if abs(y) >= 1:
@@ -743,10 +913,9 @@ def _emit_sweep(
     if cell0 is None:
         return
     base = song.t0 + row0 * row_len
-    # A later note owns its own row: clip the sweep before it, or this sweep's
-    # tail rate (and any E5) cannot collide with the new note's own row's
-    # rate/fine tune.  The crossing is usually a tick or two. The frozen
-    # pitch loses almost nothing.
+    # A later note owns its own row: clip the sweep before it, or the tail
+    # rate (and any E5) would collide with the new note's own row. The
+    # crossing is usually a tick or two.
     crossed = False
     after = note_rows.get(ev.ch, ())
     i = bisect_right(after, row0)
@@ -758,10 +927,9 @@ def _emit_sweep(
             _bump(stats, "sweep_clipped")
 
     def e5_byte(offset: float) -> int:
-        # E5xx is the note's fine tune.  One byte step is one KF step = 1/64 st
-        # on the FM platforms, half that on PCM (E5 0x40 sits exactly -0.5 st
-        # below 0x80), so trajectory offsets convert with a factor of two
-        # there.  Values above 0xBF saturate.
+        # E5xx is the note's fine tune: 1/64 st per step on FM, half that on
+        # PCM (E5 0x40 sits -0.5 st below 0x80), so offsets scale by two
+        # there. Values above 0xBF saturate.
         scale = 2.0 if ev.pcm else 1.0
         return max(0x40, min(0xBF, int(round(ev.e5 + offset * scale))))
 
@@ -784,9 +952,8 @@ def _emit_sweep(
         t_eff = start if k == 0 else rs
         if k == 0:
             # The note starts at its own pitch; the driver's first sweep step
-            # (written ~2 ticks later) is covered by this row's ramp.  Snapping
-            # it with E5 instead trades an early blip for the ramp's late lag;
-            # dropping it keeps the attack exactly on the note's pitch.
+            # (~2 ticks later) is covered by this row's ramp. Snapping it with
+            # E5 trades an early blip for the ramp's late lag.
             want = 0.0
         else:
             # Look one tick past the boundary for the step check: a driver jump
@@ -805,38 +972,31 @@ def _emit_sweep(
             else:
                 _bump(stats, "e5_skipped")
         # The physical rate runs the whole row even when the trajectory ends
-        # inside it, so the last row must be rated over its full span against
-        # the trajectory's held final value: rating it over the clipped span
-        # made the pitch overshoot by several times the remaining travel, and
-        # the E5 pin cannot fix more than +-1 semitone of that.
+        # inside it, so the last row is rated over its full span against the
+        # held final value. Rating the clipped span overshoots the travel,
+        # and the E5 pin cannot fix more than +-1 st of that.
         is_last = re_full > end
         span = (re_full - t_eff) / tick if is_last else (re - t_eff) / tick
         if k == 0 and ev.pcm:
-            # PCM note rows hold their pitch: Furnace applies a slice of the
-            # row's 01xx/02xx travel inside the key-on write, and the attack
-            # lands ~rate/128 semitones off.  The ramp starts on the next row
-            # instead; the final E5 pin still absorbs the residue.
+            # PCM note rows hold their pitch: the key-on write would apply a
+            # slice of the row's travel and land the attack ~rate/128 st off.
+            # The ramp starts on the next row; the E5 pin absorbs the rest.
             want_end = 0.0
         else:
             want_end = float(_traj_at(pts, int(re_full if is_last else re)))
         rate = 0
         if span > 0:
-            # FM: 01xx/02xx run 1 kc_kf unit per tick per unit of the
-            # parameter, linearly, all the way to 255.  The old +-96 clamp
-            # silently halved the steepest driver slides: a 2000-unit row
-            # jump came out as a slow crawl.
+            # FM: 01xx/02xx advance 1 kc_kf unit per tick per parameter
+            # unit, linearly, up to 255.
             #
-            # PCM: one parameter unit moves 1/128 st per tick, half the FM
-            # rate.  The written parameter is doubled, and the ideal rate is
-            # capped at 127.5 units/tick = the engine's 255 maximum, so
-            # ``slide`` accumulates the movement the engine actually makes.
+            # PCM: one unit moves 1/128 st per tick, half the FM rate. The
+            # written parameter is doubled and the ideal rate capped at 127.5
+            # units/tick (the engine's 255 maximum), so ``slide`` accrues the
+            # movement the engine actually makes.
             limit = 127.5 if ev.pcm else 255.0
-            # A move bigger than the slide can deliver inside this row lands
-            # instantly as a quick-legato transpose (E8xx/E9xx, y semitones,
-            # persistent until the next note; the next key-on resets it).  This
-            # is what turns register jumps and dive attacks from a rate-limited
-            # slur into the hardware's instant step; the slide then covers the
-            # sub-semitone remainder.
+            # A move the slide cannot deliver inside this row lands instantly
+            # as a quick-legato transpose (E8xx/E9xx, persistent until the
+            # next key-on); the slide covers the sub-semitone remainder.
             full = limit * span
             need = want_end - cur
             if abs(need) > full and k > 0:
@@ -873,18 +1033,17 @@ def _emit_sweep(
         param = int(round(rate * 2)) if ev.pcm else int(round(rate))
         param = max(-255, min(255, param))
         if param != last_rate or param != 0:
-            # A slide only runs on rows that carry the effect: write the rate on
-            # every row the ramp is active, not only when it changes, or the
-            # pitch freezes after the first row of a constant-rate glide.
+            # A slide only runs on rows that carry the effect, so write the
+            # rate on every active row, not only when it changes: the pitch
+            # would freeze after the first row of a constant-rate glide.
             cell = grid[ev.ch].get(row0 + k)
             if cell is None:
                 cell = _blank_row()
                 grid[ev.ch][row0 + k] = cell
             # Never leave a slide of the opposite direction next to the new
-            # one: 01xx and 02xx are separate effect codes. Both would
-            # survive on the row and the net slide becomes column-order luck.
-            # The filter keeps the row's effect slots, or the next effect
-            # would overwrite a live one instead of filling a free slot.
+            # one: both effect codes would survive and the net slide becomes
+            # column-order luck. Rebuilding the slot list keeps a live effect
+            # from being overwritten.
             cell.fx = [(c, v) for c, v in (cell.fx or [(EMPTY, EMPTY)] * fx_cols)
                        if c not in (0x01, 0x02)]
             if param:
@@ -893,17 +1052,13 @@ def _emit_sweep(
                 _add_fx(cell, 0x01 if last_rate > 0 else 0x02, 0, fx_cols, stats)
             last_rate = param
         # Accrue the movement the engine actually makes - from the written,
-        # rounded and clamped parameter - not the ideal rate.  A glide that
-        # wants 2.66 units/tick is written as 01 03, so the engine runs ~13%
-        # faster than the model believes and the error compounds over long
-        # climbs.  Every FM/C140 slide carries the same fraction-of-a-unit
-        # residue.
+        # rounded and clamped parameter - not the ideal rate. A glide that
+        # wants 2.66 units/tick is written 01 03, and the ~13% error
+        # compounds over long climbs.
         engine_rate = (param / 2.0) if ev.pcm else float(param)
-        # Fidelity: each row can only be a straight line, so sample the model
-        # against the driver's own steps inside the row.  The deviation is the
-        # audible error of condensing - a coarser grid packs more steps into one
-        # row and bends them into one line.  Counted in 1/64 semitones; 6 units
-        # is 0.1 st, the rough inaudibility floor.
+        # Fidelity: a row is a straight line, so sample the model against the
+        # driver's own steps inside it. Counted in 1/64 semitones; 6 units
+        # (0.1 st) is the rough inaudibility floor.
         if stats is not None and span > 0:
             bad_here = False
             for j in range(4):
@@ -923,28 +1078,23 @@ def _emit_sweep(
         last_k = k
         k += 1
 
-    # The rate keeps running past `end` to the last row's boundary; stop it on
-    # the following row and pin the trajectory's final pitch with E5.
+    # The rate keeps running past `end` to the last row's boundary; stop it
+    # on the following row and pin the final pitch with E5.
     #
-    # The final row above was rated over its *full* span (is_last), so `slide`
-    # already carries the ramp all the way to the row end: the pin only has to
-    # correct the rounding residue.  Adding the tail's travel again (the old
-    # `last_rate * (row_end - end) / tick` term) pulled the pitch down by that
-    # travel a second time, leaving whole notes flat until the next key-on.
+    # The final row was rated over its full span (is_last), so the pin only
+    # corrects the rounding residue. Adding the tail's travel again (the old
+    # `last_rate * (row_end - end) / tick` term) pulled the pitch down a
+    # second time and left whole notes flat.
     #
-    # A stop on a later note's own row is safe (the note's key-on still reads
-    # its own pitch; the stop only kills the ramp) and it is the row that must
-    # carry it when the driver's sweep runs into that note's row, or the ramp
-    # keeps sliding under the new note.
+    # A stop on a later note's row is safe: the key-on reads its own pitch,
+    # and the stop keeps the ramp from sliding under the new note.
     final = float(_traj_at(pts, int(end)))
     stop_row = row0 + last_k + 1
     if crossed:
-        # A later note's row follows before the trajectory ends.  That note's
-        # key-on reads its own pitch, so the running ramp may stay alive
-        # through the last row this sweep owns; the stop goes on the later
-        # note's row (a later sweep's own k=0 rate clears it again when it
-        # takes that row over).  Freezing on the last row instead loses a
-        # whole row of the tail's travel.
+        # The later note's key-on reads its own pitch, so the ramp may stay
+        # alive through the last row this sweep owns; the stop goes on that
+        # note's row (a later sweep's k=0 rate clears it). Freezing on the
+        # last row loses a row of tail travel.
         cell = grid[ev.ch].get(stop_row)
         if cell is None:
             cell = _blank_row()
@@ -1030,20 +1180,28 @@ def _assign_pcm_rows(
     return out
 
 
-def _build_patterns(song: Song, n_ch: int, pat_len: int, fx_cols: int, ch_offset: int = 0,
-                    stats: dict | None = None) -> tuple[
-    list[list[int]], list[tuple[int, int, list[Row | None]]], int
+def _pattern_len(last_row: int, cap: int = PAT_LEN_MAX) -> int:
+    """Rows a pattern gets: the last content row plus a ten-row tail.
+
+    Furnace holds one pattern length for a whole module, so the window is
+    fitted to the content: a short jingle opens as a short pattern instead of
+    one padded to the 256 ceiling. `last_row` is -1 for an empty module.
+    """
+    return max(1, min(cap, last_row + 1 + PAT_TAIL_ROWS))
+
+
+def _build_patterns(song: Song, n_ch: int, pat_len_max: int, fx_cols: int,
+                    ch_offset: int = 0, stats: dict | None = None) -> tuple[
+    list[list[int]], list[tuple[int, int, list[Row | None]]], int, int
 ]:
-    """Return (orders[ch][ord], patterns as (ch, idx, rows), loop_order).
+    """Return (orders[ch][ord], patterns as (ch, idx, rows), loop_order, pat_len).
 
     Untouched rows stay `None`: most of a pattern is empty and the writers
-    skip those without materializing a row object per slot.
+    skip those without materializing a row object per slot. `pat_len` is the
+    window the orders were walked with and every pattern is written at. A
+    track with no note events still runs through the grid, so the chip-wide
+    effects (LFO moves, an MSM6258 divider) land in the one short order.
     """
-    if not song.events:
-        orders = [[0] for _ in range(n_ch)]
-        pats = [(ch, 0, [None] * pat_len) for ch in range(n_ch)]
-        return orders, pats, 0
-
     last_sample = song.events[-1].sample if song.events else 0
     # a fade or chip write can run past the last note; the module has to carry
     # it or a voice keyed at zero (a fade-in) never gets its volume
@@ -1053,6 +1211,8 @@ def _build_patterns(song: Song, n_ch: int, pat_len: int, fx_cols: int, ch_offset
         if ev.quad_pts:
             last_sample = max(last_sample, ev.quad_pts[-1][0])
     for entry in (getattr(song, "channel_fx", ()) or ()):
+        last_sample = max(last_sample, entry[0])
+    for entry in (getattr(song, "chip_fx", ()) or ()):
         last_sample = max(last_sample, entry[0])
     # An adjusted loop carries crafted sample points, read with the writer's
     # own cell placement so every row rate opens on the same row. A raw VGM
@@ -1067,9 +1227,9 @@ def _build_patterns(song: Song, n_ch: int, pat_len: int, fx_cols: int, ch_offset
     if loop_row < 0:
         loop_row = 0
     # An adjusted loop ends on loop_end_sample. Content past that row is the
-    # old tail; Bxx would skip it, so it is not written. `content_end` is the
-    # absolute row Bxx sits on. The order walk below reuses the name end_row
-    # for each order's bound, so the jump must keep this one.
+    # old tail Bxx would skip, so it is not written. The order walk below
+    # reuses the name end_row for each order's bound, so this one keeps its
+    # own name.
     content_end = None
     content_cut = None
     if adjusted:
@@ -1086,33 +1246,6 @@ def _build_patterns(song: Song, n_ch: int, pat_len: int, fx_cols: int, ch_offset
     else:
         total_rows = max(1, song.row_of(last_sample) + 2)
         content_end = song.row_of(last_sample)
-
-    # Walk pat_len-row chunks, but force an order boundary at the VGM loop so
-    # Bxx can jump there. A long intro must not become one giant order; only
-    # `pat_len` rows would survive.
-    bounds = [0]
-    anchor = loop_row if 0 < loop_row < total_rows else None
-    pos = 0
-    while True:
-        nxt = pos + pat_len
-        if anchor is not None and pos < anchor < nxt:
-            bounds.append(anchor)
-            pos = anchor
-            continue
-        if nxt >= total_rows:
-            break
-        bounds.append(nxt)
-        pos = nxt
-    if bounds[-1] < total_rows:
-        bounds.append(total_rows)
-    raw_n = len(bounds) - 1
-    n_ord = min(256, raw_n)
-    bounds = bounds[: n_ord + 1]
-    if raw_n > 256:
-        _bump(stats, "orders_truncated")
-        song.warnings.append(
-            f"truncated to 256 orders ({raw_n} needed); raise --speed or split the VGM"
-        )
 
     grid: list[dict[int, Row]] = [dict() for _ in range(n_ch)]
     if stats is not None:
@@ -1145,17 +1278,14 @@ def _build_patterns(song: Song, n_ch: int, pat_len: int, fx_cols: int, ch_offset
             grid[ch][row] = cell
         _add_fx(cell, cmd, val, fx_cols, stats)
 
-    # E5 is a channel state and both notes and sweep steps change it, so the
-    # desired value is collected per row first and replayed in row order.
-    # Writing each value only when it changes, including back to the neutral
-    # 0x80, keeps a note's fine tune from leaking into the next one.
+    # E5 is channel state: collect the desired value per row and replay in
+    # row order, including back to the neutral 0x80, so one note's fine
+    # tune cannot leak into the next.
     note_e5: dict[tuple[int, int], int] = {}
-    # Mid-note carrier-TL fades (the driver's software volume envelope).  The
-    # OPM volume column only attenuates a carrier the log curve already scales
-    # (VOL_SCALE_LOG: written TL = op.tl + (127 - vol)), so a fade-out survives
-    # as a volume value relative to the instrument's own carrier TL.  The
-    # column is channel state, so every FM note-on re-asserts 127 (the
-    # instrument's TL) whenever any note in the track carries a fade.
+    # Mid-note carrier-TL fades: the volume column attenuates a carrier by
+    # (127 - vol) against the instrument's own TL, so the fade survives as a
+    # relative value. The column is channel state, so every FM note-on
+    # re-asserts 127 whenever any note in the track carries a fade.
     fm_tl = any(
         ev.on and not ev.pcm and ev.tl_pts and 0 <= ev.ch + ch_offset < n_ch
         for ev in song.events
@@ -1237,11 +1367,9 @@ def _build_patterns(song: Song, n_ch: int, pat_len: int, fx_cols: int, ch_offset
                     continue
                 cell.vol = max(0, min(127, 127 - (tl - t0)))
 
-    # Pitch sweeps (percussion): after every event is placed so the ramps can
-    # share the note-off rows (and their ED delays).  The sweep may step E5 on
-    # its own rows (jump correction), recorded alongside the note values.
-    # Every note row is known before this pass and sweeps only add effects,
-    # so each channel's note rows are listed once for the crossing checks.
+    # Pitch sweeps run after every event is placed, so the ramps can share
+    # the note-off rows and their ED delays. Note rows are known by now, so
+    # each channel's list is built once for the crossing checks.
     note_rows: dict[int, list[int]] = {
         ch: sorted(r for r, cell in grid[ch].items() if 0 <= cell.note < 180)
         for ch in range(n_ch)
@@ -1262,11 +1390,10 @@ def _build_patterns(song: Song, n_ch: int, pat_len: int, fx_cols: int, ch_offset
                     _emit_sweep(grid, song, ev, fx_cols, total_rows, sweep_e5,
                                 note_rows, stats=stats)
 
-    # C140 volume trajectories (fades): the driver steps the voice's volume
-    # registers and Furnace feeds the column into the chip gain live
-    # (platform/c140.cpp chVol = outVol*pan/255).  Balance steps ride along as
-    # 08xx, written only when the pair changes.  Only cells without a note are
-    # written, so a note's own volume always wins on its row.
+    # C140 volume trajectories: the volume column feeds the chip gain live
+    # (platform/c140.cpp chVol = outVol*pan/255) and balance steps ride
+    # along as 08xx. Only note-free cells are written, so a note's own
+    # volume wins on its row.
     if song.events:
         for ev in song.events:
             ev_ch = ev.ch + ch_offset
@@ -1335,6 +1462,42 @@ def _build_patterns(song: Song, n_ch: int, pat_len: int, fx_cols: int, ch_offset
             _add_fx(cell, 0xE5, val, fx_cols, stats)
             cur_e5 = val
 
+    # The pattern window: the last content row plus a ten-row tail, capped at
+    # Furnace's 256. A module carries one length for every order, so a short
+    # jingle opens short instead of padded to the ceiling. The grid is
+    # complete here, and the order walk below sizes its chunks from this.
+    last_content = max(
+        (row for ch in range(n_ch) for row in grid[ch]), default=-1
+    )
+    pat_len = _pattern_len(last_content, pat_len_max)
+
+    # Walk pat_len-row chunks, but force an order boundary at the VGM loop so
+    # Bxx can jump there. A long intro must not become one giant order; only
+    # `pat_len` rows would survive.
+    bounds = [0]
+    anchor = loop_row if 0 < loop_row < total_rows else None
+    pos = 0
+    while True:
+        nxt = pos + pat_len
+        if anchor is not None and pos < anchor < nxt:
+            bounds.append(anchor)
+            pos = anchor
+            continue
+        if nxt >= total_rows:
+            break
+        bounds.append(nxt)
+        pos = nxt
+    if bounds[-1] < total_rows:
+        bounds.append(total_rows)
+    raw_n = len(bounds) - 1
+    n_ord = min(256, raw_n)
+    bounds = bounds[: n_ord + 1]
+    if raw_n > 256:
+        _bump(stats, "orders_truncated")
+        song.warnings.append(
+            f"truncated to 256 orders ({raw_n} needed); raise --speed or split the VGM"
+        )
+
     loop_order = 0
     for oi in range(n_ord):
         if bounds[oi] == loop_row:
@@ -1360,11 +1523,9 @@ def _build_patterns(song: Song, n_ch: int, pat_len: int, fx_cols: int, ch_offset
                 if cell is None:
                     cell = rows[span - 1] = _blank_row()
                 _add_fx(cell, 0x0D, 0, fx_cols, stats)
-            # Loop jump on the last row that carries content, not on the last
-            # row of the padded order: the final order is only as long as the
-            # music, and a Bxx on the padded end would insert silence before
-            # every loop restart.
-            # Jingles with no VGM loop must not Bxx, or they restart forever.
+            # Bxx goes on the last row that carries content, not the padded
+            # order end, or every loop restart inserts silence. Jingles with
+            # no VGM loop must not Bxx.
             if oi == n_ord - 1 and song.loop_sample is not None:
                 # EDxx is a pre-effect and returns before later effects on the
                 # row are read, so a delay on the jump row swallows Bxx and
@@ -1383,15 +1544,14 @@ def _build_patterns(song: Song, n_ch: int, pat_len: int, fx_cols: int, ch_offset
             orders[ch].append(oi)
             patterns.append((ch, oi, rows))
 
-    return orders, patterns, loop_order
+    return orders, patterns, loop_order, pat_len
 
 
 def _fit_fx_cols(patterns: list[tuple[int, int, list[Row | None]]], n_ch: int) -> list[int]:
     """Effect columns per channel: one per effect the busiest row uses, 1..8.
 
-    Furnace sizes a pattern column from its effect column count, so this is
-    the fit-to-content knob (see docs/fur-writer.md). Everything a channel
-    plays stays visible and the column is never wider than its densest row.
+    Furnace sizes a pattern column from this count, so it is the
+    fit-to-content knob (docs/fur-writer.md).
     """
     cols = [1] * n_ch
     for ch, _idx, rows in patterns:
@@ -1442,21 +1602,31 @@ def write_fur(
         for h in smp.hits:
             if h.chip_id not in c352_ids:
                 c352_ids.append(h.chip_id)
-    # A PCM module with no sample chip of its own keeps the K007232 pair, so
-    # events already written on channels 8-9 still have a chip under them.
-    want_k007 = bool(pcm_smps) or (
-        include_pcm and not oki_ids and not adpcm_ids
-        and not spcm_smps and not c140_ids and not c352_ids
-    )
+    # Pitched (non-sample) chips: SCC voices and the AY-8910. Their events
+    # carry the channels and instruments, so an empty list means the chip is
+    # absent from the source.
+    scc_ids = list(getattr(song, "scc_ids", ()) or ())
+    scc_waves = list(getattr(song, "scc_waves", ()) or ())
+    scc_specs = list(getattr(song, "scc_ins", ()) or ())
+    ay_ids = list(getattr(song, "ay_ids", ()) or ())
+    ay_specs = list(getattr(song, "ay_ins", ()) or ())
+    scc_chip = CHIP_K052539 if song.vgm.k051649_plus else CHIP_K051649
+    n_scc = 5 * len(scc_ids)
+    n_ay = 3 * len(ay_ids)
+    # The K007232 pair exists only when the source carried usable samples for
+    # it. A melody-only module gets the YM2151 alone - no empty PCM channels
+    # and no chip nothing plays - and a module with another sample chip gets
+    # no K007232 either.
+    want_k007 = bool(pcm_smps)
     n_fm = 8 if include_fm else 0
     n_k007 = 2 if want_k007 else 0
     n_ch = (
         n_fm + n_k007 + 4 * len(oki_ids) + len(adpcm_ids)
         + (16 if spcm_smps else 0) + 24 * len(c140_ids) + 32 * len(c352_ids)
+        + n_scc + n_ay
     )
     if n_ch == 0:
         raise ValueError("write_fur: need include_fm and/or include_pcm")
-    pat_len = 256
     fx_cols = 8  # room for LFO 17/18/1E/1F plus pan/E5/ED/Bxx
     k_clock = song.vgm.k007232_clock or 3579545
     spcm_clock = song.vgm.segapcm_clock or SEGAPCM_CLOCK_X
@@ -1466,16 +1636,19 @@ def write_fur(
     n_ins = (
         len(fm_ins) + len(pcm_smps) + len(oki_smps) + len(adpcm_smps)
         + len(spcm_smps) + len(c140_smps) + len(c352_smps)
+        + len(scc_specs) + len(ay_specs)
     )
     n_smp = (
         len(pcm_smps) + len(oki_smps) + len(adpcm_smps)
         + len(spcm_smps) + len(c140_smps) + len(c352_smps)
     )
+    n_wav = len(scc_waves)
 
     # Analysis numbers sample-chip channels after the 8-channel FM block. With
-    # no FM those channels shift down so they still land inside n_ch.
-    orders, patterns, _loop_ord = _build_patterns(
-        song, n_ch, pat_len, fx_cols, 0 if include_fm else -8, stats=stats
+    # no FM those channels shift down so they still land inside n_ch. The
+    # pattern window comes back fitted to the content.
+    orders, patterns, _loop_ord, pat_len = _build_patterns(
+        song, n_ch, PAT_LEN_MAX, fx_cols, 0 if include_fm else -8, stats=stats
     )
     effect_cols = _fit_fx_cols(patterns, n_ch)
     n_ord = len(orders[0]) if orders else 1
@@ -1512,6 +1685,14 @@ def write_fur(
         for voice in range(32):
             names_long.append(f"C352 {cid + 1}-{voice + 1}")
             names_short.append(f"Z{cid + 1}-{voice + 1}")
+    for cid in scc_ids:
+        for voice in range(5):
+            names_long.append(f"SCC {cid + 1}-{voice + 1}")
+            names_short.append(f"K{cid + 1}-{voice + 1}")
+    for cid in ay_ids:
+        for voice in range(3):
+            names_long.append(f"PSG {cid + 1}-{voice + 1}")
+            names_short.append(f"P{cid + 1}-{voice + 1}")
 
     label_parts: list[str] = []
     if include_fm:
@@ -1528,6 +1709,10 @@ def write_fur(
         label_parts.append("C140")
     if c352_ids:
         label_parts.append("C352")
+    if scc_ids:
+        label_parts.append("SCC+" if song.vgm.k051649_plus else "SCC")
+    if ay_ids:
+        label_parts.append("AY-8910")
     chip_label = " + ".join(label_parts) or "empty"
 
     comment = (
@@ -1542,6 +1727,18 @@ def write_fur(
         comment += (
             "\nNamco C352 is chip 0xD0. Furnace 0.6.8.3 does not emulate it, "
             "so these channels stay silent in that build.\n"
+        )
+    if scc_ids:
+        comment += (
+            f"\nKonami {'SCC+ (K052539)' if song.vgm.k051649_plus else 'SCC (K051649)'}"
+            f" at {song.vgm.k051649_clock or 1789772} Hz; each SCC instrument "
+            "carries one 32-byte waveform.\n"
+        )
+    if ay_ids:
+        comment += (
+            f"\nAY-8910 at {song.vgm.ay8910_clock or 1789772} Hz; noise, "
+            "channel mode and the hardware envelope are pattern effects "
+            "(20xx/21xx/22xy/23xx/24xx).\n"
         )
 
     b = Buf()
@@ -1591,6 +1788,14 @@ def write_fur(
         flag_texts.append(
             c352_flag_text(song.vgm.c352_clock, getattr(song, "c352_quad", False))
         )
+    for cid in scc_ids:
+        chips.append(scc_chip)
+        flag_texts.append(k051649_flag_text(song.vgm.k051649_clock))
+    for cid in ay_ids:
+        chips.append(CHIP_AY8910)
+        flag_texts.append(ay8910_flag_text(
+            song.vgm.ay8910_clock, song.vgm.ay8910_type,
+        ))
     n_chips = len(chips)
 
     info_size_off, info_start = b.begin_block(b"INFO")
@@ -1604,7 +1809,7 @@ def write_fur(
     b.u8(4)
     b.u8(16)
     b.u16(n_ins)
-    b.u16(0)
+    b.u16(n_wav)
     b.u16(n_smp)
     b.u32(n_pat)
 
@@ -1637,6 +1842,9 @@ def write_fur(
 
     ins_ptr_off = len(b)
     for _ in range(n_ins):
+        b.u32(0)
+    wave_ptr_off = len(b)
+    for _ in range(n_wav):
         b.u32(0)
     smp_ptr_off = len(b)
     for _ in range(n_smp):
@@ -1736,6 +1944,18 @@ def write_fur(
         _write_ins_pcm(
             b, f"C352 {smp.start:06x}", c352_ins_base + i, INS_C352,
         )
+    for i, spec in enumerate(scc_specs):
+        ins_ptrs.append(len(b))
+        wave = scc_waves[spec.wave] if spec.wave < len(scc_waves) else b""
+        name = f"SCC {i:02d} {_wave_label(wave)}"
+        if spec.waves:
+            name += "+morph"
+        if spec.pitch:
+            name += "+pitch"
+        _write_ins_scc(b, name, spec)
+    for spec in ay_specs:
+        ins_ptrs.append(len(b))
+        _write_ins_ay(b, "PSG" + ("+pitch" if spec.pitch else ""), spec)
 
     smp_ptrs: list[int] = []
     for i, smp in enumerate(pcm_smps):
@@ -1780,8 +2000,17 @@ def write_fur(
         pat_ptrs.append(len(b))
         _write_patn(b, ch, idx, rows, fx_cols)
 
+    wave_ptrs: list[int] = []
+    for wave in scc_waves:
+        # The chip reads signed bytes; Furnace's wavetable is unsigned with
+        # 128 as the center, exactly the byte + 128 the SCC platform subtracts.
+        data = bytes((val + 128) & 0xFF for val in wave)
+        wave_ptrs.append(_write_wave(b, f"scc_wave_{_wave_label(wave)}", data))
+
     for i, p in enumerate(ins_ptrs):
         b.patch_u32(ins_ptr_off + 4 * i, p)
+    for i, p in enumerate(wave_ptrs):
+        b.patch_u32(wave_ptr_off + 4 * i, p)
     for i, p in enumerate(smp_ptrs):
         b.patch_u32(smp_ptr_off + 4 * i, p)
     for i, p in enumerate(pat_ptrs):

@@ -21,7 +21,9 @@ SKIP_DIRS = {
     "fur", "docs", "tests",
 }
 
-# Display order and names for the header-visible chips.
+# Display order and names for the header-visible chips. A K052539 rip reports
+# both "k051649" (the clock field it shares) and "scc_plus"; the label shows
+# the more specific one only.
 CHIP_LABELS = (
     ("ym2151", "YM2151"),
     ("k007232", "K007232"),
@@ -31,6 +33,9 @@ CHIP_LABELS = (
     ("c219", "C219 (unsupported)"),
     ("msm6295", "MSM6295"),
     ("msm6258", "MSM6258"),
+    ("scc_plus", "SCC+"),
+    ("k051649", "SCC"),
+    ("ay8910", "AY-8910"),
 )
 
 
@@ -47,7 +52,10 @@ class Pack:
 
     @property
     def chip_label(self) -> str:
-        names = [label for kind, label in CHIP_LABELS if kind in self.chips]
+        kinds = set(self.chips)
+        if "scc_plus" in kinds:
+            kinds.discard("k051649")
+        names = [label for kind, label in CHIP_LABELS if kind in kinds]
         return ", ".join(names)
 
 

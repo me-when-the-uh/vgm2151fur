@@ -17,8 +17,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from vgm2151fur.furwrite import (
-    CHIP_C140, CHIP_C352, CHIP_K007232, CHIP_MSM6258, CHIP_MSM6295, CHIP_SEGAPCM,
-    FUR_MAGIC,
+    CHIP_AY8910, CHIP_C140, CHIP_C352, CHIP_K007232, CHIP_K051649, CHIP_K052539,
+    CHIP_MSM6258, CHIP_MSM6295, CHIP_SEGAPCM, FUR_MAGIC,
 )
 
 CHIP_NAMES = {
@@ -29,6 +29,9 @@ CHIP_NAMES = {
     CHIP_SEGAPCM: "SegaPCM",
     CHIP_C140: "C140",
     CHIP_C352: "C352",
+    CHIP_K051649: "SCC",
+    CHIP_K052539: "SCC+",
+    CHIP_AY8910: "AY8910",
 }
 
 # Old readers take the byte field as a signed char. It stays <= 64.

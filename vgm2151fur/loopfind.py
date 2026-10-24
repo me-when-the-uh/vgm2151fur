@@ -1,32 +1,14 @@
 """Move a VGM loop marker onto the downbeat of the bar.
 
-Rippers drop the loop sample wherever the phrase happened to be when they
-hit the key. The note grid usually repeats every 4, 8, 12, or 16 pulses
-(a 4/4 bar, an 8/8 bar, or the 12-pulse cell some of these themes use).
-The marker should open that cell, not sit on the second or third pulse.
+Rippers drop the loop sample wherever the phrase happened to be, so the
+marker can sit a pulse, or a whole phrase, late. The order cut moves it onto
+the phrase's own head and opens a row early, so the voices keyed just before
+the downbeat stay inside the loop and the jump row is not the downbeat
+itself. The loop keeps the length the VGM declares.
 
-Furnace runs a row's notes and sample commands when it lands on the row,
-and a `Bxx` on that same row jumps away at the end of it. The order cut
-therefore opens a few rows before the downbeat commands (three): voices
-keyed just before the main chord are inside the loop, and the downbeat
-itself is not the jump row.
-
-A grid with no clock, or a loop that is not a whole number of bars, stays
-on the VGM marker. A clock with no repeating cell stays too, except when
-the marker sits on the empty row after a chord: the cut moves to the rows
-before that chord.
-
-The marker is also often off by a whole phrase, not just a pulse: it can
-sit inside the phrase, seconds after its first command. The loop keeps the
-length the VGM gave it — a marker late at the start matches the end of the
-log being late too — so the seam search looks for the phrase start whose
-copy sits one loop length later, still inside the log. A copy closer than
-that is an inner repetition, not the seam the marker is missing.
-Candidates run a window on either side of the marker, and the earliest
-long run of near-perfect matches wins, so a marker inside the phrase still
-opens the loop on the phrase's first command without dropping the head.
-The order opens a few rows before those commands, and the jump stops the
-same distance before the returned copy.
+A grid with no clock, or a loop that is not a whole number of bars, stays on
+the VGM marker, except when the marker sits on the empty row after a chord:
+the cut then moves to the rows before that chord.
 """
 
 from __future__ import annotations
@@ -41,36 +23,28 @@ PERIODS = (4, 8, 12, 16)
 MIN_REGULARITY = 0.75
 # One late note must not hand the clock to a sparser, perfectly even voice.
 REG_TOLERANCE = 0.05
-# Weighted pitch-class agreement through the loop body. Exact slice equality
-# stays near zero on a real bar whose voices are a row apart; 0.25 still
-# leaves a through-composed cue (no repeating cell) on the VGM marker.
+# Weighted pitch-class agreement through the loop body. Exact equality
+# stays near zero when voices sit a row apart, so 0.25 still leaves a
+# through-composed cue on the VGM marker.
 MIN_AUTOCORR = 0.25
 MIN_AUTOCORR_GAP = 0.04
 PERIOD_BAND = 0.02
 MIN_VOTE_MARGIN = 0.08
-# The winning phase has to be heavier than the phase the marker is on.
-# A few hundredths is two phases that both carry the band.
+# The winning phase must be clearly heavier than the phase the marker is on.
 MIN_PHASE_GAIN = 0.75
 # The loop beat is an arrival when it brings in this many more voices than
 # the candidate behind it. That is a pickup resolving, not a late marker.
 TEXTURE_JUMP = 2
-# The order cut opens this many rows before the first commands. One row is
-# the row whose copy the seam search actually verified. Wider cuts (three
-# rows were tried) land the seam on rows that are not exact copies of their
-# log counterparts - the PCM and effect columns drift a row or two between
-# the first and last iteration - and the loop audibly wobbles at the seam.
+# The order cut opens this many rows before the first commands: the row
+# whose copy the seam search verified. Wider cuts land the seam on rows
+# that drift between iterations, and the loop wobbles there.
 CUT_ROWS = 1
 
 
 @dataclass(frozen=True)
 class LoopFix:
-    """A replacement loop, in pattern rows.
-
-    `start_row` is the first row of the loop order. `end_row` is the row
-    `Bxx` sits on (the last row that plays). `shift_pulses` is the musical
-    move; the order cut additionally opens a few rows before the downbeat
-    commands when the clock is wider than one row.
-    """
+    """A replacement loop in pattern rows: `start_row` opens the order,
+    `end_row` carries `Bxx`."""
 
     start_row: int
     end_row: int
@@ -370,9 +344,8 @@ def _snap_empty_marker(notes, loop_row: int, end_row: int, step: int) -> LoopFix
     hits = sum(1 for row, _ch, _pitch in notes if row == chord)
     if hits < 2 or chord < 1:
         return None
-    # A few execution rows before the commands, unless that row is a whole
-    # pulse. The end follows the start by the same delta, so the played
-    # span keeps its length and every row across the seam plays once.
+    # A row before the commands, unless one row is a whole pulse. The end
+    # moves with the start, so the played span keeps its length.
     start = chord - CUT_ROWS if step > 1 else chord
     if start < 0:
         start = 0
@@ -415,16 +388,16 @@ def _phase_loop(
     vote, margin, gain, phase_scores = _phase_shift(
         grid, echoes, lead, loop_beat, end_beat, period,
     )
-    # A non-zero vote has to clear the runner-up and the phase we are on.
-    # Confirming the current phase does not, so a lead entry can still move it.
+    # A non-zero vote must clear the runner-up and the phase the marker is
+    # on. Confirming the current phase does not, so a lead entry can still
+    # move the loop.
     vote_ok = vote != 0 and margin >= MIN_VOTE_MARGIN and gain >= MIN_PHASE_GAIN
     shift = _entry_shift(grid, lead, loop_beat, period)
     if shift is not None and _ensemble(grid, loop_beat, echoes) >= _ensemble(grid, loop_beat + shift, echoes) + TEXTURE_JUMP:
         shift = None
-    # One pulse back is the late-marker case: the beat the marker sits on can
-    # be the heavier one when a double arrives there. A longer walk back has
-    # to land on a phase that is actually heavier, and it loses to a vote
-    # that already names a downbeat.
+    # One pulse back is the late-marker case (a double arriving on the
+    # marker's own beat). A longer walk back must land on a heavier phase,
+    # and loses to a vote that already names a downbeat.
     if shift is not None and abs(shift) > 1:
         dest = phase_scores.get((loop_beat + shift) % period, 0.0)
         here = phase_scores.get(loop_beat % period, 0.0)
@@ -448,14 +421,13 @@ def _phase_loop(
         return _snap_empty_marker(notes, loop_row, end_row, clock.step)
     if abs(command - loop_row) > (period * clock.step) // 2 + clock.step:
         return None
-    # A few rows before the commands. A one-row clock would put the cut on
-    # the previous pulse, which is the mid-bar cut this pass is trying to
-    # leave. The end follows the start by the same delta.
+    # A row before the commands. A one-row clock keeps the cut on the same
+    # pulse, or it would land mid-bar. The end moves with the start.
     start = max(0, command - CUT_ROWS) if clock.step > 1 else command
     delta = start - loop_row
     end = end_row + delta
-    # The VGM jump can already sit a few rows past the last note. Moving
-    # both ends by the same amount stays inside that span.
+    # The VGM jump can sit a few rows past the last note; both ends move
+    # together and stay inside that span.
     last_row = max(row for row, _ch, _pitch in notes)
     if end < start or end > max(end_row, last_row) or start > max(end_row, last_row):
         return None
@@ -608,13 +580,12 @@ def _seat_cost(exact, start: int, end: int) -> int:
 
 
 def _seat_seam(exact, start: int, end: int, lo: int, hi: int, content_end: int) -> tuple[int, int]:
-    """The seat whose rows agree exactly across the seam, when one exists.
+    """The nearby seat whose rows agree exactly across the seam, if any.
 
-    Only a nearby seat that removes every disagreement wins, nearest first:
-    a thin improvement means the tail itself is not a row-exact copy, and
-    moving the cut on that evidence only trades one wobble for another. The
-    window must fit inside the log, so a tail that runs out at the jump
-    cannot pass on emptiness. A track whose rows already agree never moves.
+    Nearest first. A thin improvement means the tail is not a row-exact
+    copy, and moving on that evidence only trades one wobble for another.
+    The window must fit inside the log, and a seat that already agrees
+    never moves.
     """
     if end + SEAT_SPAN > content_end:
         return start, end
@@ -637,17 +608,13 @@ def _phrase_seam(
     end_row: int,
     forward_rows: int,
 ) -> LoopFix | None:
-    """Move the loop onto the phrase start the ending of the track repeats.
+    """Move the loop onto the phrase start the end of the track repeats.
 
-    The VGM loop length is the invariant: the marker can sit inside the
-    phrase, but the loop keeps its length, so a candidate start's copy sits
-    one loop length later, with the comparison window fitting completely
-    inside the track. The marker being late at the start matches the end of
-    the log being late too, and a shorter copy (an inner repetition) is not
-    a seam at all. A module already cut at its loop end is left alone, so
-    reconversion is stable. Candidates run a window on either side of the
-    marker; the earliest long run of near-perfect matches wins, and its
-    heaviest command row opens the loop.
+    The VGM loop length is the invariant: a candidate start's copy sits one
+    loop length later, with the comparison window completely inside the
+    track. A shorter copy (an inner repetition) is not a seam. Candidates
+    run a window on either side of the marker; the earliest long run of
+    near-perfect matches wins, and its heaviest command row opens the loop.
     """
     span = end_row - loop_row
     window = min(int(forward_rows), span)
@@ -812,23 +779,19 @@ def row_to_sample(song, row: int) -> int:
     return song.t0 + int(math.floor(row * song.samples_per_row + 1e-6))
 
 
-# A seat for the wrap, checked against the recording's own copy of the loop
-# head. The last pass drifts a row or two, and a whole figure can land late.
-# A note's copy is searched within _COPY_DRIFT rows. _COPY_DRIFT_WIDE is the
-# drift that still counts as the same music when a start is judged on its
-# own: a pick that fails at this width is not a copy of anything.
+# The wrap is checked against the recording's own copy of the loop head,
+# which can drift a row or two. _COPY_DRIFT_WIDE is the drift that still
+# counts as the same music when a start is judged on its own.
 _COPY_DRIFT = 3
 _COPY_DRIFT_WIDE = 8
-# The copy window in rows, the share of each side that has to agree, and the
-# thin-window floor: a handful of notes is not evidence. The wide drift is
-# used when a start is judged on its own, where a note or two of the drift
-# can still go missing.
+# Comparison window in rows, the agreement share, and the thin-window floor:
+# a handful of notes is not evidence.
 _COPY_SPAN = 96
 _COPY_SHARE = 0.95
 _COPY_SHARE_WIDE = 0.90
 _COPY_MIN_EVENTS = 4
-# A pick this far past the last recorded copy row has no copy of its own.
-# A few rows of overshoot still reads the stretch behind it.
+# A pick this far past the last recorded copy row has no copy of its own; a
+# few rows of overshoot still reads the stretch behind it.
 _COPY_EDGE = 3
 
 
@@ -911,13 +874,11 @@ def _copy_head_start(by, samples_at, chan_at, start: int, length: int,
     """The row in front of `start` the recording's copy replays, plus the
     first sample of that copy.
 
-    Rows ahead of the VGM marker are intro material only while nothing brings
-    them back. When the copy at the tail sounds a row again, one loop later,
-    the loop opens on it, and the copy's own first sample pins the wrap.
-    Empty rows do not end the walk (a pickup can be followed by rests); a row
-    the copy does not answer does. Slides move their carriers' pitches while
-    the copy runs, so a row also counts as answered when most of its channels
-    sound inside the copy's window.
+    Rows ahead of the marker are intro material until the copy at the tail
+    sounds them again one loop later. Empty rows do not end the walk; a row
+    the copy does not answer does, and a row counts as answered when most
+    of its channels sound inside the copy's window (slides keep their
+    carriers sounding).
     """
     first: int | None = None
     moved = False
@@ -966,13 +927,9 @@ def _copy_aligned(notes, picked: int, end_row: int, length: int | None,
                   window: int) -> int:
     """The start the recording's own copy puts the wrap on.
 
-    The rows past the declared loop end are the copy of the loop's first
-    rows. The wrap belongs where that copy lines up. A pick below the
-    verified stretch wraps into rows the copy does not answer, and the notes
-    after the loop point are then not the ones the source plays there. A pick
-    a few rows past the last recorded copy row still reads the stretch
-    behind it; further out there is no evidence either way and the pick
-    stands.
+    A pick below the verified stretch wraps into rows the copy does not
+    answer; a few rows past the last copy row still reads the stretch
+    behind it, and further out the pick stands.
     """
     if length is None or length < 16:
         return picked
@@ -1008,12 +965,9 @@ def _declared_length(song) -> int | None:
 def _declared_end_row(song, start_row: int) -> int | None:
     """The jump row the declared loop length puts the wrap on.
 
-    The VGM header's loop length is the one iteration length the rip
-    vouches for, so the wrap sits exactly that many rows after the start
-    the fix chose, whatever the recorded content does around it. The
-    recording usually runs a little past it (the next iteration's head),
-    and those rows must stay outside the loop: a jump row carrying the
-    copy's notes plays them, and the seam strikes the head twice.
+    The header's length is the one iteration length the rip vouches for.
+    Rows the recording runs past it (the next iteration's head) stay
+    outside the loop, or the seam strikes the head twice.
     """
     length = _declared_length(song)
     if length is None:
@@ -1053,10 +1007,8 @@ def apply_loop(song) -> str | None:
     )
     head_sample: int | None = None
     if fix is None:
-        # Rows ahead of the marker are intro material only while nothing
-        # brings them back; the copy settles where the loop opens even when
-        # no other pick was found. (A pick the copy already settled is past
-        # this point and keeps its seat.)
+        # The copy settles where the loop opens even when no other pick was
+        # found; a pick the copy already settled keeps its seat.
         length = _declared_length(song)
         if length is not None:
             samples_at: dict[tuple[int, int, int], int] = {}
@@ -1086,9 +1038,9 @@ def apply_loop(song) -> str | None:
     declared = _declared_end_row(song, fix.start_row)
     if declared is not None:
         wrap_row = declared
-        # The recording's own copy of the head measures the period. When it
-        # puts the wrap earlier than the header does, the header runs past
-        # the copy and the copy's first row would sound at the seam.
+        # The copy's own period can put the wrap earlier than the header;
+        # the header would then run past the copy and sound its first row
+        # at the seam.
         length = _declared_length(song)
         by = _copy_index(notes)
         if _copy_faithful(by, fix.start_row, length, end_row, _COPY_DRIFT):
@@ -1101,16 +1053,14 @@ def apply_loop(song) -> str | None:
             wrap_row = max(fix.start_row, int(head_sample / song.samples_per_row) - 1)
         if wrap_row != fix.end_row:
             fix = replace(fix, end_row=wrap_row)
-    # A tenth of a row inside the row: every row rate reads the point as the
-    # row the loop opens on, not the row below.
+    # A tenth of a row in, so every row rate reads the point as the row the
+    # loop opens on, not the row below.
     nudge = int(song.samples_per_row / 10)
     song.loop_sample = row_to_sample(song, fix.start_row) + nudge
     song.loop_end_sample = row_to_sample(song, fix.end_row) + nudge
     # The wrap sample: content at or past it is the copy of the head and
-    # stays unwritten at every row rate. The tighter of the last row's end
-    # and the header's own one-period point. A copy that drifts a hair early
-    # still lands past this point, so the sliver of its first row that a
-    # condensed grid would fold back stays out.
+    # stays unwritten at every row rate. A copy that drifts a hair early
+    # still lands past it.
     cut = row_to_sample(song, fix.end_row + 1)
     if song.vgm.loop_samples:
         cut = min(cut, song.loop_sample + song.vgm.loop_samples)

@@ -182,10 +182,11 @@ they can be run from anywhere.
   isolate a chip.
 - `tools/pitch_shift.py <a.wav> <b.wav>`: the chroma-rotation table one pair
   of renders at a time, used by the soundcheck.
-- `tools/vgm_scan.py [root ...]`: which VGM packs use SegaPCM, C140, C352 or
-  C219 and at which clock. C219 is a C140-family part the converter does not
-  support; never batch-convert those into the C140 target. C352 converts as
-  chip 0xD0; a Furnace build with a C352 core can play it. See docs/c352.md.
+- `tools/vgm_scan.py [root ...]`: which VGM packs use SegaPCM, C140, C352,
+  C219, SCC/SCC+ or AY-8910 and at which clock. C219 is a C140-family part the
+  converter does not support; never batch-convert those into the C140 target.
+  C352 converts as chip 0xD0; a Furnace build with a C352 core can play it.
+  See docs/c352.md and docs/scc-ay8910.md.
 
 ## Environment
 

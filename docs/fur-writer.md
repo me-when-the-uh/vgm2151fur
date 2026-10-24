@@ -34,13 +34,16 @@ from that count, so a module opens with columns matched to its content
 instead of the 8-column build capacity. The count never drops below the
 busiest row, or a load-and-re-save in Furnace would drop effects.
 
-Patterns are 256 rows (Furnace's maximum, up from 64). A measured grid runs
-100 rows/s and up, so long tracks used to need hundreds of 64-row orders;
-256 keeps the order list readable. The loop row starts its own order (the
-short order before it ends with `D00`), which is what keeps loop points
-precise, and the last order's `Bxx` loop jump sits on its last content row,
-not on the padded end. Loop finding can set that end earlier than the last
-note; the rows after it are not written.
+The pattern window follows the content: the last row that carries anything
+plus ten empty rows, capped at Furnace's 256-row maximum, which a long track
+still reaches. Furnace holds one pattern length for the whole module, so a
+short jingle opens as a short pattern instead of one padded to 256 - every
+order is that long, which is why the window is fitted to the whole module and
+not to one order. The loop row starts its own order (the short order before it
+ends with `D00`), which is what keeps loop points precise, and the last
+order's `Bxx` loop jump sits on its last content row, not on the padded end.
+Loop finding can set that end earlier than the last note; the rows after it
+are not written.
 
 `edit.py` patches both volume copies, so every reader agrees. The float
 triples are located from the payload tail, anchored on the ADIR pointers: the
@@ -50,7 +53,12 @@ triples start 31 bytes plus 12 per chip before the first ADIR pointer.
 ## Chip IDs and flags
 
 - `0x82` YM2151, `0xC6` K007232, `0xAA` MSM6295, `0xAB` MSM6258, `0x9B`
-  SegaPCM, `0xCE` C140, `0xD0` C352.
+  SegaPCM, `0xCE` C140, `0xD0` C352, `0xA1` Konami SCC (K051649), `0xB4`
+  Konami SCC+ (K052539), `0x80` AY-3-8910. A module lists the chips the
+  source had usable samples for: a melody-only track opens with the YM2151
+  alone, with no K007232 pair and no PCM channels it never plays. The SCC and
+  AY are tone chips, not sample players: they are written whenever the source
+  keys a voice, even under `--melody-only`.
 - The YM2151 flag carries `customClock=` when the source clock is not
   3579545: a 4 MHz OPM plays flat otherwise.
 - The K007232 flag carries `stereo=true` and a clock when it differs from the
@@ -61,10 +69,16 @@ triples start 31 bytes plus 12 per chip before the first ADIR pointer.
   value as-is; a core copied from `c140.cpp` instead ticks at clock/192 and
   would need the C140 2/3 scale. C352 instruments are Amiga type 4, which
   such a core plays. This writer stores the real crystal.
+- The SCC and AY flags are empty when the rip's clock is within a hertz of
+  Furnace's COLOR_NTSC/2 default (1789772.7) and carry `customClock=` for
+  anything else. Furnace builds its pitch table from the double, so sending a
+  nearly identical clock would shift a table entry here and there. The AY
+  flag also carries `chipType=1` for the YM2149 family (VGM type 0x10/0x11).
 - The volume byte per chip comes from the reference player's mix, not a flat
   unity: libvgm defaults, extra-header volume entries, the C140 core scale
   (2/3) and instance division. `_FURNACE_VOLUME_SCALE` corrects the Furnace
-  cores against measured renders.
+  cores against measured renders (AY 1.46, SCC 1.04; measured on two-chip
+  modules because the player normalizes a lone chip and Furnace does not).
 
 ## Instruments
 
@@ -77,6 +91,19 @@ PCM instruments bind one sample each: K007232 two channels, MSM6295 four
 voices per chip, MSM6258 one, SegaPCM sixteen, C140 twenty-four, C352
 thirty-two. Sample bodies are stored 8-bit signed (C140 and C352 mulaw are
 16-bit linear).
+
+SCC instruments (`DIV_INS_SCC`, type 18) carry one 32-byte waveform through
+the `WS` wave-synth feature; the wave itself lives in the module's wavetable
+list (`WAVE` blocks, addressed by the INFO wave pointer table). The chip
+reads signed bytes and Furnace's wavetable is unsigned with 128 as the
+center, so each byte is stored as `signed + 128`. Notes with the same image
+and the same macros share an instrument.
+
+The AY instrument (`DIV_INS_AY`, type 6) carries a phase-reset macro (file
+code 14) - the chip restarts its hardware envelope only when the shape
+register is written, and Furnace's platform skips a write whose value did not
+change, so a drum hit reusing the previous shape would keep the stale
+envelope state - plus the pitch macro when the note's driver wrote one.
 
 ## Pitch units
 
@@ -94,6 +121,18 @@ Two effects move pitch, and their scales differ per platform:
 E8xx/E9xx quick legato adds semitones to the playing note in one write. It is
 cumulative (`note += y`), applies one tick after the row, and resets at the
 next note. Checked against Furnace 0.6.8.3 on both platforms.
+
+The SCC and AY do not use the slide effects. Their register is a 12-bit
+period, and a mid-note pitch change becomes the instrument's **pitch macro**
+(code 4): one value per tick in the engine's pitch unit, which the platform
+adds straight to the period. A mid-note waveform morph becomes the **wave
+macro** (code 3), a per-tick list of wavetable indices. Both are 16-bit signed
+where they can exceed a byte, both carry their own speed and loop, and both
+are deduplicated per trajectory, so a recurring bend or morph is one
+instrument rather than a cell per step. `pitch.py` ports Furnace's period-mode
+`DivPitchTable` and inverts it (including the offset search the macros need),
+so a source period is reproduced exactly up to one register step where the
+table's octave shift loses resolution.
 
 ## The sweep model
 

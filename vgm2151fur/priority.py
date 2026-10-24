@@ -1,12 +1,10 @@
 """How many cores a batch may use, and how quiet those processes stay.
 
-Workers are pinned to the logical CPUs. One thread stays free on small
-CPUs and two on bigger ones (a 6 core/12 thread desktop runs 10 workers),
-with a ceiling of 16; an explicit count may go up to one below the thread
-count — every thread below eight — and 31 is the safety ceiling, because
-past that the renders compete with each other and the batch runs slower.
-Worker processes and Furnace renders run at low priority: Idle on Windows,
-nice 10 elsewhere.
+Workers follow the logical CPUs, leaving one or two threads free and capping
+at 16; an explicit count may go up to one below the thread count, with 31 as
+the safety ceiling where the single-threaded renders start competing. Worker
+processes and Furnace renders run at low priority: Idle on Windows, nice 10
+elsewhere.
 """
 
 from __future__ import annotations
@@ -34,9 +32,8 @@ def default_workers(threads: int) -> int:
     """One thread stays free below six, two at six or more; ceiling 16.
 
     The heavy part of a worker is a single-threaded Furnace render, so the
-    count follows logical CPUs; the spare threads keep the desktop
-    responsive. A 6 core 12 thread machine gets 10 workers, a 22 thread one
-    gets 16.
+    count follows logical CPUs and the spare threads keep the desktop
+    responsive.
     """
     if threads < 6:
         return max(1, threads - 1)
@@ -51,10 +48,8 @@ def worker_limit() -> int:
 def worker_cap(threads: int) -> int:
     """Most workers an explicit `--workers` may use, and the default's ceiling.
 
-    Below eight threads every thread may run a worker (a two-thread machine
-    can use both). At eight or more one thread stays free, and 31 is the
-    safety ceiling: past that the single-threaded renders fight over the
-    CPU and the batch goes slower, not faster.
+    Below eight threads every thread may run a worker; at eight or more one
+    stays free, with 31 as the safety ceiling.
     """
     if threads < 8:
         return max(1, threads)

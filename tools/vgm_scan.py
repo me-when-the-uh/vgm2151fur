@@ -14,6 +14,9 @@ the hits per pack directory:
              own 32-voice chip. Furnace 0.6.8.3 does not play chip 0xD0.
     c219     the C140-family ASIC (type byte 2). The converter does not
              support it; never batch-convert these into 0xCE.
+    k051649  Konami SCC at header 0x9C; bit 31 of that field selects the
+             K052539 "SCC+" variant (listed as its own kind, scc_plus)
+    ay8910   AY-3-8910/YM2149 at header 0x74 (VGM 1.51+), type byte 0x78
 
 Detection is heuristic (header clocks plus the extra-header clock list).
 Run it before batch convert requests so the pack list is complete, and
@@ -35,7 +38,7 @@ from vgm2151fur.vgm import chips_in_head, head_bytes
 SKIP = {"output", "third_party", ".git", "__pycache__", ".commandcode",
         "node_modules", "soundcheck"}
 
-CENSUS_KINDS = {"segapcm", "c140", "c219", "c352"}
+CENSUS_KINDS = {"segapcm", "c140", "c219", "c352", "k051649", "scc_plus", "ay8910"}
 
 
 def detect(p: Path, want: int) -> set[str] | None:
@@ -53,8 +56,7 @@ def main() -> int:
     roots = [Path(r) for r in args.roots] if args.roots else [Path.cwd()]
     want = args.max_mb * 1024 * 1024
 
-    groups: dict[str, dict[str, list[str]]] = defaultdict(
-        lambda: {"segapcm": [], "c140": [], "c219": [], "c352": []})
+    groups: dict[str, dict[str, list[str]]] = defaultdict(lambda: defaultdict(list))
     for root in roots:
         for dirpath, dirnames, filenames in os.walk(root):
             dirnames[:] = [d for d in dirnames if d not in SKIP and not d.startswith(".")]

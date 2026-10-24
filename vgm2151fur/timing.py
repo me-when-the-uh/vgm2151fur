@@ -1,22 +1,14 @@
 """Measure the musical row grid from key-on timing, or say "no".
 
-Arcade YM2151 drivers schedule notes on a fixed musical unit (here: the 16th
-note) whose length in samples is *not* a whole number of 735-sample video
-frames or YM2151 timer periods, and the unit drifts per channel and section by
-a few percent.  A constant row grid therefore cannot track the note stream to
-better than half a row, and drivers also quantize each write to the 60 Hz
-frame. Events jitter around the ideal lattice by up to half a frame.
+Arcade drivers schedule notes on a fixed musical unit (the 16th note) whose
+length in samples is not a whole number of 60 Hz frames, and the unit drifts
+per channel and section by a few percent. Each measured unit is subdivided
+into rows and given several ticks (Furnace: hz = ticks/second, speed =
+ticks/row), so EDxx delays place every event within half a tick and pitch
+ramps advance at the same fine rate.
 
-The estimator measures the unit from the key-on lattice and subdivides it into
-rows.  Each row is then given several *ticks* (Furnace: hz = ticks/second,
-speed = ticks/row) so that EDxx delays place every event at its true write
-time to within half a tick (~1 ms) and pitch ramps (01xx/02xx) advance at the
-same fine rate.  The row grid itself stays as coarse as the measured unit
-allows. Patterns keep a normal tracker shape.
-
-The estimator is deliberately conservative: when the note stream does not look
-like a regular lattice it returns ``None`` and the caller falls back to the
-legacy 60 Hz heuristic.
+The estimator is deliberately conservative: no regular lattice, no grid, and
+the caller falls back to the legacy 60 Hz heuristic.
 """
 
 from __future__ import annotations
@@ -26,15 +18,13 @@ from dataclasses import dataclass
 
 from vgm2151fur.vgm import VGM_RATE, VgmFile
 
-# Target length of one tick.  2 ms is fine enough for frame-quantized note
-# starts (a frame is 735 samples = 16.7 ms) and coarse enough that ED values
-# stay small and the tick rate stays sane for every driver unit we have seen.
+# Target length of one tick: fine enough for frame-quantized note starts,
+# coarse enough that ED values stay small.
 TARGET_TICK_SAMPLES = 90.0
 
-# Shortest row the grid will subdivide the measured 16th into.  Rows shorter
-# than this are what drive the row rate (and so the tracker's BPM: Furnace
-# shows 15 x rows/s) up to 2000+; lengthening the rows trades slide-rate-change
-# granularity for readability.  See `estimate_grid(min_row=...)`.
+# Shortest row the grid will subdivide the measured 16th into. Shorter rows
+# drive the row rate (and the tracker's BPM) up; longer rows trade
+# slide-rate granularity for readability. See `estimate_grid(min_row=...)`.
 MIN_ROW_SAMPLES = 280.0
 
 
@@ -169,17 +159,15 @@ def estimate_grid(
 ) -> Grid | None:
     """Return the measured grid (a subdivided 16th note) or None.
 
-    Drivers differ in which note value dominates (16ths, 8ths, swung pairs,
-    ornaments on a finer grid). Several candidate units are tried (the
-    per-channel median, the bucketed mode and the global mode) and each is
-    scored by how many intervals it explains as integer multiples.  Among the
-    candidates that explain ~equally well the *coarsest* unit wins, because
-    finer note values still land exactly on the row grid via EDxx; this keeps
+    Several candidate units are tried (per-channel median, bucketed mode,
+    global mode), each scored by how many intervals it explains as integer
+    multiples. Among near-best candidates the *coarsest* unit wins: finer
+    note values still land on the row grid via EDxx, and coarser units keep
     patterns from growing needlessly dense.
 
-    `onsets` overrides the note times used, keyed by channel.  The default
-    reads the YM2151 key-on register.  A rip with no FM stream to measure
-    passes its sample-chip triggers here instead.
+    `onsets` overrides the note times used, keyed by channel. The default
+    reads the YM2151 key-on register; a rip with no FM stream passes its
+    sample-chip triggers here instead.
     """
     by_ch = _keyons_by_channel(vgm) if onsets is None else onsets
     deltas: list[int] = []

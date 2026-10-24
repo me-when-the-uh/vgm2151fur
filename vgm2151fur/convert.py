@@ -21,10 +21,7 @@ from vgm2151fur.vgm import load_vgm
 CONVERT_WORKERS = resolve_workers(None, jobs=10**6)[0]
 # Divergent pitch time a rendition may carry, as a share of its played time.
 # The relative test alone cannot police a track whose 1x rendition already
-# drifts: with a quarter of a bad baseline allowed, Genpei Toumaden
-# "12 Yoritomo" (5.1 s of 15.9 s) and "07 Theme of Yoshitsune" (18.3 s of
-# 30.2 s) condensed freely.  The worst faithful rendition in the same pack is
-# "06 Theme of Heiankyo" at 2.6 s of 29.8 s, so the two groups are far apart.
+# drifts, so a candidate is also capped at this share of the piece.
 DIVERGENCE_SHARE = 0.15
 VGM_SUFFIXES = {".vgm", ".vgz"}
 VGM_GLOBS = ("*.vgm", "*.vgz", "*.VGM", "*.VGZ")
@@ -156,19 +153,14 @@ def _verify_runs(
 ) -> float:
     """Milliseconds of divergent pitch between the source and the export.
 
-    The structural counters cannot see everything (retrigger/envelope wobble
-    and sub-threshold drift), so `--verify` renders each candidate and measures
-    the divergences the `compare` command reports.  The threshold is finer than
-    `compare`'s default (0.5 st / 100 ms), where a marginal variant can hide.
+    `--verify` renders each candidate and measures the divergences `compare`
+    reports, at a finer threshold (0.25 st / 60 ms) where a marginal variant
+    can hide. The result is total divergent time, not a run count: a count
+    moves with `min_run_ms`, which would make the comparison depend on the
+    floor instead of the music.
 
-    The result is total divergent time, not a count of runs.  A count moves
-    with `min_run_ms`, and the baseline moves with it, which makes the
-    comparison between candidates depend on the floor instead of the music.
-
-    `min_run_ms` has to stay under the candidate's own row length. A note
-    pushed one row late diverges for exactly one row, and at 60 ms against a
-    55 ms row (Genpei Toumaden "03 Small Mode" x4) that run is discarded
-    before it is measured.
+    `min_run_ms` has to stay under the candidate's own row length, or a note
+    pushed one row late diverges for exactly one row and is never measured.
     """
     from vgm2151fur.diag import export_fur, pitch_runs
 
@@ -196,10 +188,8 @@ def _emit(
     """Write one Song to `out_path`, optionally normalizing. (bytes, peak, gain).
 
     `gain` reuses a master volume measured on another rendition of the same
-    track.  Measuring costs a full render per variant, and the variants differ
-    only in row rate: across x1..x4 the peak of one track spans about 1 dB, so
-    one measurement levels the whole set and keeps the variants at the same
-    volume, which a per-variant fit does not.
+    track: the variants differ only in row rate, so one measurement levels
+    the set and keeps it at one volume.
     """
     # A track with no FM key-ons must not carry an empty YM2151: the chip adds a
     # second device to the export, and VGM players rescale the mix for it, which
@@ -278,6 +268,8 @@ def convert_vgm(
         "segapcm_samples": len(song.segapcm_samples) if pcm else 0,
         "c140_samples": len(song.c140_samples) if pcm else 0,
         "c352_samples": len(song.c352_samples) if pcm else 0,
+        "scc_notes": song.scc_count,
+        "ay_notes": song.ay_count,
         "events": sum(1 for e in song.events if e.on),
         "warnings": warnings,
         "name": vgm.name,
@@ -361,24 +353,18 @@ def convert_variants(
 ) -> list[dict]:
     """Write one .fur per condense factor, side by side, and pick one.
 
-    factor 1 is the canonical `<stem>.fur`; factor N is `<stem> xN.fur`, so the
-    canonical file is never overwritten by a condensed copy.  `mode` only
-    decides the reported `pick`:
-      none     -> 1x;
-      lossless -> the largest factor whose structural loss does not exceed the
-                  1x baseline (falls back to 1x);
-      all      -> the largest factor.
-    With `verify`, the lossless pick also renders each candidate and rejects
-    any that adds a sustained pitch divergence over 1x.
+    factor 1 is the canonical `<stem>.fur`; factor N is `<stem> xN.fur`, so
+    the canonical file is never overwritten. `mode` decides the reported
+    `pick`: none -> 1x; lossless -> the largest factor whose structural loss
+    stays at the 1x baseline; all -> the largest factor. With `verify`, the
+    lossless pick also renders each candidate and rejects sustained pitch
+    divergence.
 
-    The loop is one musical decision, not one per grid. It is found once on
-    the 1x rows - the densest grid, and the same loop the default file
-    carries - and the sample points are shared, which each rendition reads at
-    its own row rate.
+    The loop is found once on the 1x rows and its sample points are shared:
+    each rendition reads them at its own row rate.
 
-    With `layout="dirs"` each accepted factor is moved to `<out_dir>/default/`
-    or `<out_dir>/xN optimised/` and the rejected factors are deleted, so a
-    finished folder holds only renditions that were judged lossless.
+    With `layout="dirs"` the accepted factors move to `<out_dir>/default/`
+    or `<out_dir>/xN optimised/` and the rejected ones are deleted.
     """
     vgm = load_vgm(path)
     src = Path(path)
@@ -485,11 +471,9 @@ def convert_variants(
     elif mode == "lossless":
         measured = [r for r in ok if r.get("div_ms") is not None]
         if measured:
-            # Divergent time is not monotone in the factor: it falls to a
-            # minimum and climbs again (Genpei Toumaden "03 Small Mode" x1..
-            # x4 = 1174, 1216, 1105, 920, 1134, 1059, 2261 ms). Taking the
-            # largest accepted factor walks straight past that minimum, so
-            # pick the largest factor still within a tenth of it.
+            # Divergent time is not monotone in the factor, so taking the
+            # largest accepted factor can walk past its minimum; pick the
+            # largest factor still within a tenth of the best.
             best = min(r["div_ms"] for r in measured)
             near = [r for r in measured if r["div_ms"] <= best + max(20.0, best * 0.10)]
             pick = max(near, key=lambda r: r["factor"])
@@ -644,14 +628,11 @@ def convert_folder(
 ) -> Iterator[tuple[Path, dict | None, str | None]]:
     """Convert every VGM/VGZ to `out_dir/<name>.fur`.
 
-    Yields (src, info, None) as each file finishes, or (src, None, error) for a
-    file that raised. The rest still convert. One track per worker process,
-    at low priority. The default count follows the logical CPUs.
-
-    With `variants` set, each file is written as the 1x..`condense`x set and
-    `info` carries the whole set in `info["variants"]` plus the pick.  With
-    `layout="dirs"` the accepted factors land in `default/` and `xN optimised/`
-    subfolders and a `condense.tsv` manifest records every verdict.
+    Yields (src, info, None) as each file finishes, or (src, None, error) for
+    a file that raised. The rest still convert. With `variants`, each file is
+    written as the 1x..`condense`x set and `info` carries the whole set plus
+    the pick; `layout="dirs"` lands the accepted factors in `default/` and
+    `xN optimised/` with a `condense.tsv` manifest.
     """
     try:
         if not files:

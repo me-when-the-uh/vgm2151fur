@@ -1,4 +1,8 @@
-"""VGM / VGZ loader and command walker (YM2151, K007232, MSM6295, MSM6258, SegaPCM, C140, C352)."""
+"""VGM / VGZ loader and command walker.
+
+Chips: YM2151, K007232, MSM6295, MSM6258, SegaPCM, C140, C352, AY-3-8910,
+K051649/K052539 (SCC).
+"""
 
 from __future__ import annotations
 
@@ -8,13 +12,14 @@ import zlib
 from dataclasses import dataclass, field
 from pathlib import Path
 
-
 VGM_RATE = 44100
 CMD_YM2151 = 0x54
 CMD_K007232 = 0x41
+CMD_AY8910 = 0xA0
 CMD_MSM6258 = 0xB7
 CMD_MSM6295 = 0xB8
 CMD_SEGAPCM = 0xC0
+CMD_SCC = 0xD2
 CMD_C140 = 0xD4
 CMD_C352 = 0xE1
 CMD_DATA_BLOCK = 0x67
@@ -30,17 +35,25 @@ K007232_TRIGGER_REG = 0x1F
 EXTRA_MSM6258 = 0x16
 EXTRA_MSM6295 = 0x17
 EXTRA_SEGAPCM = 0x04
+EXTRA_AY8910 = 0x12
+EXTRA_K051649 = 0x19
 EXTRA_C140 = 0x1C
 EXTRA_C352 = 0x27
 EXTRA_K007232 = 0x2A
 # Main-header clocks (VGMFile.h layout, spec v1.71). 0x98 is MSM6295, 0x90
 # MSM6258, 0x94 its flags. K007232 has no spec field; VGMPlay tools put it at
-# 0xE8 (1.71+). C140 is 0xA8 and its type byte 0x96.
+# 0xE8 (1.71+). C140 is 0xA8 and its type byte 0x96. AY-8910 is 0x74 with its
+# type byte at 0x78 and flags at 0x79 (1.51+); K051649 is 0x9C (1.61+), where
+# bit 31 selects the K052539 (SCC-I / SCC+) variant.
 SEGAPCM_CLOCK_OFF = 0x38
 SEGAPCM_INTF_OFF = 0x3C  # bank shift; mask is the byte at 0x3E (0 → 0x70)
 SEGAPCM_MASK_OFF = 0x3E
+AY8910_CLOCK_OFF = 0x74
+AY8910_TYPE_OFF = 0x78
+AY8910_FLAGS_OFF = 0x79
 MSM6258_CLOCK_OFF = 0x90
 MSM6295_CLOCK_OFF = 0x98
+K051649_CLOCK_OFF = 0x9C
 K007232_EXTRA_CLOCK_OFF = 0xE8
 C140_CLOCK_OFF = 0xA8
 C140_TYPE_OFF = 0x96
@@ -49,13 +62,15 @@ C352_DIV_OFF = 0xD6  # hardware divider / 4; 72 means a divider of 288
 SEGAPCM_CLOCK_X = 4000000  # X board / Hang-On
 SEGAPCM_CLOCK_Y = 4026987  # Y board: 32215900/8
 C140_DEFAULT_CLOCK = 12288000  # System 2/21 rips with a bogus header field
+AY8910_DEFAULT_CLOCK = 1789772  # COLOR_NTSC/2, the MSX/ZX PSG clock
+K051649_DEFAULT_CLOCK = 1789772  # MSX SCC (half the 3.579545 MHz slot clock)
 CLOCK_MIN = 100_000
 CLOCK_MAX = 40_000_000
 # Sample-chip write commands this tool does not convert. Anything here that
 # shows up in a stream means samples are being dropped. Say so.
 UNCONVERTED_SAMPLE_CMDS = {
-    0xA0: "MultiPCM", 0xB0: "RF5C68", 0xB1: "RF5C164", 0xB2: "PWM",
-    0xB6: "uPD7759", 0x40: "NES APU DPCM",
+    0xB0: "RF5C68", 0xB1: "RF5C164", 0xB2: "PWM",
+    0xB5: "MultiPCM", 0xB6: "uPD7759", 0x40: "NES APU DPCM",
 }
 
 # Commands defined by the VGM spec. 0x60/0x64/0x65/0x69-0x6F are undefined;
@@ -143,7 +158,8 @@ class RomSlice:
 @dataclass
 class ChipWrite:
     sample: int
-    chip: str  # "ym2151" | "k007232" | "msm6295" | "msm6258" | "segapcm" | "c140" | "c352"
+    chip: str  # "ym2151" | "k007232" | "msm6295" | "msm6258" | "segapcm" |
+    #            "c140" | "c352" | "ay8910" | "k051649"
     chip_id: int
     reg: int
     val: int
@@ -185,6 +201,17 @@ class VgmFile:
     c352_clock: int = 0
     c352_divider: int = 0
     c352_mute_rear: bool = False
+    # AY-8910 header 0x74 with type byte 0x78 (0 = AY-8910, 0x10 = YM2149)
+    # and flags 0x79 (VGM 1.51+). Second instance clock comes from the extra
+    # header (chip id 0x12).
+    ay8910_clock: int = 0
+    ay8910_type: int = 0
+    ay8910_flags: int = 0
+    # K051649 / K052539 (SCC) header 0x9C (VGM 1.61+), bit 31 set for the
+    # K052539 variant. The clock is the value both libvgm and Furnace run the
+    # chip at: pitch = clock / (16 * (period + 1)).
+    k051649_clock: int = 0
+    k051649_plus: bool = False
     # Extra-header clocks, raw (bit 31 kept). Keyed by libvgm chip id.
     extra_clocks: dict[int, int] = field(default_factory=dict)
     # Extra-header volume mix: chip id -> (flags, raw value, 0x100 = 1.0).
@@ -377,7 +404,8 @@ def head_bytes(path: Path, want: int) -> bytes:
 def chips_in_head(buf: bytes) -> set[str]:
     """Chip kinds visible in a VGM header, no command stream read.
 
-    Names match the converter's chips: ym2151, msm6295, segapcm, c140, c352.
+    Names match the converter's chips: ym2151, msm6295, segapcm, c140, c352,
+    ay8910, k051649 (plus "scc_plus" for the K052539 variant), k007232.
     C219 is the C140-family part the converter does not support. It is reported
     apart from c140, and those packs should not be batch-converted. C352 is
     its own chip (32 voices); it is not folded into c140 or c219.
@@ -390,6 +418,14 @@ def chips_in_head(buf: bytes) -> set[str]:
         kinds.add("ym2151")
     if version >= 0x151 and 100_000 <= _header_clock(buf, SEGAPCM_CLOCK_OFF) <= 40_000_000:
         kinds.add("segapcm")
+    if version >= 0x151 and 100_000 <= _header_clock(buf, AY8910_CLOCK_OFF) <= 40_000_000:
+        kinds.add("ay8910")
+    k051 = _header_raw(buf, K051649_CLOCK_OFF)
+    if version >= 0x161 and _field_in_header(buf, K051649_CLOCK_OFF, 4):
+        if 100_000 <= (k051 & 0x3FFFFFFF) <= 40_000_000:
+            kinds.add("k051649")
+            if k051 & 0x80000000:
+                kinds.add("scc_plus")
     ctype = buf[C140_TYPE_OFF] if version >= 0x161 and len(buf) > C140_TYPE_OFF else 0
     c140 = _header_clock(buf, C140_CLOCK_OFF)
     if c140 == 21390 or 100_000 <= c140 <= 40_000_000:
@@ -407,6 +443,10 @@ def chips_in_head(buf: bytes) -> set[str]:
         clocks, _volumes = _extra_chip_lists(buf)
         if clocks.get(EXTRA_SEGAPCM, 0):
             kinds.add("segapcm")
+        if clocks.get(EXTRA_AY8910, 0):
+            kinds.add("ay8910")
+        if clocks.get(EXTRA_K051649, 0):
+            kinds.add("k051649")
         if clocks.get(EXTRA_C140, 0):
             kinds.add("c140")
         if clocks.get(EXTRA_MSM6295, 0):
@@ -483,6 +523,25 @@ def load_vgm(path: Path | str) -> VgmFile:
         # Extra-header id 0x27 is already a crystal. Applying the divider
         # byte again would rescale a clock that was stored with divider 1.
         c352_clock = _sane_clock(clocks.get(EXTRA_C352, 0))
+    ay_clock = _clock_or_zero(buf, AY8910_CLOCK_OFF) if ver >= 0x151 else 0
+    if not ay_clock:
+        ay_clock = _sane_clock(clocks.get(EXTRA_AY8910, 0))
+    ay_type = (
+        buf[AY8910_TYPE_OFF]
+        if ver >= 0x151 and _field_in_header(buf, AY8910_TYPE_OFF, 1) else 0
+    )
+    ay_flags = (
+        buf[AY8910_FLAGS_OFF]
+        if ver >= 0x151 and _field_in_header(buf, AY8910_FLAGS_OFF, 1) else 0
+    )
+    k051_clock = 0
+    k051_plus = False
+    if ver >= 0x161 and _field_in_header(buf, K051649_CLOCK_OFF, 4):
+        raw = _header_raw(buf, K051649_CLOCK_OFF)
+        k051_plus = bool(raw & 0x80000000)
+        k051_clock = _sane_clock(raw & 0x3FFFFFFF)
+    if not k051_clock:
+        k051_clock = _sane_clock(clocks.get(EXTRA_K051649, 0))
 
     vgm = VgmFile(
         path=path,
@@ -508,6 +567,11 @@ def load_vgm(path: Path | str) -> VgmFile:
         c352_clock=c352_clock,
         c352_divider=c352_divider,
         c352_mute_rear=c352_mute_rear,
+        ay8910_clock=ay_clock,
+        ay8910_type=ay_type,
+        ay8910_flags=ay_flags,
+        k051649_clock=k051_clock,
+        k051649_plus=k051_plus,
         extra_clocks=clocks,
         extra_volumes=volumes,
     )
@@ -569,6 +633,13 @@ def load_vgm(path: Path | str) -> VgmFile:
             vgm.writes.append(ChipWrite(sample, "k007232", (aa >> 7) & 1, aa & 0x7F, buf[pos + 2]))
             pos += 3
             continue
+        if cmd == CMD_AY8910 and pos + 3 <= n:
+            # 0xA0: register, then data. Bit 7 of the register selects the
+            # second chip instance (libvgm reads it the same way).
+            rr = buf[pos + 1]
+            vgm.writes.append(ChipWrite(sample, "ay8910", (rr >> 7) & 1, rr & 0x7F, buf[pos + 2]))
+            pos += 3
+            continue
         if cmd in (CMD_MSM6295, CMD_MSM6258) and pos + 3 <= n:
             aa = buf[pos + 1]
             name = "msm6295" if cmd == CMD_MSM6295 else "msm6258"
@@ -579,6 +650,15 @@ def load_vgm(path: Path | str) -> VgmFile:
             # 0xC0: u16-LE address (register/voice map), then data.
             addr = int.from_bytes(buf[pos + 1:pos + 3], "little")
             vgm.writes.append(ChipWrite(sample, "segapcm", 0, addr & 0x7FF, buf[pos + 3]))
+            pos += 4
+            continue
+        if cmd == CMD_SCC and pos + 4 <= n:
+            # 0xD2 pp aa dd: SCC "port" (register bank), register, data. Bit 7
+            # of pp selects the second chip instance. The register space is
+            # kept flat as (port << 8) | addr; scc.py decodes the banks.
+            pp = buf[pos + 1]
+            reg = ((pp & 0x7F) << 8) | buf[pos + 2]
+            vgm.writes.append(ChipWrite(sample, "k051649", (pp >> 7) & 1, reg, buf[pos + 3]))
             pos += 4
             continue
         if cmd == CMD_C140 and pos + 4 <= n:
@@ -630,6 +710,10 @@ def load_vgm(path: Path | str) -> VgmFile:
         )
     if any(w.chip == "c352" for w in vgm.writes) and not vgm.c352_clock:
         vgm.warnings.append("C352 clock is missing or out of range; using 24192000")
+    if any(w.chip == "ay8910" for w in vgm.writes) and not vgm.ay8910_clock:
+        vgm.warnings.append("AY-3-8910 clock is missing or out of range; using 1789772")
+    if any(w.chip == "k051649" for w in vgm.writes) and not vgm.k051649_clock:
+        vgm.warnings.append("K051649 clock is missing or out of range; using 1789772")
     return vgm
 
 

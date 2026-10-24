@@ -194,8 +194,25 @@ def _pcm_song(events, *, loop=None, speed=6, hz=60.0):
         loop_samples=0, loop_file_pos=None, loop_sample=loop,
         ym2151_clock=3579545, k007232_clock=3579545, gd3={}, roms=[], writes=[],
     )
+    # Channel 8 events only exist when the bank had audible samples, so the
+    # fixture carries one: the K007232 pair is written from the samples, not
+    # from the notes.
+    smp = PcmSample(start=0x10000, pcm7=bytes([0x40] * 16), hits=[])
     return Song(
         vgm=vgm, t0=0, loop_sample=loop, speed=speed, hz=hz,
+        fm_patches=[], pcm_samples=[smp], events=events,
+    )
+
+
+def _fm_song(events, *, speed=6, hz=60.0):
+    """A YM2151-only track: FM notes and no sample chip of its own."""
+    vgm = VgmFile(
+        path=Path("synthetic.vgm"), buf=b"", version=0x151, total_samples=1,
+        loop_samples=0, loop_file_pos=None, loop_sample=None,
+        ym2151_clock=3579545, k007232_clock=3579545, gd3={}, roms=[], writes=[],
+    )
+    return Song(
+        vgm=vgm, t0=0, loop_sample=None, speed=speed, hz=hz,
         fm_patches=[], pcm_samples=[], events=events,
     )
 
@@ -253,6 +270,67 @@ class TestPcmRowCollisions(unittest.TestCase):
         rows = _pcm_notes(song)
         self.assertEqual(len(rows), 1)
         self.assertIn((0x08, 0xFF), rows[0][1].fx)
+
+
+class TestMelodyOnlyModule(unittest.TestCase):
+    """The .fur carries the chips the source had samples for, and no others.
+
+    The writer used to keep a K007232 pair under every PCM-enabled module so
+    events on channels 8-9 still had a chip under them, which put two silent
+    PCM channels into every melody-only rip.
+    """
+
+    def test_no_sample_chip_means_no_pcm_pair(self):
+        song = _fm_song([
+            NoteEvent(sample=0, ch=0, on=True, note=108, ins=-1, vol=-1,
+                      e5=0x80, pan=0x80),
+        ])
+        data = write_fur(song, include_pcm=True, include_fm=True)
+        chips, _gains, _legacy = _chip_mix(data)
+        self.assertEqual(chips, [CHIP_YM2151])
+        mod = parse_fur(data)
+        self.assertEqual(mod.n_ch, 8)
+        self.assertEqual(mod.pcm_channels, [])
+
+    def test_k007232_samples_keep_the_pair(self):
+        song = _pcm_song([
+            NoteEvent(sample=0, ch=8, on=True, note=108, ins=0, vol=12,
+                      e5=0x80, pan=0xFF, pcm=True),
+        ])
+        mod = parse_fur(write_fur(song, include_pcm=True, include_fm=True))
+        self.assertEqual(mod.chips, [CHIP_YM2151, CHIP_K007232])
+        self.assertEqual(mod.n_ch, 10)
+        self.assertEqual(mod.pcm_channels, [8, 9])
+
+
+class TestPatternWindow(unittest.TestCase):
+    """The pattern length follows the content, not the 256-row ceiling.
+
+    Furnace holds one pattern length for the whole module and the order list
+    is walked in that unit, so the window is the last content row plus a
+    ten-row tail; only a track that needs the ceiling gets it.
+    """
+
+    def test_short_track_gets_a_fitted_window(self):
+        # 735 samples/row at speed 1, 60 Hz. The last note sits on row 20.
+        events = [
+            NoteEvent(sample=row * 735, ch=0, on=True, note=108, ins=-1,
+                      vol=-1, e5=0x80, pan=0x80)
+            for row in (0, 4, 20)
+        ]
+        mod = parse_fur(write_fur(_fm_song(events, speed=1, hz=60.0)))
+        self.assertEqual(mod.n_ord, 1)
+        self.assertEqual(mod.pat_len, 20 + 1 + 10)
+
+    def test_long_track_keeps_the_ceiling(self):
+        events = [
+            NoteEvent(sample=row * 735, ch=0, on=True, note=108, ins=-1,
+                      vol=-1, e5=0x80, pan=0x80)
+            for row in (0, 300)
+        ]
+        mod = parse_fur(write_fur(_fm_song(events, speed=1, hz=60.0)))
+        self.assertEqual(mod.pat_len, 256)
+        self.assertEqual(mod.n_ord, 2)
 
 
 class TestFurPanAmps(unittest.TestCase):
