@@ -64,7 +64,7 @@ from vgm2151fur.ym2203 import (
     YM2203_DEFAULT_CLOCK,
     YM2203_SSG_DIVIDER,
     YM2203State,
-    opn_carrier_ratios,
+    opn_carrier_octave,
     opn_note_for,
     opn_pitch_units,
 )
@@ -355,6 +355,10 @@ class Song:
     # YM2203 instances that appear in the module, in channel order. Each one
     # owns six channels: three FM then three SSG.
     ym2203_ids: list[int] = field(default_factory=list)
+    # The source used channel 3's per-operator frequencies (3-slot mode).
+    # The module then uses Furnace's YM2203 Ext system, whose 9 channels are
+    # FM1, FM2, the four channel-3 operators, then the three SSG voices.
+    ym2203_ext: bool = False
     # SSG notes collected from the YM2203s (the notes themselves ride on the
     # events; this count feeds the report and the instrument binding).
     ym2203_ssg_count: int = 0
@@ -1489,46 +1493,53 @@ def _bind_fm_pitch(
 
 def _apply_opn_carrier_octave(
     events: list[NoteEvent], fm_patches: list[FMPatch],
+    *, skip_channels: set[int] | None = None,
 ) -> int:
-    """Move YM2203 FM notes to the octave of their highest carrier.
+    """Label YM2203 FM notes at their loudest audible carrier's octave.
 
-    A carrier MULT=2 patch is heard an octave above the channel f-num, and a
-    MULT=0 (0.5) carrier an octave below.  The pattern note is moved to the
-    highest carrier's octave.  The constant pitch macro cancels only the
-    lowest carrier's octave, so the whole channel is shifted by the spread
-    between its lowest and highest carrier.
+    A carrier MULT=2 patch is heard an octave above the channel f-num, a
+    MULT=0 (0.5) carrier an octave below.  The pattern note is moved to that
+    carrier's octave for display, while a constant pitch macro cancels the
+    move exactly, so the module keeps the source's channel f-num and audio.
+    Mixed-carrier patches (e.g. [4, 2]) therefore do not shift the whole
+    channel; only the note label follows the loudest carrier.  Any pitch
+    motion already on the patch (the driver's sweep copy) gets the same
+    constant added.
 
-    If the carriers agree (e.g. all MULT=2), the spread is zero: the source
-    channel already sounds at that octave and the f-num/key scaling/envelopes
-    are preserved.  If they disagree (e.g. [2, 1, 1]), the lowest 1x carrier
-    is one octave below the audible lead, so the channel is transposed by the
-    spread, matching the reference's per-channel carrier.  Returns the number
-    of instruments shifted.
+    Returns the number of instruments relabelled.
     """
     by_ins: dict[int, list[NoteEvent]] = {}
+    skipped_ins: set[int] = set()
     for e in events:
         if not e.on or e.pcm or e.tone_chip:
+            continue
+        if skip_channels and e.ch in skip_channels:
+            if 0 <= e.ins < len(fm_patches):
+                skipped_ins.add(e.ins)
             continue
         if 0 <= e.ins < len(fm_patches):
             by_ins.setdefault(e.ins, []).append(e)
     shifted = 0
     for ins, notes in by_ins.items():
         patch = fm_patches[ins]
-        ratios = opn_carrier_ratios(patch)
-        if not ratios:
-            continue
-        octave = int(round(math.log2(max(ratios))))
-        low_octave = int(round(math.log2(min(ratios))))
-        shift = -1536 * low_octave
-        if octave == 0 and shift == 0:
+        octave = opn_carrier_octave(patch)
+        if octave == 0:
             continue
         if any(not (0 <= e.note + 12 * octave <= 179) for e in notes):
             continue
+        if ins in skipped_ins:
+            # The same instrument also plays an extended-channel-3 operator
+            # column, whose note is already the operator's real f-num.  Give
+            # the relabelled channels their own copy so the operator columns
+            # keep the unshifted patch and macro.
+            patch = replace(patch, name=f"{patch.name} L")
+            ins = len(fm_patches)
+            fm_patches.append(patch)
+            for e in notes:
+                e.ins = ins
         for e in notes:
             e.note += 12 * octave
-        if shift == 0 and not patch.pitch_macro:
-            shifted += 1
-            continue
+        shift = -1536 * octave
         if patch.pitch_macro:
             macro = tuple(v + shift for v in patch.pitch_macro)
             speed = patch.pitch_speed
@@ -1587,9 +1598,17 @@ def analyze(
         if is_opn else []
     )
     ym_clock = vgm.ym2203_clock or YM2203_DEFAULT_CLOCK
-    ym_base = {cid: 6 * i for i, cid in enumerate(ym_ids)}
+    # Channel 3's per-operator registers (0xA8-0xAE) mean the source is using
+    # 3-slot mode.  Furnace's YM2203 Ext system represents it with four
+    # operator columns instead of one channel-3 note, so the whole track uses
+    # the 9-channel layout: FM1, FM2, channel-3 OP1-4, then PSG1-3.
+    ym2203_ext = is_opn and any(
+        w.chip == "ym2203" and 0xA8 <= w.reg <= 0xAE for w in vgm.writes
+    )
+    ym_chunk = 9 if ym2203_ext else 6
+    ym_base = {cid: ym_chunk * i for i, cid in enumerate(ym_ids)}
     ym2203_ssg_count = 0
-    fm_end = 6 * len(ym_ids) if is_opn else 8
+    fm_end = ym_chunk * len(ym_ids) if is_opn else 8
     pending_off = [None] * 8  # type: list[int | None]
     chip_fx: list[tuple[int, int, int]] = []
     last_lfrq = last_wave = -1
@@ -1829,14 +1848,32 @@ def analyze(
 
     if is_opn:
         states = {cid: YM2203State() for cid in ym_ids}
-        held_idx: dict[tuple[int, int], int] = {}
-        pitch_pts: dict[tuple[int, int], list[tuple[int, int, int]]] = {}
-        pitch_base: dict[tuple[int, int], tuple[int, int]] = {}
-        opn_tl_pts: dict[tuple[int, int], list[tuple[int, int]]] = {}
-        opn_tl_last: dict[tuple[int, int], int] = {}
+        held_idx: dict[tuple[int, int, int], int] = {}
+        pitch_pts: dict[tuple[int, int, int], list[tuple[int, int, int]]] = {}
+        pitch_base: dict[tuple[int, int, int], tuple[int, int]] = {}
+        opn_tl_pts: dict[tuple[int, int, int], list[tuple[int, int]]] = {}
+        opn_tl_last: dict[tuple[int, int, int], int] = {}
         opn_offs: list[int] = []
         opn_lfo = 0
         opn_special = 0
+
+        def opn_event_ch(cid: int, ch: int, op: int = -1) -> int:
+            return ym_base[cid] + ch
+
+        # Furnace's YM2203 Extended Channel 3 platform is inconsistent about
+        # its four operator columns: the frequency register for column c is
+        # opChanOffs[c] = (1, 2, 0, 3), the instrument parameters/commit use
+        # orderedOps[c] = (0, 2, 1, 3), and the key mask uses bit c.  A single
+        # column therefore cannot carry the right frequency, parameters and
+        # key for one hardware operator.  The converter activates all four
+        # columns on every channel-3 key-on: the note on column c is the base
+        # f-num of operator EXT_FREQ_OP[c] (so the platform writes it to that
+        # hardware operator), while the instrument copy for column c carries
+        # the patch's operator EXT_ORD_OP[c] (so the commit writes the right
+        # parameters) and masks its TL when that operator is not keyed.
+        EXT_FREQ_OP = (1, 2, 0, 3)   # column -> operator whose f-num it sends
+        EXT_ORD_OP = (0, 2, 1, 3)    # column -> operator whose params it sends
+        ext_freq_col = {op: c for c, op in enumerate(EXT_FREQ_OP)}
 
         def intern_opn_patch(cid: int, ch: int, mask: int) -> int:
             snap = states[cid].snapshot(ch, mask)
@@ -1849,7 +1886,25 @@ def analyze(
             p.uses += 1
             return patch_order.index(key)
 
-        def close_opn_note(key: tuple[int, int], sample: int, *, off: bool) -> None:
+        def intern_ext_patch(cid: int, mask: int, col: int) -> int:
+            snap = states[cid].snapshot(2, 0x0F)
+            op_index = EXT_ORD_OP[col]
+            if not (mask & (1 << op_index)):
+                ops = list(snap.ops)
+                ops[op_index] = replace(ops[op_index], tl=0x7F)
+                snap = replace(snap, ops=tuple(ops))
+            key = snap.identity() + (mask, col)
+            if key not in patches:
+                snap.name = f"OPN {len(patch_order):02d}"
+                patches[key] = snap
+                patch_order.append(key)
+            p = patches[key]
+            p.uses += 1
+            return patch_order.index(key)
+
+        def close_opn_note(
+            key: tuple[int, int, int], sample: int, *, off: bool,
+        ) -> None:
             idx = held_idx.pop(key, None)
             if idx is None:
                 return
@@ -1866,7 +1921,9 @@ def analyze(
                     else:
                         merged.append(p)
                 if merged and merged[0][0] - ev.sample <= 120 and merged[0][1:] != pitch_base[key]:
-                    ev.note, ev.e5 = opn_note_for(merged[0][1], merged[0][2], ym_clock)
+                    ev.note, ev.e5 = opn_note_for(
+                        merged[0][1], merged[0][2], ym_clock
+                    )
                 distinct: list[tuple[int, int, int]] = []
                 for p in merged:
                     if not distinct or p[1:] != distinct[-1][1:]:
@@ -1880,7 +1937,7 @@ def analyze(
                 ev.end = sample
                 events.append(NoteEvent(
                     sample=sample,
-                    ch=ym_base[key[0]] + key[1],
+                    ch=ev.ch,
                     on=False,
                     note=180,
                     ins=-1,
@@ -1909,16 +1966,56 @@ def analyze(
                 if ch >= 3:
                     continue
                 mask = (val >> 4) & 0x0F
+                if ym2203_ext and ch == 2:
+                    if mask:
+                        # Re-key all four operator columns; the per-column
+                        # instrument copies carry the source key mask as TL.
+                        for c in range(4):
+                            close_opn_note((cid, ch, c), w.sample, off=False)
+                        inses = [
+                            intern_ext_patch(cid, mask, c) for c in range(4)
+                        ]
+                        for c in range(4):
+                            op = EXT_FREQ_OP[c]
+                            block, fnum = st.frequency_op(ch, op)
+                            note, e5 = opn_note_for(block, fnum, ym_clock)
+                            events.append(NoteEvent(
+                                sample=w.sample,
+                                ch=ym_base[cid] + 2 + c,
+                                on=True,
+                                note=note,
+                                ins=inses[c],
+                                vol=-1,
+                                e5=e5,
+                                pan=0,
+                                sweep_div=2.0,
+                                e5_lo=0x00,
+                                e5_hi=0xFF,
+                            ))
+                            key = (cid, ch, c)
+                            held_idx[key] = len(events) - 1
+                            pitch_base[key] = (block, fnum)
+                            pitch_pts[key] = [(w.sample, block, fnum)]
+                            opn_tl_pts[key] = []
+                            opn_tl_last[key] = 0x7F
+                        keyon_times.append(w.sample)
+                        st.kon[ch] = True
+                    else:
+                        for c in range(4):
+                            close_opn_note((cid, ch, c), w.sample, off=True)
+                        st.kon[ch] = False
+                    st.op_mask[ch] = mask
+                    continue
                 newly_on = mask & ~st.op_mask[ch]
                 st.op_mask[ch] = mask
-                key = (cid, ch)
+                key = (cid, ch, -1)
                 if mask and newly_on:
                     close_opn_note(key, w.sample, off=False)
                     block, fnum = st.frequency(ch)
                     note, e5 = opn_note_for(block, fnum, ym_clock)
                     events.append(NoteEvent(
                         sample=w.sample,
-                        ch=ym_base[cid] + ch,
+                        ch=opn_event_ch(cid, ch, -1),
                         on=True,
                         note=note,
                         ins=intern_opn_patch(cid, ch, mask),
@@ -1953,7 +2050,32 @@ def analyze(
                 continue
             if ch >= 3:
                 continue
-            key = (cid, ch)
+            if ym2203_ext and ch == 2:
+                if 0x40 <= reg <= 0x4E:
+                    # TL writes on an operator column would need the column's
+                    # own baseline for the volume column; the next key-on
+                    # picks the new TL up from the instrument copy instead.
+                    continue
+                if 0xA8 <= reg <= 0xAE:
+                    op = reg & 0x03
+                    if op < 3:
+                        key = (cid, ch, ext_freq_col[op])
+                        if key in held_idx:
+                            pitch_pts[key].append(
+                                (w.sample, *st.frequency_op(ch, op))
+                            )
+                    continue
+                # A normal channel-3 f-num write moves all four operators
+                # until the per-operator registers take over.
+                if 0xA0 <= reg <= 0xA6:
+                    for c in range(4):
+                        key = (cid, ch, c)
+                        if key in held_idx:
+                            pitch_pts[key].append(
+                                (w.sample, *st.frequency_op(ch, EXT_FREQ_OP[c]))
+                            )
+                continue
+            key = (cid, ch, -1)
             if key not in held_idx:
                 continue
             if 0xA0 <= reg <= 0xA6:
@@ -1990,7 +2112,7 @@ def analyze(
             warnings.append(
                 f"{opn_lfo} YM2203 LFO writes are not converted"
             )
-        if opn_special:
+        if opn_special and not ym2203_ext:
             warnings.append(
                 f"{opn_special} YM2203 channel-3 special-mode writes; "
                 "3-slot chords are approximated by one operator"
@@ -2500,7 +2622,9 @@ def analyze(
     )
     warnings.extend(ssg_warn)
     if ssg_hits and ym_ids:
-        ssg_at = {cid: ym_base[cid] + 3 for cid in ym_ids}
+        ssg_at = {
+            cid: ym_base[cid] + (6 if ym2203_ext else 3) for cid in ym_ids
+        }
         ym2203_ssg_count = _emit_ay_notes(
             events, channel_fx, ssg_hits, ssg_offs, ssg_at, ym_clock,
             YM2203_SSG_DIVIDER, tone_ins_base + len(scc_ins),
@@ -2685,10 +2809,17 @@ def analyze(
             p.macro_speed = mspeed
 
     # YM2203 FM patches with a power-of-two carrier MULT sound an octave
-    # above/below the channel f-num.  Move the pattern note to that octave
-    # and cancel the move with a constant pitch macro, leaving the source
-    # f-num, envelopes and key scaling untouched.
-    _apply_opn_carrier_octave(events, fm_list)
+    # above/below the channel f-num.  Label the note at the loudest audible
+    # carrier's octave and cancel the move with a constant pitch macro, so
+    # the source f-num, envelopes, key scaling and mixed-carrier balance are
+    # untouched.
+    _apply_opn_carrier_octave(
+        events, fm_list,
+        skip_channels=(
+            {ym_base[cid] + 2 + col for cid in ym_ids for col in range(4)}
+            if ym2203_ext else None
+        ),
+    )
 
     if not is_opn:
         transpose_opm_events(events, vgm.ym2151_clock)
@@ -2722,6 +2853,7 @@ def analyze(
         c352_quad=c352_quad_events,
         fm_chip="ym2203" if is_opn else "ym2151",
         ym2203_ids=ym_ids,
+        ym2203_ext=ym2203_ext,
         ym2203_ssg_count=ym2203_ssg_count,
         scc_ids=scc_ids,
         scc_waves=scc_waves,

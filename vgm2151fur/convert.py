@@ -289,6 +289,7 @@ def convert_vgm(
         "scc_notes": song.scc_count,
         "ay_notes": song.ay_count,
         "ym2203_chips": len(song.ym2203_ids),
+        "ym2203_ext": bool(getattr(song, "ym2203_ext", False)),
         "ym2203_ssg_notes": song.ym2203_ssg_count,
         "events": sum(1 for e in song.events if e.on),
         "warnings": warnings,

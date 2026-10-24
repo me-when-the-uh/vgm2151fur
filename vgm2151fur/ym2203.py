@@ -209,6 +209,19 @@ class YM2203State:
                     )
         return self.block[ch], self.fnum[ch]
 
+    def frequency_op(self, ch: int, op: int) -> tuple[int, int]:
+        """(block, fnum) for one operator of a 3-slot channel-3 voice.
+
+        Falls back to the normal channel frequency until the driver has
+        written that operator's per-operator registers.
+        """
+        if ch == 2 and self.special and 0 <= op < 3 and self.special_set[op]:
+            hi = self.special_hi[op]
+            return (hi >> 3) & 0x07, self.special_lo[op] | (
+                (hi & 0x07) << 8
+            )
+        return self.block[ch], self.fnum[ch]
+
     def snapshot(self, ch: int, mask: int = 0xF) -> FMPatch:
         fb_alg = self.fb_alg[ch]
         ops = []
@@ -232,41 +245,39 @@ class YM2203State:
         return min(self.ops[ch][i].tl for i in carriers)
 
 
-def opn_carrier_ratios(patch) -> list[float]:
-    """Power-of-two frequency ratios of the patch's carriers."""
-    if not getattr(patch, "opn", False):
-        return []
-    ratios = []
-    for i in CARRIERS.get(patch.alg, ()):
-        mult = patch.ops[i].dt_mul & 0x0F
-        ratio = 0.5 if mult == 0 else float(mult)
-        if ratio in (0.5, 1.0, 2.0, 4.0, 8.0):
-            ratios.append(ratio)
-    return ratios
-
-
 def opn_carrier_octave(patch) -> int:
-    """Octave difference between the channel f-num note and its highest carrier.
+    """Octave of the loudest audible carrier, relative to the channel f-num.
 
-    YM2203 patches often use carrier MULT=2.  The channel f-num is then the
-    lower octave while the highest carrier is one octave up.  Only exact
-    powers of two are used; a MULT=3/5/... carrier has no whole-octave
-    carrier.
+    The pattern note should show the pitch that is actually heard.  Use the
+    carrier with the lowest TL (the loudest); equally loud carriers tie-break
+    to the highest power-of-two ratio, which keeps the historical MULT=2
+    label on patches whose carriers are mixed at equal volume.  Unkeyed
+    operators arrive here with TL=0x7F and are ignored.
+
+    Return 0 when the loudest carrier is not an exact power of two (MULT
+    3/5/6/...), or when every carrier is silent: the channel note already is
+    the best label and nothing should move.
     """
-    ratios = opn_carrier_ratios(patch)
-    if not ratios:
+    if not getattr(patch, "opn", False):
         return 0
-    return int(round(math.log2(max(ratios))))
-
-
-def opn_carrier_mixed(patch) -> bool:
-    """True when the carriers disagree on the octave (e.g. [2, 1, 1]).
-
-    In that case the channel f-num carrier is the lower octave and the higher
-    carrier is the audible lead; moving the whole channel to the carrier
-    octave matches the reference.  When all carriers share one octave, the
-    channel already sounds at that octave and only the label/pitch-offset
-    should move.
-    """
-    ratios = opn_carrier_ratios(patch)
-    return bool(ratios) and min(ratios) != max(ratios)
+    best_tl = 0x80
+    best_octave: int | None = None
+    for i in CARRIERS.get(patch.alg, ()):
+        op = patch.ops[i]
+        tl = op.tl & 0x7F
+        if tl >= 0x7F:
+            continue
+        mult = op.dt_mul & 0x0F
+        ratio = 0.5 if mult == 0 else float(mult)
+        octave = (
+            int(round(math.log2(ratio)))
+            if ratio in (0.5, 1.0, 2.0, 4.0, 8.0)
+            else None
+        )
+        if tl < best_tl:
+            best_tl = tl
+            best_octave = octave
+        elif tl == best_tl and octave is not None:
+            if best_octave is None or octave > best_octave:
+                best_octave = octave
+    return best_octave or 0

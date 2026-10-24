@@ -12,7 +12,7 @@ from vgm2151fur.ay8910 import ay_rate, collect_ay8910
 from vgm2151fur.diag import opn_pitch_stream, pitch_runs
 from vgm2151fur.furio import CHIP_CHANNELS, iter_blocks, parse_fur
 from vgm2151fur.furwrite import (
-    CHIP_YM2203, INS_AY, INS_FM, write_fur,
+    CHIP_YM2203, CHIP_YM2203_EXT, INS_AY, INS_FM, write_fur,
 )
 from vgm2151fur.furnace import export_vgm, find_furnace
 from vgm2151fur.vgm import ChipWrite, VgmFile, chips_in_head, load_vgm
@@ -364,16 +364,28 @@ class TestYm2203SpecialCases(unittest.TestCase):
             ChipWrite(60000, "ym2203", 0, 0x28, 0x02),
         ]
         song = analyze(_vgm(ws, ym2203_clock=CLOCK))
-        ev = next(e for e in song.events if e.on)
+        evs = [e for e in song.events if e.on]
+        self.assertEqual(len(evs), 4)
+        # The ext column that carries operator 0's frequency is module
+        # channel 4 (column 2; Furnace's opChanOffs order is 1,2,0,3).
+        ev = next(e for e in evs if e.ch == 4)
         self.assertEqual((ev.note, ev.e5), opn_note_for(4, 0x205, CLOCK))
-        self.assertIn("special-mode", " ".join(song.warnings))
+        self.assertTrue(song.ym2203_ext)
+        self.assertNotIn("special-mode", " ".join(song.warnings))
+        self.assertTrue(all(
+            e.ch in (2, 3, 4, 5) for e in evs
+        ))
+        mod = parse_fur(write_fur(song))
+        self.assertEqual(mod.chips, [CHIP_YM2203_EXT])
+        self.assertEqual(mod.n_ch, 9)
 
-    def test_mixed_carrier_transposes_the_channel_octave(self):
+    def test_mixed_carrier_labels_without_moving_the_audio(self):
         # alg 5, carrier op2 MULT=2, other carriers MULT=1: mixed.  The
-        # channel f-num is the lower octave while the audible carrier is one
-        # octave up (the Legendary Wings OPN 00 situation).  The channel is
-        # transposed one octave, matching the reference's carrier; there is no
-        # cancelling pitch macro because the lowest carrier is 1x.
+        # loudest carrier sets the note label (A#4), while the compensating
+        # pitch macro keeps the source channel f-num/audio exactly.  A mixed
+        # patch must not transpose the whole channel: that made the 1x
+        # carriers (and, on other patches, the loudest carrier) an octave
+        # high.
         ws = [w for w in _patch(100) if w.reg not in (0xB0, 0x34)]
         ws += [
             ChipWrite(100, "ym2203", 0, 0xB0, 0x05),   # alg 5
@@ -390,8 +402,59 @@ class TestYm2203SpecialCases(unittest.TestCase):
         self.assertEqual((ev.note, ev.e5), (note + 12, e5))
         patch = song.fm_patches[ev.ins]
         self.assertEqual(sorted(patch.ops[i].dt_mul & 0x0F for i in (1, 2, 3)), [1, 1, 2])
-        self.assertEqual(patch.pitch_macro, ())
+        self.assertEqual(patch.pitch_macro, (-1536,))
         self.assertEqual(furnace_note_name(ev.note), "A#4")
+
+    def test_loudest_carrier_sets_the_label(self):
+        # alg 4, carriers op2 MULT=4 and op4 MULT=2.  The 2x carrier is 3 dB
+        # louder (lower TL), so it is the audible lead: the label moves one
+        # octave, not two, and the macro keeps the source f-num.
+        ws = [
+            w for w in _patch(100)
+            if w.reg not in (0xB0, 0x34, 0x38, 0x3C, 0x44, 0x4C)
+        ]
+        ws += [
+            ChipWrite(100, "ym2203", 0, 0xB0, 0x04),   # alg 4
+            ChipWrite(100, "ym2203", 0, 0x34, 0x04),   # op2 MULT=4
+            ChipWrite(100, "ym2203", 0, 0x3C, 0x02),   # op4 MULT=2
+            ChipWrite(100, "ym2203", 0, 0x44, 0x14),   # op2 TL 0x14 (quieter)
+            ChipWrite(100, "ym2203", 0, 0x4C, 0x11),   # op4 TL 0x11 (louder)
+            ChipWrite(100, "ym2203", 0, 0xA4, 0x25),
+            ChipWrite(100, "ym2203", 0, 0xA0, 0xBA),
+            ChipWrite(100, "ym2203", 0, 0x28, 0xF0),
+            ChipWrite(60000, "ym2203", 0, 0x28, 0x00),
+        ]
+        clock = 1_500_000
+        song = analyze(_vgm(ws, ym2203_clock=clock))
+        note, e5 = opn_note_for(4, 1466, clock)
+        ev = next(e for e in song.events if e.on)
+        self.assertEqual((ev.note, ev.e5), (note + 12, e5))
+        self.assertEqual(song.fm_patches[ev.ins].pitch_macro, (-1536,))
+
+    def test_non_octave_loudest_carrier_is_not_relabelled(self):
+        # The loudest carrier is MULT=3; there is no whole-octave label, so
+        # the note stays at the channel f-num and no macro is added.
+        ws = [
+            w for w in _patch(100)
+            if w.reg not in (0xB0, 0x34, 0x44, 0x48, 0x4C)
+        ]
+        ws += [
+            ChipWrite(100, "ym2203", 0, 0xB0, 0x05),   # alg 5
+            ChipWrite(100, "ym2203", 0, 0x34, 0x03),   # op2 MULT=3 (loudest)
+            ChipWrite(100, "ym2203", 0, 0x44, 0x00),   # op2 TL 0
+            ChipWrite(100, "ym2203", 0, 0x48, 0x20),   # other carriers quieter
+            ChipWrite(100, "ym2203", 0, 0x4C, 0x20),
+            ChipWrite(100, "ym2203", 0, 0xA4, 0x25),
+            ChipWrite(100, "ym2203", 0, 0xA0, 0xBA),
+            ChipWrite(100, "ym2203", 0, 0x28, 0xF0),
+            ChipWrite(60000, "ym2203", 0, 0x28, 0x00),
+        ]
+        clock = 1_500_000
+        song = analyze(_vgm(ws, ym2203_clock=clock))
+        note, e5 = opn_note_for(4, 1466, clock)
+        ev = next(e for e in song.events if e.on)
+        self.assertEqual((ev.note, ev.e5), (note, e5))
+        self.assertEqual(song.fm_patches[ev.ins].pitch_macro, ())
 
     def test_uniform_carrier_keeps_the_channel_octave(self):
         # All three alg-5 carriers are MULT=2, so the channel already sounds

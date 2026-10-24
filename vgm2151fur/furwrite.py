@@ -42,6 +42,8 @@ CHIP_YM2151 = 0x82
 # Furnace's YM2203 (OPN): three FM channels followed by the AY-compatible
 # SSG's three voices, six channels per instance.
 CHIP_YM2203 = 0x8D
+# Extended channel 3: FM1, FM2, the four operators of FM3, then PSG1-3.
+CHIP_YM2203_EXT = 0xB6
 CHIP_MSM6295 = 0xAA
 CHIP_MSM6258 = 0xAB
 CHIP_K007232 = 0xC6
@@ -1704,6 +1706,7 @@ def write_fur(
 ) -> bytes:
     gd3 = song.vgm.gd3
     ym_chip = getattr(song, "fm_chip", "ym2151") == "ym2203"
+    ym_ext = bool(getattr(song, "ym2203_ext", False)) if ym_chip else False
     ym_ids = list(getattr(song, "ym2203_ids", ()) or ()) if ym_chip else []
     # A YM2203 system owns its three SSG voices even when only those carry
     # notes, so the chip is present whenever the file has one.  The FM
@@ -1744,7 +1747,9 @@ def write_fur(
     # and no chip nothing plays - and a module with another sample chip gets
     # no K007232 either.
     want_k007 = bool(pcm_smps)
-    n_fm = (3 * len(ym_ids) if ym_chip else 8) if fm_present else 0
+    n_fm = (
+        (6 if ym_ext else 3) * len(ym_ids) if ym_chip else 8
+    ) if fm_present else 0
     # The SSG is part of each YM2203 system, not a separate AY chip.
     n_ssg = 3 * len(ym_ids) if (ym_chip and fm_present) else 0
     n_k007 = 2 if want_k007 else 0
@@ -1776,7 +1781,7 @@ def write_fur(
     # channels, or 3 FM + 3 SSG per YM2203). With no FM those channels shift
     # down so they still land inside n_ch. The pattern window comes back
     # fitted to the content.
-    fm_block = (6 * len(ym_ids)) if ym_chip else 8
+    fm_block = ((9 if ym_ext else 6) * len(ym_ids)) if ym_chip else 8
     orders, patterns, _loop_ord, pat_len = _build_patterns(
         song, n_ch, PAT_LEN_MAX, fx_cols, 0 if fm_present else -fm_block,
         stats=stats,
@@ -1789,6 +1794,22 @@ def write_fur(
     names_short: list[str] = []
     if ym_chip and fm_present:
         for cid in range(len(ym_ids)):
+            if ym_ext:
+                for voice, label in enumerate(("FM 1", "FM 2")):
+                    names_long.append(f"{label} ({cid + 1})" if len(ym_ids) > 1 else label)
+                    names_short.append(f"F{cid + 1}-{voice + 1}")
+                for voice in range(4):
+                    # Column c carries operator (1,2,0,3)[c]'s frequency
+                    # (Furnace's ext frequency-register order).
+                    op_label = (1, 2, 0, 3)[voice] + 1
+                    label = f"FM 3 OP{op_label}"
+                    names_long.append(f"{label} ({cid + 1})" if len(ym_ids) > 1 else label)
+                    names_short.append(f"O{cid + 1}-{op_label}")
+                for voice in range(3):
+                    label = f"PSG {voice + 1}"
+                    names_long.append(f"{label} ({cid + 1})" if len(ym_ids) > 1 else label)
+                    names_short.append(f"P{cid + 1}-{voice + 1}")
+                continue
             for voice in range(3):
                 names_long.append(f"FM {cid + 1}-{voice + 1}")
                 names_short.append(f"F{cid + 1}-{voice + 1}")
@@ -1903,7 +1924,10 @@ def write_fur(
     flag_texts: list[str] = []
     if fm_present:
         for _cid in (ym_ids or [0]):
-            chips.append(CHIP_YM2203 if ym_chip else CHIP_YM2151)
+            if ym_chip:
+                chips.append(CHIP_YM2203_EXT if ym_ext else CHIP_YM2203)
+            else:
+                chips.append(CHIP_YM2151)
             fm_clock = song.vgm.ym2203_clock if ym_chip else song.vgm.ym2151_clock
             # Both cores default to 3.579545 MHz.  At any other clock the
             # notes play at the wrong pitch unless the flag carries it.

@@ -21,6 +21,7 @@ from vgm2151fur.furwrite import (
 CHIP_CHANNELS = {
     0x82: 8,  # YM2151
     0x8D: 6,  # YM2203: 3 FM + 3 SSG voices
+    0xB6: 9,  # YM2203 Ext: 2 FM + 4 channel-3 operators + 3 SSG
     CHIP_MSM6295: 4,  # MSM6295
     CHIP_MSM6258: 1,  # MSM6258
     CHIP_K007232: 2,  # K007232
