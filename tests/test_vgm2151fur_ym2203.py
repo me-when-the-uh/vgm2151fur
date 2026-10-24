@@ -361,6 +361,7 @@ class TestYm2203SpecialCases(unittest.TestCase):
             ChipWrite(100, "ym2203", 0, 0x3E, 0x01),
             ChipWrite(100, "ym2203", 0, 0xB2, 0x07),
             ChipWrite(100, "ym2203", 0, 0x28, 0xF2),
+            ChipWrite(2000, "ym2203", 0, 0x28, 0xF2),  # same mask: no retrigger
             ChipWrite(60000, "ym2203", 0, 0x28, 0x02),
         ]
         song = analyze(_vgm(ws, ym2203_clock=CLOCK))

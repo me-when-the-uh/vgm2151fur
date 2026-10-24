@@ -42,6 +42,8 @@ AY_VOICES = 3
 AY_DEFAULT_CLOCK = 1789772  # COLOR_NTSC/2, the MSX/ZX Spectrum PSG clock
 # Gates shorter than this are driver housekeeping, not music.
 AY_MIN_NOTE = 100
+# A loud gate level followed by the real level this soon is one note.
+AY_GATE_PAIR = 1000
 
 REG_TONE_LO = (0, 2, 4)
 REG_TONE_HI = (1, 3, 5)
@@ -245,7 +247,9 @@ def collect_ay8910(
         cid = w.chip_id
         st = state.setdefault(cid, _blank_chip())
         reg = st["reg"]
-        r = w.reg & 0x0F
+        if w.reg > 0x0F:
+            continue
+        r = w.reg
         val = w.val & 0xFF
         if reg[r] == val:
             continue
@@ -287,6 +291,20 @@ def collect_ay8910(
                 # how MSX drivers trigger drum decays.
                 update_gate(st, cid, voice, w.sample, retrigger=True)
                 continue
+            level = val & 0x0F
+            if w.sample - hit.sample_time <= AY_GATE_PAIR and level < hit.vol:
+                # Loud gate then the real quiet level: keep the quiet level
+                # as the note's opening, not a separate volume step.
+                hit.vol = level
+                window = hit.sample_time + AY_GATE_PAIR
+                hit.vol_pts = [p for p in hit.vol_pts if p[0] > window]
+                if hit.env:
+                    hit.env = False
+                    hit.fx_pts.append((
+                        w.sample, FX_MODE,
+                        ay_mode(hit.tone, hit.noise, False) - 1,
+                    ))
+                continue
             if hit.env:
                 # The level write also clears the envelope bit; the channel
                 # mode has to follow or the register keeps using the
@@ -295,7 +313,7 @@ def collect_ay8910(
                 hit.fx_pts.append((
                     w.sample, FX_MODE, ay_mode(hit.tone, hit.noise, False) - 1,
                 ))
-            hit.vol_pts.append((w.sample, val & 0x0F))
+            hit.vol_pts.append((w.sample, level))
             continue
         if r == REG_MIXER:
             for voice in range(AY_VOICES):

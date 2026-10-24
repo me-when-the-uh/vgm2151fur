@@ -1338,7 +1338,8 @@ def _emit_ay_notes(
         if base is None:
             continue
         ch = base + h.voice
-        gate_end = h.off_sample or (total_samples or h.sample_time)
+        st = h.sample_time
+        gate_end = h.off_sample or (total_samples or st)
         if h.opened_tone or h.freq_pts:
             segs = segment_periods(
                 [(h.sample_time, h.period), *h.freq_pts],
@@ -1352,34 +1353,34 @@ def _emit_ay_notes(
         buckets: list[list[tuple[int, int, int]]] = [[] for _ in segs]
         for t, fx, val in h.fx_pts:
             idx = 0
-            for i, (st, _per, _intra) in enumerate(segs):
-                if st <= t:
+            for i, (sst, _per, _intra) in enumerate(segs):
+                if sst <= t:
                     idx = i
                 else:
                     break
             buckets[idx].append((t, fx, val))
-        for i, (st, period, intra) in enumerate(segs):
+        for i, (sst, period, intra) in enumerate(segs):
             nxt = segs[i + 1][0] if i + 1 < len(segs) else 0
             seg_end = nxt or h.off_sample
             bound = nxt or gate_end
             note, e5 = ay_note(clock, period, divider)
-            steps = _tone_steps(intra, st, 0, _AY_MERGE_GAP)
-            vol = _value_at(h.vol_pts, st, h.vol)
+            steps = _tone_steps(intra, sst, 0, _AY_MERGE_GAP)
+            vol = _value_at(h.vol_pts, sst, h.vol)
             vol_pts = tuple(
-                (t, v, None) for t, v in h.vol_pts if st < t < bound
+                (t, v, None) for t, v in h.vol_pts if sst < t < bound
             )
             prev_st = segs[i - 1][0] if i else -1
             latest: dict[int, int] = {}
             for t, fx, val in buckets[i]:
-                if t > st:
+                if t > sst:
                     continue
                 if fx == FX_ENV_SET and i > 0 and t <= prev_st:
                     continue
                 latest[fx] = val
             for fx, val in latest.items():
-                channel_fx.append((st, ch, fx, val))
+                channel_fx.append((sst, ch, fx, val))
             events.append(NoteEvent(
-                sample=st,
+                sample=sst,
                 ch=ch,
                 on=True,
                 note=note,
@@ -1860,19 +1861,9 @@ def analyze(
         def opn_event_ch(cid: int, ch: int, op: int = -1) -> int:
             return ym_base[cid] + ch
 
-        # Furnace's YM2203 Extended Channel 3 platform is inconsistent about
-        # its four operator columns: the frequency register for column c is
-        # opChanOffs[c] = (1, 2, 0, 3), the instrument parameters/commit use
-        # orderedOps[c] = (0, 2, 1, 3), and the key mask uses bit c.  A single
-        # column therefore cannot carry the right frequency, parameters and
-        # key for one hardware operator.  The converter activates all four
-        # columns on every channel-3 key-on: the note on column c is the base
-        # f-num of operator EXT_FREQ_OP[c] (so the platform writes it to that
-        # hardware operator), while the instrument copy for column c carries
-        # the patch's operator EXT_ORD_OP[c] (so the commit writes the right
-        # parameters) and masks its TL when that operator is not keyed.
+        # Furnace's ext columns disagree: frequency order (1,2,0,3),
+        # parameter order (0,2,1,3), key mask bit = column.
         EXT_FREQ_OP = (1, 2, 0, 3)   # column -> operator whose f-num it sends
-        EXT_ORD_OP = (0, 2, 1, 3)    # column -> operator whose params it sends
         ext_freq_col = {op: c for c, op in enumerate(EXT_FREQ_OP)}
 
         def intern_opn_patch(cid: int, ch: int, mask: int) -> int:
@@ -1886,21 +1877,24 @@ def analyze(
             p.uses += 1
             return patch_order.index(key)
 
-        def intern_ext_patch(cid: int, mask: int, col: int) -> int:
+        def intern_ext_patch(cid: int) -> int:
             snap = states[cid].snapshot(2, 0x0F)
-            op_index = EXT_ORD_OP[col]
-            if not (mask & (1 << op_index)):
-                ops = list(snap.ops)
-                ops[op_index] = replace(ops[op_index], tl=0x7F)
-                snap = replace(snap, ops=tuple(ops))
-            key = snap.identity() + (mask, col)
-            if key not in patches:
-                snap.name = f"OPN {len(patch_order):02d}"
-                patches[key] = snap
-                patch_order.append(key)
-            p = patches[key]
-            p.uses += 1
-            return patch_order.index(key)
+            cache = ext_patch_cache.setdefault(cid, {})
+            key0 = (
+                snap.alg & 7,
+                snap.fb & 7,
+                tuple(op.as_tuple(include_tl=False) for op in snap.ops),
+            )
+            idx = cache.get(key0)
+            if idx is not None:
+                return idx
+            key = ("ext", cid, key0)
+            snap.name = f"OPN {len(patch_order):02d}"
+            patches[key] = snap
+            patch_order.append(key)
+            idx = len(patch_order) - 1
+            cache[key0] = idx
+            return idx
 
         def close_opn_note(
             key: tuple[int, int, int], sample: int, *, off: bool,
@@ -1947,6 +1941,10 @@ def analyze(
                 ))
                 opn_offs.append(len(events) - 1)
 
+        ext_active_freqs: dict[int, tuple] = {}
+        ext_patch_cache: dict[int, dict[tuple, int]] = {}
+        ext_ready: set[int] = set()
+
         for w in vgm.writes:
             if w.chip != "ym2203":
                 continue  # the SSG stream is read by collect_ay8910
@@ -1967,25 +1965,42 @@ def analyze(
                     continue
                 mask = (val >> 4) & 0x0F
                 if ym2203_ext and ch == 2:
+                    prev = st.op_mask[ch]
                     if mask:
-                        # Re-key all four operator columns; the per-column
-                        # instrument copies carry the source key mask as TL.
+                        if cid not in ext_ready:
+                            if mask != 0x0F:
+                                continue
+                            ext_ready.add(cid)
+                        freqs = tuple(st.frequency_op(ch, h) for h in range(4))
+                        active = ext_active_freqs.get(cid)
                         for c in range(4):
+                            bit = 1 << c
+                            if (prev & bit) and not (mask & bit):
+                                close_opn_note((cid, ch, c), w.sample, off=True)
+                        emitted = False
+                        for c in range(4):
+                            bit = 1 << c
+                            if not (mask & bit):
+                                continue
+                            fresh = not (prev & bit) or active is None
+                            changed = (
+                                active is not None
+                                and freqs[EXT_FREQ_OP[c]] != active[EXT_FREQ_OP[c]]
+                            )
+                            if not (fresh or changed):
+                                continue
                             close_opn_note((cid, ch, c), w.sample, off=False)
-                        inses = [
-                            intern_ext_patch(cid, mask, c) for c in range(4)
-                        ]
-                        for c in range(4):
+                            ins = intern_ext_patch(cid)
                             op = EXT_FREQ_OP[c]
-                            block, fnum = st.frequency_op(ch, op)
+                            block, fnum = freqs[op]
                             note, e5 = opn_note_for(block, fnum, ym_clock)
                             events.append(NoteEvent(
                                 sample=w.sample,
                                 ch=ym_base[cid] + 2 + c,
                                 on=True,
                                 note=note,
-                                ins=inses[c],
-                                vol=-1,
+                                ins=ins,
+                                vol=127,
                                 e5=e5,
                                 pan=0,
                                 sweep_div=2.0,
@@ -1998,11 +2013,15 @@ def analyze(
                             pitch_pts[key] = [(w.sample, block, fnum)]
                             opn_tl_pts[key] = []
                             opn_tl_last[key] = 0x7F
-                        keyon_times.append(w.sample)
+                            emitted = True
+                        ext_active_freqs[cid] = freqs
+                        if emitted:
+                            keyon_times.append(w.sample)
                         st.kon[ch] = True
                     else:
                         for c in range(4):
                             close_opn_note((cid, ch, c), w.sample, off=True)
+                        ext_active_freqs.pop(cid, None)
                         st.kon[ch] = False
                     st.op_mask[ch] = mask
                     continue

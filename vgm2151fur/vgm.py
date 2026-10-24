@@ -673,7 +673,7 @@ def load_vgm(path: Path | str) -> VgmFile:
                     stray_ym2203_second = True
             reg = buf[pos + 1]
             val = buf[pos + 2]
-            name = "ym2203_ssg" if reg < 0x20 else "ym2203"
+            name = "ym2203_ssg" if reg < 0x10 else "ym2203"
             vgm.writes.append(ChipWrite(sample, name, cid, reg, val))
             pos += 3
             continue

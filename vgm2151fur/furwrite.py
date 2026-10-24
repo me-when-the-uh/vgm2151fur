@@ -1509,6 +1509,7 @@ def _build_patterns(song: Song, n_ch: int, pat_len_max: int, fx_cols: int,
             if not (ev.on and ev.vol_pts) or ev_ch < 0 or ev_ch >= n_ch:
                 continue
             last_pan = None if ev.no_pan else ev.pan
+            note_vol_done = False
             for sample, value, pan in ev.vol_pts:
                 if content_cut is not None and sample >= content_cut:
                     continue
@@ -1521,6 +1522,29 @@ def _build_patterns(song: Song, n_ch: int, pat_len_max: int, fx_cols: int,
                 if cell is None:
                     cell = _blank_row()
                     grid[ev_ch][row] = cell
+                first_at_note = (
+                    cell.note >= 0
+                    and ev.tone_chip
+                    and row in note_rows.get(ev_ch, ())
+                    and not note_vol_done
+                )
+                if first_at_note:
+                    # A loud gate and its quiet follow-up share the note row;
+                    # let the quiet step set the note instead of dropping it.
+                    note_vol_done = True
+                    if ev.vol_slide:
+                        cont = bool(pan)
+                        level = _slide_level(value) if cont else value
+                        cell.vol = level
+                        _add_fx(cell, 0xFA, 0x01 if cont else 0x00, fx_cols, stats)
+                        if delay:
+                            _add_fx(cell, 0xED, delay, fx_cols, stats)
+                    else:
+                        cell.vol = value
+                        if pan is not None and (last_pan is None or pan != last_pan):
+                            _add_fx(cell, 0x08, pan & 0xFF, fx_cols, stats)
+                            last_pan = pan
+                    continue
                 if cell.note >= 0:
                     _bump(stats, "vol_step_dropped")
                     continue
