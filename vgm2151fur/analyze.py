@@ -1732,6 +1732,7 @@ def analyze(
     condense: float = 1.0,
     grid_cache: dict | None = None,
     c352_quad: bool = False,
+    dac_slices: bool = False,
 ) -> Song:
     """Build the Song for one rendition of `vgm`.
 
@@ -2754,12 +2755,17 @@ def analyze(
     dac_ch = -1
     dac_stats: dict = {}
     if pcm and is_opn2:
-        dac_samples, dac_plays, dac_warn, dac_stats = collect_dac(vgm)
+        dac_samples, dac_plays, dac_warn, dac_stats = collect_dac(
+            vgm, slices=dac_slices,
+        )
         warnings.extend(dac_warn)
         dac_ch = ym_base.get(ym2612_ids[0], 0) + (8 if ym2612_ext else 5)
-        if dac_writes and not dac_plays and not dac_stats.get("dac_disabled_bytes"):
+        if (
+            dac_writes and not dac_plays and not dac_warn
+            and not dac_stats.get("dac_disabled_bytes")
+        ):
             warnings.append(
-                f"{dac_writes} YM2612 DAC writes but no playable DAC slice"
+                f"{dac_writes} YM2612 DAC writes but no playable DAC data"
             )
 
     # Genesis PSG.  The SN76489 has no key-on, so the collector gates on its
@@ -3206,8 +3212,11 @@ def analyze(
         fm_end + (2 if audible else 0) + 4 * len(oki_samples) + len(adpcm_samples)
         + (16 if spcm_audible else 0) + 24 * len(c140_audible) + 32 * len(c352_audible)
     )
+    # DAC maps are added once after the row grid is known (below).  Counting
+    # the collector's transient list here as well would shift every tone
+    # instrument by a second map.
     tone_ins_base = (
-        len(patch_order) + ((len(dac_samples) + 119) // 120)
+        len(patch_order)
         + (len(audible) if pcm else 0) + len(oki_samples)
         + len(adpcm_samples) + len(spcm_audible) + len(c140_audible) + len(c352_audible)
     )
@@ -3507,8 +3516,12 @@ def analyze(
     )
     _rebase_non_fm_ins(events, fm_before_pitch, len(patch_order))
     if fm_pitch_copies:
+        # The DAC sample maps sit between the FM patches and the sample/tone
+        # instruments.  The recompute must keep them, or PSG/SCC notes point
+        # at a DAC map and the tone channels are silent.
         tone_ins_base = (
-            len(patch_order) + (len(audible) if pcm else 0) + len(oki_samples)
+            len(patch_order) + n_dac_ins
+            + (len(audible) if pcm else 0) + len(oki_samples)
             + len(adpcm_samples) + len(spcm_audible) + len(c140_audible)
             + len(c352_audible)
         )
@@ -3726,11 +3739,28 @@ def format_report(song: Song) -> str:
     if song.dac_count:
         data = sum(len(s.data) for s in song.dac_samples)
         maps = (len(song.dac_samples) + 119) // 120
-        runs = song.dac_stats.get("dac_runs", 0)
         source = song.dac_stats.get("dac_source_bytes", 0)
+        mode = song.dac_stats.get("dac_mode", "slices")
+        if mode == "chunks":
+            shape = f"{len(song.dac_samples)} PCM chunks"
+            extra = (
+                f", {song.dac_stats.get('dac_pan_chunks', 0)} pan chunks"
+                f", {song.dac_stats.get('dac_trimmed_silence_bytes', 0)} "
+                "silence bytes skipped"
+            )
+        elif mode == "packed":
+            shape = f"{len(song.dac_samples)} PCM phrases"
+            extra = f", {song.dac_stats.get('dac_trimmed_silence_bytes', 0)} silence bytes skipped"
+        elif mode == "timeline":
+            shape = "1 timeline sample"
+            extra = ""
+        else:
+            shape = f"{len(song.dac_samples)} slices"
+            silent = song.dac_stats.get("dac_silent_groups", 0)
+            extra = f", {silent} silent rows skipped" if silent else ""
         lines.append(
-            f"DAC         {song.dac_count} notes  {len(song.dac_samples)} slices  "
-            f"{maps} maps  {data} bytes  ({runs} source runs, {source} bytes)"
+            f"DAC         {song.dac_count} notes  {shape}  {maps} maps  "
+            f"{data} bytes  ({source} source bytes{extra})"
         )
     n_regions = (
         len(song.pcm_samples) + len(song.segapcm_samples) + len(song.c140_samples)

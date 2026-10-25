@@ -156,10 +156,30 @@ These are concrete failure modes worth checking first:
   FM6's key-ons are ordinary FM notes. Collecting the stream regardless of
   `0x2B` creates notes that collide with those FM6 rows. Gate the collector on
   the enable state; only the read cursor advances while disabled.
-- **A timeline is not a slice representation.** A continuous 22.05 kHz sample
-  preserves the audio but stores holds and silence and cannot be edited per
-  hit. The sliced path keeps source runs, merges only same-row runs, and puts
-  the note on the preceding tick with the held byte as lead.
+- **More samples can be unloadable.** The per-run slice representation is
+  smaller, but dense tracks produce 1,098-12,624 samples and Furnace 0.6.8.3
+  rejects them with `invalid sample count!` even with map base 0. The release
+  default is a sequence of rate-exact PCM chunks, at most 0.25 s each, capped
+  at 240; the 130-sample probe and the 240-sample track 20 load. Do not go
+  back to one sample/note for the whole track: it holds the first pan and
+  loses the source's pan changes. The slice path is an explicit editing mode.
+  Test the actual release binary, not only the dev build.
+- **Notes on silence.** A row or phrase whose bytes are all `0x80` is a rest,
+  not a PCM event. It gets no note and no sample-map selector. The chunked
+  default starts every chunk on audio and skips leading/silent phrases; the
+  slice grouper drops pure-silent rows and appends one zero frame to the
+  preceding sample. The old slice path emitted 540/1,287/2,618 such notes on
+  Contra 02/04/20.
+- **One note cannot carry pan.** A single PCM phrase note captured the first
+  `0xB6` pan for the whole track; on Contra 02 it was right-only. Split chunks
+  at pan changes and emit the matching `08 xy` on each note. The source has
+  24 pan writes on that track; the chunked module is 57 both, 12 right and 6
+  left. The first 12 right notes are the source's intro section.
+- **PSG pointed at a DAC map.** The DAC maps sit between the FM patches and
+  the tone instruments. The tone base must count them exactly once, including
+  after an FM pitch copy. A stale module put every PSG note on a DAC map and
+  the PSG was silent while the source noise was audible. The binding now uses
+  `SN`/STD; the regression test checks INS2 type 0.
 
 ## Anti-WET rules
 
@@ -185,8 +205,9 @@ Run a small representative set, not only the synthetic suite:
 | YM2151 | `VGM_collection/YM2151/` (`Quester`, `Block Hole`, `Willow`, ...) | clock transposition, KON state, E5 persistence, sweeps, LFO reset, instrument fields |
 | YM2203 | `VGM_collection/YM2203` | SSG notes, ext-channel routing, carrier octave, instrument count |
 | YM2612 FM + PSG | `VGM_collection/YM2612/Thunder Force IV ...` | 48-track pitch/field audit, PSG period/volume, algorithms |
-| YM2612 DAC | `VGM_collection/YM2612/Contra Hard Corps ...` | source run bytes, 0x2B enable, slice starts/bodies, FM6 pan, key-on audit, module size |
-| YM2612 sparse DAC | Sonic packs and synthetic sparse slices | sample selection, direct `0x2A`, no spurious notes |
+| YM2612 DAC | `VGM_collection/YM2612/Contra Hard Corps ...` | chunk sequence <=240, split at pan changes, map base 0; no silence notes; 0x2B; render in release Furnace |
+| YM2612 slice mode | Synthetic slice tests and short tracks | direct `0x2A`, gaps, holds, same-row merge, maps; do not use for dense release modules |
+| PSG instrument binding | Sonic 3 prototype 01 and the synthetic DAC+pitch-copy test | PSG notes must use INS_STD (`SN`), never a DAC map |
 | Sample chips | C140/C352/SegaPCM/K007232/OKI packs | clock flags, sample bodies, loops, instrument indices |
 
 For any pack, `report` first, then convert one track, then the pack. Use
@@ -201,7 +222,11 @@ A converter change is complete only when:
 - the reference pack has been regenerated (no stale files);
 - the source/export audit is clean, or the remaining difference is explicitly
   named in a warning and in the chip doc;
-- the module still loads through Furnace (`fur2vgm.py` or `fur2wav.py`);
+- the module still loads through the development Furnace;
+- for a DAC or PSG change, it also loads in the release Furnace at
+  `C:\Users\User\Music\furnace-0.6.8.3-win64\furnace.exe`;
+- a dense DAC module has one sample map with `first_sample=0` and one note per
+  audio phrase; no silence-only row/phrase has a note or selector;
 - the relevant docs (`opm-notes.md`, `ym2612.md`, ...) agree with the code;
 - if the change affects DAC representation, `dac-redesign.md` and the size
   measurements are updated as well.

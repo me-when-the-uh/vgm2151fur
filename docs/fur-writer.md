@@ -108,15 +108,18 @@ E5 carries the key-on remainder.
 YM2612 instruments use the same type 1 and OPN operator layout. They also
 carry the channel's PMS/AMS in the FM feature, and the carrier TLs are stored
 relative to the loudest carrier while the note's volume column carries the
-absolute level (Furnace's `newVolumeScaling` makes that exact). DAC slices use
-one `DIV_INS_AMIGA` sample-map instrument per 120 samples, with pattern note
-60+slot selecting the slice; the sample's C-4 rate sets the DAC clock. Runs
-that start in one tracker row are merged into one slice with explicit holds,
-and the note is placed on the preceding tick; the sample starts with the
-previously held byte, so the source content is not row-quantized. Pan changes
-inside a row are `08xy` channel effects at the row start. The
-SN76489 uses a plain `DIV_INS_STD` instrument (pitch macro only), a 0-15
-volume column, and effect `20xy` for noise mode. The FM feature's four
+absolute level (Furnace's `newVolumeScaling` makes that exact). The DAC default
+uses `DIV_INS_AMIGA` sample maps of 120 slots, each map with `first_sample=0`;
+pattern note `60 + slot` selects a release-capped rate-exact PCM chunk. The
+map entries are global sample indices; a nonzero `first_sample` makes release
+Furnace read an embedded sample count and reject the module. Each chunk note
+is placed on the preceding tick and the sample starts with the previously held
+byte, so the source content is not row-quantized. The `08 xy` pan effect on
+each chunk note comes from the source `0xB6` at that chunk start. The per-run
+slice representation is explicit (`slices=True`) and uses 120 slices per map;
+it is not the release default. The SN76489 uses a plain `DIV_INS_STD`
+instrument (pitch macro only), a 0-15 volume column, and effect `20xy` for
+noise mode. PSG notes must point at that STD instrument. The FM feature's four
 operator columns of the Ext system share one timbre instrument.
 
 PCM instruments bind one sample each: K007232 two channels, MSM6295 four

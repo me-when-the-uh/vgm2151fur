@@ -1,26 +1,27 @@
-"""YM2612 DAC PCM bank -> deduplicated slices and FM6 playback notes.
+"""YM2612 DAC PCM bank -> rate-exact PCM phrases (default) or slices.
 
 VGM 1.50 encodes a DAC stream as a type-0 data block (unsigned 8-bit PCM)
 plus 0xE0 (set read pointer) and 0x80-0x8F (play one byte, then wait 0-15
 samples).  Direct 0x2A writes are the same audio without a bank address.
 Modern logs use 0x92 (rate) and 0x95 (one type-0 block).
 
-The collector below turns all three forms into one event model.  A *run* is
-a maximal stretch of DAC bytes with no pause: each next byte starts when the
-previous byte's wait ends.  Pointer changes do not break a run; only time
-does.  A run's rate comes from its own event span, so the bytes play at the
-driver's actual write rate rather than being resampled to a fixed timeline.
+The default is a sequence of rate-exact PCM chunks, each played by one FM6
+note.  Chunks split at pan changes and at most every 0.25 s, capped at 240
+samples because Furnace 0.6.8.3 rejects dense sample-map sets with "invalid
+sample count!" (a 130-sample probe loads; 392 slices do not).  The sample
+rate is the source's smallest positive write interval in that chunk
+(`round(44100 / min_interval)`), so every source byte has a distinct frame.
+Phrases split only on pauses over 2,048 VGM samples.  A silence-only phrase
+and leading silence create no sample and no note; a chunk starts on audio and
+one trailing 0x80 frame sets the DAC's hold to silence.  The pan at each
+chunk comes from 0xB6, so the module follows the source's left/right changes
+instead of holding the first pan for the whole track.
 
-Runs are deduplicated by (bytes, rate).  Furnace plays one sample per FM6
-note and holds the sample's last frame after it ends, so a pause between
-runs needs no stored frames: the next note cuts the hold.
-
-A tracker row carries one note per channel.  Two runs that start in the same
-row therefore cannot become two notes.  `group_dac_plays` merges them into
-one sample: the runs' bytes stay in source order and the gap between them is
-an explicit run of the previous byte.  The note is placed on the preceding
-tick and the sample carries the residual hold, so the audible content starts
-at the source time instead of a quantised one.
+`collect_dac(..., slices=True)` is the explicit editing representation: source
+runs at their own rate, deduplicated, same-row merged, one sample map per 120
+slices.  A row that is pure silence gets no note; the preceding sample gets a
+zero tail.  `collect_dac(..., timeline=True)` is the old 22.05 kHz comparison
+body.  `group_dac_plays` places the chosen plays on the tick grid.
 """
 
 from __future__ import annotations
@@ -35,10 +36,16 @@ from vgm2151fur.vgm import VGM_RATE, VgmFile
 DAC_GAP = 512
 DAC_MIN_SAMPLES = 8
 DAC_MAP_CAPACITY = 120
-# The dense-timeline fallback (kept for comparison; the sliced path is the
-# default).  A gap larger than this starts another phrase.
+# The dense-timeline fallback is kept for comparison; the release-capped
+# chunked path is the default.  A gap larger than this starts another phrase.
 DAC_RUN_GAP = 2048
 DAC_TIMELINE_RATE = 22050
+# Release Furnace rejects very large sample sets.  The 130-sample probe loads
+# in 0.6.8.3; a 392-sample slice track does not.  Stay well below the wall.
+DAC_RELEASE_SAMPLES = 240
+# A chunk is at most this long, so a dense track becomes a real sequence of
+# PCM chunks rather than one matryoshka sample.  Short sources stay one chunk.
+DAC_CHUNK_SECONDS = 0.25
 # Furnace clamps a sample-playback rate to this value.
 DAC_RATE_MAX = 192000
 DAC_RATE_MIN = 1
@@ -206,19 +213,17 @@ def _add_sample(
     return idx
 
 
-def collect_dac(
-    vgm: VgmFile, *, timeline: bool = False,
+def _collect_slices(
+    vgm: VgmFile,
 ) -> tuple[list[DacSample], list[DacPlay], list[str], dict]:
-    """Return (samples, plays, warnings, stats).
+    """Slice representation: source runs, deduplicated and row-merged.
 
-    `plays` are per source run, not per sample: two runs with the same bytes
-    share a sample but remain two notes.  `group_dac_plays` resolves the
-    tracker's one-note-per-row limit without dropping either.
+    This is the explicit editing representation (`collect_dac(..., slices=True)`).
+    It is not the default because release Furnace has a hard sample-count
+    limit and a dense Contra track produces thousands of samples.
     """
     if not vgm.dac_events and not vgm.dac_block_plays:
         return [], [], [], {}
-    if timeline:
-        return _collect_timeline(vgm)
 
     stats: dict = {}
     warnings: list[str] = []
@@ -362,6 +367,283 @@ def collect_dac(
     return samples, plays, warnings, stats
 
 
+def _packed_words(
+    vgm: VgmFile, stats: dict, enable_tl: list[tuple[int, bool]],
+) -> list[tuple[float, int, int]]:
+    """Canonical words with block plays expanded, same-time groups reduced."""
+    words: list[tuple[float, int, int]] = list(
+        _byte_events(vgm, stats, enable_tl)
+    )
+    for t, block, rate in vgm.dac_block_plays:
+        if not (0 <= block < len(vgm.dac_blocks)):
+            continue
+        if not _dac_enabled_at(enable_tl, t):
+            stats["dac_disabled_bytes"] = stats.get("dac_disabled_bytes", 0) + 1
+            continue
+        body = _signed_bank(bytes(vgm.dac_blocks[block]))
+        if not body:
+            continue
+        step = VGM_RATE / (rate if rate > 0 else VGM_RATE)
+        for i, byte in enumerate(body):
+            words.append((t + i * step, byte, 0))
+        stats["dac_block_plays"] = stats.get("dac_block_plays", 0) + 1
+    if not words:
+        return []
+    words.sort(key=lambda w: w[0])
+    reduced: list[tuple[float, int, int]] = []
+    i = 0
+    while i < len(words):
+        t = words[i][0]
+        j = i + 1
+        while j < len(words) and words[j][0] == t:
+            j += 1
+        group = words[i:j]
+        kept = group[-1]
+        if len(group) > 1:
+            values = {w[1] for w in group}
+            if len(values) == 1:
+                stats["dac_collapsed_bytes"] = (
+                    stats.get("dac_collapsed_bytes", 0) + len(group)
+                )
+            else:
+                stats["dac_same_time_runs"] = (
+                    stats.get("dac_same_time_runs", 0) + 1
+                )
+                stats["dac_same_time_bytes"] = (
+                    stats.get("dac_same_time_bytes", 0) + len(group)
+                )
+                stats["dac_same_time_dropped"] = (
+                    stats.get("dac_same_time_dropped", 0) + len(group) - 1
+                )
+        reduced.append(kept)
+        i = j
+    return reduced
+
+
+def _collect_packed(
+    vgm: VgmFile,
+) -> tuple[list[DacSample], list[DacPlay], list[str], dict]:
+    """Release-capped PCM chunks, no silence notes, pan changes preserved.
+
+    A phrase is split only on a long pause, so a drum run and its short
+    inter-hit 0x80 rests stay one real PCM stream.  Leading silence, a
+    silence-only phrase, and the long tail after the last audio write become
+    no note at all.  Within a phrase the audio is split at every 0xB6 pan
+    change and into at most 0.25 s chunks; the total is capped at
+    DAC_RELEASE_SAMPLES (240) because release Furnace rejects very large
+    sample sets.  A chunk starts on an audio word, so no note is a rest; one
+    trailing zero frame sets the hold to silence.  The rate is the chunk's
+    smallest write interval, so every source byte has a distinct frame.  The
+    old 22.05 kHz timeline is not used.
+    """
+    if not vgm.dac_events and not vgm.dac_block_plays:
+        return [], [], [], {}
+    stats: dict = {}
+    warnings: list[str] = []
+    pan_timeline = _pan_timeline(vgm)
+    enable_tl = _dac_enable_timeline(vgm)
+    words = _packed_words(vgm, stats, enable_tl)
+
+    if not words:
+        if stats.get("dac_disabled_bytes"):
+            warnings.append(
+                f"{stats['dac_disabled_bytes']} YM2612 DAC writes while the DAC "
+                "is disabled (0x2B bit 7 clear); no DAC audio"
+            )
+        return [], [], warnings, stats
+
+    phrases: list[list[tuple[float, int, int]]] = []
+    current: list[tuple[float, int, int]] = []
+    for word in words:
+        if current and word[0] - current[-1][0] > DAC_RUN_GAP:
+            phrases.append(current)
+            current = []
+        current.append(word)
+    if current:
+        phrases.append(current)
+
+    phrase_info: list[dict] = []
+    trimmed = 0
+    total_span = 0.0
+    for phrase in phrases:
+        audio = [i for i, w in enumerate(phrase) if w[1] != 0]
+        if not audio:
+            stats["dac_silent_phrases"] = (
+                stats.get("dac_silent_phrases", 0) + 1
+            )
+            trimmed += len(phrase)
+            continue
+        first_i = audio[0]
+        last_i = audio[-1]
+        tail_i = None
+        for j in range(last_i + 1, len(phrase)):
+            if phrase[j][1] == 0:
+                tail_i = j
+                break
+        trimmed += first_i + (
+            len(phrase) - 1 - last_i - (1 if tail_i is not None else 0)
+        )
+        span = max(1.0, phrase[last_i][0] - phrase[first_i][0])
+        phrase_info.append({
+            "phrase": phrase,
+            "audio": audio,
+            "first_i": first_i,
+            "last_i": last_i,
+            "tail_i": tail_i,
+            "span": span,
+            "pans": [_pan_at(pan_timeline, phrase[i][0]) for i in audio],
+        })
+        total_span += span
+        stats["dac_phrases"] = stats.get("dac_phrases", 0) + 1
+
+    total_span = max(total_span, 1.0)
+    target_chunks = max(1, min(
+        DAC_RELEASE_SAMPLES,
+        int(total_span / (VGM_RATE * DAC_CHUNK_SECONDS) + 0.9999),
+    ))
+    stats["dac_target_chunks"] = target_chunks
+
+    samples: list[DacSample] = []
+    plays: list[DacPlay] = []
+    pan_chunks = 0
+    for info in phrase_info:
+        phrase = info["phrase"]
+        audio = info["audio"]
+        pans = info["pans"]
+        budget = max(1, int(round(
+            target_chunks * info["span"] / total_span
+        )))
+        segments: list[tuple[int, int, int]] = []
+        seg_start = 0
+        for k in range(1, len(audio)):
+            if pans[k] != pans[seg_start]:
+                segments.append((seg_start, k - 1, pans[seg_start]))
+                seg_start = k
+        segments.append((seg_start, len(audio) - 1, pans[seg_start]))
+        allocations: list[int] = []
+        for s0, s1, _pan in segments:
+            count = max(1, int(round(
+                budget * (s1 - s0 + 1) / len(audio)
+            )))
+            count = min(count, s1 - s0 + 1)
+            allocations.append(count)
+        for (seg0, seg1, seg_pan), count in zip(segments, allocations):
+            seg_len = seg1 - seg0 + 1
+            last_pan = None
+            for k in range(count):
+                a0 = seg0 + (k * seg_len) // count
+                a1 = seg0 + ((k + 1) * seg_len) // count - 1
+                if a1 < a0:
+                    continue
+                w0 = audio[a0]
+                w1 = audio[a1]
+                chunk_tail = None
+                for j in range(w1 + 1, len(phrase)):
+                    if phrase[j][1] == 0:
+                        chunk_tail = j
+                        break
+                selected = phrase[w0:w1 + 1] + (
+                    [phrase[chunk_tail]] if chunk_tail is not None else []
+                )
+                start = selected[0][0]
+                times = [w[0] for w in selected]
+                deltas = [
+                    b - a for a, b in zip(times, times[1:]) if b > a
+                ]
+                min_wait = min(deltas) if deltas else 1.0
+                rate = max(
+                    DAC_RATE_MIN,
+                    min(DAC_RATE_MAX, int(round(VGM_RATE / min_wait))),
+                )
+                out = bytearray()
+                previous = 0x80
+                for t, byte, _wait in selected:
+                    frame = int(round((t - start) * rate / VGM_RATE))
+                    if frame < len(out):
+                        out[frame] = byte
+                        stats["dac_frame_collisions"] = (
+                            stats.get("dac_frame_collisions", 0) + 1
+                        )
+                        previous = byte
+                        continue
+                    if frame > len(out):
+                        out.extend(bytes([previous]) * (frame - len(out)))
+                    out.append(byte)
+                    previous = byte
+                data = bytes(out)
+                idx = len(samples)
+                samples.append(DacSample(0, len(data), data, rate, start))
+                chunk_pan = _pan_at(pan_timeline, start)
+                plays.append(DacPlay(
+                    start, idx, chunk_pan,
+                    int(round(selected[-1][0] - start)),
+                ))
+                if chunk_pan != last_pan:
+                    pan_chunks += 1
+                    last_pan = chunk_pan
+                stats["dac_chunks"] = stats.get("dac_chunks", 0) + 1
+                if chunk_pan != seg_pan:
+                    stats["dac_pan_mismatch"] = (
+                        stats.get("dac_pan_mismatch", 0) + 1
+                    )
+
+    if len(samples) > DAC_RELEASE_SAMPLES:
+        stats["dac_release_trimmed"] = len(samples) - DAC_RELEASE_SAMPLES
+        del samples[DAC_RELEASE_SAMPLES:]
+        plays = [p for p in plays if p.sample < DAC_RELEASE_SAMPLES]
+
+    stats["dac_mode"] = "chunks"
+    stats["dac_source_bytes"] = len(words)
+    stats["dac_trimmed_silence_bytes"] = trimmed
+    stats["dac_chunks"] = len(samples)
+    stats["dac_pan_chunks"] = pan_chunks
+    stats["dac_unique_samples"] = len(samples)
+    stats["dac_sample_bytes"] = sum(len(s.data) for s in samples)
+    stats["dac_notes"] = len(plays)
+
+    if stats.get("dac_disabled_audible"):
+        warnings.append(
+            f"{stats['dac_disabled_audible']} non-silent YM2612 DAC writes "
+            "while the DAC is disabled; ignored"
+        )
+    if stats.get("dac_same_time_runs"):
+        warnings.append(
+            f"{stats['dac_same_time_runs']} YM2612 DAC bursts "
+            f"({stats.get('dac_same_time_bytes', 0)} bytes) share one VGM "
+            "sample; only the final value is kept"
+        )
+    if stats.get("dac_frame_collisions"):
+        warnings.append(
+            f"{stats['dac_frame_collisions']} YM2612 DAC writes rounded to an "
+            "already-written phrase frame; the later value at that frame is kept"
+        )
+    if stats.get("dac_bank_overrun"):
+        warnings.append(
+            f"{stats['dac_bank_overrun']} YM2612 DAC reads ran past the PCM bank"
+        )
+    if not samples:
+        warnings.append(
+            "YM2612 DAC stream contains only silence; no DAC notes written"
+        )
+    return samples, plays, warnings, stats
+
+
+def collect_dac(
+    vgm: VgmFile, *, slices: bool = False, timeline: bool = False,
+) -> tuple[list[DacSample], list[DacPlay], list[str], dict]:
+    """Return (samples, plays, warnings, stats).
+
+    Default: release-capped rate-exact PCM chunks, split at pan changes.
+    `slices=True`: the per-run sample-map editor representation.
+    `timeline=True`: the old 22.05 kHz comparison body.
+    """
+    if timeline:
+        return _collect_timeline(vgm)
+    if slices:
+        return _collect_slices(vgm)
+    return _collect_packed(vgm)
+
+
 def _group_rate(
     samples: list[DacSample], items: list[DacPlay],
     next_onset: dict[int, int],
@@ -452,8 +734,59 @@ def group_dac_plays(
     previous_sample: int | None = None
     previous_time = 0
 
+    def is_silent(p: DacPlay) -> bool:
+        payload = samples[p.sample].data
+        return bool(payload) and not any(payload)
+
     for row in sorted(groups):
         items = groups[row]
+        if all(is_silent(p) for p in items):
+            # A row whose only DAC content is 0x80 is a rest, not a PCM
+            # event.  Do not write a note or a sample-map selector for it.
+            # Make the preceding audio sample end on a zero byte instead, so
+            # Furnace holds silence after it; the source's hold until this
+            # row is the preceding byte.
+            stats["dac_silent_groups"] = stats.get("dac_silent_groups", 0) + 1
+            stats["dac_silent_notes"] = stats.get("dac_silent_notes", 0) + 1
+            stats["dac_silent_plays"] = (
+                stats.get("dac_silent_plays", 0) + len(items)
+            )
+            stats["dac_silent_bytes"] = (
+                stats.get("dac_silent_bytes", 0)
+                + sum(len(samples[p.sample].data) for p in items)
+            )
+            if notes:
+                prev_time, prev_idx, prev_pan = notes[-1]
+                prev = out[prev_idx]
+                if prev.data and prev.data[-1] != 0:
+                    target = int(round(
+                        (items[0].onset - prev_time) * prev.c4_rate / VGM_RATE
+                    ))
+                    target = max(target, len(prev.data))
+                    body = (
+                        prev.data
+                        + bytes([prev.data[-1]]) * (target - len(prev.data))
+                        + b"\x00"
+                    )
+                    if any(i == prev_idx for _t, i, _p in notes[:-1]):
+                        new_idx = _add_sample(
+                            out, by_key, body, prev.c4_rate, prev.onset,
+                        )
+                    else:
+                        by_key.pop((prev.data, prev.c4_rate), None)
+                        out[prev_idx] = DacSample(
+                            prev.start, len(body), body, prev.c4_rate, prev.onset,
+                        )
+                        by_key[(body, prev.c4_rate)] = prev_idx
+                        new_idx = prev_idx
+                    notes[-1] = (prev_time, new_idx, prev_pan)
+                    previous_sample = new_idx
+                    previous_time = prev_time
+                    stats["dac_silence_tail_bytes"] = (
+                        stats.get("dac_silence_tail_bytes", 0)
+                        + len(body) - len(prev.data)
+                    )
+            continue
         first = items[0]
         _row, delay = place(first.onset)
         note_time = placed_time(_row, delay)

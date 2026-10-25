@@ -1,218 +1,173 @@
-# YM2612 DAC: deduplicated slices for FM6
+# YM2612 DAC: release-capped PCM chunks, pan-aware
 
-Status: **implemented**. The continuous 22.05 kHz timeline remains available
-through `collect_dac(vgm, timeline=True)` for comparison, but the converter's
-default is the sliced path described here. Read `ym2612.md` for the chip
-registers and `implementation-notes.md` for the stabilisation loop.
+Status: **implemented**. The default is a sequence of **rate-exact PCM
+chunks**, one FM6 note each. Chunks split at every `0xB6` pan change and at
+most every 0.25 s, and the track is capped at 240 samples so Furnace 0.6.8.3
+loads it. A chunk starts on an audio byte; silence-only phrases and leading
+silence get no note. The per-run slice path is explicit
+(`collect_dac(..., slices=True)`), not the default. The old 22.05 kHz body is
+`collect_dac(..., timeline=True)` for comparison only.
+
+This replaces the previous one-sample-per-audio-phrase default. That was one
+matryoshka sample: one FM6 note held the first pan for the whole track (on
+Contra 02 the note was `08 0F`, right only). The source writes 24 `0xB6`
+values on track 02 alone (`0xE0/0xC0` both, `0x40` right, `0x80` left, then
+`0x40/0x80` alternating). A single note cannot represent them. Chunks are the
+smallest representation that is still a real sequence, keeps the source
+bytes, and fits the release sample limit.
+
+## Why chunks, not one phrase or thousands of slices
+
+- **Release sample limit.** The 130-sample probe module loads in 0.6.8.3; a
+  392-sample slice track fails with `invalid sample count!`; the old 1,098/
+  3,054/12,624 slice sets fail even with every map base 0. The chunked
+  75/219/240 modules load. Track 20 at 240 samples renders a
+  57,995,896-byte WAV.
+- **One phrase is a matryoshka and loses pan.** It has one note, one pan. The
+  source's pan changes are lost; on 02 the first note was right for the
+  entire track.
+- **Thousands of slices do not load.** The slice path is kept for editing,
+  but it cannot be the release default on a dense track.
+- **A chunk sequence is real PCM.** Each chunk is source bytes at the
+  natural rate; the pattern has one note per chunk, not one selector per
+  silence and not one sample for the whole track.
 
 ## What the converter does
 
-`vgm2151fur/ym2612dac.py` has one canonical decoder and one scheduler:
+`vgm2151fur/ym2612dac.py`:
 
-1. **Decode.** Old `0xE0`/`0x80`-`0x8F` streams, direct `0x2A` writes and
-   modern `0x92` rate plus `0x95` block plays become one ordered event stream.
-   Writes while `0x2B` bit 7 is clear are inaudible and are skipped; the read
-   cursor still advances, so the next enabled byte lands at its source
-   address. A log with no `0x2B` write is treated as DAC-enabled.  A group of
-   bytes at one VGM timestamp is a driver burst; only its final value sounds
-   in the reference player, so it becomes one byte and the dropped
-   intermediate values are counted in the warning.
-2. **Slice.** A *run* is a maximal stretch of bytes with no pause. A pointer
-   change does not split it; only a gap between the previous byte's wait and
-   the next byte does. The run rate is
-   `44100 * (bytes - 1) / (last_time - first_time)`, so the bytes play at the
-   driver's own write rate instead of a fixed timeline. A run whose bytes are
-   all equal stores one frame and relies on the DAC's hold. Runs are
-   deduplicated by `(bytes, rate)`.
-3. **Place.** The source is monophonic, but a tracker row carries one note on
-   FM6. Runs whose starts land in the same row are merged into one sample:
-   their bytes stay in source order, and the gap between them becomes an
-   explicit run of the previous byte. The note is placed on the preceding
-   tick (`place_tick(..., floor=True)`) and the sample begins with the value
-   the DAC was holding, so the audible content starts at its source frame
-   instead of the row boundary. Runs in later rows keep their own notes, so
-   the stream stays slice-editable. One note per row is the only constraint;
-   no run is dropped.
-4. **Emit.** Slices are grouped 120 per `DIV_INS_AMIGA` sample-map instrument.
-   A pattern note `60 + slot` selects a slice and is never musically
-   transposed. The sample's C-4 rate is compensated for Furnace's reference,
-   so the exported `0x92` rate matches the intended rate within 1 Hz of
-   integer rounding. Pan comes from `0xB6` at each note; a pan change inside
-   a row becomes an `08xy` channel effect at the row start, because an ED
-   delay on that cell would move the note too.
+1. **Decode.** Old `0xE0`/`0x80`-`0x8F`, direct `0x2A` and modern `0x92`/
+   `0x95` become one ordered word stream. `0x2B` bit 7 gates audibility.
+   Several values at one VGM timestamp collapse to the final value (the
+   reference player writes them at one output sample) with a warning.
+2. **Phrases.** A phrase splits only on a pause larger than 2,048 VGM
+   samples, so short inter-hit rests stay in the PCM.
+3. **Chunks.** Within a phrase, audio words split at every `0xB6` pan change
+   and into at most 0.25 s pieces. The total is capped at
+   `DAC_RELEASE_SAMPLES = 240`; excess chunks are trimmed with a report
+   stat rather than producing an unloadable module.
+4. **Body.** Each chunk starts at an audio word, never on a rest. It stops at
+   its last audio word plus one trailing `0x80` frame, so Furnace holds
+   silence after the chunk. Intermediate silence bytes are the source PCM
+   hold. Leading silence and silence-only phrases produce no sample/note.
+5. **Rate.** `round(44100 / smallest positive write interval in the chunk)`
+   makes every byte occupy a distinct frame; the minimum and maximum are
+   clamped. Holds fill the gaps.
+6. **Pan.** `DacPlay.pan` is `_pan_at(0xB6)` at the chunk start. The writer
+   turns it into `08 xy` (`C0`→`FF` both, `80`→`F0` left, `40`→`0F` right).
+7. **Place/emit.** `group_dac_plays` puts the chunk on the preceding tick,
+   merges chunks that land in one row without dropping audio, and emits one
+   note per surviving chunk. Samples are grouped 120 per `DIV_INS_AMIGA` map;
+   every map reports `first_sample=0`.
 
-Warnings are emitted for a disabled DAC, a rate clamped to 192,000 Hz, a
-multi-value burst at one VGM timestamp (collapsed to its final value, because
-the reference player writes them at one output sample), a read past the bank,
-an overshoot when a merged sample cannot fit, and the 250-instrument /
-65,535-sample limits. A source with no usable DAC bank keeps the old warning.
+The explicit `slices=True` path is unchanged except that a pure-silent row is
+skipped and the preceding sample gets a zero tail. The old `timeline=True`
+body is not used.
 
-## What the timeline did (historical)
+## Release evidence
 
-The old path rendered one continuous 22.05 kHz sample per phrase. It was
-accurate for the existing Contra set and passed the old byte/rate checks, but
-it stored every held and silent frame, was not slice-editable, and forced a
-separate `_stream_mode` heuristic. It is now a comparison fallback only.
+`C:\Users\User\Music\furnace-0.6.8.3-win64\furnace.exe`:
 
-Current measured cost (timeline vs slices, full-track direct write, zlib
-level 5):
+- 130-sample probe (two maps, base 0): renders;
+- 392-sample x4 slice: rejects;
+- 75-sample chunk 02: renders, 5,509,576-byte WAV;
+- 219-sample chunk 04: renders, 16,895,664-byte WAV;
+- 240-sample chunk 20: renders, 57,995,896-byte WAV;
+- the one-phrase 02/04 (64,028/297,651 bytes) also rendered, but its one note
+  held the intro right pan for the whole track; it is superseded by chunks.
 
-| Measure | Timeline | Slices |
-| --- | ---: | ---: |
-| Contra pack, raw `.fur` total | 46.53 MB | 30.07 MB |
-| Contra pack, zlib level 5 total | 12.85 MB | 7.30 MB |
-| Largest Contra module | 1.29 MB | 0.75 MB (track 20) |
-| Track 04 source bank | 132,055 bytes | 132,055 bytes |
-| Track 04 stored sample bytes | 1,206,705 | 444,425 |
-| Track 04 stored / bank | 9.1x | 3.4x |
-| Track 04 audible source bytes | 426,320 | 444,425 stored (1.04x) |
-| Track 20 stored sample bytes | 4,110,624 | 1,501,683 |
-| Track 20 source bytes | 1,448,979 | 1,501,683 stored (1.04x) |
-| vgm2fur Contra baseline | 2.31 MB total | 237 KB largest |
+## Measured cost (compressed `.fur`, zlib 5)
 
-The pack is still larger than vgm2fur's 2.31 MB because every source byte and
-every source onset is kept, and same-row runs are merged into
-context-specific samples. It is 1.76x smaller compressed than the timeline
-and 1.55x smaller raw, while the stored sample bytes are roughly the source
-played bytes instead of a 2.2-3.8x materialised timeline.
+| Track | Old 22.05k timeline | Silence-free slices | One phrase (wrong pan) | Chunks |
+| --- | ---: | ---: | ---: | ---: |
+| 02 Locked & Loaded | 91,052 | 41,221 | 64,028 | **66,768** |
+| 04 Contra Overdrive | 367,285 | 239,146 | 297,651 | **305,234** |
+| 20 Moonlit Army | 1,289,422 | 724,017 | 1,013,233 | **1,021,470** |
 
-Reference tracks (compressed `.fur`; sample bytes; slices; maps; notes):
+| Track | Chunk samples/notes | Sample maps | Pan chunks | Pan distribution (notes) |
+| --- | ---: | ---: | ---: | --- |
+| 02 | 75 | 1 | 24 | 57 both, 12 right, 6 left |
+| 04 | 219 | 2 | 3 | 196 both, 23 right |
+| 20 | 240 | 2 | 3 | 234 both, 6 right |
 
-| Track | Old z5 | New z5 | Old sample | New sample | Slices | Maps | Notes |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 01 Konami Music (DAC disabled) | 1,750 | 1,466 | n/a | 0 | 0 | 0 | 0 |
-| 03 Charshoe X | 360,004 | 245,986 | 938,389 | 326,053 | 4,017 | 34 | 4,636 |
-| 04 Contra Overdrive | 367,285 | 248,959 | 1,206,705 | 444,425 | 3,399 | 29 | 4,341 |
-| 07 Alien's Den | 712,283 | 342,737 | 1,775,209 | 689,831 | 7,193 | 60 | 7,551 |
-| 14 Guillotine | 431,294 | 234,910 | 1,199,495 | 507,539 | 3,248 | 28 | 3,260 |
-| 20 Moonlit Army | 1,289,422 | 753,355 | 4,110,624 | 1,501,683 | 13,044 | 109 | 15,251 |
+Track 02's first 12 right notes are the source's intro section: `0xB6=0x40`
+is written at sample 195 before the first audio word at 369. The old
+`fur-fixed` one-note timeline was `08 FF` (both) because its note started at
+sample 0, before that write; the chunked default follows the source. The rest
+of track 02 is 57 both and 6 left, so the track is no longer right-only.
 
-Full pack: 154,155 slices, 15.94 MB of stored sample bodies, 179,831 DAC
-notes, 240,278 source runs. The largest map count is 109 (track 20), which
-leaves room for the FM instruments under the 250-slot limit.
+The x4/02 module is 66,510 bytes, 75 samples, one map, 75 notes, same pan
+distribution. The 04 default/x4 is 219 samples/two maps; 20 is 240/two maps.
+The 02 chunk count fits one 120-slot map; that is a map-capacity fact, not a
+single note.
 
-## Accuracy evidence
+Full pack after the chunked change: 203 modules, 68,388,008 bytes. The 1x
+`condense.tsv` reports 50,692 keys (45,177 FM + the DAC chunk notes), 0
+missed, `psg_miss=0`, 13 field differences and up to 2,182 ms divergence from
+the newly audible PSG path. The old 45,500/0 figure was measured with PSG
+notes pointing at a DAC map, i.e. silent.
 
-The acceptance run is `scratchpad/full_audit.py` in the development session;
-the durable checks are the tests in `tests/test_vgm2151fur_ym2612.py` and
-`audit.compare_keyons`.
+## Pan and the right-channel report
 
-Full Contra pack (29 tracks, direct write, every module exported through
-Furnace):
+The previous one-phrase default put one note at the first audio phrase and
+therefore one `08` effect for the whole track. On 02 that was `08 0F` (right),
+matching a `0xB6=0x40` write at the phrase start and losing all later pan. The
+chunked default emits an effect on each chunk. The first 12 notes are still
+right because the source is right there; after the `0xC0` write at 151,224
+the notes are both, and after `0x80` they are left. If the source pan is not
+wanted, that is a source/authoring decision, not a converter stuck on right.
 
-- **45,500 / 45,500** source `0x28` key-ons matched; **0 missed**.
-- **0** effective FM operator-field mismatches.
-- **0** divergent pitch runs at 0.25 semitone / 60 ms on any track.
-- **179,831 / 179,831** DAC notes matched to an exported `0x95` start within
-  100 ms.
-- **0** missing sample bodies: every stored slice body appears in the export.
-- Sample-map selectors match every note; every block body is byte-identical
-  to its slice after the signed/unsigned boundary.
-- Exported `0x92` rates match the intended slice rate exactly or one hertz
-  low because of integer C-4 rounding; the rate check reports 0 bad rates on
-  every track.
-- Tracks 09, 10 and 13 have extra exported starts from the module's loop
-  replay. No source note is missed (`dac_missed = 0` on all 29 tracks).
-- The old timeline path is retained for comparison; the source bytes and the
-  source-versus-export audit are the authority, not the old module bodies.
+## Silence rule
 
-Strict end-of-track check: five notes (tracks 03, 06, 10, 13 and 22) are the
-last run of the track and fall outside a ±2-sample start check against the
-export's final length. They are inside the 100 ms audit window and their
-sample bodies are present; the module's last row is cut by the source's end,
-not by a collision. Keep this in mind if a future change needs frame-exact
-last-note starts.
+- A phrase whose signed bytes are all `0x00` (source `0x80`) gets no chunk.
+- A chunk starts on an audio word; leading silence is not stored.
+- One trailing zero frame sets the DAC hold to silence; the rest is free.
+- A short silence between audio hits inside a chunk is the source's PCM hold.
+  It is not a separate note.
+- The slice mode drops pure-silent rows and appends a zero tail to the
+  preceding sample.
 
-Audio on Contra track 04, using the project's `fur_soundcheck.py` with
-`vgm2wav-mute`:
+## Tests
 
-| | best shift | chroma median (fur) | chroma median (export) |
-| --- | ---: | ---: | ---: |
-| Timeline | 0 | 0.995 | 0.996 |
-| Slices | 0 | 0.996 | 0.996 |
+`tests/test_vgm2151fur_ym2612.py` (383 passed, 1 skipped):
 
-The full-mix 5-30 s comparison (same script, gain-normalised) is within
-0.008 envelope correlation and 0.05 log-spectral distance of the timeline:
-new fur 0.952 / 3.03 / RMS 0.709 vs old 0.960 / 3.14 / 0.714; new export
-0.957 / 0.333 / 0.397 vs old 0.962 / 0.281 / 0.400. The project's chroma
-check, which is the acceptance tool, is equal or slightly better.
-
-## Acceptance tests added
-
-`tests/test_vgm2151fur_ym2612.py::TestYm2612DacSlices`:
-
-- direct `0x2A` stream becomes one slice;
-- a 4,410-sample gap stores no frames;
-- 32 identical bytes collapse to one frame + the DAC hold;
-- two runs in one row merge without a note collision;
-- 130 distinct slices produce two sample maps and two instruments;
-- a pan change between rows reaches the note; a pan change inside a row
-  becomes a channel effect;
-- a modern `0x92`/`0x95` block play is a slice, and a repeated block is
-  deduplicated;
-- a disabled DAC leaves FM6 key-ons as FM notes;
-- a same-time multi-value burst keeps only the final value and warns;
-- a Furnace export round trip matches every start and body.
-
-The existing dense-path test now expects the source rate (11,025 Hz for a
-four-sample wait) instead of the old 22,050 Hz timeline, and a separate test
-keeps the explicit `timeline=True` fallback working for comparison.
-
-## Why the merge is necessary
-
-A tracker row has one FM6 note. The source's DAC bytes arrive every 3-5 VGM
-samples, so one note per source run is impossible. The old timeline avoided
-the problem by embedding the whole phrase in one sample, at the cost of
-materialising frames. The sliced path merges only runs that share a row,
-keeps the source bytes, and stores the inter-run gap as an explicit hold.
-The note is on the preceding tick and the sample starts with the held byte,
-so the merge does not move the audible content to the row boundary.
+- chunked: 20 s of PCM becomes >1 and <=240 chunks at the 0.25 s budget;
+  three source pans appear on chunk notes and module `08` effects; a short
+  300-byte stream stays one chunk; a long gap splits audio and drops the
+  silence phrase; a silence-only source has no notes; the smallest interval
+  sets the rate; a map's base is 0;
+- explicit slice: direct/block plays, long gaps, holds, same-row merge, maps,
+  pan, disabled DAC, export round trip, silence-row removal;
+- PSG binding to INS_STD after a DAC and pitch copy;
+- the full suite and Furnace round trips.
 
 ## Remaining limits
 
-- A group of distinct bytes at one VGM timestamp cannot be timed; only the
-  final value is kept and the dropped bytes are counted in the warning. The
-  Contra set has no such audible burst (its initialization bursts are silence
-  or happen while the DAC is disabled); Sonic Emerald Hill has one 1,612-byte
-  burst and reports it.
-- A source that disables the DAC mid-phrase stops new DAC slices, but there
-  is no explicit DAC note-off: the last sample can hold its final value until
-  the next FM6 key-on. The reference packs do not toggle mid-track; add a DAC
-  note-off at the 0x2B transition if a future source needs it.
-- Five Contra tracks (03, 06, 10, 13, 22) have their final DAC note just
-  outside a ±2-sample start check against the export's last sample. They are
-  inside the 100 ms audit and their bodies are present; the cut is the
-  source's end, not a collision.
-- Tracks 09, 10 and 13 have extra exported starts from the module's loop
-  replay; no source note is missed.
-- The old timeline is retained as `collect_dac(..., timeline=True)` for
-  comparison; it is not the default and should not gain features.
-- The pack remains larger than vgm2fur because every source byte and onset is
-  kept and same-row runs are context-merged. That is the deliberate
-  accuracy-over-size choice.
+- The 240-sample cap is the release wall. A track with very many pan changes
+  can trim chunks; `dac_release_trimmed` reports it.
+- The x4 FM condense still drops/merges FM rows by design.
+- The newly audible PSG exposes PSG pitch differences; the FM-only TFIV audit
+  remains clean. Split the audit before quoting an all-channel zero.
+- A chunk may contain short internal silence; it is PCM, not a rest note.
+- The 02 map count is one because 75 <= 120; do not read that as one note.
 
 ## Do not do this
 
-- Do not re-introduce a 22.05 kHz timeline as the default. It is a comparison
-  fallback only.
-- Do not lower the sample rate or use 4-bit samples to save space.
-- Do not transpose a sample-map selector; `60 + slot` is not a pitch.
-- Do not add a second sample-map or instrument-index allocator inside
-  `ym2612dac.py`; the writer's shared layout is the only source of truth.
-- Do not skip a run because its row already has a note. Merge it, or report
-  an overshoot; a silent drop is the old vgm2fur failure mode.
-- Do not ignore `0x2B`: a disabled DAC must not create phantom FM6 notes.
+- Do not collapse a track back to one sample/note; the pan and the sequence
+  both disappear.
+- Do not emit more than 240 samples for a dense release module.
+- Do not put a note or selector on a silence-only row/phrase.
+- Do not use a nonzero `first_sample`; 0.6.8.3 reads it as an embedded sample
+  count.
+- Do not point PSG/SCC/AY notes at a DAC map; count the DAC maps once.
+- Do not ignore `0x2B`.
 
 ## Related files
 
-- `../vgm2151fur/ym2612dac.py` — decoder, run collector and row grouper.
-- `../vgm2151fur/analyze.py` — DAC notes, instrument bases, disabled-DAC
-  handling and the report.
-- `../vgm2151fur/furwrite.py` — sample maps, sample-rate compensation and
-  FM6 encoding.
-- `../vgm2151fur/vgm.py` — DAC command/data-block parsing.
-- `../vgm2151fur/audit.py` — source/export key-on, DAC start and rate audit.
-- `../tests/test_vgm2151fur_ym2612.py` — synthetic slices and Furnace round
-  trips.
-- `ym2612.md` — register model, current audit numbers and known limits.
-- `implementation-notes.md` — evidence loop and anti-WET rules.
+- `../vgm2151fur/ym2612dac.py` — decoder, chunk builder, slice mode, silence.
+- `../vgm2151fur/analyze.py` — DAC/tone bases, PSG binding, report.
+- `../vgm2151fur/furwrite.py` — sample maps, base 0, pan effects.
+- `../vgm2151fur/audit.py` — source/export key-on, DAC start/rate audit.
+- `../tests/test_vgm2151fur_ym2612.py` — chunk/slice/silence/PSG tests.
+- `ym2612.md` — registers and verification.
+- `implementation-notes.md` — evidence loop.

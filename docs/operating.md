@@ -91,12 +91,16 @@ with or without the manifest - the manifest just lets you read it.
 
 Genesis PSG notes are converted automatically; `--melody-only` keeps the DAC
 (and other sample-chip) data out, while the FM/PSG side still converts. A
-dense YM2612 DAC stream now becomes deduplicated source slices: same-row runs
-are merged into one sample with explicit holds, and the note is placed on the
-preceding tick so the source bytes keep their exact time. This is independent
-of the row grid and is not counted as a condense loss. The old continuous
-22.05 kHz timeline is kept only for comparison (`collect_dac(...,
-timeline=True)`); the current size and audit numbers are in `dac-redesign.md`.
+dense YM2612 DAC stream becomes a release-capped sequence of rate-exact PCM
+chunks, one FM6 note each, split at every `0xB6` pan change and at most every
+0.25 s (240-sample cap), with every map at `first_sample=0`. A chunk starts on
+audio, so silence-only phrases and leading silence get no note; the rate is
+derived from the smallest source write interval. This is independent of the
+row grid and is not counted as a condense loss. The per-run slice
+representation remains available as `collect_dac(..., slices=True)` for
+editing but exceeds Furnace 0.6.8.3's sample-count limit on dense tracks; the
+old 22.05 kHz body is `timeline=True` for comparison only. The current size,
+pan counts and release numbers are in `dac-redesign.md`.
 
 Conversion renders each finished track once through the Furnace console and
 fits the module's master volume to a -2.5 dBFS peak (one render per track,

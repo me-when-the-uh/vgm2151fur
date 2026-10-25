@@ -2495,7 +2495,11 @@ def write_fur(
             first + slot
             for slot in range(min(120, len(dac_smps) - group * 120))
         ]
-        _write_ins_sample_map(b, f"DAC {group + 1}", first, maps)
+        # Release Furnace reads this u16 as an embedded sample count.  The
+        # old fur-fixed modules all use 0; the map entries carry the global
+        # sample indices.  A nonzero base (120, 240, ...) makes 0.6.8.3 say
+        # "invalid sample count!".
+        _write_ins_sample_map(b, f"DAC {group + 1}", 0, maps)
 
     for i, smp in enumerate(pcm_smps):
         ins_ptrs.append(len(b))

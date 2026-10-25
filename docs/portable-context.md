@@ -12,12 +12,12 @@ C:\Users\User\Desktop\Pets\ripper\tools\arcade-vgm-rip\
     vgm2151fur\               implementation
       vgm.py                  VGM parser and data blocks
       analyze.py              chip state machines -> Song / NoteEvent / samples
-      ym2612dac.py            YM2612 DAC collector (sliced; timeline fallback)
+      ym2612dac.py            YM2612 DAC collector (chunked default)
       furwrite.py             Furnace .fur writer
       furio.py                .fur reader / linter
       audit.py, diag.py       source-vs-export audits
     docs\                     chip notes and this handoff material
-    tests\                    pytest suite (375 passing, 1 skipped)
+    tests\                    pytest suite (383 passing, 1 skipped)
     tools\                    fur2vgm, fur2wav, vgmdiff, vgmchroma, soundcheck
   VGM_collection\             local reference packs
     YM2151\                   Quester, Block Hole, Willow, ...
@@ -54,23 +54,42 @@ files are zlib-wrapped at level 5; `write_fur` itself returns raw bytes unless
   and correct OPM operator order. Details are in `opm-notes.md`.
 - YM2612 FM + PSG is audited on Thunder Force IV; Contra Hard Corps is the DAC
   reference.
-- The YM2612 DAC default is **deduplicated source slices**. Runs are split by
-  time, not by pointer changes; runs that start in one tracker row merge into
-  one sample with explicit holds; the note is placed on the preceding tick and
-  the sample starts with the previously held byte. The old 22,050 Hz timeline
-  is `collect_dac(..., timeline=True)` for comparison only.
+- The YM2612 DAC default is a **release-capped sequence of rate-exact PCM
+  chunks**, one FM6 note each, split at every `0xB6` pan change and at most
+  every 0.25 s, capped at 240 samples. A chunk starts on audio; silence-only
+  phrases/leading silence get no note; a trailing `0x80` sets the hold to
+  silence. The rate is `round(44100 / smallest positive interval)`, so every
+  source byte has a distinct frame. Track 02 is 75 chunks/notes (one 120-slot
+  map; 57 both, 12 right, 6 left), 04 is 219 (two maps), 20 is 240 (two maps).
+  The per-run slice path is explicit (`slices=True`) and not release-safe at
+  dense sample counts; the old 22.05 kHz body is `timeline=True` for
+  comparison only. Do not go back to one sample/note per phrase: it loses the
+  source pan changes (the 02 one-phrase note was right-only).
 - A `0x2B` write without bit 7 means no DAC audio; its FM6 key-ons stay FM
   notes (Contra track 01). No `0x2B` write means the DAC is assumed enabled.
-- `tests/test_vgm2151fur_ym2612.py` covers the sliced DAC path (direct `0x2A`,
-  gaps, holds, same-row merges, >120 slices, multiple maps, pan changes,
-  disabled DAC, modern blocks), PCM round trips, pan, key-on masks, operator
-  order and full Furnace exports.
+- The slice mode drops pure-silence rows and extends the preceding sample
+  with a zero tail; a row must never get a note whose only content is
+  silence.
+- The tone-instrument base counts the DAC maps exactly once, including after
+  an FM pitch copy. PSG/SCC/AY notes bind to their own STD/SN/AY instrument,
+  never a DAC map.
+- `tests/test_vgm2151fur_ym2612.py` covers the chunked default (a 20 s stream
+  becomes >1 and <=240 chunks at the 0.25 s budget; three source pans appear
+  on notes and `08` effects; short streams stay one chunk; long gaps split
+  audio and drop silence; silence-only has no notes; natural rate; map base
+  0), the explicit slice mode, the silence-row rule, PSG binding, PCM round
+  trips, pan, key-on masks, operator order and Furnace exports. Full suite:
+  383 passed, 1 skipped.
 - Current Contra artifacts are under
   `VGM_collection\YM2612\Contra Hard Corps (Mega Drive, Genesis)\`:
-  `fur-fixed` (timeline reference), `fur-sliced` (current sliced set with its
-  `COMPARISON.txt` and `comparison.tsv`) and `fur-vgm2fur` (old vgm2fur
-  baseline). The older `wave-compare` tree is not present in this checkout;
-  the current audio check is `tools/fur_soundcheck.py`.
+  `fur-fixed` (old timeline reference), `fur-vgm2fur` (old baseline) and
+  `fur/` (the regenerated chunked default and 1x..4x variants with
+  `condense.tsv`; 203 modules, 68.4 MB). The rejected `fur-sliced` tree was
+  removed. The current audio check is `tools/fur_soundcheck.py`.
+- Release Furnace is part of the contract: check
+  `C:\Users\User\Music\furnace-0.6.8.3-win64\furnace.exe`, not only the
+  development build. The 75/219/240-sample chunk modules render there; the
+  slice modules exceed its sample count.
 
 ## Invariants
 
@@ -123,18 +142,20 @@ wrong but not which sample, event or instrument is wrong.
 
 ## Next task
 
-The slice-based DAC replacement is implemented and audited: the Contra pack
-keeps 45,500/45,500 key-ons with zero field/pitch differences, all 179,831
-DAC notes match, and the set is 7.30 MB compressed instead of 12.85 MB. Read
-`dac-redesign.md` for the design and measured cost. Remaining useful work:
+The chunked DAC is implemented and regenerated on the Contra pack: 75/219/240
+chunks on 02/04/20, split at pan changes, one sample per 0.25 s maximum,
+capped at 240, and all three render in Furnace 0.6.8.3 (including the
+240-sample track 20). The slice path remains explicit (`slices=True`) but
+exceeds the release sample limit on dense tracks. Read `dac-redesign.md` for
+the design and measured cost. Remaining useful work:
 
-- Regenerate `fur-sliced` and its comparison files after any converter change
-  (`scratchpad` scripts are not durable; use `convert` or a small direct
-  analyze/write loop).
-- Archive the track 04 `fur_soundcheck` WAVs and chroma output with the pack.
-- Decide whether the timeline fallback should be deleted now that the sliced
-  path passes; it is currently only `collect_dac(..., timeline=True)`.
-- Sonic Emerald Hill is audited: 1,319 DAC slices/notes, 0 pitch runs,
-  0 bad rates and one explicit same-time burst warning. The remaining Sonic
-  packs and a non-Contra DAC source are still worth the same check before
-  broadening the default.
+- Regenerate the Sonic packs with the PSG fix; the fresh Sonic 01 binds `SN`,
+  but the old `fur/` modules still point PSG at a DAC map.
+- Split the full audit into FM and PSG. The chunked 1x manifest reports 50,692
+  keys (45,177 FM + 5,515 DAC chunks), 0 missed, 13 field differences and up
+  to 2,182 ms divergence from the newly audible PSG; the old combined 45,500
+  was measured with silent PSG notes.
+- Archive the track 04 `fur_soundcheck` output with the pack.
+- Keep `fur-sliced` removed. Regenerate `fur/` after any converter change,
+  never patch only the reported track.
+- The old `timeline=True` body is a comparison/diagnostic, not a default.
