@@ -252,12 +252,3 @@ Play the `.fur` next to the WAV (Furnace 0.6+). The grid line in
 subdivision it chose. Drum-channel rows should show `EDxx` (frame-exact
 note starts), `E5xx` (initial KF fine tuning) and `02xx`/`01xx` ramps with
 an `xx = 0` stop at the end of each sweep.
-
-## Stabilising this path
-
-The OPM path is the reference for how to add a chip without accumulating
-special cases. The cross-cutting method, evidence hierarchy and anti-WET rules
-are in `implementation-notes.md`. The durable handoff context is
-`portable-context.md`. Use the `VGM_collection/YM2151/` packs (Quester, Block
-Hole, Willow, ...) for full-pipeline checks; do not rely on a synthetic OPM
-test as proof that a clock, KON-state or sweep change is safe.

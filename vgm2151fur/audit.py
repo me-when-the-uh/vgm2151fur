@@ -197,14 +197,11 @@ def compare_psg(src: VgmFile, exp: VgmFile) -> dict:
 
 def compare_dac(src: VgmFile, exp: VgmFile) -> dict:
     """Count source DAC notes matched to an exported DAC stream start."""
-    # The final DAC notes are the row-grouped ones; use the analyzer so this
-    # check sees the same onsets the module does.
     from vgm2151fur.analyze import analyze
 
     song = analyze(src)
     notes = [e.sample for e in song.events if e.dac and e.on]
-    # Furnace flushes the sample table at the end of an export; those plays
-    # are not note starts and must not count as extra DAC events.
+    # Ignore the exporter's end-of-file sample flush.
     limit = src.total_samples or (max(notes, default=0) + 1)
     starts = [t for t, _block, _rate in exp.dac_block_plays if t < limit]
     if not notes:
@@ -223,16 +220,13 @@ def compare_dac(src: VgmFile, exp: VgmFile) -> dict:
             missed += 1
         else:
             used.add(best[1])
-    # The exporter uploads one block per sample in module order, so a block's
-    # index selects the same DacSample.  Integer C-4 rounding is allowed 2 Hz.
+    # Blocks are exported in sample order; allow 2 Hz C-4 rounding.
     rate_bad = 0
     if len(exp.dac_blocks) == len(song.dac_samples):
         for _t, block, rate in exp.dac_block_plays:
             if block >= len(song.dac_samples):
                 continue
             want = song.dac_samples[block].c4_rate
-            # A run clamped to Furnace's 192 kHz ceiling exports below the
-            # clamp; the clamp warning already covers it.
             if want >= 192000:
                 continue
             if abs(rate - want) > 2:

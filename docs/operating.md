@@ -89,18 +89,7 @@ re-derived from the source on every run, so a reconversion
 (`tools/reconvert_all.py --optimize lossless [--verify]`) reaches the same set
 with or without the manifest - the manifest just lets you read it.
 
-Genesis PSG notes are converted automatically; `--melody-only` keeps the DAC
-(and other sample-chip) data out, while the FM/PSG side still converts. A
-dense YM2612 DAC stream becomes a release-capped sequence of rate-exact PCM
-chunks, one FM6 note each, split at every `0xB6` pan change and at most every
-0.25 s (240-sample cap), with every map at `first_sample=0`. A chunk starts on
-audio, so silence-only phrases and leading silence get no note; the rate is
-derived from the smallest source write interval. This is independent of the
-row grid and is not counted as a condense loss. The per-run slice
-representation remains available as `collect_dac(..., slices=True)` for
-editing but exceeds Furnace 0.6.8.3's sample-count limit on dense tracks; the
-old 22.05 kHz body is `timeline=True` for comparison only. The current size,
-pan counts and release numbers are in `dac-redesign.md`.
+Genesis PSG notes are converted automatically; `--melody-only` keeps the DAC (and other sample-chip) data out, while the FM/PSG side still converts. The YM2612 DAC default is release-capped PCM chunks: one FM6 note per chunk, split at every `0xB6` pan change and at most every 0.25 s, with a small sample budget so release Furnace loads the module. Silence-only chunks and leading silence get no note. `collect_dac(..., slices=True)` is the explicit per-run slice mode; `timeline=True` is the old comparison body. The SN76489 system volume defaults to 0.500; an absolute VGM extra-header volume entry overrides it.
 
 Conversion renders each finished track once through the Furnace console and
 fits the module's master volume to a -2.5 dBFS peak (one render per track,
@@ -174,11 +163,6 @@ difference.
 Volumes above 1.0 need the INF2 format, which only newer Furnace saves
 produce. On an old-style INFO file the tool caps at 1.0 and the listing shows
 the capped value.
-
-The converter writes the SN76489 system volume at **0.500** (32/64) by
-default, not the reference player's 1.0; an absolute VGM extra-header volume
-entry replaces it. `edit --chip SN76489 --value 0.5` can set it on a finished
-module.
 
 ## Verifying a track
 

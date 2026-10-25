@@ -105,24 +105,7 @@ the OPN sustain rate (0x70) and SSG-EG (0x90) instead of DT2. A per-note pitch
 macro (code 4) on an instrument copy reproduces later f-num writes; the note's
 E5 carries the key-on remainder.
 
-YM2612 instruments use the same type 1 and OPN operator layout. They also
-carry the channel's PMS/AMS in the FM feature, and the carrier TLs are stored
-relative to the loudest carrier while the note's volume column carries the
-absolute level (Furnace's `newVolumeScaling` makes that exact). The DAC default
-uses `DIV_INS_AMIGA` sample maps of 120 slots, each map with `first_sample=0`;
-pattern note `60 + slot` selects a release-capped rate-exact PCM chunk. The
-map entries are global sample indices; a nonzero `first_sample` makes release
-Furnace read an embedded sample count and reject the module. Each chunk note
-is placed on the preceding tick and the sample starts with the previously held
-byte, so the source content is not row-quantized. The `08 xy` pan effect on
-each chunk note comes from the source `0xB6` at that chunk start. The per-run
-slice representation is explicit (`slices=True`) and uses 120 slices per map;
-it is not the release default. The SN76489 uses a plain `DIV_INS_STD`
-instrument (pitch macro only), a 0-15 volume column, and effect `20xy` for
-noise mode. PSG notes must point at that STD instrument. The SN76489 system
-volume defaults to 0.500 (32/64), not the reference player's 1.0; an absolute
-extra-header volume entry replaces it. The FM feature's four operator columns
-of the Ext system share one timbre instrument.
+YM2612 instruments use the same type 1 and OPN operator layout. They also carry the channel's PMS/AMS in the FM feature, and the carrier TLs are stored relative to the loudest carrier while the note's volume column carries the absolute level (Furnace's `newVolumeScaling` makes that exact). The DAC uses `DIV_INS_AMIGA` sample maps of 120 slots with `first_sample=0`; pattern note `60+slot` selects a release-capped PCM chunk. `collect_dac(..., slices=True)` is the explicit per-run slice mode. The SN76489 uses a plain `DIV_INS_STD` instrument (pitch macro only), a 0-15 volume column, and effect `20xy` for noise mode; its system volume defaults to 0.500, and an absolute extra-header volume entry overrides it. The FM feature's four operator columns of the Ext system share one timbre instrument.
 
 PCM instruments bind one sample each: K007232 two channels, MSM6295 four
 voices per chip, MSM6258 one, SegaPCM sixteen, C140 twenty-four, C352

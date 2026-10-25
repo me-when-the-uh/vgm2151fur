@@ -435,11 +435,8 @@ class Song:
     psg_ids: list[int] = field(default_factory=list)
     psg_ins: list[ToneIns] = field(default_factory=list)
     psg_count: int = 0
-    # YM2612 DAC (Contra-style PCM stream): sample bodies on FM6.
     dac_samples: list[DacSample] = field(default_factory=list)
     dac_count: int = 0
-    # Runs/slices/bytes produced by the DAC collector and row grouper.  The
-    # report and the size table read it; empty when the source has no DAC.
     dac_stats: dict = field(default_factory=dict)
 
     @property
@@ -2745,10 +2742,7 @@ def analyze(
                 "but timer-generated key-ons are not synthesized"
             )
 
-    # YM2612 DAC.  Collect one canonical slice per source run here.  The
-    # same-row grouping needs the final row grid, so the FM6 notes are made
-    # after the grid is chosen, below.  Nothing between here and there may
-    # assume the DAC instrument count (it is added and rebased then).
+    # Collect DAC runs now; group them after the row grid is known.
     dac_samples: list[DacSample] = []
     dac_plays: list[DacPlay] = []
     dac_count = 0
@@ -2834,9 +2828,7 @@ def analyze(
     row_subdiv = 1
 
     rom, pcm_samples = build_pcm_bank(vgm)
-    # DAC instruments are grouped after the row grid is known; their maps are
-    # inserted ahead of the PCM/tone instruments and every non-FM instrument
-    # index is rebased at that point.
+    # DAC maps are inserted after the row grid; rebase non-FM instruments once.
     n_dac_ins = 0
     pcm_ins_base = len(patch_order) + n_dac_ins
     if pcm:
@@ -3212,9 +3204,7 @@ def analyze(
         fm_end + (2 if audible else 0) + 4 * len(oki_samples) + len(adpcm_samples)
         + (16 if spcm_audible else 0) + 24 * len(c140_audible) + 32 * len(c352_audible)
     )
-    # DAC maps are added once after the row grid is known (below).  Counting
-    # the collector's transient list here as well would shift every tone
-    # instrument by a second map.
+    # Count the final DAC maps once, below; the collector's list is transient.
     tone_ins_base = (
         len(patch_order)
         + (len(audible) if pcm else 0) + len(oki_samples)
@@ -3457,9 +3447,7 @@ def analyze(
         )
         grid_note = f"{grid_note}; condensed x{condense:g}" if grid_note else f"condensed x{condense:g}"
 
-    # YM2612 DAC grouping.  The row grid is final now, so runs that start in
-    # the same row can be merged instead of silently losing one.  The merged
-    # maps go before the PCM/tone instruments, so those indices move once.
+    # Group DAC runs after the row grid; insert their maps before tone instruments.
     dac_pan_events: list[tuple[int, int]] = []
     if dac_plays and dac_ch >= 0:
         dac_base = len(patch_order)
@@ -3516,9 +3504,7 @@ def analyze(
     )
     _rebase_non_fm_ins(events, fm_before_pitch, len(patch_order))
     if fm_pitch_copies:
-        # The DAC sample maps sit between the FM patches and the sample/tone
-        # instruments.  The recompute must keep them, or PSG/SCC notes point
-        # at a DAC map and the tone channels are silent.
+        # Keep the DAC maps when recomputing after pitch copies.
         tone_ins_base = (
             len(patch_order) + n_dac_ins
             + (len(audible) if pcm else 0) + len(oki_samples)

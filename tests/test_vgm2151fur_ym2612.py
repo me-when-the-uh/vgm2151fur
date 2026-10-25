@@ -295,8 +295,6 @@ class TestGenesisPsgDac(unittest.TestCase):
         self.assertFalse(warn)
         self.assertEqual(len(samples), 1)
         self.assertEqual(len(plays), 1)
-        # Four samples per byte is the source rate, not the old 22.05 kHz
-        # timeline rate: the slice stores one frame per source byte.
         self.assertEqual(samples[0].c4_rate, 11025)
         song = analyze(src)
         self.assertEqual(song.dac_count, 1)
@@ -316,9 +314,7 @@ class TestGenesisPsgDac(unittest.TestCase):
         )
 
     def test_psg_uses_the_sn_instrument_after_a_dac_and_pitch_copy(self):
-        # The DAC maps sit between FM patches and tone instruments.  A pitch
-        # copy makes analyze recompute that base; it must keep the DAC count
-        # or every PSG note points at a sample map and the channel is silent.
+        # The pitch-copy base recompute must keep the DAC maps.
         ws = _fm_note(4, 1204, off=60000)
         ws += [
             ChipWrite(30000, "ym2612", 0, 0xA4, (4 << 3) | ((1250 >> 8) & 7)),
@@ -443,9 +439,7 @@ class TestYm2612DacSlices(unittest.TestCase):
         self.assertEqual(held.data, b"\x00")
         self.assertEqual(stats["dac_collapsed_bytes"], 32)
         song = analyze(src, speed=6, dac_slices=True)
-        # The run of 0x80 is a rest, not a PCM note; the audio run still
-        # becomes a note.  The collector keeps the silent slice internally,
-        # but the row grouper never writes it to the pattern.
+        # A pure-silence run produces no note.
         self.assertEqual(song.dac_count, 1)
         self.assertEqual(len(song.dac_samples), 1)
         self.assertEqual(len(song.dac_samples[0].data), 4)
@@ -736,17 +730,14 @@ class TestYm2612DacSlices(unittest.TestCase):
         self.assertEqual(len(samples), 1)
         self.assertEqual(len(plays), 1)
         self.assertEqual(samples[0].c4_rate, 14700)
-        # 3, 4 and 5 sample waits at 14,700 Hz: frames 0, 1, 2 and 4.  Frame 3
-        # is the DAC holding 0x93 between the third and fourth byte.
+        # Waits 3, 4, 5 at 14,700 Hz: frames 0, 1, 2, 4; frame 3 holds 0x93.
         self.assertEqual(
             samples[0].data,
             self._signed(bytes([0x91, 0x92, 0x93, 0x93, 0x94])),
         )
 
     def test_long_pcm_is_a_release_capped_chunk_sequence_with_pan(self):
-        # 20 s of 4-wait PCM: 80 chunks at the 0.25 s budget, not one
-        # matryoshka sample.  The source pans left then right, so chunk notes
-        # must carry both pan values.
+        # 20 s at 4-wait: more than one chunk, with source pan changes.
         bank = bytes((0x80 + (i % 31) - 15) & 0xFF for i in range(220500))
         bank, events = self._runs([(0, bank, 4)])
         writes = self._marker() + [

@@ -119,11 +119,9 @@ PAT_TAIL_ROWS = 10
 # 8.8 fixed-point defaults with 0x100 = the YM2151's unity, per-chip core
 # patches, and the extra-header mix entries (bit 15 of a value means
 # "relative", otherwise it replaces the default).
-# SN76489 is the deliberate exception: the reference player's default is
-# 0x100, but the converter writes 0x80 (0.500) so the PSG sits under the FM
-# mix.  An absolute extra-header volume entry still replaces it.
+# SN76489 is mixed at 0.500 by default; absolute extra-header entries override.
 _DEV_DEFAULT_VOLUME = {
-    0x00: 0x80,  # SN76489, converter default 0.500
+    0x00: 0x80,
     0x03: 0x100, 0x04: 0x180, 0x12: 0x100, 0x18: 0x100, 0x19: 0xA0,
     0x1C: 0x100, 0x27: 0x40,
 }
@@ -2498,10 +2496,7 @@ def write_fur(
             first + slot
             for slot in range(min(120, len(dac_smps) - group * 120))
         ]
-        # Release Furnace reads this u16 as an embedded sample count.  The
-        # old fur-fixed modules all use 0; the map entries carry the global
-        # sample indices.  A nonzero base (120, 240, ...) makes 0.6.8.3 say
-        # "invalid sample count!".
+        # 0.6.8.3 reads a nonzero base as an embedded sample count.
         _write_ins_sample_map(b, f"DAC {group + 1}", 0, maps)
 
     for i, smp in enumerate(pcm_smps):

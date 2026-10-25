@@ -1,27 +1,7 @@
-"""YM2612 DAC PCM bank -> rate-exact PCM phrases (default) or slices.
+"""YM2612 DAC: rate-exact PCM chunks (default), editable slices, or the old timeline.
 
-VGM 1.50 encodes a DAC stream as a type-0 data block (unsigned 8-bit PCM)
-plus 0xE0 (set read pointer) and 0x80-0x8F (play one byte, then wait 0-15
-samples).  Direct 0x2A writes are the same audio without a bank address.
-Modern logs use 0x92 (rate) and 0x95 (one type-0 block).
-
-The default is a sequence of rate-exact PCM chunks, each played by one FM6
-note.  Chunks split at pan changes and at most every 0.25 s, capped at 240
-samples because Furnace 0.6.8.3 rejects dense sample-map sets with "invalid
-sample count!" (a 130-sample probe loads; 392 slices do not).  The sample
-rate is the source's smallest positive write interval in that chunk
-(`round(44100 / min_interval)`), so every source byte has a distinct frame.
-Phrases split only on pauses over 2,048 VGM samples.  A silence-only phrase
-and leading silence create no sample and no note; a chunk starts on audio and
-one trailing 0x80 frame sets the DAC's hold to silence.  The pan at each
-chunk comes from 0xB6, so the module follows the source's left/right changes
-instead of holding the first pan for the whole track.
-
-`collect_dac(..., slices=True)` is the explicit editing representation: source
-runs at their own rate, deduplicated, same-row merged, one sample map per 120
-slices.  A row that is pure silence gets no note; the preceding sample gets a
-zero tail.  `collect_dac(..., timeline=True)` is the old 22.05 kHz comparison
-body.  `group_dac_plays` places the chosen plays on the tick grid.
+The default emits one FM6 note per audio chunk. `slices=True` keeps the per-run
+slice representation; `timeline=True` is the old comparison body.
 """
 
 from __future__ import annotations
@@ -36,15 +16,12 @@ from vgm2151fur.vgm import VGM_RATE, VgmFile
 DAC_GAP = 512
 DAC_MIN_SAMPLES = 8
 DAC_MAP_CAPACITY = 120
-# The dense-timeline fallback is kept for comparison; the release-capped
-# chunked path is the default.  A gap larger than this starts another phrase.
+# A pause over this starts another phrase.
 DAC_RUN_GAP = 2048
 DAC_TIMELINE_RATE = 22050
-# Release Furnace rejects very large sample sets.  The 130-sample probe loads
-# in 0.6.8.3; a 392-sample slice track does not.  Stay well below the wall.
+# Keep the module below release Furnace's sample-count limit.
 DAC_RELEASE_SAMPLES = 240
-# A chunk is at most this long, so a dense track becomes a real sequence of
-# PCM chunks rather than one matryoshka sample.  Short sources stay one chunk.
+# Audio chunk length; short sources stay one chunk.
 DAC_CHUNK_SECONDS = 0.25
 # Furnace clamps a sample-playback rate to this value.
 DAC_RATE_MAX = 192000
@@ -62,12 +39,7 @@ class DacSample:
 
 @dataclass(frozen=True)
 class DacPlay:
-    """One source run played on FM6.
-
-    `span` is the source time from the first byte to the last, in VGM
-    samples.  A run whose bytes are all equal stores one byte and sets
-    `collapsed`; the hold is recreated from `span` when runs are merged.
-    """
+    """One source run played on FM6."""
 
     onset: int
     sample: int
@@ -81,12 +53,7 @@ def _signed_bank(raw: bytes) -> bytes:
 
 
 def _pan_byte(raw: int) -> int:
-    """Genesis channel-6 pan as Furnace's split 4-bit pan byte.
-
-    YM2612 0xB6 bits 7/6 are left/right enables; Furnace's 08 effect uses
-    one 4-bit nibble per side, so C0 (both) must become FF, not C0 (left
-    only), and 40 (right) must become 0F.
-    """
+    """Genesis 0xB6 pan bits to Furnace's split 4-bit pan byte."""
     left = bool(raw & 0x80)
     right = bool(raw & 0x40)
     if left and right:
@@ -117,13 +84,7 @@ def _pan_at(timeline: list[tuple[int, int]], t: int) -> int:
 
 
 def _dac_enable_timeline(vgm: VgmFile) -> list[tuple[int, bool]]:
-    """(sample, enabled) for the first YM2612's 0x2B writes.
-
-    A source with no 0x2B write is treated as enabled: some rips omit the
-    register even though their DAC stream is audible.  A log that writes 0x2B
-    but never sets bit 7 has no audible DAC at all (track 01 of the Contra
-    set is one); its FM6 key-ons are ordinary FM notes.
-    """
+    """(sample, enabled) for the first YM2612's 0x2B writes."""
     return [
         (w.sample, bool(w.val & 0x80))
         for w in vgm.writes
@@ -216,12 +177,7 @@ def _add_sample(
 def _collect_slices(
     vgm: VgmFile,
 ) -> tuple[list[DacSample], list[DacPlay], list[str], dict]:
-    """Slice representation: source runs, deduplicated and row-merged.
-
-    This is the explicit editing representation (`collect_dac(..., slices=True)`).
-    It is not the default because release Furnace has a hard sample-count
-    limit and a dense Contra track produces thousands of samples.
-    """
+    """Explicit per-run slice representation for editing."""
     if not vgm.dac_events and not vgm.dac_block_plays:
         return [], [], [], {}
 
@@ -257,8 +213,6 @@ def _collect_slices(
         elif span > 0:
             rate = _clamp_rate(VGM_RATE * (count - 1) / span, stats)
         else:
-            # Defensive only: the run loop splits same-timestamp groups before
-            # they reach here.
             data = data[-1:]
             rate = VGM_RATE
             collapsed = True
@@ -273,25 +227,15 @@ def _collect_slices(
         while j < len(words) and words[j][0] == t:
             j += 1
         if j - i > 1:
-            # One driver burst at a single VGM timestamp.  The reference
-            # player writes them all at one output sample, so only the final
-            # value sounds.  Keep that value as its own run; the row grouper
-            # then bridges the hold to the next byte.  Playing the
-            # intermediate values at 192 kHz would push every later byte in
-            # the row late and is not what a player emits.
+            # Same-time burst: only the final value sounds.
             if run:
                 flush()
             kept = words[j - 1]
             if len({w[1] for w in words[i:j]}) == 1:
-                # A repeated value is a hold, not a lost waveform.  Store it
-                # once; the row grouper recreates the hold from the times.
                 stats["dac_collapsed_bytes"] = (
                     stats.get("dac_collapsed_bytes", 0) + (j - i)
                 )
             else:
-                # Distinct values at one timestamp: the reference player
-                # writes them at one output sample, so only the final value
-                # sounds.  Count the bytes that cannot be timed.
                 stats["dac_same_time_runs"] = (
                     stats.get("dac_same_time_runs", 0) + 1
                 )
@@ -301,8 +245,6 @@ def _collect_slices(
                 stats["dac_same_time_dropped"] = (
                     stats.get("dac_same_time_dropped", 0) + (j - i - 1)
                 )
-            # `flush` counts the one stored byte; add the collapsed rest so
-            # the source-byte statistic still matches the log.
             stats["dac_source_bytes"] = (
                 stats.get("dac_source_bytes", 0) + (j - i - 1)
             )
@@ -316,8 +258,7 @@ def _collect_slices(
         i += 1
     flush()
 
-    # Modern 0x92/0x95 block plays.  Each 0x95 supplies one whole body at a
-    # known rate; that is already a slice.
+    # Modern block plays: each 0x95 supplies one slice.
     for t, block, rate in vgm.dac_block_plays:
         if not (0 <= block < len(vgm.dac_blocks)):
             continue
@@ -423,19 +364,7 @@ def _packed_words(
 def _collect_packed(
     vgm: VgmFile,
 ) -> tuple[list[DacSample], list[DacPlay], list[str], dict]:
-    """Release-capped PCM chunks, no silence notes, pan changes preserved.
-
-    A phrase is split only on a long pause, so a drum run and its short
-    inter-hit 0x80 rests stay one real PCM stream.  Leading silence, a
-    silence-only phrase, and the long tail after the last audio write become
-    no note at all.  Within a phrase the audio is split at every 0xB6 pan
-    change and into at most 0.25 s chunks; the total is capped at
-    DAC_RELEASE_SAMPLES (240) because release Furnace rejects very large
-    sample sets.  A chunk starts on an audio word, so no note is a rest; one
-    trailing zero frame sets the hold to silence.  The rate is the chunk's
-    smallest write interval, so every source byte has a distinct frame.  The
-    old 22.05 kHz timeline is not used.
-    """
+    """Build release-capped PCM chunks, split at pan changes and pauses."""
     if not vgm.dac_events and not vgm.dac_block_plays:
         return [], [], [], {}
     stats: dict = {}
@@ -648,12 +577,7 @@ def _group_rate(
     samples: list[DacSample], items: list[DacPlay],
     next_onset: dict[int, int],
 ) -> int:
-    """One playback rate for a merged row.
-
-    Natural rates are weighted by byte count.  The lower bound makes every
-    run's bytes fit before the next run starts, so the merged sample's holds
-    can land each source onset exactly.
-    """
+    """One playback rate for a merged row."""
     weighted = 0.0
     weight = 0
     for p in items:
@@ -697,13 +621,7 @@ def group_dac_plays(
     list[DacSample], list[tuple[int, int, int]], list[tuple[int, int]],
     list[str], dict,
 ]:
-    """Merge same-row runs and return (samples, notes, pan_events, warnings, stats).
-
-    A note is ``(placed_sample, sample_index, pan)``; the sample index selects
-    the slot inside its 120-entry map.  Runs in one row become one sample so
-    no source byte or onset is dropped.  `placed_sample` is on the tick grid,
-    and the sample starts with the previously held byte for the residual.
-    """
+    """Merge same-row plays and return grouped samples, notes, pans, warnings and stats."""
     if not plays:
         return samples, [], [], [], {}
     stats: dict = {}
@@ -741,11 +659,7 @@ def group_dac_plays(
     for row in sorted(groups):
         items = groups[row]
         if all(is_silent(p) for p in items):
-            # A row whose only DAC content is 0x80 is a rest, not a PCM
-            # event.  Do not write a note or a sample-map selector for it.
-            # Make the preceding audio sample end on a zero byte instead, so
-            # Furnace holds silence after it; the source's hold until this
-            # row is the preceding byte.
+            # Pure-silent row: tail the previous sample with 0x00, no note.
             stats["dac_silent_groups"] = stats.get("dac_silent_groups", 0) + 1
             stats["dac_silent_notes"] = stats.get("dac_silent_notes", 0) + 1
             stats["dac_silent_plays"] = (
@@ -820,9 +734,7 @@ def group_dac_plays(
             data.extend(payload)
             held = payload[-1]
             if i and p.pan != items[i - 1].pan:
-                # Pan is channel state, not a note: land it at the row start.
-                # An ED on this cell would delay the row's note as well, and
-                # the note's own onset is the more important timing.
+                # Pan is channel state; land it at the row start.
                 prow, _pdelay = place(p.onset)
                 pan_events.append((placed_time(prow, 0), p.pan))
 
@@ -849,11 +761,7 @@ def group_dac_plays(
 def _collect_timeline(
     vgm: VgmFile,
 ) -> tuple[list[DacSample], list[DacPlay], list[str], dict]:
-    """Compatibility fallback: one continuous 22.05 kHz sample per phrase.
-
-    Kept so the sliced path can be compared against the old representation.
-    It materialises held and silent frames and is not the default.
-    """
+    """Old 22.05 kHz comparison body."""
     warnings: list[str] = []
     bank = _signed_bank(bytes(vgm.dac_data))
     if not bank:
