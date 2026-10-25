@@ -90,11 +90,13 @@ re-derived from the source on every run, so a reconversion
 with or without the manifest - the manifest just lets you read it.
 
 Genesis PSG notes are converted automatically; `--melody-only` keeps the DAC
-(and other sample-chip) data out, while the FM/PSG side still converts. A dense
-YM2612 DAC stream is stored as a continuous 22.05 kHz timeline sample, so
-Contra-style modules are intentionally larger than FM-only ones; this is not
-counted as a condense loss because the DAC timeline is independent of the
-row grid.
+(and other sample-chip) data out, while the FM/PSG side still converts. A
+dense YM2612 DAC stream now becomes deduplicated source slices: same-row runs
+are merged into one sample with explicit holds, and the note is placed on the
+preceding tick so the source bytes keep their exact time. This is independent
+of the row grid and is not counted as a condense loss. The old continuous
+22.05 kHz timeline is kept only for comparison (`collect_dac(...,
+timeline=True)`); the current size and audit numbers are in `dac-redesign.md`.
 
 Conversion renders each finished track once through the Furnace console and
 fits the module's master volume to a -2.5 dBFS peak (one render per track,

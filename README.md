@@ -82,13 +82,19 @@ tests/          pytest suite
 docs/           operating guide, format notes, chip notes
 ```
 
+For a fresh session, start with `docs/portable-context.md`, then
+`docs/implementation-notes.md`. Chip facts are in `docs/opm-notes.md`,
+`docs/ym2203.md` and `docs/ym2612.md`; the DAC design, measured cost and
+acceptance record is `docs/dac-redesign.md`, and the follow-up handoff prompt
+is `docs/next-model-prompt.md`.
+
 ## Known limits
 
 - The YM2151, YM2203 and YM2612 models cover the OPM/OPN/OPN2 register sets the arcade and Genesis drivers use. Other chips (YM3812, YM2608, ...) are not supported.
 - YM2203 notes are labelled at the highest carrier's octave when a patch uses a power-of-two carrier MULT. A constant pitch macro on the instrument keeps the source f-num/block/audio unchanged, so the pattern note matches the audible carrier.
 - The YM2203's channel-3 3-slot chord is reduced to one operator, CSM timer key-ons are not synthesized, and LFO writes are skipped; the report throws a warning when it sees them. Very fast SSG ornaments shorter than a pattern row are simplified (`docs/ym2203.md`).
 - The Genesis SN76489 PSG is converted as four extra channels (three tone + noise). Extreme periods below the musical table range and two PSG notes on the same channel/row are approximated.
-- The YM2612 DAC is converted from the type-0 PCM bank. Sparse slices become per-hit samples, while dense old-style streams become a continuous 22.05 kHz timeline sample per phrase. This preserves Contra-style percussion but makes those modules larger (up to ~4 MB). Direct `0x2A`-only DAC streams and DAC data without a play stream still throws a warning. Channel-3 special and CSM per-operator frequencies are converted (the Ext system); CSM timer key-ons are not synthesized. LFO, PMS/AMS, pan and SSG-EG are converted (`docs/ym2612.md`).
+- The YM2612 DAC is converted from the type-0 PCM bank, direct `0x2A` writes and modern `0x92`/`0x95` blocks. Runs of source bytes are deduplicated by bytes and rate; runs that start in one tracker row are merged into one sample with explicit holds, so every source byte and the source rate survive without the old 22.05 kHz timeline. A sample map holds 120 slices; more than 250 instruments or 65,535 samples warns. A same-time multi-value burst is collapsed to its final value with a warning; a rate above 192 kHz is clamped with a warning. The old timeline remains available for comparison (`collect_dac(..., timeline=True)`), not as the default. A source that writes `0x2B` without setting bit 7 has no DAC audio, so its FM6 key-ons stay FM notes. Channel-3 special and CSM per-operator frequencies are converted (the Ext system); CSM timer key-ons are not synthesized. LFO, PMS/AMS, pan and SSG-EG are converted (`docs/ym2612.md`).
 - Furnace 0.6.8.3 has no C352 core; a build with the ported core can play those modules (`docs/c352.md`).
 - Chip volumes above unity only exist in INF2 files.
 - Patterns are 256 rows; the row grid is estimated per track and very fine pitch motion is approximated with per-row ramps (`docs/fur-writer.md`).

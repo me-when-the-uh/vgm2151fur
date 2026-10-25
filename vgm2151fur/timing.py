@@ -13,6 +13,7 @@ the caller falls back to the legacy 60 Hz heuristic.
 
 from __future__ import annotations
 
+import math
 from collections import Counter
 from dataclasses import dataclass
 
@@ -152,6 +153,41 @@ def hz_speed_for_row(row: float, tick_samples: float) -> tuple[float, int]:
     while speed > 1 and row / speed < 40.0:
         speed //= 2
     return VGM_RATE * speed / row, speed
+
+
+def place_tick(
+    sample: int,
+    t0: int,
+    row_samples: float,
+    speed: int,
+    tick_samples: float = TARGET_TICK_SAMPLES,
+    *,
+    floor: bool = False,
+    stats: dict | None = None,
+) -> tuple[int, int]:
+    """Map a source sample to (row, ED delay in ticks).
+
+    The one placement rule every chip path shares. ``floor=False`` rounds to
+    the nearest tick (the normal note/effect placement). ``floor=True`` picks
+    the preceding tick, which lets a caller prepend the held byte for the
+    residual and keep the audible content at its exact source time; the DAC
+    slice writer uses that.
+    """
+    if speed <= 1:
+        row = max(0, int(math.floor(
+            (sample - t0) / row_samples + (0.0 if floor else 0.5)
+        )))
+        return row, 0
+    row = max(0, int((sample - t0) // row_samples))
+    target = t0 + row * row_samples
+    offset = (sample - target) / tick_samples
+    d = int(math.floor(offset)) if floor else int(round(offset))
+    if d >= speed:
+        row += 1
+        d = 0
+        if stats is not None:
+            stats["ed_rolled"] = stats.get("ed_rolled", 0) + 1
+    return row, max(0, d)
 
 
 def condense_row(

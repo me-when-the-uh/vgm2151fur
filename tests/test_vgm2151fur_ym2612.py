@@ -35,10 +35,10 @@ HAVE_FURNACE = find_furnace() is not None
 CLOCK = 7670453
 
 
-def _vgm(writes, **kw):
+def _vgm(writes, *, total_samples=400000, **kw):
     return VgmFile(
         path=Path("synthetic.vgm"), buf=b"", version=0x161,
-        total_samples=400000, loop_samples=0, loop_file_pos=None,
+        total_samples=total_samples, loop_samples=0, loop_file_pos=None,
         loop_sample=None, ym2151_clock=0, k007232_clock=0, gd3={},
         roms=[], writes=sorted(writes, key=lambda w: w.sample),
         ym2612_clock=CLOCK, **kw,
@@ -217,12 +217,12 @@ class TestGenesisPsgDac(unittest.TestCase):
                 ChipWrite(0, "ym2612", 0, 0xB6, raw),
             ]
             src = _vgm(writes, dac_data=bytearray(bank), dac_events=events)
-            samples, notes, warn = collect_dac(src)
+            samples, plays, warn, _stats = collect_dac(src)
             self.assertFalse(warn)
             self.assertEqual(len(samples), 1)
             self.assertEqual(samples[0].data[0], 0x00)
             self.assertEqual(samples[0].data[1], 0x10)
-            self.assertEqual(notes[0][3], expected)
+            self.assertEqual(plays[0].pan, expected)
 
     def test_collect_psg_tone_noise_and_pitch(self):
         ws = [
@@ -289,11 +289,13 @@ class TestGenesisPsgDac(unittest.TestCase):
         src = _vgm(
             ws, dac_data=bytearray(bank), dac_events=events,
         )
-        samples, plays, warn = collect_dac(src)
+        samples, plays, warn, _stats = collect_dac(src)
         self.assertFalse(warn)
         self.assertEqual(len(samples), 1)
         self.assertEqual(len(plays), 1)
-        self.assertEqual(samples[0].c4_rate, 22050)
+        # Four samples per byte is the source rate, not the old 22.05 kHz
+        # timeline rate: the slice stores one frame per source byte.
+        self.assertEqual(samples[0].c4_rate, 11025)
         song = analyze(src)
         self.assertEqual(song.dac_count, 1)
         fur = TMP / "genesis_dac.fur"
@@ -305,11 +307,259 @@ class TestGenesisPsgDac(unittest.TestCase):
         exp = load_vgm(vgm)
         self.assertEqual(len(exp.dac_blocks), 1)
         self.assertTrue(exp.dac_block_plays)
-        self.assertEqual(exp.dac_block_plays[0][2], 22050)
+        self.assertEqual(exp.dac_block_plays[0][2], 11025)
         self.assertEqual(
             bytes((b - 0x80) & 0xFF for b in exp.dac_blocks[0]),
             samples[0].data,
         )
+
+
+class TestYm2612DacSlices(unittest.TestCase):
+    """The sliced FM6 DAC path: source bytes, holds, maps and timing."""
+
+    @staticmethod
+    def _runs(spec):
+        """Build (bank, dac_events) for [(onset, bytes, wait), ...]."""
+        bank = bytearray()
+        events: list[tuple[int, int, int]] = []
+        for t, data, wait in spec:
+            off = len(bank)
+            bank.extend(data)
+            events.append((t, 0, off))
+            for i in range(len(data)):
+                events.append((t + i * wait, 1, wait))
+        return bank, events
+
+    @staticmethod
+    def _signed(data: bytes) -> bytes:
+        return bytes((x - 0x80) & 0xFF for x in data)
+
+    @staticmethod
+    def _marker():
+        """One YM2612 write marks the chip present for `analyze`."""
+        return [ChipWrite(0, "ym2612", 0, 0x22, 0)]
+
+    def test_same_time_burst_keeps_the_final_value(self):
+        events = [(0, 2, 0x90), (0, 2, 0xA0), (0, 2, 0xB0), (100, 2, 0x80)]
+        src = _vgm(
+            self._marker(), dac_events=events, total_samples=1000,
+        )
+        samples, _plays, warn, stats = collect_dac(src)
+        self.assertEqual(stats["dac_same_time_bytes"], 3)
+        self.assertEqual(stats["dac_same_time_dropped"], 2)
+        self.assertTrue(any("share one VGM sample" in w for w in warn))
+        final = next(s for s in samples if s.data == b"\x30")
+        self.assertEqual(final.c4_rate, 44100)
+        song = analyze(src, speed=6)
+        self.assertEqual(song.dac_count, 1)
+        self.assertEqual(song.dac_samples[0].data[0], 0x30)
+        self.assertEqual(song.dac_samples[0].data[-1], 0x00)
+
+    def test_timeline_fallback_is_explicit(self):
+        bank = bytes((0x80 + (i % 31) - 15) & 0xFF for i in range(300))
+        events = [(0, 0, 0)]
+        events += [(i * 4, 1, 4) for i in range(300)]
+        src = _vgm(
+            self._marker(), dac_data=bytearray(bank), dac_events=events,
+            total_samples=400000,
+        )
+        samples, plays, _warn, stats = collect_dac(src, timeline=True)
+        self.assertEqual(stats.get("dac_timeline"), 1)
+        self.assertEqual(len(samples), 1)
+        self.assertEqual(samples[0].c4_rate, 22050)
+        self.assertEqual(len(plays), 1)
+
+    def test_direct_2a_stream_is_one_slice(self):
+        values = [0x80, 0x90, 0x70, 0x60]
+        events = [(i * 2, 2, v) for i, v in enumerate(values)]
+        src = _vgm(self._marker(), dac_events=events, total_samples=1000)
+        samples, plays, warn, _stats = collect_dac(src)
+        self.assertFalse(warn)
+        self.assertEqual(len(samples), 1)
+        self.assertEqual(samples[0].data, self._signed(bytes(values)))
+        self.assertEqual(plays[0].onset, 0)
+        song = analyze(src, speed=6)
+        self.assertEqual(song.dac_count, 1)
+        self.assertEqual(song.dac_samples[0].data, samples[0].data)
+
+    def test_long_gap_is_not_materialised(self):
+        bank, events = self._runs([
+            (0, bytes([0x81, 0x82, 0x83, 0x84]), 4),
+            (4410, bytes([0x85, 0x86, 0x87, 0x88]), 4),
+        ])
+        src = _vgm(
+            self._marker(), dac_data=bank, dac_events=events,
+            total_samples=9000,
+        )
+        song = analyze(src, speed=6)
+        self.assertEqual(song.dac_count, 2)
+        # Each row owns its own run; the 4,410-sample pause stores no frames.
+        self.assertEqual(sorted(len(s.data) for s in song.dac_samples), [4, 4])
+
+    def test_held_byte_is_one_frame_plus_the_dac_hold(self):
+        bank, events = self._runs([
+            (0, bytes([0x80] * 32), 4),
+            (4410, bytes([0x90, 0x91, 0x92, 0x93]), 4),
+        ])
+        src = _vgm(
+            self._marker(), dac_data=bank, dac_events=events,
+            total_samples=9000,
+        )
+        samples, _plays, _warn, stats = collect_dac(src)
+        self.assertEqual(len(samples), 2)
+        held = next(s for s in samples if len(s.data) == 1)
+        self.assertEqual(held.data, b"\x00")
+        self.assertEqual(stats["dac_collapsed_bytes"], 32)
+        song = analyze(src, speed=6)
+        self.assertEqual(song.dac_count, 2)
+        self.assertEqual(sorted(len(s.data) for s in song.dac_samples), [1, 4])
+
+    def test_same_row_runs_merge_without_a_drop(self):
+        a = bytes([0x01, 0x02, 0x03, 0x04])
+        b = bytes([0x05, 0x06, 0x07, 0x08])
+        bank, events = self._runs([(0, a, 4), (100, b, 4)])
+        src = _vgm(
+            self._marker(), dac_data=bank, dac_events=events,
+            total_samples=1000,
+        )
+        song = analyze(src, speed=6)
+        self.assertEqual(song.dac_count, 1)
+        self.assertEqual(len(song.dac_samples), 1)
+        data = song.dac_samples[0].data
+        ia = data.find(self._signed(a))
+        ib = data.find(self._signed(b), ia + len(a))
+        self.assertGreaterEqual(ia, 0)
+        self.assertGreater(ib, ia)
+        stats: dict = {}
+        write_fur(song, include_pcm=True, stats=stats)
+        self.assertEqual(stats.get("note_collision", 0), 0)
+
+    def test_more_than_120_slices_use_multiple_maps(self):
+        spec = []
+        for i in range(130):
+            data = bytes([0x80 + (i & 0x7F), 0x80 + (i >> 7)])
+            spec.append((i * 4410, data, 4))
+        bank, events = self._runs(spec)
+        src = _vgm(
+            self._marker(), dac_data=bank, dac_events=events,
+            total_samples=580000,
+        )
+        song = analyze(src, speed=6)
+        self.assertEqual(song.dac_count, 130)
+        self.assertEqual(len(song.dac_samples), 130)
+        self.assertEqual((len(song.dac_samples) + 119) // 120, 2)
+        self.assertEqual({e.ins for e in song.events if e.dac}, {0, 1})
+        # Sample 120 is the first of the second map: slot 0, instrument 1.
+        second = sorted(song.dac_samples, key=lambda s: s.onset)[120]
+        self.assertEqual(second.onset, 120 * 4410)
+        cell = next(e for e in song.events if e.dac and e.sample == 120 * 4410)
+        self.assertEqual((cell.note, cell.ins), (60, 1))
+        fur = TMP / "dac_maps.fur"
+        fur.write_bytes(write_fur(song, include_pcm=True))
+        m = parse_fur(fur.read_bytes())
+        self.assertEqual(len(m.samples), 130)
+        self.assertEqual(m.ins_sample[:2], [0, 120])
+
+    def test_pan_change_between_rows_reaches_the_note(self):
+        bank, events = self._runs([
+            (0, bytes([0x91, 0x92, 0x93, 0x94]), 4),
+            (4410, bytes([0x95, 0x96, 0x97, 0x98]), 4),
+        ])
+        writes = [ChipWrite(2000, "ym2612", 0, 0xB6, 0x40)]
+        src = _vgm(
+            writes, dac_data=bank, dac_events=events, total_samples=9000,
+        )
+        song = analyze(src, speed=6)
+        pans = [e.pan for e in song.events if e.dac]
+        self.assertEqual(pans, [0xFF, 0x0F])
+
+    def test_pan_change_inside_a_row_is_a_channel_effect(self):
+        bank, events = self._runs([
+            (0, bytes([0x91, 0x92, 0x93, 0x94]), 4),
+            (100, bytes([0x95, 0x96, 0x97, 0x98]), 4),
+        ])
+        writes = [ChipWrite(50, "ym2612", 0, 0xB6, 0x40)]
+        src = _vgm(
+            writes, dac_data=bank, dac_events=events, total_samples=1000,
+        )
+        song = analyze(src, speed=6)
+        notes = [e for e in song.events if e.dac]
+        self.assertEqual(len(notes), 1)
+        self.assertEqual(notes[0].pan, 0xFF)
+        pans = [fx for fx in song.channel_fx if fx[1] == 5 and fx[2] == 0x08]
+        self.assertTrue(pans)
+        self.assertEqual(pans[0][3], 0x0F)
+
+    def test_disabled_dac_leaves_fm6_alone(self):
+        # Track 01 writes 0x2B=0 and never enables the DAC.  Its 0x2A
+        # writes are inaudible and its FM6 key-on must stay an FM note.
+        ws = [
+            ChipWrite(0, "ym2612", 0, 0x2B, 0x00),
+            *_fm_note(4, 1204, t=100, off=0, ch=5),
+            ChipWrite(200, "ym2612", 0, 0x2A, 0x90),
+        ]
+        src = _vgm(ws, dac_events=[(200, 2, 0x90)], total_samples=1000)
+        song = analyze(src, speed=6)
+        self.assertEqual(song.dac_count, 0)
+        self.assertTrue(any("disabled" in w for w in song.warnings))
+        fm6 = [
+            e for e in song.events
+            if e.on and e.ch == 5 and not e.dac and not e.pcm
+        ]
+        self.assertTrue(fm6)
+        self.assertTrue(all(e.ins >= 0 for e in fm6))
+
+    def test_modern_block_play_is_a_slice(self):
+        body = bytes([0x80, 0x90, 0x70, 0x60, 0x50])
+        src = _vgm(
+            self._marker(), dac_blocks=[body],
+            dac_block_plays=[(0, 0, 11025), (4410, 0, 11025)],
+            total_samples=9000,
+        )
+        samples, plays, warn, _stats = collect_dac(src)
+        self.assertFalse(warn)
+        self.assertEqual(len(samples), 1)
+        self.assertEqual(samples[0].data, self._signed(body))
+        self.assertEqual(samples[0].c4_rate, 11025)
+        self.assertEqual(len(plays), 2)
+        song = analyze(src, speed=6)
+        self.assertEqual(song.dac_count, 2)
+
+    @unittest.skipUnless(HAVE_FURNACE, "furnace console build missing")
+    def test_export_starts_and_bodies_match_the_slices(self):
+        spec = [
+            (0, bytes([0x91, 0x92, 0x93, 0x94]), 4),
+            (4410, bytes([0x95, 0x96, 0x97, 0x98]), 4),
+            (8820, bytes([0x99, 0x9A, 0x9B, 0x9C]), 4),
+        ]
+        bank, events = self._runs(spec)
+        src = _vgm(
+            self._marker(), dac_data=bank, dac_events=events,
+            total_samples=14000,
+        )
+        song = analyze(src, speed=6)
+        fur = TMP / "dac_slices.fur"
+        fur.write_bytes(write_fur(song, include_pcm=True))
+        vgm = TMP / "dac_slices.vgm"
+        export_vgm(fur, vgm)
+        exp = load_vgm(vgm)
+        notes = sorted(e.sample for e in song.events if e.dac)
+        starts = sorted(
+            p[0] for p in exp.dac_block_plays
+            if p[0] < song.vgm.total_samples
+        )
+        self.assertEqual(len(notes), 3)
+        for note in notes:
+            self.assertTrue(
+                any(abs(start - note) <= 2 for start in starts),
+                (note, starts),
+            )
+        bodies = {bytes(b) for b in exp.dac_blocks}
+        ours = {
+            bytes((x + 0x80) & 0xFF for x in s.data)
+            for s in song.dac_samples
+        }
+        self.assertLessEqual(ours, bodies)
 
 
 class TestYm2612Pitch(unittest.TestCase):

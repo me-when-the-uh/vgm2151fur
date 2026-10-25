@@ -110,7 +110,11 @@ carry the channel's PMS/AMS in the FM feature, and the carrier TLs are stored
 relative to the loudest carrier while the note's volume column carries the
 absolute level (Furnace's `newVolumeScaling` makes that exact). DAC slices use
 one `DIV_INS_AMIGA` sample-map instrument per 120 samples, with pattern note
-60+slot selecting the slice; the sample's C-4 rate sets the DAC clock. The
+60+slot selecting the slice; the sample's C-4 rate sets the DAC clock. Runs
+that start in one tracker row are merged into one slice with explicit holds,
+and the note is placed on the preceding tick; the sample starts with the
+previously held byte, so the source content is not row-quantized. Pan changes
+inside a row are `08xy` channel effects at the row start. The
 SN76489 uses a plain `DIV_INS_STD` instrument (pitch macro only), a 0-15
 volume column, and effect `20xy` for noise mode. The FM feature's four
 operator columns of the Ext system share one timbre instrument.

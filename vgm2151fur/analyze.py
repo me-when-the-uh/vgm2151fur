@@ -65,6 +65,7 @@ from vgm2151fur.timing import (
     Grid,
     condense_row,
     estimate_grid,
+    place_tick,
     refine_pcm_grid,
 )
 from vgm2151fur.vgm import VGM_RATE, VgmFile
@@ -82,7 +83,12 @@ from vgm2151fur.ym2612 import (
     YM2612State,
     ym2612_note_for,
 )
-from vgm2151fur.ym2612dac import DacSample, collect_dac
+from vgm2151fur.ym2612dac import (
+    DacPlay,
+    DacSample,
+    collect_dac,
+    group_dac_plays,
+)
 
 
 # Official YM2151 KC note nibble → semitone from C of this octave.
@@ -432,6 +438,9 @@ class Song:
     # YM2612 DAC (Contra-style PCM stream): sample bodies on FM6.
     dac_samples: list[DacSample] = field(default_factory=list)
     dac_count: int = 0
+    # Runs/slices/bytes produced by the DAC collector and row grouper.  The
+    # report and the size table read it; empty when the source has no DAC.
+    dac_stats: dict = field(default_factory=dict)
 
     @property
     def samples_per_row(self) -> float:
@@ -454,18 +463,10 @@ class Song:
         under half a tick. `stats["ed_rolled"]` counts offsets too large for
         the row's tick count.
         """
-        if self.speed <= 1:
-            return self.row_of(sample), 0
-        row = max(0, int((sample - self.t0) // self.samples_per_row))
-        tick = VGM_RATE / self.hz
-        target = self.t0 + row * self.samples_per_row
-        d = int(round((sample - target) / tick))
-        if d >= self.speed:
-            row += 1
-            d = 0
-            if stats is not None:
-                stats["ed_rolled"] = stats.get("ed_rolled", 0) + 1
-        return row, max(0, d)
+        return place_tick(
+            sample, self.t0, self.samples_per_row, self.speed,
+            VGM_RATE / self.hz, stats=stats,
+        )
 
     def delay_ticks(self, sample: int, row: int) -> int:
         """Ticks after the row start; 0 if on-grid (compat wrapper)."""
@@ -2743,29 +2744,20 @@ def analyze(
                 "but timer-generated key-ons are not synthesized"
             )
 
-    # YM2612 DAC.  It shares FM6 with ordinary FM notes, switching the
-    # channel into sample mode through the instrument type.
+    # YM2612 DAC.  Collect one canonical slice per source run here.  The
+    # same-row grouping needs the final row grid, so the FM6 notes are made
+    # after the grid is chosen, below.  Nothing between here and there may
+    # assume the DAC instrument count (it is added and rebased then).
     dac_samples: list[DacSample] = []
+    dac_plays: list[DacPlay] = []
     dac_count = 0
+    dac_ch = -1
+    dac_stats: dict = {}
     if pcm and is_opn2:
-        dac_samples, dac_notes, dac_warn = collect_dac(vgm)
+        dac_samples, dac_plays, dac_warn, dac_stats = collect_dac(vgm)
         warnings.extend(dac_warn)
         dac_ch = ym_base.get(ym2612_ids[0], 0) + (8 if ym2612_ext else 5)
-        for onset, _sample_idx, note, pan in dac_notes:
-            group = _sample_idx // 120
-            events.append(NoteEvent(
-                sample=onset,
-                ch=dac_ch,
-                on=True,
-                note=note,
-                ins=len(patch_order) + group,
-                vol=127,
-                e5=0x80,
-                pan=pan,
-                dac=True,
-            ))
-        dac_count = len(dac_notes)
-        if dac_writes and not dac_count:
+        if dac_writes and not dac_plays and not dac_stats.get("dac_disabled_bytes"):
             warnings.append(
                 f"{dac_writes} YM2612 DAC writes but no playable DAC slice"
             )
@@ -2836,7 +2828,10 @@ def analyze(
     row_subdiv = 1
 
     rom, pcm_samples = build_pcm_bank(vgm)
-    n_dac_ins = ((len(dac_samples) + 119) // 120) if pcm else 0
+    # DAC instruments are grouped after the row grid is known; their maps are
+    # inserted ahead of the PCM/tone instruments and every non-FM instrument
+    # index is rebased at that point.
+    n_dac_ins = 0
     pcm_ins_base = len(patch_order) + n_dac_ins
     if pcm:
         clock = vgm.k007232_clock or 3579545
@@ -3453,6 +3448,42 @@ def analyze(
         )
         grid_note = f"{grid_note}; condensed x{condense:g}" if grid_note else f"condensed x{condense:g}"
 
+    # YM2612 DAC grouping.  The row grid is final now, so runs that start in
+    # the same row can be merged instead of silently losing one.  The merged
+    # maps go before the PCM/tone instruments, so those indices move once.
+    dac_pan_events: list[tuple[int, int]] = []
+    if dac_plays and dac_ch >= 0:
+        dac_base = len(patch_order)
+        (
+            dac_samples, dac_notes, dac_pan_events,
+            dac_group_warn, dac_group_stats,
+        ) = group_dac_plays(
+            dac_samples, dac_plays, hz=hz, speed=use_speed, t0=t0,
+            total_samples=vgm.total_samples or 0,
+        )
+        dac_stats.update(dac_group_stats)
+        warnings.extend(dac_group_warn)
+        n_dac_ins = (len(dac_samples) + 119) // 120
+        if n_dac_ins:
+            _rebase_non_fm_ins(events, dac_base, dac_base + n_dac_ins)
+            tone_ins_base += n_dac_ins
+        for placed, sample_idx, pan in dac_notes:
+            events.append(NoteEvent(
+                sample=placed,
+                ch=dac_ch,
+                on=True,
+                note=60 + sample_idx % 120,
+                ins=dac_base + sample_idx // 120,
+                vol=127,
+                e5=0x80,
+                pan=pan,
+                dac=True,
+            ))
+        for placed, pan in dac_pan_events:
+            channel_fx.append((placed, dac_ch, 0x08, pan))
+        events.sort(key=lambda e: (e.sample, e.ch, 0 if e.on else 1))
+        dac_count = len(dac_notes)
+
     hilight_a, hilight_b = 4, 16
     if tone_hilight and row_subdiv >= 1:
         hilight_a = min(255, max(1, int(round(4 * row_subdiv))))
@@ -3463,7 +3494,8 @@ def analyze(
     # instrument base moves down and must be recomputed before the tone
     # events are bound.
     foreign_ins = (
-        (len(audible) if pcm else 0) + len(oki_samples) + len(adpcm_samples)
+        n_dac_ins
+        + (len(audible) if pcm else 0) + len(oki_samples) + len(adpcm_samples)
         + len(spcm_audible) + len(c140_audible) + len(c352_audible)
     )
     fm_pitch_clock = ym2612_clock if is_opn2 else ym_clock
@@ -3547,6 +3579,27 @@ def analyze(
     )
     _rebase_non_fm_ins(events, fm_before_octave, len(fm_list))
 
+    n_total_ins = (
+        len(fm_list) + n_dac_ins
+        + (len(audible) if pcm else 0) + len(oki_samples) + len(adpcm_samples)
+        + len(spcm_audible) + len(c140_audible) + len(c352_audible)
+        + len(scc_ins) + len(ay_ins) + len(psg_ins)
+    )
+    if n_total_ins > 250:
+        warnings.append(
+            f"{n_total_ins} instruments exceed Furnace's 250-slot limit; "
+            "the extra instruments cannot be addressed"
+        )
+    n_total_smp = (
+        len(pcm_samples if pcm else []) + len(oki_samples) + len(adpcm_samples)
+        + len(spcm_audible) + len(c140_audible) + len(c352_audible)
+        + len(dac_samples)
+    )
+    if n_total_smp > 65535:
+        warnings.append(
+            f"{n_total_smp} samples exceed the 16-bit sample-map index range"
+        )
+
     if not is_opn and not is_opn2:
         transpose_opm_events(events, vgm.ym2151_clock)
 
@@ -3596,6 +3649,7 @@ def analyze(
         psg_count=psg_count,
         dac_samples=dac_samples,
         dac_count=dac_count,
+        dac_stats=dac_stats,
     )
 
 
@@ -3655,10 +3709,13 @@ def format_report(song: Song) -> str:
         fm_end = (9 if song.ym2612_ext else 6) * len(song.ym2612_ids)
         fm_ons = sum(
             1 for e in song.events
-            if e.on and not e.pcm and 0 <= e.ch < fm_end
+            if e.on and not e.pcm and not e.dac and 0 <= e.ch < fm_end
         )
     else:
-        fm_ons = sum(1 for e in song.events if e.on and not e.pcm and e.ch < 8)
+        fm_ons = sum(
+            1 for e in song.events
+            if e.on and not e.pcm and not e.dac and e.ch < 8
+        )
     pcm_ons = sum(1 for e in song.events if e.on and e.pcm)
     lines.append(f"FM notes    {fm_ons}")
     if song.psg_ids:
@@ -3668,9 +3725,12 @@ def format_report(song: Song) -> str:
         )
     if song.dac_count:
         data = sum(len(s.data) for s in song.dac_samples)
+        maps = (len(song.dac_samples) + 119) // 120
+        runs = song.dac_stats.get("dac_runs", 0)
+        source = song.dac_stats.get("dac_source_bytes", 0)
         lines.append(
-            f"DAC         {song.dac_count} phrases  {len(song.dac_samples)} samples  "
-            f"{data} bytes"
+            f"DAC         {song.dac_count} notes  {len(song.dac_samples)} slices  "
+            f"{maps} maps  {data} bytes  ({runs} source runs, {source} bytes)"
         )
     n_regions = (
         len(song.pcm_samples) + len(song.segapcm_samples) + len(song.c140_samples)
