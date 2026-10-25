@@ -450,7 +450,7 @@ def _add_convert_flags(parser: argparse.ArgumentParser, *, bare: bool) -> None:
     )
     parser.add_argument("--melody-only", action="store_true", help="skip sample chips")
     parser.add_argument("--pcm-only", action="store_true",
-                        help="skip the YM2151/YM2203")
+                        help="skip the YM2151/YM2203/YM2612")
     parser.add_argument(
         "--no-normalize",
         action="store_true",
@@ -475,9 +475,9 @@ def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
         prog="vgm2151fur",
         description=(
-            "Transcribe YM2151 (OPM) and YM2203 (OPN) + sample-chip (K007232, "
-            "MSM6295, MSM6258, SegaPCM, C140, C352) VGMs into Furnace .fur "
-            "files, and edit the result."
+            "Transcribe YM2151 (OPM), YM2203 (OPN) and YM2612 (OPN2) + "
+            "sample-chip (K007232, MSM6295, MSM6258, SegaPCM, C140, C352) "
+            "VGMs into Furnace .fur files, and edit the result."
         ),
         epilog=EPILOG,
         formatter_class=argparse.RawDescriptionHelpFormatter,

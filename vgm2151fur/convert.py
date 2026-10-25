@@ -10,7 +10,9 @@ from pathlib import Path
 from vgm2151fur import furio
 from vgm2151fur.analyze import analyze, format_report
 from vgm2151fur.furnace import FurnaceError, restore_console
-from vgm2151fur.furwrite import dev_max, loss_total, write_fur
+from vgm2151fur.furwrite import (
+    compress_fur, dev_max, keyon_loss, loss_total, write_fur,
+)
 from vgm2151fur.levels import normalize_module
 from vgm2151fur.loopfind import apply_loop
 from vgm2151fur.pcm import dump_pcm as dump_pcm_files
@@ -156,7 +158,7 @@ def furnace_bpm(song) -> float:
 def _verify_runs(
     src_vgm, fur_path: Path, channels: int = 8,
     threshold_st: float = 0.25, min_run_ms: float = 60.0,
-) -> float:
+) -> dict:
     """Milliseconds of divergent pitch between the source and the export.
 
     `--verify` renders each candidate and measures the divergences `compare`
@@ -168,17 +170,32 @@ def _verify_runs(
     `min_run_ms` has to stay under the candidate's own row length, or a note
     pushed one row late diverges for exactly one row and is never measured.
     """
+    from vgm2151fur.audit import compare_keyons
     from vgm2151fur.diag import export_fur, pitch_runs
 
     # A YM2203 module has six channels per chip (3 FM + 3 SSG): the FM
     # channels compare f-num/block and the SSG channels compare tone period.
+    # A YM2612 has six (or nine in the Ext layout) per chip.
     ym_ids = {
         w.chip_id for w in src_vgm.writes
         if w.chip in ("ym2203", "ym2203_ssg")
     }
+    ym2612_ids = {
+        w.chip_id for w in src_vgm.writes if w.chip == "ym2612"
+    }
     has_opm = any(w.chip == "ym2151" for w in src_vgm.writes)
-    if ym_ids and not has_opm:
-        channels = 6 * len(ym_ids)
+    if ym2612_ids and not has_opm:
+        ext = any(
+            w.chip == "ym2612" and (w.reg & 0xFF) == 0x27 and (w.val & 0xC0)
+            for w in src_vgm.writes
+        )
+        channels = (9 if ext else 6) * len(ym2612_ids)
+    elif ym_ids and not has_opm:
+        ext = any(
+            w.chip == "ym2203" and 0xA8 <= w.reg <= 0xAE
+            for w in src_vgm.writes
+        )
+        channels = (9 if ext else 6) * len(ym_ids)
     exp = fur_path.with_suffix(".verify.vgm")
     try:
         export_fur(fur_path, exp)
@@ -188,7 +205,9 @@ def _verify_runs(
             for run in pitch_runs(src_vgm, other, ch, threshold_st=threshold_st,
                                   min_run_ms=min_run_ms):
                 total += run.t1 - run.t0
-        return total / 44.1
+        verdict = compare_keyons(src_vgm, other)
+        verdict["div_ms"] = total / 44.1
+        return verdict
     finally:
         try:
             exp.unlink()
@@ -218,6 +237,7 @@ def _emit(
     out_path.write_bytes(data)
     if normalize and gain is not None:
         data = furio.set_master_volume(data, gain)
+        data = compress_fur(data)
         out_path.write_bytes(data)
         return data, None, gain
     peak = applied = None
@@ -237,7 +257,8 @@ def _emit(
             if result is not None:
                 data = result.data
                 peak, applied = result.peak, result.gain
-                out_path.write_bytes(data)
+    data = compress_fur(data)
+    out_path.write_bytes(data)
     return data, peak, applied
 
 
@@ -278,6 +299,8 @@ def convert_vgm(
         "condense": condense,
         "loss": dict(stats),
         "loss_total": loss_total(stats),
+        "keyons": stats.get("keyons", 0),
+        "missed": keyon_loss(stats),
         "dev_max": dev_max(stats),
         "fm_patches": len(song.fm_patches) if (include_fm and song.fm_patches) else 0,
         "pcm_samples": sum(1 for s in song.pcm_samples if s.length >= 8) if pcm else 0,
@@ -291,6 +314,9 @@ def convert_vgm(
         "ym2203_chips": len(song.ym2203_ids),
         "ym2203_ext": bool(getattr(song, "ym2203_ext", False)),
         "ym2203_ssg_notes": song.ym2203_ssg_count,
+        "psg_notes": song.psg_count,
+        "dac_notes": song.dac_count,
+        "dac_samples": len(song.dac_samples),
         "events": sum(1 for e in song.events if e.on),
         "warnings": warnings,
         "name": vgm.name,
@@ -343,14 +369,25 @@ def _place_dirs(results: list[dict], out_dir: Path, keep: set) -> None:
 
 
 _MANIFEST = "condense.tsv"
-_MANIFEST_HEADER = "track\tfactor\tfile\tbpm\tloss\tdev\tdiv\tlossless\tpick\tgrid\n"
+_MANIFEST_HEADER = (
+    "track\tfactor\tfile\tbpm\tloss\tdev\tdiv\tkeys\tmiss\t"
+    "audit_miss\tfields\ttl\tpsg_miss\tdac_miss\tlossless\tpick\tgrid\n"
+)
 
 
 def _manifest_line(src: Path, v: dict) -> str:
     div = "" if v.get("div_ms") is None else f"{v['div_ms']:.1f}"
+    audit = v.get("audit") or {}
+    fields = sum((audit.get("fields") or {}).values()) if audit else None
     return "\t".join((
         src.stem, f"{v['factor']:g}", Path(v["dst"]).name,
         f"{v['bpm']:.1f}", str(v["loss_total"]), str(v["dev_max"]), div,
+        str(v.get("keyons", "")), str(v.get("missed", "")),
+        str(audit.get("missed", "")) if audit else "",
+        str(fields) if fields is not None else "",
+        str(audit.get("tl", "")) if audit else "",
+        str(audit.get("psg_missed", "")) if audit else "",
+        str(audit.get("dac_missed", "")) if audit else "",
         "1" if v.get("lossless") else "0", "1" if v.get("pick") else "0",
         v.get("grid", ""),
     )) + "\n"
@@ -421,6 +458,11 @@ def convert_variants(
         if shared_gain is None and gain is not None:
             shared_gain = gain
         row_ms = song.samples_per_row / 44.1
+        verdict = (
+            _verify_runs(
+                vgm, out_path, min_run_ms=max(4.0, min(60.0, row_ms * 0.75)),
+            ) if verify else None
+        )
         results.append({
             "factor": factor,
             "dst": str(out_path),
@@ -432,16 +474,15 @@ def convert_variants(
             "grid": song.grid_note,
             "loss": dict(stats),
             "loss_total": loss_total(stats),
+            "keyons": stats.get("keyons", 0),
+            "missed": keyon_loss(stats),
             "dev_max": dev_max(stats),
             "warnings": warnings,
             "loop": loop_note,
             "peak": peak,
             "gain": gain,
-            "div_ms": (
-                _verify_runs(
-                    vgm, out_path, min_run_ms=max(4.0, min(60.0, row_ms * 0.75)),
-                ) if verify else None
-            ),
+            "div_ms": verdict.get("div_ms") if verdict else None,
+            "audit": verdict,
         })
     # The variants sharing a measurement all report the track's peak.
     measured = next((r["peak"] for r in results if r["peak"] is not None), None)
@@ -537,9 +578,30 @@ def format_variant_lines(variants: list[dict], dest: Path) -> list[str]:
         mark = "  <= pick" if v["pick"] else ""
         dropped = "" if v.get("lossless", True) else "  (dropped)"
         div = f"  div {v['div_ms']:>7.1f}ms" if v.get("div_ms") is not None else ""
+        keys = v.get("keyons")
+        miss = v.get("missed")
+        keep = (
+            f"  keys {keys:>4} miss {miss:>3}"
+            if keys is not None and miss is not None else ""
+        )
+        audit = v.get("audit") or {}
+        check = ""
+        if audit:
+            nfields = sum((audit.get("fields") or {}).values())
+            check = (
+                f"  aud {audit.get('matched', 0)}/"
+                f"{audit.get('matched', 0) + audit.get('missed', 0)}"
+                f" miss {audit.get('missed', 0)} fld {nfields}"
+            )
+            if audit.get("psg_missed"):
+                check += f" psgmiss {audit['psg_missed']}"
+            dac_total = audit.get("dac_matched", 0) + audit.get("dac_missed", 0)
+            if dac_total:
+                check += f" dac {audit.get('dac_matched', 0)}/{dac_total}"
         lines.append(
             f"{factor:<{factor_w}}  BPM {v['bpm']:7.0f}  {where:<{where_w}}  "
-            f"loss {v['loss_total']:>4}  dev {v['dev_max']:>4}{div}{mark}{dropped}"
+            f"loss {v['loss_total']:>4}{keep}{check}  dev {v['dev_max']:>4}"
+            f"{div}{mark}{dropped}"
         )
     return lines
 

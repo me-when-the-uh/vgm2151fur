@@ -12,9 +12,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-# Carrier sets in register order (op1..op4).  YM2151 and YM2203 use the same
-# eight algorithms: 0-3 are chains ending on op4, 4 splits into two pairs,
-# 5 and 6 add op1-fed carriers, 7 is additive.
+# YM2151 (OPM) carrier sets in its register order (0x40/0x48/0x50/0x58).
+# Algorithms 0-3 are chains ending on op4, 4 splits into two pairs, 5 and 6
+# add op1-fed carriers, 7 is additive.
 CARRIERS = {
     0: (3,),
     1: (3,),
@@ -25,6 +25,35 @@ CARRIERS = {
     6: (1, 2, 3),
     7: (0, 1, 2, 3),
 }
+
+# OPN (YM2203/YM2612) carrier sets in *register* order.  The OPN register
+# pages are S1, S3, S2, S4 (0x30/0x34/0x38/0x3C), while the datasheet's
+# algorithm diagrams use S1..S4.  Furnace's Genesis/OPN platform uses the
+# same register order (opOffs 0,4,8,12) and its isOutput table is:
+#   alg 4 -> S2, S4 = registers 0x38, 0x3C -> indices 2, 3
+# Using the OPM/datasheet-order pair (1,3) here normalizes S3 and S4 and
+# leaves the real carrier S2 at full level, which changes both gain and the
+# modulator/carrier balance of every algorithm-4 voice.
+OPN_CARRIERS = {
+    0: (3,),
+    1: (3,),
+    2: (3,),
+    3: (3,),
+    4: (2, 3),
+    5: (1, 2, 3),
+    6: (1, 2, 3),
+    7: (0, 1, 2, 3),
+}
+
+
+def carriers_for(alg: int, opn: bool) -> tuple[int, ...]:
+    return (OPN_CARRIERS if opn else CARRIERS).get(alg & 7, (3,))
+
+
+# The 0x28 KON mask bits follow the datasheet operator order S1,S2,S3,S4,
+# while DivInstrumentFM/OpRegs store the operators in register order
+# S1,S3,S2,S4.  Index by *register* operator: which mask bit enables it.
+OPN_OP_TO_MASK = (0, 2, 1, 3)
 
 
 @dataclass
@@ -79,10 +108,18 @@ class FMPatch:
 
         Furnace applies volume on a log curve, so a stripped TL cannot be
         reconstructed from pattern volume. Keep TL on the instrument.
+        OPN also keeps PMS/AMS: the platform writes 0xB4 from the instrument
+        at note-on only when the instrument changes, so two patches that
+        differ only in LFO sensitivity must not merge.
         """
         op_keys = tuple(self.ops[i].as_tuple(include_tl=True) for i in range(4))
+        if self.opn:
+            return (self.alg & 7, self.fb & 7, self.opn, self.ams, self.pms, op_keys)
         return (self.alg & 7, self.fb & 7, self.opn, op_keys)
 
+    def carriers(self) -> tuple[int, ...]:
+        return carriers_for(self.alg & 7, self.opn)
+
     def carrier_tl(self) -> int:
-        tls = [self.ops[i].tl & 0x7F for i in CARRIERS.get(self.alg & 7, (3,))]
+        tls = [self.ops[i].tl & 0x7F for i in self.carriers()]
         return min(tls) if tls else 0x7F

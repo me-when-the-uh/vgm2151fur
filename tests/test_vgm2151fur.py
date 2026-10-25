@@ -303,6 +303,17 @@ class TestMelodyOnlyModule(unittest.TestCase):
         self.assertEqual(mod.pcm_channels, [8, 9])
 
 
+class TestCompression(unittest.TestCase):
+    def test_compressed_module_round_trip(self):
+        song = analyze(note_song(), pcm=False)
+        raw = write_fur(song, include_pcm=False)
+        comp = write_fur(song, include_pcm=False, compress=True)
+        self.assertEqual(comp[:1], b"x")
+        self.assertLess(len(comp), len(raw))
+        self.assertEqual(fw.decompress_fur(comp), raw)
+        self.assertEqual(parse_fur(comp).n_ch, parse_fur(raw).n_ch)
+
+
 class TestPatternWindow(unittest.TestCase):
     """The pattern length follows the content, not the 256-row ceiling.
 

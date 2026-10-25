@@ -68,6 +68,17 @@ def _keyons_by_channel(vgm: VgmFile) -> dict[int, list[int]]:
             # Per-operator key masks; any 0->1 start is an onset. Keep chip
             # instances apart without colliding with the YM2151's 0-7.
             out.setdefault(1000 + w.chip_id * 3 + (w.val & 3), []).append(w.sample)
+        elif (
+            w.chip == "ym2612" and not (w.reg & 0x100)
+            and (w.reg & 0xFF) == 0x28 and (w.val & 0xF0)
+        ):
+            # Same rule for the YM2612's six channels.  Key-on encodes the
+            # second group as 4-6 after the reserved 3.
+            raw = w.val & 0x07
+            if raw in (3, 7):
+                continue
+            ch = raw if raw < 3 else raw - 1
+            out.setdefault(2000 + w.chip_id * 6 + ch, []).append(w.sample)
     for v in out.values():
         v.sort()
     return out

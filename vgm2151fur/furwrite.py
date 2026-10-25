@@ -1,20 +1,25 @@
 """Write a Furnace .fur (format 157): INFO + ADIR + INS2 + SMP2 + PATN.
 
 Format 157 is the first version with PATN, where note 0 = C-(-5) and
-108 = C-4 (no DefleMask leftover octave split). Uncompressed. Modern
-Furnace still loads this; version only controls which INFO fields are
-read, not which chips exist (YM2151 0x82, MSM6295 0xAA, MSM6258 0xAB,
-K007232 0xC6, SegaPCM 0x9B, C140 0xCE, C352 0xD0).
+108 = C-4 (no DefleMask leftover octave split). The writer returns the raw
+module by default; `compress_fur` and `write_fur(..., compress=True)` wrap it
+in the zlib container Furnace accepts. Modern Furnace loads both; version
+only controls which INFO fields are read, not which chips exist (YM2151
+0x82, MSM6295 0xAA, MSM6258 0xAB, K007232 0xC6, SegaPCM 0x9B, C140 0xCE,
+C352 0xD0).
 """
 
 from __future__ import annotations
 
+import math
 import struct
+import zlib
 from bisect import bisect_left, bisect_right
 from collections import Counter
 from dataclasses import dataclass, replace
 
-from vgm2151fur.analyze import CARRIERS, Song, ToneIns
+from vgm2151fur.analyze import Song, ToneIns
+from vgm2151fur.fm import CARRIERS, OPN_CARRIERS
 from vgm2151fur.c140 import c140_furnace_clock
 from vgm2151fur.c352 import C352_DEFAULT_CLOCK
 from vgm2151fur.oki import msm6258_flag_text, oki_flag_text, oki_needs_banked
@@ -25,15 +30,25 @@ from vgm2151fur.pitch import FURNACE_CLOCK_DEFAULT, module_clock
 # dtTable = (7, 6, 5, 0, 1, 2, 3, 4) so YM2151 register DT survives the
 # second mapping. Raw DT in the file is heard as the wrong detune.
 YM_DT_TO_FURNACE = (3, 4, 5, 6, 7, 2, 1, 0)
+# OPN DT1 has the same positive 0..3 / negative -1..-3 encoding, but 4 is
+# "negative zero" and must behave as 0.  Furnace's dt index 7 maps to raw 4,
+# which is positive one step, so use a separate table for OPN.
+OPN_DT_TO_FURNACE = (3, 4, 5, 6, 3, 2, 1, 0)
 
 
 def ym_dt_to_furnace(ym_dt: int) -> int:
     return YM_DT_TO_FURNACE[ym_dt & 7]
 
 
-def pack_dt_mul(dt_mul: int) -> int:
-    """YM2151 0x40 register → Furnace FM-feature DT/MULT byte."""
-    return (ym_dt_to_furnace((dt_mul >> 4) & 7) << 4) | (dt_mul & 0x0F)
+def opn_dt_to_furnace(ym_dt: int) -> int:
+    return OPN_DT_TO_FURNACE[ym_dt & 7]
+
+
+def pack_dt_mul(dt_mul: int, opn: bool = False) -> int:
+    """YM2151/YM2612 0x40 or 0x30 register → Furnace DT/MULT byte."""
+    dt = (dt_mul >> 4) & 7
+    index = opn_dt_to_furnace(dt) if opn else ym_dt_to_furnace(dt)
+    return (index << 4) | (dt_mul & 0x0F)
 
 
 FUR_MAGIC = b"-Furnace module-"
@@ -44,6 +59,15 @@ CHIP_YM2151 = 0x82
 CHIP_YM2203 = 0x8D
 # Extended channel 3: FM1, FM2, the four operators of FM3, then PSG1-3.
 CHIP_YM2203_EXT = 0xB6
+# Furnace's YM2612 (OPN2): six FM channels per instance; channel 6 can be a
+# sample player.  The Ext layout splits channel 3 into four operator columns
+# (9 channels).  The CSM layout adds a timer channel (10 channels).
+CHIP_YM2612 = 0x83
+CHIP_YM2612_EXT = 0xA0
+CHIP_YM2612_CSM = 0xC1
+# TI SN76489 (the SMS platform): three square voices then noise.  A Genesis
+# module carries it as a second system after the YM2612.
+CHIP_SMS = 0x03
 CHIP_MSM6295 = 0xAA
 CHIP_MSM6258 = 0xAB
 CHIP_K007232 = 0xC6
@@ -72,10 +96,15 @@ INS_C352 = 4
 # DIV_INS_AY (volume/noise/envelope macros) and DIV_INS_SCC (32-byte wavetable
 # through the wave synth).
 INS_AY = 6
+INS_STD = 0
 INS_SCC = 18
 SMP_DEPTH_8BIT = 8
 SMP_DEPTH_16BIT = 16
 SMP_DEPTH_VOX = 10
+# Furnace's DAC rate is calcFreq(C-4) * sampleRate / getCenterRate(); the
+# engine's C-4 reference is a hair sharp, so a 22050 Hz sample exports as
+# 22073.  Compensate at write time so the DAC clock matches the source.
+DAC_RATE_COMPENSATION = 22050.0 / 22073.0
 # Furnace system defaults used to decide when to send customClock.
 SEGAPCM_CLOCK_X = 4000000
 SEGAPCM_CLOCK_Y = 4026987
@@ -91,6 +120,7 @@ PAT_TAIL_ROWS = 10
 # patches, and the extra-header mix entries (bit 15 of a value means
 # "relative", otherwise it replaces the default).
 _DEV_DEFAULT_VOLUME = {
+    0x00: 0x100,  # SN76489
     0x03: 0x100, 0x04: 0x180, 0x12: 0x100, 0x18: 0x100, 0x19: 0xA0,
     0x1C: 0x100, 0x27: 0x40,
 }
@@ -102,13 +132,13 @@ _DEV_CORE_PATCH = {
 # (measured on two-chip modules: the player's overall-volume normalizer scales
 # a lone chip, and Furnace has no such step).
 _FURNACE_VOLUME_SCALE = {
-    0x03: 1.0, 0x04: 1.0, 0x12: 1.46, 0x18: 1.0, 0x1C: 0.7,
+    0x00: 1.0, 0x03: 1.0, 0x04: 1.0, 0x12: 1.46, 0x18: 1.0, 0x1C: 0.7,
     0x19: 1.04,
 }
 # MSM6258 (0x17, the player default is 0x11E) keeps unity; its Furnace core is
 # uncalibrated. The MSM6295 (0x18) is unity as measured.
 _CHIP_DEV = {CHIP_YM2151: 0x03, CHIP_SEGAPCM: 0x04, CHIP_MSM6295: 0x18,
-             CHIP_C140: 0x1C, CHIP_C352: 0x27,
+             CHIP_C140: 0x1C, CHIP_C352: 0x27, CHIP_SMS: 0x00,
              CHIP_K051649: 0x19, CHIP_K052539: 0x19, CHIP_AY8910: 0x12}
 
 
@@ -215,15 +245,17 @@ def _write_fm_feature(b: Buf, patch) -> None:
     b.u8(((patch.alg & 7) << 4) | (patch.fb & 7))
     b.u8(((patch.ams & 3) << 3) | (patch.pms & 7))
     b.u8(0x20)  # 4-op bit; version < 224 has no Block byte
-    carriers = set(CARRIERS.get(patch.alg & 7, (3,)))
     opn = bool(getattr(patch, "opn", False))
+    carriers = set((OPN_CARRIERS if opn else CARRIERS).get(patch.alg & 7, (3,)))
     for idx in range(4):
         op = patch.ops[idx]
         # Keep the logged TL. KVS=2 still lets the volume column attenuate
         # carriers, but at vol 127 (Furnace default) TL is used as written.
+        # OPN sets it on every operator like the reference converter: the
+        # platform's KVS test only applies it to real carriers.
         tl = op.tl & 0x7F
-        kvs = 2 if idx in carriers else 0
-        b.u8(pack_dt_mul(op.dt_mul))
+        kvs = 2 if (opn or idx in carriers) else 0
+        b.u8(pack_dt_mul(op.dt_mul, opn=opn))
         b.u8(tl)
         b.u8(op.ks_ar & 0xDF)
         b.u8(op.am_d1r)
@@ -322,6 +354,40 @@ def _write_ins_opm(b: Buf, name: str, patch) -> None:
     b.b[na_size:na_size + 2] = int(len(b.b) - na_start).to_bytes(2, "little")
     _write_fm_feature(b, patch)
     _write_ma(b, patch)
+    b.raw(b"EN")
+    b.end_block(size_off, start)
+
+
+def _write_ins_sample_map(
+    b: Buf, name: str, first_sample: int, maps: list[int],
+) -> None:
+    """DIV_INS_AMIGA with 120 note slots, one sample per slot.
+
+    Version 157 reads the map from note 60; each entry stores ``freq`` 48,
+    which the reader adds to 60, so the platform plays every slice at C-4 and
+    uses the sample's own C-4 rate.  ``map`` is the global sample index.
+    """
+    size_off, start = b.begin_block(b"INS2")
+    b.u16(FUR_VERSION)
+    b.u16(INS_C352)
+    b.raw(b"NA")
+    na_size = len(b.b)
+    b.u16(0)
+    na_start = len(b.b)
+    b.strz(name)
+    b.b[na_size:na_size + 2] = int(len(b.b) - na_start).to_bytes(2, "little")
+    b.raw(b"SM")
+    sm_size = len(b.b)
+    b.u16(0)
+    sm_start = len(b.b)
+    b.u16(first_sample)
+    b.u8(1)   # use the note map
+    b.u8(31)  # wave length field (unused for samples)
+    for slot in range(120):
+        b.u16(48)  # note 60 + 48 = C-4 in the pre-246 encoding
+        b.u16(maps[slot] if slot < len(maps) else -1)
+    b.b[sm_size:sm_size + 2] = int(len(b.b) - sm_start).to_bytes(2, "little")
+    _write_ma(b)
     b.raw(b"EN")
     b.end_block(size_off, start)
 
@@ -465,6 +531,26 @@ def _write_tone_macros(b: Buf, ins, *, wave: bool, reset: bool = False) -> None:
         _write_macro(b, 14, [1, 0], speed=1)
     b.u8(255)  # stop
     b.b[ma_size:ma_size + 2] = int(len(b.b) - ma_start).to_bytes(2, "little")
+
+
+def _write_ins_psg(b: Buf, name: str, ins=None) -> None:
+    """DIV_INS_STD for the SMS/SN76489: only the pitch macro is needed.
+
+    The 4-bit volume is the pattern column, and noise mode rides on the 20xy
+    effect, so a no-motion note gets a plain instrument.
+    """
+    size_off, start = b.begin_block(b"INS2")
+    b.u16(FUR_VERSION)
+    b.u16(INS_STD)
+    b.raw(b"NA")
+    na_size = len(b.b)
+    b.u16(0)
+    na_start = len(b.b)
+    b.strz(name)
+    b.b[na_size:na_size + 2] = int(len(b.b) - na_start).to_bytes(2, "little")
+    _write_tone_macros(b, ins or ToneIns(), wave=False)
+    b.raw(b"EN")
+    b.end_block(size_off, start)
 
 
 def _write_ins_ay(b: Buf, name: str, ins=None) -> None:
@@ -742,6 +828,18 @@ def loss_total(stats: dict) -> int:
     return sum(stats.get(k, 0) for k in LOSS_KEYS)
 
 
+def keyon_loss(stats: dict | None) -> int:
+    """Source key-ons the writer could not place on a pattern cell."""
+    if not stats:
+        return 0
+    return (
+        stats.get("note_collision", 0)
+        + stats.get("pcm_unplaced", 0)
+        + stats.get("pcm_evicted", 0)
+        + stats.get("orders_truncated", 0)
+    )
+
+
 def dev_max(stats: dict) -> int:
     """Worst per-row pitch deviation from the driver's steps, in 1/64 st.
 
@@ -941,6 +1039,139 @@ def _traj_at(pts: list[tuple[int, int]], t: int) -> int:
     return v
 
 
+def _emit_steps(
+    grid: list[dict[int, Row]],
+    song: Song,
+    ev,
+    fx_cols: int,
+    total_rows: int,
+    e5_writes: dict[tuple[int, int], int],
+    chan: int | None = None,
+    stats: dict | None = None,
+) -> None:
+    """Encode a short held-step pitch trajectory as row effects.
+
+    A driver that writes one new f-num and holds it (an octave switch, a
+    percussion bend) needs no instrument macro: E8xx/E9xx carry the whole
+    semitones and E5xx the remainder.  The step lands on the row containing
+    its write, so the only error is the row quantization itself.
+    """
+    if chan is not None and chan != ev.ch:
+        ev = replace(ev, ch=chan)
+    ch = ev.ch
+    if ch >= len(grid):
+        return
+    div = 2.0 if (ev.pcm or ev.sweep_div >= 2.0) else 1.0
+    note_row = song.place(ev.sample, stats)[0]
+    # One row can carry one transpose and one fine-tune step.  If the driver
+    # wrote several f-nums inside one row, the last one is the row's pitch;
+    # the intermediate values are shorter than a row and cannot be heard.
+    by_row: dict[int, int] = {}
+    for t, delta in ev.pitch_steps:
+        row = song.place(t, stats)[0]
+        if row <= note_row:
+            row = note_row + 1
+        if 0 <= row < total_rows:
+            by_row[row] = delta
+    e5w = ev.e5
+    xpose = 0
+
+    def free_row(r: int) -> int | None:
+        while r < total_rows:
+            cell = grid[ch].get(r)
+            if cell is None or not (0 <= cell.note < 180):
+                return r
+            r += 1
+        return None
+
+    def cell_at(r: int) -> Row:
+        cell = grid[ch].get(r)
+        if cell is None:
+            cell = _blank_row()
+            grid[ch][r] = cell
+        return cell
+
+    targets = sorted(by_row)
+    e8_rows: set[int] = set()
+    # A pitch step must not spill past its own note: the rows after the
+    # note-off belong to the next note on the channel, which resets its pitch
+    # from its own key-on.  This matters for a large octave jump whose E8xx
+    # chunks need more rows than the note has left.
+    limit_row = total_rows
+    if ev.end:
+        limit_row = min(
+            total_rows, max(note_row + 1, song.place(ev.end, stats)[0] + 1),
+        )
+    for idx, row in enumerate(targets):
+        if row >= limit_row:
+            break
+        delta = by_row[row]
+        next_row = targets[idx + 1] if idx + 1 < len(targets) else total_rows
+        next_row = min(next_row, limit_row)
+        cell = grid[ch].get(row)
+        if cell is not None and 0 <= cell.note < 180:
+            # A later note owns this row and carries its own pitch.
+            continue
+        # E8xx/E9xx only reach +-15 semitones.  A larger jump (an octave
+        # switch on a bass line can be 19+) is split over consecutive rows.
+        # Never borrow a row that a later step owns: its own effect must land
+        # there, and overwriting the slot would break the cumulative chain.
+        cur_row = row
+        while cur_row < next_row:
+            need = delta - (xpose + (e5w - ev.e5) / div)
+            if abs(need) <= 1024:
+                break
+            y = 15 if need > 0 else -15
+            _add_fx(cell_at(cur_row), 0xE8 if y > 0 else 0xE9, 15, fx_cols, stats)
+            e8_rows.add(cur_row)
+            xpose += 64 * y
+            nxt = free_row(cur_row + 1)
+            if nxt is None or nxt >= next_row:
+                cur_row = next_row
+                break
+            cur_row = nxt
+        if cur_row >= next_row:
+            # No room before the next step; that step's target will carry the
+            # remainder using its own row.
+            continue
+        need = delta - (xpose + (e5w - ev.e5) / div)
+        if abs(need) < 1e-6:
+            continue
+        # Keep E5 inside its own range instead of pinning it to a rail: the
+        # semitone transpose that brings the residual back into +-1 semitone
+        # is written as E8xx/E9xx.  A slow glide then moves every row instead
+        # of jumping half a semitone at a time once E5 saturates.
+        desired = delta - xpose
+        hi_units = (ev.e5_hi - ev.e5) / div
+        lo_units = (ev.e5_lo - ev.e5) / div
+        if desired > hi_units:
+            semis = int(math.ceil((desired - hi_units) / 64.0))
+        elif desired < lo_units:
+            semis = int(math.floor((desired - lo_units) / 64.0))
+        else:
+            semis = 0
+        if semis:
+            if cur_row in e8_rows:
+                # This row already carries a chunk; a second E8 would
+                # replace it.  Carry the rest to the next free row.
+                nxt = free_row(cur_row + 1)
+                if nxt is None or nxt >= next_row:
+                    continue
+                cur_row = nxt
+            y = max(-15, min(15, semis))
+            _add_fx(cell_at(cur_row), 0xE8 if y > 0 else 0xE9, abs(y), fx_cols, stats)
+            e8_rows.add(cur_row)
+            xpose += 64 * y
+        desired = delta - xpose
+        new_e5 = max(
+            ev.e5_lo,
+            min(ev.e5_hi, int(round(ev.e5 + desired * div))),
+        )
+        if new_e5 != e5w:
+            e5_writes[(ch, cur_row)] = new_e5
+            e5w = new_e5
+
+
 def _emit_sweep(
     grid: list[dict[int, Row]],
     song: Song,
@@ -1009,12 +1240,16 @@ def _emit_sweep(
             crossed = True
             _bump(stats, "sweep_clipped")
 
+    # E5 and 01xx/02xx both move the platform's pitch value, whose unit is
+    # 1/128 semitone in linear mode.  The sweep trajectory is in 1/64
+    # semitones, so OPN and PCM events (sweep_div 2) need two engine units
+    # per trajectory unit; OPM keeps its historical one-unit mapping.
+    div = 2.0 if (ev.pcm or ev.sweep_div >= 2.0) else 1.0
+
     def e5_byte(offset: float) -> int:
-        # E5xx is the note's fine tune: 1/64 st per step on FM, half that on
-        # PCM (E5 0x40 sits -0.5 st below 0x80), so offsets scale by two
-        # there. Values above 0xBF saturate.
-        scale = 2.0 if ev.pcm else 1.0
-        return max(0x40, min(0xBF, int(round(ev.e5 + offset * scale))))
+        # E5xx is the note's fine tune; fine-tune bytes and slide units
+        # advance the same pitch value.
+        return max(ev.e5_lo, min(ev.e5_hi, int(round(ev.e5 + offset * div))))
 
     e5w = ev.e5
     slide = 0.0  # ramp accumulation in trajectory units
@@ -1043,7 +1278,7 @@ def _emit_sweep(
             # that lands just after the row start should still be snapped onto
             # this row, not smeared by the row's ramp.
             want = float(_traj_at(pts, int(rs + tick)))
-        cur = (e5w - ev.e5) / (2.0 if ev.pcm else 1.0) + slide + xpose
+        cur = (e5w - ev.e5) / div + slide + xpose
         cell_k = grid[ev.ch].get(row0 + k)
         if abs(want - cur) >= 6:
             if cell_k is None or not (0 <= cell_k.note < 180):
@@ -1051,7 +1286,7 @@ def _emit_sweep(
                 # note's row the note's own E5 has to win (it sets the attack).
                 e5w = e5_byte(want - slide - xpose)
                 e5_writes[(ev.ch, row0 + k)] = e5w
-                cur = (e5w - ev.e5) / (2.0 if ev.pcm else 1.0) + slide + xpose
+                cur = (e5w - ev.e5) / div + slide + xpose
             else:
                 _bump(stats, "e5_skipped")
         # The physical rate runs the whole row even when the trajectory ends
@@ -1076,7 +1311,7 @@ def _emit_sweep(
             # written parameter is doubled and the ideal rate capped at 127.5
             # units/tick (the engine's 255 maximum), so ``slide`` accrues the
             # movement the engine actually makes.
-            limit = 127.5 if ev.pcm else 255.0
+            limit = 255.0 / div
             # A move the slide cannot deliver inside this row lands instantly
             # as a quick-legato transpose (E8xx/E9xx, persistent until the
             # next key-on); the slide covers the sub-semitone remainder.
@@ -1113,7 +1348,7 @@ def _emit_sweep(
                 else:
                     _bump(stats, "legato_skipped")
             rate = max(-limit, min(limit, (want_end - cur) / span))
-        param = int(round(rate * 2)) if ev.pcm else int(round(rate))
+        param = int(round(rate * div))
         param = max(-255, min(255, param))
         if param != last_rate or param != 0:
             # A slide only runs on rows that carry the effect, so write the
@@ -1138,7 +1373,7 @@ def _emit_sweep(
         # rounded and clamped parameter - not the ideal rate. A glide that
         # wants 2.66 units/tick is written 01 03, and the ~13% error
         # compounds over long climbs.
-        engine_rate = (param / 2.0) if ev.pcm else float(param)
+        engine_rate = param / div
         # Fidelity: a row is a straight line, so sample the model against the
         # driver's own steps inside it. Counted in 1/64 semitones; 6 units
         # (0.1 st) is the rough inaudibility floor.
@@ -1286,6 +1521,14 @@ def _build_patterns(song: Song, n_ch: int, pat_len_max: int, fx_cols: int,
     effects (LFO moves, an MSM6258 divider) land in the one short order.
     """
     last_sample = song.events[-1].sample if song.events else 0
+    # A final note with no key-off (a sustained pad or drone) holds to the
+    # end of the log.  The pattern otherwise stops at the key-on and the
+    # export loops while the source is still sounding.
+    if any(
+        ev.on and not ev.pcm and not ev.dac and not ev.tone_chip and not ev.end
+        for ev in song.events
+    ):
+        last_sample = max(last_sample, song.vgm.total_samples)
     # a fade or chip write can run past the last note; the module has to carry
     # it or a voice keyed at zero (a fade-in) never gets its volume
     for ev in song.events:
@@ -1388,6 +1631,8 @@ def _build_patterns(song: Song, n_ch: int, pat_len_max: int, fx_cols: int,
             continue
         if content_cut is not None and ev.sample >= content_cut:
             continue
+        if ev.on:
+            _bump(stats, "keyons")
         if ev.on and ev.pcm:
             assigned = pcm_pos.get(id(ev))
             if assigned is None:
@@ -1484,6 +1729,24 @@ def _build_patterns(song: Song, n_ch: int, pat_len_max: int, fx_cols: int,
         for ch in range(n_ch)
     }
     sweep_e5: dict[tuple[int, int], int] = {}
+    if song.events:
+        for ev in song.events:
+            if (
+                ev.on
+                and ev.pitch_steps
+                and 0 <= ev.ch + ch_offset < n_ch
+                and (content_cut is None or ev.sample < content_cut)
+            ):
+                if ch_offset:
+                    _emit_steps(
+                        grid, song, ev, fx_cols, total_rows, sweep_e5,
+                        chan=ev.ch + ch_offset, stats=stats,
+                    )
+                else:
+                    _emit_steps(
+                        grid, song, ev, fx_cols, total_rows, sweep_e5,
+                        stats=stats,
+                    )
     if song.events:
         for ev in song.events:
             if (
@@ -1724,17 +1987,42 @@ def _grouped(samples):
     return ids, groups
 
 
+def compress_fur(data: bytes, level: int = 5) -> bytes:
+    """Wrap a raw .fur in the zlib container Furnace's loader expects."""
+    return zlib.compress(data, level)
+
+
+def decompress_fur(data: bytes) -> bytes:
+    """Undo `compress_fur`, or return an already-raw module unchanged."""
+    if data[:1] != b"x":
+        return data
+    try:
+        return zlib.decompress(data)
+    except zlib.error:
+        return data
+
+
 def write_fur(
     song: Song, *, include_pcm: bool = True, include_fm: bool = True,
-    stats: dict | None = None,
+    stats: dict | None = None, compress: bool = False,
 ) -> bytes:
     gd3 = song.vgm.gd3
-    ym_chip = getattr(song, "fm_chip", "ym2151") == "ym2203"
-    ym_ext = bool(getattr(song, "ym2203_ext", False)) if ym_chip else False
-    ym_ids = list(getattr(song, "ym2203_ids", ()) or ()) if ym_chip else []
-    # A YM2203 system owns its three SSG voices even when only those carry
-    # notes, so the chip is present whenever the file has one.  The FM
-    # instrument list may be empty for an SSG-only track.
+    fm_family = getattr(song, "fm_chip", "ym2151")
+    ym2203 = fm_family == "ym2203"
+    ym2612 = fm_family == "ym2612"
+    ym_chip = ym2203 or ym2612
+    ym_ext = bool(
+        (getattr(song, "ym2203_ext", False) if ym2203 else
+         getattr(song, "ym2612_ext", False))
+    ) if ym_chip else False
+    ym_ids = list(
+        (getattr(song, "ym2203_ids", ()) if ym2203 else
+         getattr(song, "ym2612_ids", ())) or ()
+    ) if ym_chip else []
+    # A YM2612 system is the only FM chip the source needs even when no FM
+    # note was converted (its extra channels are just silent), so it is
+    # present whenever the log had the chip.  A YM2203 system likewise owns
+    # its three SSG voices.
     fm_present = include_fm and (bool(ym_ids) if ym_chip else True)
     fm_ins = song.fm_patches if fm_present else []
     pcm_smps = [s for s in song.pcm_samples if s.length >= 8] if include_pcm else []
@@ -1743,6 +2031,12 @@ def write_fur(
     spcm_smps = [s for s in song.segapcm_samples if s.length >= 8] if include_pcm else []
     c140_smps = [s for s in song.c140_samples if s.length >= 8] if include_pcm else []
     c352_smps = [s for s in song.c352_samples if s.length >= 8] if include_pcm else []
+    dac_smps = list(getattr(song, "dac_samples", ()) or ()) if include_pcm else []
+    n_dac_ins = (len(dac_smps) + 119) // 120
+    dac_smp_base = (
+        len(pcm_smps) + len(oki_smps) + len(adpcm_smps)
+        + len(spcm_smps) + len(c140_smps) + len(c352_smps)
+    )
     oki_ids, oki_groups = _grouped(oki_smps)
     adpcm_ids, adpcm_groups = _grouped(adpcm_smps)
     c140_ids: list[int] = []
@@ -1763,22 +2057,29 @@ def write_fur(
     scc_specs = list(getattr(song, "scc_ins", ()) or ())
     ay_ids = list(getattr(song, "ay_ids", ()) or ())
     ay_specs = list(getattr(song, "ay_ins", ()) or ())
+    psg_ids = list(getattr(song, "psg_ids", ()) or ())
+    psg_specs = list(getattr(song, "psg_ins", ()) or ())
     scc_chip = CHIP_K052539 if song.vgm.k051649_plus else CHIP_K051649
     n_scc = 5 * len(scc_ids)
     n_ay = 3 * len(ay_ids)
+    n_psg = 4 * len(psg_ids)
     # The K007232 pair exists only when the source carried usable samples for
     # it. A melody-only module gets the YM2151 alone - no empty PCM channels
     # and no chip nothing plays - and a module with another sample chip gets
     # no K007232 either.
     want_k007 = bool(pcm_smps)
     n_fm = (
-        (6 if ym_ext else 3) * len(ym_ids) if ym_chip else 8
+        (
+            (9 if ym_ext else 6) * len(ym_ids) if ym2612
+            else (6 if ym_ext else 3) * len(ym_ids)
+        )
+        if ym_chip else 8
     ) if fm_present else 0
     # The SSG is part of each YM2203 system, not a separate AY chip.
-    n_ssg = 3 * len(ym_ids) if (ym_chip and fm_present) else 0
+    n_ssg = 3 * len(ym_ids) if (ym2203 and fm_present) else 0
     n_k007 = 2 if want_k007 else 0
     n_ch = (
-        n_fm + n_ssg + n_k007 + 4 * len(oki_ids) + len(adpcm_ids)
+        n_fm + n_ssg + n_psg + n_k007 + 4 * len(oki_ids) + len(adpcm_ids)
         + (16 if spcm_smps else 0) + 24 * len(c140_ids) + 32 * len(c352_ids)
         + n_scc + n_ay
     )
@@ -1791,13 +2092,14 @@ def write_fur(
     c352_clock = song.vgm.c352_clock or C352_DEFAULT_CLOCK
 
     n_ins = (
-        len(fm_ins) + len(pcm_smps) + len(oki_smps) + len(adpcm_smps)
+        len(fm_ins) + n_dac_ins + len(pcm_smps) + len(oki_smps) + len(adpcm_smps)
         + len(spcm_smps) + len(c140_smps) + len(c352_smps)
-        + len(scc_specs) + len(ay_specs)
+        + len(scc_specs) + len(ay_specs) + len(psg_specs)
     )
     n_smp = (
         len(pcm_smps) + len(oki_smps) + len(adpcm_smps)
         + len(spcm_smps) + len(c140_smps) + len(c352_smps)
+        + len(dac_smps)
     )
     n_wav = len(scc_waves)
 
@@ -1805,9 +2107,10 @@ def write_fur(
     # channels, or 3 FM + 3 SSG per YM2203). With no FM those channels shift
     # down so they still land inside n_ch. The pattern window comes back
     # fitted to the content.
-    fm_block = ((9 if ym_ext else 6) * len(ym_ids)) if ym_chip else 8
+    fm_analysis_block = ((9 if ym_ext else 6) * len(ym_ids)) if ym_chip else 8
     orders, patterns, _loop_ord, pat_len = _build_patterns(
-        song, n_ch, PAT_LEN_MAX, fx_cols, 0 if fm_present else -fm_block,
+        song, n_ch, PAT_LEN_MAX, fx_cols,
+        0 if fm_present else -fm_analysis_block,
         stats=stats,
     )
     effect_cols = _fit_fx_cols(patterns, n_ch)
@@ -1816,7 +2119,28 @@ def write_fur(
 
     names_long: list[str] = []
     names_short: list[str] = []
-    if ym_chip and fm_present:
+    if ym2612 and fm_present:
+        for cid in range(len(ym_ids)):
+            suffix = f" ({cid + 1})" if len(ym_ids) > 1 else ""
+            if ym_ext:
+                for voice, label in enumerate(("FM 1", "FM 2")):
+                    names_long.append(f"{label}{suffix}")
+                    names_short.append(f"F{cid + 1}-{voice + 1}")
+                for voice in range(4):
+                    # Column c carries operator (1,2,0,3)[c]'s frequency.
+                    op_label = (1, 2, 0, 3)[voice] + 1
+                    label = f"FM 3 OP{op_label}"
+                    names_long.append(f"{label}{suffix}")
+                    names_short.append(f"O{cid + 1}-{op_label}")
+                for voice in range(3):
+                    label = f"FM {voice + 4}"
+                    names_long.append(f"{label}{suffix}")
+                    names_short.append(f"F{cid + 1}-{voice + 4}")
+            else:
+                for voice in range(6):
+                    names_long.append(f"FM {voice + 1}{suffix}")
+                    names_short.append(f"F{cid + 1}-{voice + 1}")
+    elif ym_chip and fm_present:
         for cid in range(len(ym_ids)):
             if ym_ext:
                 for voice, label in enumerate(("FM 1", "FM 2")):
@@ -1843,6 +2167,14 @@ def write_fur(
     elif n_fm:
         names_long += [f"FM {i + 1}" for i in range(n_fm)]
         names_short += [f"F{i + 1}" for i in range(n_fm)]
+    if psg_ids:
+        for cid in range(len(psg_ids)):
+            suffix = f" ({cid + 1})" if len(psg_ids) > 1 else ""
+            for voice in range(3):
+                names_long.append(f"PSG {voice + 1}{suffix}")
+                names_short.append(f"S{cid + 1}-{voice + 1}")
+            names_long.append(f"PSG Noise{suffix}")
+            names_short.append(f"S{cid + 1}-N")
     if n_k007:
         names_long += [f"PCM {i + 1}" for i in range(n_k007)]
         names_short += [f"P{i + 1}" for i in range(n_k007)]
@@ -1880,12 +2212,17 @@ def write_fur(
 
     label_parts: list[str] = []
     if fm_present:
-        if ym_chip:
+        if ym2612:
+            base = "YM2612" + (" Ext" if ym_ext else "")
+            label_parts.append(f"{base} x{len(ym_ids)}" if len(ym_ids) > 1 else base)
+        elif ym2203:
             label_parts.append(
                 f"YM2203 x{len(ym_ids)}" if len(ym_ids) > 1 else "YM2203"
             )
         else:
             label_parts.append("YM2151")
+    if psg_ids:
+        label_parts.append("SN76489")
     if n_k007:
         label_parts.append("K007232")
     if oki_ids:
@@ -1929,7 +2266,21 @@ def write_fur(
             "channel mode and the hardware envelope are pattern effects "
             "(20xx/21xx/22xy/23xx/24xx).\n"
         )
-    if ym_chip:
+    if ym2612:
+        comment += (
+            f"\nYM2612 at {song.vgm.ym2612_clock or 7670453} Hz; each system "
+            "has six FM voices"
+            + (" and channel 3 split into four operator columns" if ym_ext else "")
+            + ". LFO enable/speed is effect 10xy and per-channel PMS/AMS are "
+            "62xx/63xx.\n"
+        )
+    if psg_ids:
+        comment += (
+            f"\nSN76489 at {song.vgm.sn76489_clock or 3579545} Hz; three "
+            "square voices then noise. The volume column is the 4-bit "
+            "attenuation (15 = loudest) and 20xy selects the noise mode.\n"
+        )
+    elif ym_chip:
         comment += (
             f"\nYM2203 at {song.vgm.ym2203_clock or 3579545} Hz; each system "
             "has three FM voices then three SSG voices. The SSG register "
@@ -1948,17 +2299,37 @@ def write_fur(
     flag_texts: list[str] = []
     if fm_present:
         for _cid in (ym_ids or [0]):
-            if ym_chip:
+            if ym2612:
+                chips.append(CHIP_YM2612_EXT if ym_ext else CHIP_YM2612)
+            elif ym2203:
                 chips.append(CHIP_YM2203_EXT if ym_ext else CHIP_YM2203)
             else:
                 chips.append(CHIP_YM2151)
-            fm_clock = song.vgm.ym2203_clock if ym_chip else song.vgm.ym2151_clock
-            # Both cores default to 3.579545 MHz.  At any other clock the
-            # notes play at the wrong pitch unless the flag carries it.
+            if ym2612:
+                fm_clock = song.vgm.ym2612_clock
+                # Furnace's Genesis default is COLOR_NTSC*15/7 truncated to
+                # 7670454, while the VGM header normally says 7670453.  Write
+                # the source clock so the exported pitch register matches it.
+                fm_default = 7670454
+            elif ym2203:
+                fm_clock = song.vgm.ym2203_clock
+                fm_default = 3579545
+            else:
+                fm_clock = song.vgm.ym2151_clock
+                fm_default = 3579545
+            # The cores default to their console clocks.  At any other clock
+            # the notes play at the wrong pitch unless the flag carries it.
             flag_texts.append(
                 f"customClock={fm_clock}"
-                if fm_clock and fm_clock != 3579545 else ""
+                if fm_clock and fm_clock != fm_default else ""
             )
+    for _cid in psg_ids:
+        chips.append(CHIP_SMS)
+        psg_clock = song.vgm.sn76489_clock or 3579545
+        if abs(psg_clock - 3579545) <= 2:
+            flag_texts.append("clockSel=0")
+        else:
+            flag_texts.append(f"customClock={psg_clock}")
     if n_k007:
         chips.append(CHIP_K007232)
         flags = "stereo=true"
@@ -2117,6 +2488,15 @@ def write_fur(
         fam = "OPN" if getattr(patch, "opn", False) else "OPM"
         _write_ins_opm(b, patch.name or f"{fam} {i:02d}", patch)
 
+    for group in range(n_dac_ins):
+        ins_ptrs.append(len(b))
+        first = dac_smp_base + group * 120
+        maps = [
+            first + slot
+            for slot in range(min(120, len(dac_smps) - group * 120))
+        ]
+        _write_ins_sample_map(b, f"DAC {group + 1}", first, maps)
+
     for i, smp in enumerate(pcm_smps):
         ins_ptrs.append(len(b))
         _write_ins_pcm(b, f"PCM {_pcm_label(smp, i)}", i)
@@ -2158,6 +2538,9 @@ def write_fur(
     for spec in ay_specs:
         ins_ptrs.append(len(b))
         _write_ins_ay(b, "PSG" + ("+pitch" if spec.pitch else ""), spec)
+    for spec in psg_specs:
+        ins_ptrs.append(len(b))
+        _write_ins_psg(b, "SN" + ("+pitch" if spec.pitch else ""), spec)
 
     smp_ptrs: list[int] = []
     for i, smp in enumerate(pcm_smps):
@@ -2196,6 +2579,10 @@ def write_fur(
             depth=smp.depth,
             loop_mode=smp.loop_mode,
         )
+    for i, smp in enumerate(dac_smps):
+        smp_ptrs.append(len(b))
+        rate = max(1, int(round(smp.c4_rate * DAC_RATE_COMPENSATION)))
+        _write_sample_s8(b, f"dac_{i:03d}", smp.data, rate)
 
     pat_ptrs: list[int] = []
     for ch, idx, rows in patterns:
@@ -2218,11 +2605,13 @@ def write_fur(
     for i, p in enumerate(pat_ptrs):
         b.patch_u32(pat_ptr_off + 4 * i, p)
 
-    return bytes(b.b)
+    data = bytes(b.b)
+    return compress_fur(data) if compress else data
 
 
 def parse_fur_skeleton(data: bytes) -> dict:
     """Walk a .fur we wrote and return header facts (for tests / sanity)."""
+    data = decompress_fur(data)
     if data[:16] != FUR_MAGIC:
         raise ValueError("not a Furnace module")
     ver = struct.unpack_from("<H", data, 16)[0]

@@ -14,7 +14,7 @@ from __future__ import annotations
 import math
 from dataclasses import replace
 
-from vgm2151fur.fm import CARRIERS, FMPatch, OpRegs
+from vgm2151fur.fm import FMPatch, OpRegs, OPN_CARRIERS, OPN_OP_TO_MASK
 
 YM2203_DEFAULT_CLOCK = 3579545
 YM2203_SSG_DIVIDER = 16
@@ -227,7 +227,7 @@ class YM2203State:
         ops = []
         for i, op in enumerate(self.ops[ch]):
             op = replace(op)
-            if not mask & (1 << i):
+            if not mask & (1 << OPN_OP_TO_MASK[i]):
                 op.tl = 0x7F
             ops.append(op)
         return FMPatch(
@@ -241,7 +241,7 @@ class YM2203State:
 
     def carrier_tl(self, ch: int) -> int:
         alg = self.fb_alg[ch] & 0x07
-        carriers = CARRIERS.get(alg, (3,))
+        carriers = OPN_CARRIERS.get(alg, (3,))
         return min(self.ops[ch][i].tl for i in carriers)
 
 
@@ -262,7 +262,7 @@ def opn_carrier_octave(patch) -> int:
         return 0
     best_tl = 0x80
     best_octave: int | None = None
-    for i in CARRIERS.get(patch.alg, ()):
+    for i in OPN_CARRIERS.get(patch.alg & 7, ()):
         op = patch.ops[i]
         tl = op.tl & 0x7F
         if tl >= 0x7F:

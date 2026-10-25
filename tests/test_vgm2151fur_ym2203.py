@@ -7,7 +7,9 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from vgm2151fur.analyze import analyze, furnace_note_name
+from vgm2151fur.analyze import (
+    _SSG_VOLUME_TRIM, analyze, furnace_note_name,
+)
 from vgm2151fur.ay8910 import ay_rate, collect_ay8910
 from vgm2151fur.diag import opn_pitch_stream, pitch_runs
 from vgm2151fur.furio import CHIP_CHANNELS, iter_blocks, parse_fur
@@ -247,6 +249,23 @@ class TestYm2203Analyze(unittest.TestCase):
         self.assertEqual(macro[0], 0)
         self.assertGreater(max(macro), 0)
 
+    def test_long_pitch_sweep_becomes_pitch_macro(self):
+        ws = _fm_note(4, 1204, off=60000)
+        for i, fnum in enumerate((1210, 1260) * 6):
+            t = 30000 + i * 1000
+            ws += [
+                ChipWrite(t, "ym2203", 0, 0xA4, (4 << 3) | ((fnum >> 8) & 7)),
+                ChipWrite(t, "ym2203", 0, 0xA0, fnum & 0xFF),
+            ]
+        song = analyze(_vgm(ws, ym2203_clock=CLOCK))
+        ev = next(e for e in song.events if e.on)
+        self.assertGreater(len(ev.fm_pitch_pts), 4)
+        self.assertNotEqual(ev.ins, 0)
+        macro = song.fm_patches[ev.ins].pitch_macro
+        self.assertTrue(macro)
+        self.assertEqual(macro[0], 0)
+        self.assertGreater(max(macro), 0)
+
     def test_ssg_note_lands_on_voice3(self):
         song = analyze(_vgm(_ssg_note(), ym2203_clock=CLOCK))
         self.assertEqual(song.ym2203_ssg_count, 1)
@@ -333,10 +352,12 @@ class TestYm2203Writer(unittest.TestCase):
 
     def test_pitch_macro_rides_on_an_instrument_copy(self):
         ws = _fm_note(4, 1204, off=60000)
-        ws += [
-            ChipWrite(30000, "ym2203", 0, 0xA4, (4 << 3) | ((1250 >> 8) & 7)),
-            ChipWrite(30000, "ym2203", 0, 0xA0, 1250 & 0xFF),
-        ]
+        for i, fnum in enumerate((1210, 1260) * 6):
+            t = 30000 + i * 1000
+            ws += [
+                ChipWrite(t, "ym2203", 0, 0xA4, (4 << 3) | ((fnum >> 8) & 7)),
+                ChipWrite(t, "ym2203", 0, 0xA0, fnum & 0xFF),
+            ]
         song = self._song(ws)
         ev = next(e for e in song.events if e.on)
         self.assertTrue(song.fm_patches[ev.ins].pitch_macro)
@@ -407,19 +428,20 @@ class TestYm2203SpecialCases(unittest.TestCase):
         self.assertEqual(furnace_note_name(ev.note), "A#4")
 
     def test_loudest_carrier_sets_the_label(self):
-        # alg 4, carriers op2 MULT=4 and op4 MULT=2.  The 2x carrier is 3 dB
-        # louder (lower TL), so it is the audible lead: the label moves one
-        # octave, not two, and the macro keeps the source f-num.
+        # alg 4, carriers S2 (0x38) MULT=4 and S4 (0x3C) MULT=2.  The 2x
+        # carrier is 3 dB louder (lower TL), so it is the audible lead: the
+        # label moves one octave, not two, and the macro keeps the source
+        # f-num.
         ws = [
             w for w in _patch(100)
-            if w.reg not in (0xB0, 0x34, 0x38, 0x3C, 0x44, 0x4C)
+            if w.reg not in (0xB0, 0x34, 0x38, 0x3C, 0x44, 0x48, 0x4C)
         ]
         ws += [
             ChipWrite(100, "ym2203", 0, 0xB0, 0x04),   # alg 4
-            ChipWrite(100, "ym2203", 0, 0x34, 0x04),   # op2 MULT=4
-            ChipWrite(100, "ym2203", 0, 0x3C, 0x02),   # op4 MULT=2
-            ChipWrite(100, "ym2203", 0, 0x44, 0x14),   # op2 TL 0x14 (quieter)
-            ChipWrite(100, "ym2203", 0, 0x4C, 0x11),   # op4 TL 0x11 (louder)
+            ChipWrite(100, "ym2203", 0, 0x38, 0x04),   # S2 MULT=4
+            ChipWrite(100, "ym2203", 0, 0x3C, 0x02),   # S4 MULT=2
+            ChipWrite(100, "ym2203", 0, 0x48, 0x14),   # S2 TL 0x14 (quieter)
+            ChipWrite(100, "ym2203", 0, 0x4C, 0x11),   # S4 TL 0x11 (louder)
             ChipWrite(100, "ym2203", 0, 0xA4, 0x25),
             ChipWrite(100, "ym2203", 0, 0xA0, 0xBA),
             ChipWrite(100, "ym2203", 0, 0x28, 0xF0),
@@ -595,7 +617,7 @@ class TestYm2203Furnace(unittest.TestCase):
                 reg.setdefault(w.reg, set()).add(w.val)
         self.assertIn(0x1C, reg.get(0, set()))
         self.assertIn(0x01, reg.get(1, set()))
-        self.assertIn(0x0F, reg.get(8, set()))
+        self.assertIn(0x0F - _SSG_VOLUME_TRIM, reg.get(8, set()))
 
 
 class TestYm2203OctaveConvention(unittest.TestCase):

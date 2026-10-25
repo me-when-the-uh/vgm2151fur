@@ -14,14 +14,20 @@ from pathlib import Path
 
 from vgm2151fur.furwrite import (
     CHIP_AY8910, CHIP_C140, CHIP_C352, CHIP_K007232, CHIP_K051649, CHIP_K052539,
-    CHIP_MSM6258, CHIP_MSM6295, CHIP_SEGAPCM, FUR_MAGIC,
+    CHIP_MSM6258, CHIP_MSM6295, CHIP_SEGAPCM, CHIP_YM2612, CHIP_YM2612_CSM,
+    CHIP_YM2612_EXT, FUR_MAGIC, decompress_fur,
 )
 
 
 CHIP_CHANNELS = {
+    0x02: 10,  # Sega Genesis: 6 FM + 4 PSG (system used by vgm2fur)
+    0x42: 13,  # Sega Genesis Ext: 9 FM + 4 PSG
     0x82: 8,  # YM2151
     0x8D: 6,  # YM2203: 3 FM + 3 SSG voices
     0xB6: 9,  # YM2203 Ext: 2 FM + 4 channel-3 operators + 3 SSG
+    CHIP_YM2612: 6,  # YM2612: 6 FM voices (channel 6 may play samples)
+    CHIP_YM2612_EXT: 9,  # YM2612 Ext: 2 FM + 4 channel-3 operators + FM4-6
+    CHIP_YM2612_CSM: 10,  # YM2612 CSM: Ext + the CSM timer channel
     CHIP_MSM6295: 4,  # MSM6295
     CHIP_MSM6258: 1,  # MSM6258
     CHIP_K007232: 2,  # K007232
@@ -31,6 +37,7 @@ CHIP_CHANNELS = {
     CHIP_K051649: 5,  # Konami SCC
     CHIP_K052539: 5,  # Konami SCC+
     CHIP_AY8910: 3,  # AY-3-8910
+    0x03: 4,  # TI SN76489 (three tone + noise)
     0xBB: 8,  # Namco C30 WSG
     0xCF: 16,  # Namco C219
 }
@@ -298,6 +305,7 @@ def _pcm_channels(chips: list[int]) -> list[int]:
 
 
 def parse_fur(data: bytes) -> FurModule:
+    data = decompress_fur(data)
     ver = struct.unpack_from("<H", data, 16)[0]
     info_ptr = struct.unpack_from("<I", data, 20)[0]
     mag = data[info_ptr:info_ptr + 4]

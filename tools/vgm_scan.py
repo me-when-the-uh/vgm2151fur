@@ -18,6 +18,7 @@ the hits per pack directory:
              K052539 "SCC+" variant (listed as its own kind, scc_plus)
     ay8910   AY-3-8910/YM2149 at header 0x74 (VGM 1.51+), type byte 0x78
     ym2203   YM2203 at header 0x44; bit 30 marks a second chip (0xA5 writes)
+    ym2612   YM2612 at header 0x2C; bit 30 marks a second chip (0xA2/A3 writes)
 
 Detection is heuristic (header clocks plus the extra-header clock list).
 Run it before batch convert requests so the pack list is complete, and
@@ -40,7 +41,7 @@ SKIP = {"output", "third_party", ".git", "__pycache__", ".commandcode",
         "node_modules", "soundcheck"}
 
 CENSUS_KINDS = {"segapcm", "c140", "c219", "c352", "k051649", "scc_plus",
-                "ay8910", "ym2203"}
+                "ay8910", "ym2203", "ym2612"}
 
 
 def detect(p: Path, want: int) -> set[str] | None:

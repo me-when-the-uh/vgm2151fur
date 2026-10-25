@@ -14,6 +14,7 @@ if str(ROOT) not in sys.path:
 from vgm2151fur.analyze import (
     Song,
     _musical_row,
+    _rebase_non_fm_ins,
     _shift_note_e5,
     analyze,
     FMPatch,
@@ -505,11 +506,26 @@ class TestClockTransposition(unittest.TestCase):
             NoteEvent(sample=0, ch=0, on=True, note=60, ins=0, vol=-1, e5=0x80, pan=0),
             NoteEvent(sample=0, ch=8, on=True, note=60, ins=0, vol=15, e5=0x80, pan=0, pcm=True),
             NoteEvent(sample=100, ch=9, on=True, note=72, ins=1, vol=15, e5=0x80, pan=0, pcm=True),
+            NoteEvent(sample=0, ch=5, on=True, note=60, ins=8, vol=127, e5=0x80,
+                      pan=0xFF, dac=True),
         ]
         transpose_opm_events(events, 4000000)
         self.assertEqual((events[0].note, events[0].e5), (61, 0x80 + 59))
         self.assertEqual((events[1].note, events[1].e5), (60, 0x80))
         self.assertEqual((events[2].note, events[2].e5), (72, 0x80))
+        self.assertEqual((events[3].note, events[3].e5), (60, 0x80))
+
+    def test_appended_fm_instruments_rebase_sample_slots(self):
+        events = [
+            NoteEvent(sample=0, ch=5, on=True, note=60, ins=8, vol=127,
+                      e5=0x80, pan=0xFF, dac=True),
+            NoteEvent(sample=0, ch=6, on=True, note=60, ins=9, vol=15,
+                      e5=0x80, pan=0, tone_chip=3),
+            NoteEvent(sample=0, ch=0, on=True, note=60, ins=8, vol=-1,
+                      e5=0x80, pan=0),
+        ]
+        _rebase_non_fm_ins(events, 8, 9)
+        self.assertEqual([e.ins for e in events], [9, 10, 8])
 
 
 class TestOpmLfoDepth(unittest.TestCase):

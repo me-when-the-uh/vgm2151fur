@@ -56,13 +56,26 @@ steps would otherwise be skipped. `--factors 1,1.5,2,2.5,3,4` writes an
 explicit ladder instead (fractional allowed). Before trusting a whole pack,
 run `compare` on the chosen variant.
 
-The grid is measured from a lattice of note starts. The YM2151 or YM2203
-key-on register supplies it when the rip has a usable FM stream. When it
-does not - the C352 and SegaPCM-only board rips have no FM chip at all - the
-sample-chip trigger times are measured the same way, which keeps those rips
-off the 60 Hz frame fallback. That fallback reads as exactly 900 BPM
+Every variant line and `condense.tsv` row now carries `keys`/`miss`:
+`keys` is the source key-on count the writer considered and `miss` is the
+number it could not put on a free pattern cell (same-row collisions, evicted
+PCM, truncated orders). This is cheap and available without `--verify`.
+With `--verify`, the same row adds `aud matched/total miss N fld N`: the
+exported module is compared against the source on every key-on, including
+the SN76489 notes, and `fld` counts effective FM operator-field mismatches.
+A source with DAC phrases also shows `dac M/T`, matched against the exported
+DAC stream starts. The full audit costs no extra render - it consumes the
+export the pitch check already produced. `condense.tsv` has the
+corresponding `audit_miss`, `fields`, `tl`, `psg_miss` and `dac_miss`
+columns.
+
+The grid is measured from a lattice of note starts. The YM2151, YM2203 or
+YM2612 key-on register supplies it when the rip has a usable FM stream. When
+it does not - the C352 and SegaPCM-only board rips have no FM chip at all -
+the sample-chip trigger times are measured the same way, which keeps those
+rips off the 60 Hz frame fallback. That fallback reads as exactly 900 BPM
 (60 rows/s) and carries no musical information. A rip whose FM lattice
-already measures uses it alone. A YM2203 whose SSG driver writes periods
+already measures uses it alone. A YM2203 or YM2612 whose driver writes pitch
 faster than the resulting tick gets `hz` and `speed` raised together (same
 row length and BPM), so the pitch macro still sees each write.
 
@@ -75,6 +88,13 @@ flat `<name> xN.fur` siblings unless you pass `--dirs`. The verdict is
 re-derived from the source on every run, so a reconversion
 (`tools/reconvert_all.py --optimize lossless [--verify]`) reaches the same set
 with or without the manifest - the manifest just lets you read it.
+
+Genesis PSG notes are converted automatically; `--melody-only` keeps the DAC
+(and other sample-chip) data out, while the FM/PSG side still converts. A dense
+YM2612 DAC stream is stored as a continuous 22.05 kHz timeline sample, so
+Contra-style modules are intentionally larger than FM-only ones; this is not
+counted as a condense loss because the DAC timeline is independent of the
+row grid.
 
 Conversion renders each finished track once through the Furnace console and
 fits the module's master volume to a -2.5 dBFS peak (one render per track,
@@ -186,11 +206,13 @@ they can be run from anywhere.
 - `tools/pitch_shift.py <a.wav> <b.wav>`: the chroma-rotation table one pair
   of renders at a time, used by the soundcheck.
 - `tools/vgm_scan.py [root ...]`: which VGM packs use SegaPCM, C140, C352,
-  C219, SCC/SCC+, AY-8910 or YM2203 and at which clock. C219 is a C140-family
-  part the converter does not support; never batch-convert those into the
-  C140 target. C352 converts as chip 0xD0; a Furnace build with a C352 core
-  can play it. YM2203 converts as chip 0x8D (3 FM + 3 SSG voices per chip).
-  See docs/c352.md, docs/scc-ay8910.md and docs/ym2203.md.
+  C219, SCC/SCC+, AY-8910, YM2203 or YM2612 and at which clock. C219 is a
+  C140-family part the converter does not support; never batch-convert those
+  into the C140 target. C352 converts as chip 0xD0; a Furnace build with a
+  C352 core can play it. YM2203 converts as chip 0x8D (3 FM + 3 SSG voices
+  per chip); YM2612 as chip 0x83 (6 FM) or 0xA0 when the source uses the
+  channel-3-operator layout. See docs/c352.md, docs/scc-ay8910.md,
+  docs/ym2203.md and docs/ym2612.md.
 
 ## Environment
 

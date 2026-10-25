@@ -8,7 +8,10 @@ here instead of repeating it.
 
 A module is `FUR_MAGIC` (16 bytes), a version (`157`), a reserved word, and a
 pointer to the song info block. The writer emits the old `INFO` block, which
-Furnace 0.6 reads and re-saves. Blocks that follow are `ADIR` (empty asset
+Furnace 0.6 reads and re-saves. `write_fur` returns raw bytes; `convert` wraps
+the final module in zlib level 5 (`compress_fur`), the only outer compression
+Furnace's `.fur` loader recognizes (no LZ4/Zstd). `parse_fur` accepts both
+forms. Blocks that follow are `ADIR` (empty asset
 directories), `INS2` (instruments), `SMP2` (samples), `PATN` (patterns), all
 pointed to from the info payload.
 
@@ -52,18 +55,24 @@ triples start 31 bytes plus 12 per chip before the first ADIR pointer.
 
 ## Chip IDs and flags
 
-- `0x82` YM2151, `0x8D` YM2203, `0xC6` K007232, `0xAA` MSM6295, `0xAB`
-  MSM6258, `0x9B` SegaPCM, `0xCE` C140, `0xD0` C352, `0xA1` Konami SCC
-  (K051649), `0xB4` Konami SCC+ (K052539), `0x80` AY-3-8910. A module lists
+- `0x82` YM2151, `0x8D` YM2203, `0x83` YM2612 (`0xA0` Ext, `0xC1` CSM),
+  `0x03` SN76489 (SMS), `0xC6` K007232, `0xAA` MSM6295, `0xAB` MSM6258,
+  `0x9B` SegaPCM, `0xCE` C140, `0xD0` C352, `0xA1` Konami SCC (K051649),
+  `0xB4` Konami SCC+ (K052539), `0x80` AY-3-8910. A module lists
   the chips the source had usable samples for: a melody-only track opens with
   the YM2151 alone, with no K007232 pair and no PCM channels it never plays.
   The SCC and AY are tone chips, not sample players: they are written whenever
   the source keys a voice, even under `--melody-only`. A YM2203 is one system
-  of six channels (FM 1-3 then PSG 1-3); a dual source writes two systems in
-  chip order.
+  of six channels (FM 1-3 then PSG 1-3); a YM2612 is six FM channels, or nine
+  with channel 3 split into its four operator columns. A Genesis source adds
+  a second `0x03` system after it: four SN76489 channels (three tone then
+  noise), for ten channels total. A dual source writes two systems in chip
+  order.
 - The YM2151 flag carries `customClock=` when the source clock is not
   3579545: a 4 MHz OPM plays flat otherwise. Each YM2203 system carries the
-  same flag for its own clock (default 3579545).
+  same flag for its own clock (default 3579545). The YM2612 default is the
+  Genesis clock truncated to 7670454, so a 7670453 header also gets the flag;
+  this keeps the exported f-num/block identical to the source.
 - The K007232 flag carries `stereo=true` and a clock when it differs from the
   default.
 - The OKI flag encodes pin 7 and banking; the C140 flag carries the clock and
@@ -96,6 +105,16 @@ the OPN sustain rate (0x70) and SSG-EG (0x90) instead of DT2. A per-note pitch
 macro (code 4) on an instrument copy reproduces later f-num writes; the note's
 E5 carries the key-on remainder.
 
+YM2612 instruments use the same type 1 and OPN operator layout. They also
+carry the channel's PMS/AMS in the FM feature, and the carrier TLs are stored
+relative to the loudest carrier while the note's volume column carries the
+absolute level (Furnace's `newVolumeScaling` makes that exact). DAC slices use
+one `DIV_INS_AMIGA` sample-map instrument per 120 samples, with pattern note
+60+slot selecting the slice; the sample's C-4 rate sets the DAC clock. The
+SN76489 uses a plain `DIV_INS_STD` instrument (pitch macro only), a 0-15
+volume column, and effect `20xy` for noise mode. The FM feature's four
+operator columns of the Ext system share one timbre instrument.
+
 PCM instruments bind one sample each: K007232 two channels, MSM6295 four
 voices per chip, MSM6258 one, SegaPCM sixteen, C140 twenty-four, C352
 thirty-two. Sample bodies are stored 8-bit signed (C140 and C352 mulaw are
@@ -118,22 +137,24 @@ envelope state - plus the pitch macro when the note's driver wrote one.
 
 The YM2151 and the per-row sweep model work in kc/kf units: 1/64 semitone.
 One key-code step is 64 units, and the YM2151 KF register contributes its top
-six bits (`kf >> 2`). The YM2203 is the exception: Furnace's OPN platform
-runs in **linear pitch** mode, so a pattern note is 128 units per semitone,
-E5 is 1/128 semitone, and the per-tick pitch macro uses the same units. The
-YM2203 note is chosen by inverting Furnace's linear note -> block/f-num
-conversion; it does not use the per-row sweep model.
+six bits (`kf >> 2`). The YM2203 and YM2612 are the exception: Furnace's OPN
+platforms run in **linear pitch** mode, so a pattern note is 128 units per
+semitone, E5 is 1/128 semitone, and the per-tick pitch macro uses the same
+units. The note is chosen by inverting Furnace's linear note -> block/f-num
+conversion; it does not use the per-row sweep model. The YM2612's
+`fmFreqBase` is 9437184, twice the YM2203's, so the same note number plays an
+octave above a YM2203 and the inverse uses that platform's own formula.
 
 Two effects move pitch, and their scales differ per platform:
 
-| Effect | YM2151 | PCM / YM2203 / period table |
+| Effect | YM2151 | PCM / YM2203 / YM2612 / period table |
 |---|---|---|
 | E5 fine tune, per byte step | 1/64 st | 1/128 st |
 | 01xx/02xx slide, per parameter unit per tick | 1 kc/kf unit (1/64 st) | 1/128 st |
 
 E8xx/E9xx quick legato adds semitones to the playing note in one write. It is
 cumulative (`note += y`), applies one tick after the row, and resets at the
-next note. Checked against Furnace 0.6.8.3 on both platforms.
+next note. Checked against Furnace 0.6.8.3 on all three platforms.
 
 A held period step of about a semitone is a new note. Vibrato and pitch
 slides are the instrument's **pitch macro** (code 4), one value per tick in

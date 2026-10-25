@@ -1,7 +1,7 @@
 """VGM / VGZ loader and command walker.
 
-Chips: YM2151, YM2203, K007232, MSM6295, MSM6258, SegaPCM, C140, C352,
-AY-3-8910, K051649/K052539 (SCC).
+Chips: YM2151, YM2203, YM2612, K007232, MSM6295, MSM6258, SegaPCM, C140,
+C352, AY-3-8910, K051649/K052539 (SCC).
 """
 
 from __future__ import annotations
@@ -14,6 +14,16 @@ from pathlib import Path
 
 VGM_RATE = 44100
 CMD_YM2151 = 0x54
+# 0x52/0x53 are the first YM2612's two register banks; 0xA2/0xA3 are the
+# second instance in a dual-chip log.  The chip's 9-bit register address is
+# stored flat as (bank << 8) | register, matching ymfm's index.
+CMD_YM2612_P0 = 0x52
+CMD_YM2612_P1 = 0x53
+CMD_YM2612_B_P0 = 0xA2
+CMD_YM2612_B_P1 = 0xA3
+CMD_SN76489 = 0x50
+CMD_DAC_WRITE = 0x2A
+CMD_DAC_ENABLE = 0x2B
 # 0x55 is the first YM2203's register port; 0xA5 is the second instance in a
 # dual-chip log.  Registers 0x00-0x0F are the built-in SSG, everything above
 # is FM.
@@ -36,9 +46,10 @@ SEGAPCM_ROM_TYPE = 0x80  # SegaPCM ROM
 C140_ROM_TYPE = 0x8D  # Namco C140 ROM
 C352_ROM_TYPE = 0x92  # Namco C352 ROM
 K007232_TRIGGER_REG = 0x1F
-# Extra-header chip ids (libvgm device index). 0x2A is K007232.
+# Extra-header chip ids (libvgm device index). 0x02 is YM2612, 0x2A K007232.
 EXTRA_MSM6258 = 0x16
 EXTRA_MSM6295 = 0x17
+EXTRA_YM2612 = 0x02
 EXTRA_YM2203 = 0x06
 EXTRA_SEGAPCM = 0x04
 EXTRA_AY8910 = 0x12
@@ -54,6 +65,16 @@ EXTRA_K007232 = 0x2A
 SEGAPCM_CLOCK_OFF = 0x38
 SEGAPCM_INTF_OFF = 0x3C  # bank shift; mask is the byte at 0x3E (0 → 0x70)
 SEGAPCM_MASK_OFF = 0x3E
+# YM2612 clock at 0x2C.  Bit 30 is the dual-instance flag; 0xA2/0xA3 then
+# answer for the second chip.  The field predates the 1.50 data-offset header.
+YM2612_CLOCK_OFF = 0x2C
+YM2612_DUAL_BIT = 0x40000000
+YM2612_DEFAULT_CLOCK = 7670453  # NTSC Genesis master clock (COLOR_NTSC * 15/7)
+# VGM 0x0C is the SN76489 clock.  The Genesis feeds it COLOR_NTSC/1 = 3579545;
+# Furnace's SMS core runs the same clock and derives note periods with
+# toneDivider 64.
+SN76489_CLOCK_OFF = 0x0C
+SN76489_DEFAULT_CLOCK = 3579545
 # YM2203 clock at 0x44.  Bit 30 is the "cheat mode" flag for a second
 # instance, which then answers on command 0xA5; the clock itself is the same.
 YM2203_CLOCK_OFF = 0x44
@@ -169,8 +190,9 @@ class RomSlice:
 @dataclass
 class ChipWrite:
     sample: int
-    chip: str  # "ym2151" | "k007232" | "msm6295" | "msm6258" | "segapcm" |
-    #            "c140" | "c352" | "ay8910" | "k051649"
+    chip: str  # "ym2151" | "ym2203" | "ym2612" | "k007232" | "msm6295" |
+    #            "msm6258" | "segapcm" | "c140" | "c352" | "ay8910" |
+    #            "k051649"
     chip_id: int
     reg: int
     val: int
@@ -181,6 +203,9 @@ class VgmFile:
     path: Path
     buf: bytes
     version: int
+    # Corrected to the 0x66 sample when the header disagrees: several logs
+    # declare a length far past their last command, and patterns, grid
+    # budgets and source-vs-export checks need the timeline the log covers.
     total_samples: int
     loop_samples: int
     loop_file_pos: int | None
@@ -191,6 +216,25 @@ class VgmFile:
     roms: list[RomSlice] = field(default_factory=list)
     writes: list[ChipWrite] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    # YM2612 header 0x2C.  A dual-chip log carries bit 30; 0x52/0x53 target
+    # the first instance and 0xA2/0xA3 the second.  Register addresses are
+    # kept flat as bank << 8 | register.
+    ym2612_clock: int = 0
+    ym2612_dual: bool = False
+    # Genesis SN76489 header 0x0C.  The data bytes arrive as 0x50 writes;
+    # they are a serial register stream, not address/data pairs.
+    sn76489_clock: int = 0
+    # VGM 1.50 YM2612 PCM: data block type 0x00 is the sample bank, and
+    # 0xE0 sets the read pointer.  0x80-0x8F play one byte (plus a 0-15
+    # sample wait).  0x2A is a direct DAC byte.  Events keep stream order:
+    # (sample, 0=set pointer, 1=play byte, 2=direct DAC write, value).
+    dac_data: bytearray = field(default_factory=bytearray)
+    dac_events: list[tuple[int, int, int]] = field(default_factory=list)
+    # Modern DAC stream control (0x90-0x95).  Furnace exports a module as
+    # 0x90/0x91 once, then 0x92 (rate) + 0x95 (one type-0 block) per sample.
+    dac_blocks: list[bytes] = field(default_factory=list)
+    dac_block_plays: list[tuple[int, int, int]] = field(default_factory=list)
+    dac_stream_rates: dict[int, int] = field(default_factory=dict)
     # YM2203 header 0x44.  A dual-chip log carries bit 30 in the clock field;
     # both instances share the clock.  0x55 targets the first chip, 0xA5 the
     # second.  Registers 0x00-0x0F are the SSG.
@@ -432,6 +476,14 @@ def chips_in_head(buf: bytes) -> set[str]:
     version = _header_raw(buf, 8)
     if _header_clock(buf, 0x30):
         kinds.add("ym2151")
+    if _field_in_header(buf, YM2612_CLOCK_OFF, 4):
+        ym2612_raw = _header_raw(buf, YM2612_CLOCK_OFF)
+        if CLOCK_MIN <= (ym2612_raw & 0x3FFFFFFF) <= CLOCK_MAX:
+            kinds.add("ym2612")
+            if ym2612_raw & YM2612_DUAL_BIT:
+                kinds.add("ym2612_dual")
+    if 100_000 <= _header_clock(buf, SN76489_CLOCK_OFF) <= 40_000_000:
+        kinds.add("sn76489")
     if version >= 0x131 and _field_in_header(buf, YM2203_CLOCK_OFF, 4):
         ym2203_raw = _header_raw(buf, YM2203_CLOCK_OFF)
         if 100_000 <= (ym2203_raw & 0x3FFFFFFF) <= 40_000_000:
@@ -463,6 +515,8 @@ def chips_in_head(buf: bytes) -> set[str]:
         kinds.add("k007232")
     if len(buf) >= 0xC0:
         clocks, _volumes = _extra_chip_lists(buf)
+        if clocks.get(EXTRA_YM2612, 0):
+            kinds.add("ym2612")
         if clocks.get(EXTRA_YM2203, 0):
             kinds.add("ym2203")
         if clocks.get(EXTRA_SEGAPCM, 0):
@@ -512,12 +566,19 @@ def load_vgm(path: Path | str) -> VgmFile:
     extra = _extra_chip_lists(buf)
     clocks, volumes = extra
     ym_clock = _header_clock(buf, 0x30) or 3579545
+    # YM2612: the clock field also carries the dual-instance flag in bit 30.
+    ym2612_raw = _header_raw(buf, YM2612_CLOCK_OFF)
+    ym2612_dual = bool(ym2612_raw & YM2612_DUAL_BIT)
+    ym2612_clock = _sane_clock(ym2612_raw)
+    if not ym2612_clock:
+        ym2612_clock = _sane_clock(clocks.get(EXTRA_YM2612, 0))
     # YM2203: the clock field also carries the dual-instance flag in bit 30.
     ym2203_raw = _header_raw(buf, YM2203_CLOCK_OFF)
     ym2203_dual = bool(ym2203_raw & YM2203_DUAL_BIT)
     ym2203_clock = _sane_clock(ym2203_raw)
     if not ym2203_clock:
         ym2203_clock = _sane_clock(clocks.get(EXTRA_YM2203, 0))
+    sn76489_clock = _clock_or_zero(buf, SN76489_CLOCK_OFF)
     k_clock = _k007232_clock(buf, clocks, ym_clock, ver)
     oki_raw = _header_raw(buf, 0x98) if ver >= 0x161 else 0
     adpcm_raw = _header_raw(buf, 0x90) if ver >= 0x161 else 0
@@ -584,6 +645,9 @@ def load_vgm(path: Path | str) -> VgmFile:
         ym2151_clock=ym_clock,
         k007232_clock=k_clock,
         gd3=parse_gd3(buf),
+        ym2612_clock=ym2612_clock,
+        ym2612_dual=ym2612_dual,
+        sn76489_clock=sn76489_clock,
         ym2203_clock=ym2203_clock,
         ym2203_dual=ym2203_dual,
         msm6295_clock=oki_raw & 0x3FFFFFFF,
@@ -614,11 +678,14 @@ def load_vgm(path: Path | str) -> VgmFile:
     loop_sample: int | None = None
     skipped_sample_cmds: set[int] = set()
     stray_ym2203_second = False
+    stray_ym2612_second = False
+    saw_end = False
     while pos < n:
         if loop_pos is not None and loop_sample is None and pos >= loop_pos:
             loop_sample = sample
         cmd = buf[pos]
         if cmd == CMD_END:
+            saw_end = True
             break
         if cmd == CMD_DATA_BLOCK:
             if pos + 7 > n:
@@ -628,17 +695,24 @@ def load_vgm(path: Path | str) -> VgmFile:
             chip_id = (size >> 31) & 1
             size &= 0x7FFFFFFF
             payload = buf[pos + 7:pos + 7 + size]
-            kind = {
-                K007232_ROM_TYPE: "k007232",
-                OKI_ROM_TYPE: "msm6295",
-                SEGAPCM_ROM_TYPE: "segapcm",
-                C140_ROM_TYPE: "c140",
-                C352_ROM_TYPE: "c352",
-            }.get(typ) if len(payload) >= 8 else None
-            if kind:
-                rom_size = int.from_bytes(payload[0:4], "little")
-                start = int.from_bytes(payload[4:8], "little")
-                vgm.roms.append(RomSlice(chip_id, rom_size, start, payload[8:], kind))
+            if typ == 0x00:
+                # YM2612 PCM sample bank. The payload is unsigned 8-bit PCM;
+                # the old stream reads it through 0xE0/0x80-0x8F, the modern
+                # one through 0x95 block ids.
+                vgm.dac_blocks.append(payload)
+                vgm.dac_data.extend(payload)
+            else:
+                kind = {
+                    K007232_ROM_TYPE: "k007232",
+                    OKI_ROM_TYPE: "msm6295",
+                    SEGAPCM_ROM_TYPE: "segapcm",
+                    C140_ROM_TYPE: "c140",
+                    C352_ROM_TYPE: "c352",
+                }.get(typ) if len(payload) >= 8 else None
+                if kind:
+                    rom_size = int.from_bytes(payload[0:4], "little")
+                    start = int.from_bytes(payload[4:8], "little")
+                    vgm.roms.append(RomSlice(chip_id, rom_size, start, payload[8:], kind))
             pos += 7 + size
             continue
         if cmd == 0x61 and pos + 3 <= n:
@@ -657,8 +731,86 @@ def load_vgm(path: Path | str) -> VgmFile:
             sample += (cmd & 0x0F) + 1
             pos += 1
             continue
+        if 0x80 <= cmd <= 0x8F:
+            # VGM 1.50 YM2612 PCM stream: play one byte from the data block
+            # pointer, then wait 0-15 samples.  The timing is the same as a
+            # generic wait, but it also advances the DAC read cursor.
+            wait = cmd & 0x0F
+            vgm.dac_events.append((sample, 1, wait))
+            sample += wait
+            pos += 1
+            continue
+        if cmd == 0xE0 and pos + 5 <= n:
+            ptr = int.from_bytes(buf[pos + 1:pos + 5], "little")
+            vgm.dac_events.append((sample, 0, ptr))
+            pos += 5
+            continue
+        if cmd == 0x92 and pos + 6 <= n:
+            stream = buf[pos + 1]
+            vgm.dac_stream_rates[stream] = int.from_bytes(buf[pos + 2:pos + 6], "little")
+            pos += 6
+            continue
+        if cmd == 0x95 and pos + 5 <= n:
+            stream = buf[pos + 1]
+            block = int.from_bytes(buf[pos + 2:pos + 4], "little")
+            rate = vgm.dac_stream_rates.get(stream, VGM_RATE)
+            vgm.dac_block_plays.append((sample, block, rate))
+            pos += 5
+            continue
+        if cmd == 0x90 and pos + 5 <= n:
+            # Stream setup: stream id, chip type, chip id, register.
+            pos += 5
+            continue
+        if cmd == 0x91 and pos + 5 <= n:
+            # Stream data source: bank, step size, step base.
+            pos += 5
+            continue
+        if cmd == 0x93 and pos + 11 <= n:
+            # Play-from-start-position form.  The fast 0x95 form is the one
+            # Furnace uses; keep the stream running rather than desync.
+            pos += 11
+            continue
+        if cmd == 0x94 and pos + 2 <= n:
+            pos += 2
+            continue
+        if cmd == CMD_DAC_WRITE and pos + 2 <= n:
+            vgm.dac_events.append((sample, 2, buf[pos + 1]))
+            pos += 2
+            continue
+        if cmd == CMD_DAC_ENABLE and pos + 2 <= n:
+            # Some logs use the standalone DAC enable command instead of
+            # writing YM2612 register 0x2B through 0x52.
+            vgm.writes.append(ChipWrite(sample, "ym2612", 0, 0x2B, buf[pos + 1]))
+            pos += 2
+            continue
+        if cmd == CMD_SN76489 and pos + 2 <= n:
+            # One SN76489 serial data byte.  The latch/register/channel is
+            # encoded inside the byte; reg is unused.
+            vgm.writes.append(ChipWrite(sample, "sn76489", 0, 0, buf[pos + 1]))
+            pos += 2
+            continue
         if cmd == CMD_YM2151 and pos + 3 <= n:
             vgm.writes.append(ChipWrite(sample, "ym2151", 0, buf[pos + 1], buf[pos + 2]))
+            pos += 3
+            continue
+        if (
+            cmd in (CMD_YM2612_P0, CMD_YM2612_P1, CMD_YM2612_B_P0, CMD_YM2612_B_P1)
+            and pos + 3 <= n
+        ):
+            # 0x52/0x53 are the first YM2612's two banks, 0xA2/0xA3 the
+            # second chip's.  The register address is kept flat so bank 1
+            # reads as 0x100+reg (ymfm's index), which is how channels 4-6
+            # are selected.
+            cid = 0
+            if cmd in (CMD_YM2612_B_P0, CMD_YM2612_B_P1):
+                if ym2612_dual:
+                    cid = 1
+                else:
+                    stray_ym2612_second = True
+            bank = 0x100 if cmd in (CMD_YM2612_P1, CMD_YM2612_B_P1) else 0
+            vgm.writes.append(ChipWrite(
+                sample, "ym2612", cid, bank | buf[pos + 1], buf[pos + 2],
+            ))
             pos += 3
             continue
         if cmd in (CMD_YM2203, CMD_YM2203_2) and pos + 3 <= n:
@@ -741,6 +893,20 @@ def load_vgm(path: Path | str) -> VgmFile:
         pos += cmd_size(cmd)
 
     vgm.loop_sample = loop_sample
+    # The 0x66 command's sample is the timeline the file really covers.  A
+    # header total far past it truncates the converted module against a
+    # source that still holds its last note, and a header total of 0 loses
+    # the grid/order budget entirely, so the stream length wins.
+    if saw_end:
+        if total != sample:
+            if total and abs(total - sample) > VGM_RATE // 10:
+                vgm.warnings.append(
+                    f"header length {total} samples, stream ends at {sample}; "
+                    "using the stream length"
+                )
+            vgm.total_samples = sample
+    elif not total:
+        vgm.total_samples = sample
     if skipped_sample_cmds:
         names = sorted({UNCONVERTED_SAMPLE_CMDS[c] for c in skipped_sample_cmds})
         first = min(skipped_sample_cmds)
@@ -765,6 +931,41 @@ def load_vgm(path: Path | str) -> VgmFile:
         vgm.warnings.append("K051649 clock is missing or out of range; using 1789772")
     if any(w.chip in ("ym2203", "ym2203_ssg") for w in vgm.writes) and not vgm.ym2203_clock:
         vgm.warnings.append("YM2203 clock is missing or out of range; using 3579545")
+    if any(w.chip == "ym2612" for w in vgm.writes) and not vgm.ym2612_clock:
+        vgm.warnings.append(
+            f"YM2612 clock is missing or out of range; using {YM2612_DEFAULT_CLOCK}"
+        )
+    if any(w.chip == "sn76489" for w in vgm.writes) and not vgm.sn76489_clock:
+        vgm.warnings.append(
+            f"SN76489 clock is missing or out of range; using {SN76489_DEFAULT_CLOCK}"
+        )
+    if vgm.dac_data and not vgm.dac_events and not vgm.dac_block_plays:
+        vgm.warnings.append(
+            "YM2612 PCM data block present but no DAC play stream; "
+            "the DAC data is unused"
+        )
+    if vgm.dac_events and not vgm.dac_data and any(kind == 1 for _t, kind, _v in vgm.dac_events):
+        vgm.warnings.append(
+            "YM2612 DAC play commands present but no PCM data block; "
+            "the DAC stream cannot be reconstructed"
+        )
+    if (
+        not vgm.dac_data
+        and any(kind == 2 for _t, kind, _v in vgm.dac_events)
+    ):
+        vgm.warnings.append(
+            "YM2612 direct 0x2A DAC writes are not converted (no PCM bank)"
+        )
+    if vgm.dac_block_plays and not vgm.dac_events:
+        vgm.warnings.append(
+            "modern 0x95 DAC stream control is parsed for the audit but not "
+            "converted as source PCM"
+        )
+    if stray_ym2612_second:
+        vgm.warnings.append(
+            "0xA2/0xA3 YM2612 writes without the dual-instance header bit; "
+            "they were treated as the first chip"
+        )
     if stray_ym2203_second:
         vgm.warnings.append(
             "0xA5 YM2203 writes without the dual-instance header bit; "

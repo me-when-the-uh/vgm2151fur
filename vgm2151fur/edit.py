@@ -18,12 +18,18 @@ from pathlib import Path
 
 from vgm2151fur.furwrite import (
     CHIP_AY8910, CHIP_C140, CHIP_C352, CHIP_K007232, CHIP_K051649, CHIP_K052539,
-    CHIP_MSM6258, CHIP_MSM6295, CHIP_SEGAPCM, FUR_MAGIC,
+    CHIP_MSM6258, CHIP_MSM6295, CHIP_SEGAPCM, CHIP_YM2612, CHIP_YM2612_CSM,
+    CHIP_YM2612_EXT, FUR_MAGIC, compress_fur,
 )
 
 CHIP_NAMES = {
+    0x02: "Sega Genesis",
+    0x42: "Sega Genesis Ext",
     0x82: "YM2151",
     0x8D: "YM2203",
+    CHIP_YM2612: "YM2612",
+    CHIP_YM2612_EXT: "YM2612 Ext",
+    CHIP_YM2612_CSM: "YM2612 CSM",
     CHIP_MSM6295: "MSM6295",
     CHIP_MSM6258: "MSM6258",
     CHIP_K007232: "K007232",
@@ -150,7 +156,9 @@ def read_chips(data: bytes) -> list[Chip]:
 
 
 def read_chips_file(path: Path) -> list[Chip]:
-    return read_chips(Path(path).read_bytes())
+    from vgm2151fur.furio import load_fur_bytes
+
+    return read_chips(load_fur_bytes(Path(path)))
 
 
 def set_chip_volume(
@@ -198,9 +206,14 @@ def set_chip_volume_file(
     targets: list[int] | None = None,
     dry_run: bool = False,
 ) -> list[Chip]:
+    from vgm2151fur.furio import load_fur_bytes
+
     path = Path(path)
-    data = path.read_bytes()
+    raw = path.read_bytes()
+    data = load_fur_bytes(path)
     patched, chips = set_chip_volume(data, factor=factor, value=value, targets=targets)
     if not dry_run and patched != data:
+        if raw[:16] != FUR_MAGIC:
+            patched = compress_fur(patched)
         path.write_bytes(patched)
     return chips

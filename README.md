@@ -4,6 +4,7 @@ Converts arcade VGM/VGZ rips into Furnace Tracker modules.
 Supported chips:
 - Yamaha YM2151 (OPM)
 - Yamaha YM2203 (OPN)
+- Yamaha YM2612 (OPN2), including channel-3 special/CSM frequency layouts
 - Namco C140
 - Namco C352 (requires a development build of Furnace from a compatible fork. A build with C352 support (built from https://github.com/me-when-the-uh/furnace-ports) is located in `./furnace-c352` - use at your own risk, since it's always a good idea to build from source instead of relying on someone else's builds)
 - Konami K007232 (experimental)
@@ -51,7 +52,7 @@ python -m vgm2151fur compare "01 Track.vgz" out/01.Track.fur --channel 4
 python -m vgm2151fur render out/01.Track.fur --loops 2
 ```
 
-`convert` writes one `.fur` per input. `-o` sets the output folder (the default is a `fur/` folder beside the input). `--speed N` pins ticks per row when the automatic grid estimate is wrong, `--workers N` sets how many tracks run at once, and `--melody-only` / `--pcm-only` restrict the chips. A folder of packs writes each pack to its own `fur/` folder, or to `-o/<pack>`. Every track prints its size, grid speed, instrument and sample counts, and any warnings.
+`convert` writes one zlib-compressed `.fur` per input. `-o` sets the output folder (the default is a `fur/` folder beside the input). `--speed N` pins ticks per row when the automatic grid estimate is wrong, `--workers N` sets how many tracks run at once, and `--melody-only` / `--pcm-only` restrict the chips. A folder of packs writes each pack to its own `fur/` folder, or to `-o/<pack>`. Every track prints its size, grid speed, instrument and sample counts, and any warnings.
 
 `report` prints the analysis without writing anything. Use it to see which chips a VGM uses, how the grid was estimated, and what was skipped.
 
@@ -61,7 +62,7 @@ python -m vgm2151fur render out/01.Track.fur --loops 2
 
 `render` writes a WAV of a `.fur` so you can hear the conversion.
 
-`--variants` writes the 1x/2x/3x/4x row-condensing ladder side by side, and `--optimize lossless` marks the largest factor that adds no structural loss; `--verify` renders each candidate and rejects sustained pitch divergence. `docs/operating.md` has the workflow.
+`--variants` writes the 1x/2x/3x/4x row-condensing ladder side by side, and `--optimize lossless` marks the largest factor that adds no structural loss. Every variant reports `keys`/`miss` (source key-ons and the ones the pattern could not place); `--verify` exports each candidate, rejects sustained pitch divergence, and adds the precise key-on audit (`aud`, missed key-ons, effective operator field mismatches). `docs/operating.md` has the workflow and the `condense.tsv` columns.
 
 ## Tests
 
@@ -83,9 +84,11 @@ docs/           operating guide, format notes, chip notes
 
 ## Known limits
 
-- The YM2151 and YM2203 models cover the OPM/OPN register sets the arcade drivers use. Other chips (YM2612, YM3812, ...) are not supported.
+- The YM2151, YM2203 and YM2612 models cover the OPM/OPN/OPN2 register sets the arcade and Genesis drivers use. Other chips (YM3812, YM2608, ...) are not supported.
 - YM2203 notes are labelled at the highest carrier's octave when a patch uses a power-of-two carrier MULT. A constant pitch macro on the instrument keeps the source f-num/block/audio unchanged, so the pattern note matches the audible carrier.
-- The YM2203's channel-3 3-slot chord is reduced to one operator, CSM timer key-ons are not synthesized, and LFO writes are skipped; the report warns when it sees them. Very fast SSG ornaments shorter than a pattern row are simplified (`docs/ym2203.md`).
+- The YM2203's channel-3 3-slot chord is reduced to one operator, CSM timer key-ons are not synthesized, and LFO writes are skipped; the report throws a warning when it sees them. Very fast SSG ornaments shorter than a pattern row are simplified (`docs/ym2203.md`).
+- The Genesis SN76489 PSG is converted as four extra channels (three tone + noise). Extreme periods below the musical table range and two PSG notes on the same channel/row are approximated.
+- The YM2612 DAC is converted from the type-0 PCM bank. Sparse slices become per-hit samples, while dense old-style streams become a continuous 22.05 kHz timeline sample per phrase. This preserves Contra-style percussion but makes those modules larger (up to ~4 MB). Direct `0x2A`-only DAC streams and DAC data without a play stream still throws a warning. Channel-3 special and CSM per-operator frequencies are converted (the Ext system); CSM timer key-ons are not synthesized. LFO, PMS/AMS, pan and SSG-EG are converted (`docs/ym2612.md`).
 - Furnace 0.6.8.3 has no C352 core; a build with the ported core can play those modules (`docs/c352.md`).
 - Chip volumes above unity only exist in INF2 files.
 - Patterns are 256 rows; the row grid is estimated per track and very fine pitch motion is approximated with per-row ramps (`docs/fur-writer.md`).
