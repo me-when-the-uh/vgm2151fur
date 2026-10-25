@@ -119,8 +119,10 @@ each chunk note comes from the source `0xB6` at that chunk start. The per-run
 slice representation is explicit (`slices=True`) and uses 120 slices per map;
 it is not the release default. The SN76489 uses a plain `DIV_INS_STD`
 instrument (pitch macro only), a 0-15 volume column, and effect `20xy` for
-noise mode. PSG notes must point at that STD instrument. The FM feature's four
-operator columns of the Ext system share one timbre instrument.
+noise mode. PSG notes must point at that STD instrument. The SN76489 system
+volume defaults to 0.500 (32/64), not the reference player's 1.0; an absolute
+extra-header volume entry replaces it. The FM feature's four operator columns
+of the Ext system share one timbre instrument.
 
 PCM instruments bind one sample each: K007232 two channels, MSM6295 four
 voices per chip, MSM6258 one, SegaPCM sixteen, C140 twenty-four, C352

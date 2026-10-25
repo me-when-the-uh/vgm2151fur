@@ -119,8 +119,11 @@ PAT_TAIL_ROWS = 10
 # 8.8 fixed-point defaults with 0x100 = the YM2151's unity, per-chip core
 # patches, and the extra-header mix entries (bit 15 of a value means
 # "relative", otherwise it replaces the default).
+# SN76489 is the deliberate exception: the reference player's default is
+# 0x100, but the converter writes 0x80 (0.500) so the PSG sits under the FM
+# mix.  An absolute extra-header volume entry still replaces it.
 _DEV_DEFAULT_VOLUME = {
-    0x00: 0x100,  # SN76489
+    0x00: 0x80,  # SN76489, converter default 0.500
     0x03: 0x100, 0x04: 0x180, 0x12: 0x100, 0x18: 0x100, 0x19: 0xA0,
     0x1C: 0x100, 0x27: 0x40,
 }

@@ -45,7 +45,8 @@ The old 22.05 kHz body is `timeline=True` for comparison only.
   track 20, 240 samples); the WAVs have the same duration as the old
   timeline. The one-phrase default is gone: one note held the first pan for
   the whole track.
-- Full suite: 383 passed, 1 skipped.
+- Full suite: 384 passed, 1 skipped. The SN76489 default `.fur` system volume
+  is 0.500 (32/64); an absolute VGM extra-header volume still overrides it.
 - The chunked 1x manifest reports 50,692 keys (45,177 FM + 5,515 DAC chunk
   notes), 0 missed, `psg_miss = 0`, 13 field differences and up to 2,182 ms
   divergence from the newly audible PSG. The old combined 45,500/0/0 was

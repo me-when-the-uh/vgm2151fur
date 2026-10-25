@@ -129,7 +129,8 @@ wanted, that is a source/authoring decision, not a converter stuck on right.
 
 ## Tests
 
-`tests/test_vgm2151fur_ym2612.py` (383 passed, 1 skipped):
+`tests/test_vgm2151fur_ym2612.py` and the new-chip volume tests (384 passed,
+1 skipped):
 
 - chunked: 20 s of PCM becomes >1 and <=240 chunks at the 0.25 s budget;
   three source pans appear on chunk notes and module `08` effects; a short

@@ -529,6 +529,14 @@ class TestChipVolumes(unittest.TestCase):
         song = SimpleNamespace(vgm=_vgm([], msm6295_dual=False))
         self.assertAlmostEqual(_sample_chip_volume(song, CHIP_MSM6295, 1), 1.0)
 
+    def test_sn76489_default_fur_volume_is_half(self):
+        from types import SimpleNamespace
+
+        from vgm2151fur.furwrite import CHIP_SMS, _sample_chip_volume
+
+        song = SimpleNamespace(vgm=_vgm([]))
+        self.assertAlmostEqual(_sample_chip_volume(song, CHIP_SMS, 1), 0.5)
+
 
 class TestC140FadesAndSlides(unittest.TestCase):
     @staticmethod

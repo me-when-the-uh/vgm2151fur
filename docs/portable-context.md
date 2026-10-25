@@ -17,7 +17,7 @@ C:\Users\User\Desktop\Pets\ripper\tools\arcade-vgm-rip\
       furio.py                .fur reader / linter
       audit.py, diag.py       source-vs-export audits
     docs\                     chip notes and this handoff material
-    tests\                    pytest suite (383 passing, 1 skipped)
+    tests\                    pytest suite (384 passing, 1 skipped)
     tools\                    fur2vgm, fur2wav, vgmdiff, vgmchroma, soundcheck
   VGM_collection\             local reference packs
     YM2151\                   Quester, Block Hole, Willow, ...
@@ -73,13 +73,16 @@ files are zlib-wrapped at level 5; `write_fur` itself returns raw bytes unless
 - The tone-instrument base counts the DAC maps exactly once, including after
   an FM pitch copy. PSG/SCC/AY notes bind to their own STD/SN/AY instrument,
   never a DAC map.
+- The SN76489 default `.fur` system volume is **0.500** (32/64), not the
+  reference player's 1.0. An absolute VGM extra-header volume entry still
+  replaces it; `edit --chip SN76489 --value` overrides a finished module.
 - `tests/test_vgm2151fur_ym2612.py` covers the chunked default (a 20 s stream
   becomes >1 and <=240 chunks at the 0.25 s budget; three source pans appear
   on notes and `08` effects; short streams stay one chunk; long gaps split
   audio and drop silence; silence-only has no notes; natural rate; map base
   0), the explicit slice mode, the silence-row rule, PSG binding, PCM round
   trips, pan, key-on masks, operator order and Furnace exports. Full suite:
-  383 passed, 1 skipped.
+  384 passed, 1 skipped.
 - Current Contra artifacts are under
   `VGM_collection\YM2612\Contra Hard Corps (Mega Drive, Genesis)\`:
   `fur-fixed` (old timeline reference), `fur-vgm2fur` (old baseline) and

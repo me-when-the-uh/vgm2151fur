@@ -175,6 +175,11 @@ Volumes above 1.0 need the INF2 format, which only newer Furnace saves
 produce. On an old-style INFO file the tool caps at 1.0 and the listing shows
 the capped value.
 
+The converter writes the SN76489 system volume at **0.500** (32/64) by
+default, not the reference player's 1.0; an absolute VGM extra-header volume
+entry replaces it. `edit --chip SN76489 --value 0.5` can set it on a finished
+module.
+
 ## Verifying a track
 
 Three levels of checking exist, cheapest first.
