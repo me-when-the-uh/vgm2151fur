@@ -1278,6 +1278,46 @@ class TestC352(unittest.TestCase):
         smp = song.c352_samples[0]
         self.assertEqual(smp.loop_start, 0x01)
 
+    def test_next_note_preload_does_not_move_the_loop(self):
+        # the driver preloads the next note's geometry on this voice before
+        # its strobe. The end write must not re-arm the crossing guard: the
+        # next end is below the key-on start, so the old live-end span wrapped
+        # and the write after the crossing was taken for a mid-note rewrite.
+        rom = bytearray(0x40000)
+        for i in range(len(rom)):
+            rom[i] = (i * 5 + 1) & 0xFF
+        writes = _lattice() + self._regs(
+            60000, vol_f=0x4000, vol_r=0, freq=0x8000, flags=0x4002,
+            bank=0, start=0x0300, end=0x03C7, loop=0x0320,
+        ) + [
+            self._strobe(60000),
+            *self._regs(60700, start=0x0100, end=0x01C7, loop=0x0100),
+            *self._regs(60750, flags=0x0000),
+            *self._regs(60760, flags=0x4002),
+            self._strobe(60800),
+        ]
+        song = self._song(writes, rom, rom_size=0x40000)
+        smp = [s for s in song.c352_samples if s.start == 0x300][0]
+        self.assertEqual((smp.loop_start, smp.loop_end), (0x20, 0xC8))
+
+    def test_stopped_note_that_reaches_the_loop_carries_it(self):
+        # the reach test works in ROM frames, not VGM samples: at this
+        # frequency 200 frames fit inside 150 samples
+        rom = bytearray(0x20000)
+        for i in range(len(rom)):
+            rom[i] = (i * 7 + 3) & 0xFF
+        writes = _lattice() + self._regs(
+            60000, vol_f=0x4000, vol_r=0, freq=0xFFFF, flags=0x4002,
+            bank=0, start=0x0100, end=0x01C7, loop=0x01C8,
+        ) + [
+            self._strobe(60000),
+            *self._regs(60150, flags=0x0000),
+            self._strobe(60150),
+        ]
+        song = self._song(writes, rom, rom_size=0x20000)
+        smp = song.c352_samples[0]
+        self.assertEqual((smp.loop_start, smp.length), (0xC8, 0xC8 + 0x10000))
+
     def test_stopped_note_does_not_carry_the_loop_region(self):
         # a note the driver stops before the running address reaches wave_end
         # never loops, so the payload stays the intro - the big loop bodies

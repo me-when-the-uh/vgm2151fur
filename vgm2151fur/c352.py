@@ -131,6 +131,26 @@ def hit_played_freq(hit: "C352Hit") -> int:
     return hit.freq & 0xFFFF
 
 
+def hit_played_frames(hit: "C352Hit", end_sample: int, clock: int) -> float:
+    """ROM frames the voice advances from key-on until ``end_sample``."""
+    if end_sample <= hit.sample_time:
+        return 0.0
+    freq = hit.freq & 0xFFFF
+    prev = hit.sample_time
+    total = 0.0
+    for t, f in hit.freq_pts:
+        if t <= prev:
+            freq = f
+            continue
+        if t >= end_sample:
+            break
+        total += c352_rate(clock, freq) * (t - prev) / VGM_RATE
+        freq = f
+        prev = t
+    total += c352_rate(clock, freq) * (end_sample - prev) / VGM_RATE
+    return total
+
+
 def _mix(vol_f: int, vol_r: int, mute_rear: bool) -> tuple[int, int]:
     """Front pair, plus the rear pair unless the header mutes it. Each side clamps at 255."""
     left = (vol_f >> 8) & 0xFF
@@ -313,7 +333,14 @@ def _plan(hit: C352Hit, rom: bytes, vgm: VgmFile, acc: dict[str, int]) -> dict |
     start = hit.start & 0xFFFF
     end = hit.end & 0xFFFF
     loop = hit.loop & 0xFFFF
-    if hit.geo_at_cross is not None:
+    clock = vgm.c352_clock or C352_DEFAULT_CLOCK
+    stop = hit.off_sample or vgm.total_samples or 0
+    swing = (start - end) & 0xFFFF if reverse else (end - start) & 0xFFFF
+    # a rewrite only matters if the voice reaches the crossing it feeds; a
+    # driver that preloads the next note's start/loop on a voice it stops
+    # first must not move this note's loop
+    crossed = stop == 0 or hit_played_frames(hit, stop, clock) >= swing
+    if hit.geo_at_cross is not None and crossed:
         # the jump uses the live wave_loop and wave_start (the LINK target's
         # high half); end and bank keep their key-on values. The walk still
         # starts at the key-on address.
@@ -412,7 +439,7 @@ def _plan(hit: C352Hit, rom: bytes, vgm: VgmFile, acc: dict[str, int]) -> dict |
     # loops, so the loop region does not have to be carried (the module would
     # only hold bytes its playback never reaches). off_sample 0 means the note
     # was never stopped and runs to the end.
-    reaches_loop = hit.off_sample == 0 or (hit.off_sample - hit.sample_time) >= n
+    reaches_loop = stop == 0 or hit_played_frames(hit, stop, clock) >= n
 
     if link:
         intro_n = n
@@ -798,7 +825,7 @@ def collect_c352(
             # rewrite; a write after the crossing is for the next pass. end
             # and bank are also rewritten mid-note, but as stop/shorten
             # tricks, so the key-on values stay in charge.
-            if st["played"][voice] < ((reg[voice][REG_END] - hit.start) & 0xFFFF):
+            if st["played"][voice] < ((hit.end - hit.start) & 0xFFFF):
                 hit.geo_at_cross = (reg[voice][REG_START], reg[voice][REG_LOOP])
         elif r in (REG_END, REG_LOOP):
             if st["stop"][voice] is not None:

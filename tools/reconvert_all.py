@@ -74,10 +74,10 @@ def plan(sources_root: Path, output_root: Path) -> list[tuple[str, Path, Path]]:
         fur_dir = pack_dir / "fur"
         if not fur_dir.is_dir():
             continue
-        furs = sorted(fur_dir.glob("*.fur"))
+        # The dir layout keeps its canonical 1x files in default/.
+        furs = sorted((fur_dir / "default").glob("*.fur"))
         if not furs:
-            # The dir layout keeps its canonical 1x files in default/.
-            furs = sorted((fur_dir / "default").glob("*.fur"))
+            furs = sorted(fur_dir.glob("*.fur"))
         if not furs:
             continue
         best, best_score = None, 0
