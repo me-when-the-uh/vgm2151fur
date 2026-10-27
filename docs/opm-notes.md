@@ -82,6 +82,38 @@ would make every step ~9× too short, i.e. full vibrato the instant the note
 starts. One trajectory per instrument is a known approximation; see the
 gaps section.
 
+## LFO re-anchoring (TEST register)
+
+Capcom's CP System 1 driver, as heard on Willow, writes `0x01=02` then
+`0x01=00` around every key-on. TEST bit 1 gates the LFO's wave-3 term, and
+the pulse re-seeds the OPM's pseudo-random LFO sequence at the note. Without
+it an audio-rate LFO (LFRQ FF is about 200 Hz) can be an arbitrary phase off
+by the time a long note starts. With PMS 7/PMD 7F that is audible pitch:
+Willow's stage 6-1 lead plays over a semitone sharp from 19 s.
+
+Furnace has no effect that writes `0x01` alone. `17xx` writes `0x01=00` and
+`LFRQ=xx`. `1700` writes `0x01=02` and `LFRQ=00`. The converter emits the
+pulse as two effects one engine tick apart:
+
+| tick | effect | writes |
+|---|---|---|
+| T | `1700` | `01=02`, `18=00` |
+| T+1 | `17<lfrq>` | `01=00`, `18=<lfrq>` |
+
+The restore carries a one-tick placement offset and lands on another channel
+at the same pattern row, because a cell holds one `17xx`. The driver's
+following `0x01=00` is dropped within two samples of the pulse. The delayed
+restore already clears the bit, and a write at T would overwrite the `1700`.
+
+**Furnace must not elide same-value LFO writes.** The OPM reloads its LFO
+counter on every `0x18` write, including one that writes the same value.
+Drivers that rewrite `LFRQ` at each key-on rely on that. The local Furnace
+source carries the fix: `src/engine/platform/fmsharedbase.h` marks
+`0x01/0x18/0x19/0x1B` writes dirty, and `arcade.cpp` writes them even when
+unchanged. A stock Furnace build still plays the module, but drops the
+same-value reloads and the LFO phase drifts as before. The `.fur` uses only
+standard effects and remains portable.
+
 ## Percussion pitch sweeps
 
 The percussion channel does not hold a constant pitch: right after each
@@ -180,6 +212,11 @@ check.
   instrument.** Notes that deviate from the common PMS/AMS trajectory get
   the common one. `vgmdiff.py` cannot see this; export the track and
   compare `0x38`–`0x3F` writes, or listen.
+- **The LFO register stream is carried at row resolution.** The TEST pulse
+  and every `0x18` write reach the module (see "LFO re-anchoring"), but a
+  write between row boundaries lands on the row's tick. At audio rate
+  (LFRQ FF) that placement error is a large phase change. Very fast vibrato
+  still differs note by note. Slow LFRQ values are reproduced faithfully.
 - **Operator-level key tricks are partly flattened.** The KON mask is
   tracked per operator (an envelope restarts only on a 0→1 bit transition,
   matching ymfm), so redundant key-on writes and per-operator changes while
@@ -247,8 +284,7 @@ python -m vgm2151fur "track.vgz" --out output/pack/fur
 & ..\vgm2wav-mute.exe "track.vgz" "$env:TEMP\track.wav"
 ```
 
-Play the `.fur` next to the WAV (Furnace 0.6+). The grid line in
-`--report` names the measured lattice, the rows per second and the
-subdivision it chose. Drum-channel rows should show `EDxx` (frame-exact
-note starts), `E5xx` (initial KF fine tuning) and `02xx`/`01xx` ramps with
-an `xx = 0` stop at the end of each sweep.
+The grid line in `--report` names the measured lattice, the rows per second,
+and the subdivision it chose. Drum-channel rows should show `EDxx`
+(frame-exact note starts), `E5xx` (initial KF fine tuning) and `02xx`/`01xx`
+ramps with an `xx = 0` stop at the end of each sweep.

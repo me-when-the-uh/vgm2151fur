@@ -1,14 +1,9 @@
-"""Measure the musical row grid from key-on timing, or say "no".
+"""Measure the musical row grid from key-on timing, or return None.
 
-Arcade drivers schedule notes on a fixed musical unit (the 16th note) whose
-length in samples is not a whole number of 60 Hz frames, and the unit drifts
-per channel and section by a few percent. Each measured unit is subdivided
-into rows and given several ticks (Furnace: hz = ticks/second, speed =
-ticks/row), so EDxx delays place every event within half a tick and pitch
-ramps advance at the same fine rate.
-
-The estimator is deliberately conservative: no regular lattice, no grid, and
-the caller falls back to the legacy 60 Hz heuristic.
+Drivers schedule notes on a 16th note whose length is not a whole number of
+60 Hz frames. The measured unit is subdivided into rows and ticks, and EDxx
+places every event within half a tick. The estimator is conservative, and
+the caller falls back to the legacy 60 Hz heuristic when no lattice fits.
 """
 
 from __future__ import annotations
@@ -99,21 +94,24 @@ def _bucketed_mode(vals: list[int], bucket: int = 4) -> float:
 def _refine_unit(deltas: list[int], guess: float) -> float:
     """Least-squares refinement of the note unit around a candidate.
 
-    Only intervals at least ~0.6x the guess take part, so ornament notes on a
-    finer grid do not drag the fit away from the candidate's lattice.
+    Only intervals at least ~0.6x the guess take part. Ornament notes on a
+    finer grid must not drag the fit away from the candidate's lattice.
     """
     usable = [d for d in deltas if d >= 0.6 * guess]
     if len(usable) < 8:
         usable = deltas
+    # Repeated intervals dominate the sum. Folding them into weights keeps
+    # the 600-point search affordable on dense percussive tracks.
+    weights = tuple(Counter(usable).items())
 
     def cost(t: float) -> float:
         total = 0.0
-        for d in usable:
+        for d, n in weights:
             k = round(d / t)
             if k < 1:
                 k = 1
             r = d - k * t
-            total += r * r / k  # weight long deltas a little less
+            total += n * r * r / k  # weight long deltas a little less
         return total
 
     lo, hi = guess * 0.9, guess * 1.1
@@ -167,11 +165,8 @@ def place_tick(
 ) -> tuple[int, int]:
     """Map a source sample to (row, ED delay in ticks).
 
-    The one placement rule every chip path shares. ``floor=False`` rounds to
-    the nearest tick (the normal note/effect placement). ``floor=True`` picks
-    the preceding tick, which lets a caller prepend the held byte for the
-    residual and keep the audible content at its exact source time; the DAC
-    slice writer uses that.
+    `floor=False` rounds to the nearest tick. `floor=True` uses the preceding
+    tick. A caller can prepend the held byte and keep the exact source time.
     """
     if speed <= 1:
         row = max(0, int(math.floor(
@@ -212,17 +207,11 @@ def estimate_grid(
     onsets: dict[int, list[int]] | None = None,
     label: str = "key-on lattice",
 ) -> Grid | None:
-    """Return the measured grid (a subdivided 16th note) or None.
+    """Return the measured grid, a subdivided 16th note, or None.
 
-    Several candidate units are tried (per-channel median, bucketed mode,
-    global mode), each scored by how many intervals it explains as integer
-    multiples. Among near-best candidates the *coarsest* unit wins: finer
-    note values still land on the row grid via EDxx, and coarser units keep
-    patterns from growing needlessly dense.
-
-    `onsets` overrides the note times used, keyed by channel. The default
-    reads the YM2151 key-on register; a rip with no FM stream passes its
-    sample-chip triggers here instead.
+    Candidate units are scored by how many intervals they explain as integer
+    multiples, and the coarsest near-best unit wins. `onsets` overrides the
+    note times, keyed by channel.
     """
     by_ch = _keyons_by_channel(vgm) if onsets is None else onsets
     deltas: list[int] = []
@@ -359,13 +348,11 @@ def refine_pcm_grid(
     gaps: list[int],
     tick_samples: float = TARGET_TICK_SAMPLES,
 ) -> tuple[float, int, int, str]:
-    """Shrink the row so each same-voice restart the order budget can hold
-    lands on its own row.
+    """Shrink the row until each playable same-voice restart has its own row.
 
-    ``gaps`` are distances between restarts on one voice. A gap shorter than
-    the finest row that fits in 256 orders cannot have its own row; the
-    pattern writer keeps the later write of that pair. The returned grid is
-    the one passed in when that grid already separates every gap that fits.
+    `gaps` are distances between restarts on one voice. A gap below the
+    finest row that fits in 256 orders cannot have its own row. Returns the
+    input grid unchanged when every gap already fits.
     """
     if extent <= 0 or speed <= 0 or hz <= 0 or not gaps:
         return hz, speed, subdiv, ""

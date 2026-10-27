@@ -1,14 +1,10 @@
 """Move a VGM loop marker onto the downbeat of the bar.
 
-Rippers drop the loop sample wherever the phrase happened to be, so the
-marker can sit a pulse, or a whole phrase, late. The order cut moves it onto
-the phrase's own head and opens a row early, so the voices keyed just before
-the downbeat stay inside the loop and the jump row is not the downbeat
-itself. The loop keeps the length the VGM declares.
-
-A grid with no clock, or a loop that is not a whole number of bars, stays on
-the VGM marker, except when the marker sits on the empty row after a chord:
-the cut then moves to the rows before that chord.
+Rippers drop the marker where the phrase happened to be, and it can sit a
+pulse or a phrase late. The cut moves it onto the phrase head and opens a
+row early, keeping voices keyed just before the downbeat inside the loop.
+The loop keeps the length the VGM declares. A loop that is not a whole
+number of bars stays on the VGM marker.
 """
 
 from __future__ import annotations
@@ -24,7 +20,7 @@ MIN_REGULARITY = 0.75
 # One late note must not hand the clock to a sparser, perfectly even voice.
 REG_TOLERANCE = 0.05
 # Weighted pitch-class agreement through the loop body. Exact equality
-# stays near zero when voices sit a row apart, so 0.25 still leaves a
+# stays near zero when voices sit a row apart. 0.25 still leaves a
 # through-composed cue on the VGM marker.
 MIN_AUTOCORR = 0.25
 MIN_AUTOCORR_GAP = 0.04

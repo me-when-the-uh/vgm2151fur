@@ -88,7 +88,7 @@ def find_furnace() -> Path | None:
     return Path(which) if which else None
 
 
-def _run(fur: Path, out: Path, extra: list[str]) -> Path:
+def _run(fur: Path, out: Path, extra: list[str], timeout: float | None = None) -> Path:
     exe = find_furnace()
     if exe is None:
         raise FurnaceError(
@@ -113,7 +113,16 @@ def _run(fur: Path, out: Path, extra: list[str]) -> Path:
         **({"creationflags": flags} if flags else {}),
     )
     try:
-        stdout, _err = proc.communicate()
+        stdout, _err = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        try:
+            proc.communicate(timeout=5)
+        except Exception:
+            pass
+        raise FurnaceError(
+            f"{fur.name}: furnace timed out after {timeout:.0f}s"
+        )
     except BaseException:
         proc.kill()
         try:
@@ -134,8 +143,10 @@ def render_wav(fur: Path, out: Path, *, loops: int = 1, outformat: str | None = 
     if outformat:
         extra += ["-outformat", outformat]
     extra.append("-output")
-    return _run(fur, out, extra)
+    return _run(fur, out, extra, timeout=900)
 
 
 def export_vgm(fur: Path, out: Path) -> Path:
-    return _run(fur, out, ["-vgmout"])
+    # A malformed module opens a modal dialog instead of exiting. A register
+    # walk exports in far less than a minute.
+    return _run(fur, out, ["-vgmout"], timeout=60)

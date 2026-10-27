@@ -21,9 +21,7 @@ from vgm2151fur.vgm import load_vgm
 
 # The desktop default: logical CPUs minus one or two threads, capped at 16.
 CONVERT_WORKERS = resolve_workers(None, jobs=10**6)[0]
-# Divergent pitch time a rendition may carry, as a share of its played time.
-# The relative test alone cannot police a track whose 1x rendition already
-# drifts, so a candidate is also capped at this share of the piece.
+# A rendition may carry this share of its played time as divergent pitch.
 DIVERGENCE_SHARE = 0.15
 VGM_SUFFIXES = {".vgm", ".vgz"}
 VGM_GLOBS = ("*.vgm", "*.vgz", "*.VGM", "*.VGZ")
@@ -161,14 +159,9 @@ def _verify_runs(
 ) -> dict:
     """Milliseconds of divergent pitch between the source and the export.
 
-    `--verify` renders each candidate and measures the divergences `compare`
-    reports, at a finer threshold (0.25 st / 60 ms) where a marginal variant
-    can hide. The result is total divergent time, not a run count: a count
-    moves with `min_run_ms`, which would make the comparison depend on the
-    floor instead of the music.
-
-    `min_run_ms` has to stay under the candidate's own row length, or a note
-    pushed one row late diverges for exactly one row and is never measured.
+    `--verify` measures the runs `compare` reports at 0.25 st / 60 ms. The
+    result is total divergent time, not a run count. `min_run_ms` must stay
+    under the candidate's row length, or a one-row error is discarded.
     """
     from vgm2151fur.audit import compare_keyons
     from vgm2151fur.diag import export_fur, pitch_runs
@@ -219,16 +212,13 @@ def _emit(
     song, out_path: Path, *, pcm: bool, include_fm: bool, normalize: bool,
     warnings: list, stats: dict, gain: float | None = None,
 ) -> tuple[bytes, float | None, float | None]:
-    """Write one Song to `out_path`, optionally normalizing. (bytes, peak, gain).
+    """Write one Song to `out_path`. Returns (bytes, peak, gain).
 
-    `gain` reuses a master volume measured on another rendition of the same
-    track: the variants differ only in row rate, so one measurement levels
-    the set and keeps it at one volume.
+    `gain` reuses a master volume measured on another rendition of the track.
     """
-    # A track with no FM key-ons must not carry an empty YM2151: the chip adds a
-    # second device to the export, and VGM players rescale the mix for it, which
-    # drops the sample chip's level. The YM2203 is different: its SSG voices
-    # belong to the same system, so an SSG-only track still needs the chip.
+    # An empty YM2151 adds a second device to the export and VGM players
+    # rescale the mix, dropping the sample chip's level. The YM2203 SSG
+    # belongs to the same system, and an SSG-only track keeps the chip.
     use_fm = include_fm and (
         bool(song.fm_patches) or bool(getattr(song, "ym2203_ids", ()) or ())
     )
@@ -332,11 +322,7 @@ def _optimised_dir(factor: float) -> str:
 
 
 def default_factors(condense: float) -> tuple[float, ...]:
-    """The 1x..Nx ladder with the half steps kept: 1, 1.5, 2, 2.5, ... N.
-
-    A row is not a whole number of samples.  A unit that lands between two
-    whole steps would otherwise be skipped.
-    """
+    """The 1x..Nx ladder with half steps: 1, 1.5, 2, 2.5, ... N."""
     top = max(1.0, float(condense))
     out: list[float] = []
     step = 1
@@ -409,20 +395,12 @@ def convert_variants(
     layout: str = "flat",
     c352_quad: bool = False,
 ) -> list[dict]:
-    """Write one .fur per condense factor, side by side, and pick one.
+    """Write one .fur per condense factor and pick one.
 
-    factor 1 is the canonical `<stem>.fur`; factor N is `<stem> xN.fur`, so
-    the canonical file is never overwritten. `mode` decides the reported
-    `pick`: none -> 1x; lossless -> the largest factor whose structural loss
-    stays at the 1x baseline; all -> the largest factor. With `verify`, the
-    lossless pick also renders each candidate and rejects sustained pitch
-    divergence.
-
-    The loop is found once on the 1x rows and its sample points are shared:
-    each rendition reads them at its own row rate.
-
-    With `layout="dirs"` the accepted factors move to `<out_dir>/default/`
-    or `<out_dir>/xN optimised/` and the rejected ones are deleted.
+    Factor 1 is the canonical `<stem>.fur`; factor N adds ` xN`. `mode`
+    chooses the pick: none -> 1x, lossless -> largest accepted factor, all ->
+    largest factor. With `layout="dirs"` accepted factors move to
+    `default/` and `xN optimised/`.
     """
     vgm = load_vgm(path)
     src = Path(path)
@@ -458,11 +436,23 @@ def convert_variants(
         if shared_gain is None and gain is not None:
             shared_gain = gain
         row_ms = song.samples_per_row / 44.1
-        verdict = (
-            _verify_runs(
-                vgm, out_path, min_run_ms=max(4.0, min(60.0, row_ms * 0.75)),
-            ) if verify else None
-        )
+        # Furnace rejects a module over its instrument limit.
+        over_limit = any("250-slot" in w for w in warnings)
+        verify_failed = bool(verify and over_limit)
+        verdict = None
+        if verify and over_limit:
+            warnings.append(
+                "verification skipped: the module exceeds Furnace's instrument limit"
+            )
+        elif verify:
+            try:
+                verdict = _verify_runs(
+                    vgm, out_path,
+                    min_run_ms=max(4.0, min(60.0, row_ms * 0.75)),
+                )
+            except FurnaceError as exc:
+                verify_failed = True
+                warnings.append(f"verification skipped: {exc}")
         results.append({
             "factor": factor,
             "dst": str(out_path),
@@ -483,6 +473,7 @@ def convert_variants(
             "gain": gain,
             "div_ms": verdict.get("div_ms") if verdict else None,
             "audit": verdict,
+            "verify_failed": verify_failed,
         })
     # The variants sharing a measurement all report the track's peak.
     measured = next((r["peak"] for r in results if r["peak"] is not None), None)
@@ -508,11 +499,14 @@ def convert_variants(
 
     def _lossless(r: dict) -> bool:
         if verify:
+            # An uninspected rendition is not lossless.
+            if r.get("verify_failed"):
+                return False
             if sum(r["loss"].get(k, 0) for k in hard_keys) > base_hard:
                 return False
             if base_div is not None and r.get("div_ms") is not None:
-                # Divergent time scales with the length of the piece, so the
-                # slack is relative with a floor for near-perfect baselines.
+                # Divergent time scales with the length of the piece. The
+                # slack is relative, with a floor for near-perfect baselines.
                 if r["div_ms"] > base_div + max(20.0, base_div * 0.25):
                     return False
                 if r["div_ms"] > div_cap:
@@ -533,9 +527,9 @@ def convert_variants(
     elif mode == "lossless":
         measured = [r for r in ok if r.get("div_ms") is not None]
         if measured:
-            # Divergent time is not monotone in the factor, so taking the
-            # largest accepted factor can walk past its minimum; pick the
-            # largest factor still within a tenth of the best.
+            # Divergent time is not monotone in the factor, and the largest
+            # accepted factor can walk past its minimum. Pick the largest
+            # factor still within a tenth of the best.
             best = min(r["div_ms"] for r in measured)
             near = [r for r in measured if r["div_ms"] <= best + max(20.0, best * 0.10)]
             pick = max(near, key=lambda r: r["factor"])
@@ -547,7 +541,7 @@ def convert_variants(
         r["pick"] = r is pick
     if layout == "dirs":
         # 1x is the canonical file and the reference every verdict is measured
-        # against, so it is written even when nothing else survives.
+        # against. Write it even when nothing else survives.
         keep = {r["factor"] for r in (results if mode == "all" else ok)}
         keep.add(base["factor"])
         _place_dirs(results, out_dir, keep=keep)

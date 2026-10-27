@@ -12,8 +12,13 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "tests"))
 
-from vgm2151fur.analyze import _flush_pms_ramp  # noqa: E402
+import _synth  # noqa: E402
+
+from vgm2151fur import furwrite as fw  # noqa: E402
+from vgm2151fur.analyze import _flush_pms_ramp, analyze  # noqa: E402
+from vgm2151fur.vgm import ChipWrite  # noqa: E402
 
 
 class TestPmsRamp(unittest.TestCase):
@@ -36,6 +41,54 @@ class TestPmsRamp(unittest.TestCase):
         pms, _ams, deltas = acc[3][0]
         self.assertEqual(pms, [0, 6])
         self.assertEqual(deltas[0], 300)
+
+
+class TestOpmTestPulse(unittest.TestCase):
+    """The TEST-register pulse the driver uses to re-seed the OPM LFO."""
+
+    def _song(self):
+        key_on = 60000
+        writes = _synth.lattice(40)
+        for reg, val in _synth.PATCH:
+            writes.append(ChipWrite(key_on - 1000, "ym2151", 0, reg, val))
+        writes.append(ChipWrite(key_on - 3000, "ym2151", 0, 0x18, 0x0A))
+        writes.append(ChipWrite(key_on, "ym2151", 0, 0x28, 0x48))
+        writes.append(ChipWrite(key_on, "ym2151", 0, 0x30, 0x00))
+        writes.append(ChipWrite(key_on, "ym2151", 0, 0x08, 0x78))
+        # The driver pulses TEST bit 1 right after the key-on.
+        writes.append(ChipWrite(key_on, "ym2151", 0, 0x01, 0x02))
+        writes.append(ChipWrite(key_on, "ym2151", 0, 0x01, 0x00))
+        writes.sort(key=lambda w: w.sample)
+        return analyze(_synth.vgm(writes)), key_on
+
+    def test_pulse_and_restore_are_both_emitted(self):
+        song, key_on = self._song()
+        fx = [e for e in song.chip_fx if e[1] == 0x17]
+        self.assertTrue(any(len(e) == 3 and e[2] == 0 for e in fx),
+                        "the 0x02 edge must become 17 00")
+        self.assertTrue(any(len(e) == 4 and e[2] == 0x0A and e[3] == 1
+                            for e in fx),
+                        "the restore must carry the LFO speed one tick later")
+        self.assertTrue(all(e[0] <= key_on + 2 for e in fx))
+
+    def test_restore_lands_one_tick_after_the_pulse(self):
+        song, _key_on = self._song()
+        _orders, patterns, _loop, _pat_len = fw._build_patterns(
+            song, 8, fw.PAT_LEN_MAX, 8)
+        cells = []
+        for ch, _idx, rows in patterns:
+            for cell in rows:
+                if cell is None:
+                    continue
+                for cmd, val in cell.fx or ():
+                    if cmd == 0x17 and val in (0, 0x0A):
+                        ed = next((v for c, v in cell.fx or () if c == 0xED), 0)
+                        cells.append((ch, cmd, val, ed))
+        self.assertIn((0, 0x17, 0x00, 0), cells)
+        self.assertTrue(
+            any(c[1] == 0x17 and c[2] == 0x0A and c[3] == 1 for c in cells),
+            cells,
+        )
 
 
 if __name__ == "__main__":
