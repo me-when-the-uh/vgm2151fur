@@ -31,12 +31,15 @@ from vgm2151fur.c352 import (
 )
 from vgm2151fur.fm import CARRIERS, FMPatch, OpRegs, OPN_CARRIERS
 from vgm2151fur.oki import (
+    ADPCM_MAP_SLOTS,
     FURNACE_C4,
+    MSM6258_MAP_NOTE,
     AdpcmSample,
     OkiSample,
     collect_msm6258,
     collect_oki,
     msm6258_div_fx,
+    msm6258_ins_count,
 )
 from vgm2151fur.pcm import PcmSample, build_pcm_bank, pitch_to_note, rate_to_note
 from vgm2151fur.pitch import (
@@ -2787,6 +2790,8 @@ def analyze(
 
     oki_samples: list[OkiSample] = []
     adpcm_samples: list[AdpcmSample] = []
+    n_adpcm_ins = 0
+    n_adpcm_ch = 0
     spcm_audible: list[SegapcmSample] = []
     c140_audible: list[C140Sample] = []
     c352_audible: list[C352Sample] = []
@@ -2844,20 +2849,30 @@ def analyze(
                 adpcm_ids.append(smp.chip_id)
         adpcm_at = {cid: adpcm_base + i for i, cid in enumerate(adpcm_ids)}
         ins1 = ins0 + len(oki_samples)
-        div_done: set[int] = set()
+        n_adpcm_ch = len(adpcm_ids)
+        n_adpcm_ins = msm6258_ins_count(len(adpcm_samples))
+        # None means "not yet set". Effect 2 is the /512 default, so a later
+        # sample that returns to it still has to write 20 02.
+        div_now: dict[int, int | None] = {}
         for i, smp in enumerate(adpcm_samples):
-            ins = ins1 + i
+            ins = ins1 + i // ADPCM_MAP_SLOTS
+            note = MSM6258_MAP_NOTE + (i % ADPCM_MAP_SLOTS)
             ch = adpcm_at[smp.chip_id]
             fx = msm6258_div_fx(smp.divider)
-            if fx is not None and smp.chip_id not in div_done:
-                div_done.add(smp.chip_id)
-                channel_fx.append((0, ch, 0x20, fx))
+            if smp.chip_id not in div_now:
+                div_now[smp.chip_id] = fx
+                if fx is not None:
+                    channel_fx.append((0, ch, 0x20, fx))
+            elif div_now[smp.chip_id] != fx:
+                div_now[smp.chip_id] = fx
+                when = smp.hits[0].sample_time if smp.hits else 0
+                channel_fx.append((when, ch, 0x20, 2 if fx is None else fx))
             for h in smp.hits:
                 events.append(NoteEvent(
                     sample=h.sample_time,
                     ch=ch,
                     on=True,
-                    note=FURNACE_C4,
+                    note=note,
                     ins=ins,
                     vol=8,
                     e5=0x80,
@@ -2885,7 +2900,7 @@ def analyze(
         warnings.extend(spcm_warn)
         spcm_audible = [s for s in spcm_samples if s.length >= 8]
         spcm_base = adpcm_base + len(adpcm_ids)
-        ins2 = ins1 + len(adpcm_samples)
+        ins2 = ins1 + n_adpcm_ins
         spcm_peak = max(
             (max(h.vol_l, h.vol_r) for s in spcm_audible for h in s.hits), default=0
         )
@@ -3114,14 +3129,14 @@ def analyze(
     # SCC and AY are pitched chips and convert even under --melody-only. Their
     # channels follow the FM block and every sample chip.
     tone_base = (
-        fm_end + (2 if audible else 0) + 4 * len(oki_samples) + len(adpcm_samples)
+        fm_end + (2 if audible else 0) + 4 * len(oki_samples) + n_adpcm_ch
         + (16 if spcm_audible else 0) + 24 * len(c140_audible) + 32 * len(c352_audible)
     )
     # Count the final DAC maps once, below; the collector's list is transient.
     tone_ins_base = (
         len(patch_order)
         + (len(audible) if pcm else 0) + len(oki_samples)
-        + len(adpcm_samples) + len(spcm_audible) + len(c140_audible) + len(c352_audible)
+        + n_adpcm_ins + len(spcm_audible) + len(c140_audible) + len(c352_audible)
     )
     scc_ids: list[int] = []
     scc_waves: list[bytes] = []
@@ -3399,7 +3414,7 @@ def analyze(
     # tone events.
     foreign_ins = (
         n_dac_ins
-        + (len(audible) if pcm else 0) + len(oki_samples) + len(adpcm_samples)
+        + (len(audible) if pcm else 0) + len(oki_samples) + n_adpcm_ins
         + len(spcm_audible) + len(c140_audible) + len(c352_audible)
     )
     fm_pitch_clock = ym2612_clock if is_opn2 else ym_clock
@@ -3415,7 +3430,7 @@ def analyze(
         tone_ins_base = (
             len(patch_order) + n_dac_ins
             + (len(audible) if pcm else 0) + len(oki_samples)
-            + len(adpcm_samples) + len(spcm_audible) + len(c140_audible)
+            + n_adpcm_ins + len(spcm_audible) + len(c140_audible)
             + len(c352_audible)
         )
     if fm_pitch_lost:
@@ -3485,7 +3500,7 @@ def analyze(
 
     n_total_ins = (
         len(fm_list) + n_dac_ins
-        + (len(audible) if pcm else 0) + len(oki_samples) + len(adpcm_samples)
+        + (len(audible) if pcm else 0) + len(oki_samples) + n_adpcm_ins
         + len(spcm_audible) + len(c140_audible) + len(c352_audible)
         + len(scc_ins) + len(ay_ins) + len(psg_ins)
     )

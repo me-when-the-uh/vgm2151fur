@@ -9,6 +9,8 @@ Supported chips:
 - Namco C352 (requires a development build of Furnace from a compatible fork. A build with C352 support (built from https://github.com/me-when-the-uh/furnace-ports) is located in `./furnace-c352` - use at your own risk, since it's always a good idea to build from source instead of relying on someone else's builds)
 - Konami K007232 (experimental)
 - Konami SCC / SCC+ (K051649/K052539) (experimental)
+- OKI MSM6295
+- OKI MSM6258 (Sharp X68000 ADPCM)
 
 It runs on Windows and Linux with Python 3.11 or newer.
 

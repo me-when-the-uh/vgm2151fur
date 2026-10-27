@@ -347,15 +347,17 @@ def _write_ins_opm(b: Buf, name: str, patch) -> None:
 
 def _write_ins_sample_map(
     b: Buf, name: str, first_sample: int, maps: list[int],
+    ins_type: int = INS_C352,
 ) -> None:
-    """DIV_INS_AMIGA with 120 note slots, one sample per slot.
+    """120 note slots, one sample per slot.
 
     Each slot stores freq 48, which the reader adds to note 60. Every slice
-    plays at C-4 and uses the sample's own rate.
+    plays at C-4 and uses the sample's own rate. `first_sample` stays 0:
+    Furnace 0.6.8.3 reads a nonzero base as an embedded sample count.
     """
     size_off, start = b.begin_block(b"INS2")
     b.u16(FUR_VERSION)
-    b.u16(INS_C352)
+    b.u16(ins_type)
     b.raw(b"NA")
     na_size = len(b.b)
     b.u16(0)
@@ -600,11 +602,24 @@ def _write_sample(b: Buf, name: str, pcm7: bytes, c4_rate: int, volume_scale: fl
     b.end_block(size_off, start)
 
 
-def _write_vox(b: Buf, name: str, data: bytes, c4_rate: int) -> None:
-    """OKI ADPCM bytes. Furnace copies `length` bytes straight into the phrase ROM."""
+def _write_vox(
+    b: Buf, name: str, data: bytes, c4_rate: int, *,
+    nibble_count: bool = False, swap_nibbles: bool = False,
+) -> None:
+    """VOX ADPCM. MSM6295 stores a byte count; MSM6258 stores a nibble count.
+
+    Furnace sets lengthVOX to (samples+1)/2 and plays that many bytes, and
+    its MSM6258 core swaps nibbles again before okim6258::data_w (low nibble
+    first). A nibble count plus one swap makes the chip see the VGM byte.
+    MSM6295 copies dataVOX into ROM with no swap, so it keeps the byte count.
+    """
+    stored = data
+    if swap_nibbles:
+        stored = bytes((((x & 0x0F) << 4) | (x >> 4)) & 0xFF for x in data)
+    count = len(stored) * 2 if nibble_count else len(stored)
     size_off, start = b.begin_block(b"SMP2")
     b.strz(name)
-    b.u32(len(data))
+    b.u32(count)
     b.u32(c4_rate)
     b.u32(c4_rate)
     b.u8(SMP_DEPTH_VOX)
@@ -615,7 +630,7 @@ def _write_vox(b: Buf, name: str, data: bytes, c4_rate: int) -> None:
     b.s32(-1)
     for _ in range(4):
         b.u32(0xFFFFFFFF)
-    b.raw(data)
+    b.raw(stored)
     b.end_block(size_off, start)
 
 
@@ -2049,6 +2064,7 @@ def write_fur(
     pcm_smps = [s for s in song.pcm_samples if s.length >= 8] if include_pcm else []
     oki_smps = list(song.oki_samples) if include_pcm else []
     adpcm_smps = list(song.msm6258_samples) if include_pcm else []
+    n_adpcm_ins = (len(adpcm_smps) + 119) // 120
     spcm_smps = [s for s in song.segapcm_samples if s.length >= 8] if include_pcm else []
     c140_smps = [s for s in song.c140_samples if s.length >= 8] if include_pcm else []
     c352_smps = [s for s in song.c352_samples if s.length >= 8] if include_pcm else []
@@ -2111,7 +2127,7 @@ def write_fur(
     c352_clock = song.vgm.c352_clock or C352_DEFAULT_CLOCK
 
     n_ins = (
-        len(fm_ins) + n_dac_ins + len(pcm_smps) + len(oki_smps) + len(adpcm_smps)
+        len(fm_ins) + n_dac_ins + len(pcm_smps) + len(oki_smps) + n_adpcm_ins
         + len(spcm_smps) + len(c140_smps) + len(c352_smps)
         + len(scc_specs) + len(ay_specs) + len(psg_specs)
     )
@@ -2521,10 +2537,16 @@ def write_fur(
     for i, smp in enumerate(oki_smps):
         ins_ptrs.append(len(b))
         _write_ins_pcm(b, smp.name, len(pcm_smps) + i, INS_MSM6295)
-    for i, smp in enumerate(adpcm_smps):
+    adpcm_smp_base = len(pcm_smps) + len(oki_smps)
+    for group in range(n_adpcm_ins):
         ins_ptrs.append(len(b))
-        _write_ins_pcm(
-            b, smp.name, len(pcm_smps) + len(oki_smps) + i, INS_MSM6258,
+        start = group * 120
+        maps = [
+            adpcm_smp_base + start + slot
+            for slot in range(min(120, len(adpcm_smps) - start))
+        ]
+        _write_ins_sample_map(
+            b, f"ADPCM {group + 1}", 0, maps, INS_MSM6258,
         )
     spcm_ins_base = len(pcm_smps) + len(oki_smps) + len(adpcm_smps)
     for i, smp in enumerate(spcm_smps):
@@ -2575,7 +2597,10 @@ def write_fur(
         _write_vox(b, smp.name, smp.data, smp.rate)
     for smp in adpcm_smps:
         smp_ptrs.append(len(b))
-        _write_vox(b, smp.name, smp.data, smp.rate)
+        _write_vox(
+            b, smp.name, smp.data, smp.rate,
+            nibble_count=True, swap_nibbles=True,
+        )
     for smp in spcm_smps:
         smp_ptrs.append(len(b))
         _write_sample_s8(

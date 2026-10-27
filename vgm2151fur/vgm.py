@@ -40,6 +40,8 @@ CMD_C352 = 0xE1
 CMD_DATA_BLOCK = 0x67
 CMD_END = 0x66
 CMD_STREAM_SETUP = 0x90
+# Stream-control chip type (0x90 tt), not the extra-header id. OKIM6258 is 0x17.
+STREAM_OKIM6258 = 0x17
 K007232_ROM_TYPE = 0x94  # 0x80 + 0x14
 OKI_ROM_TYPE = 0x8B  # OKIM6295 ROM
 SEGAPCM_ROM_TYPE = 0x80  # SegaPCM ROM
@@ -188,6 +190,31 @@ class RomSlice:
 
 
 @dataclass
+class Msm6258Play:
+    """One OKIM6258 DAC-stream start (0x95, or 0x93).
+
+    `block` indexes `VgmFile.adpcm_blocks`. `length_mode` 3 plays that whole
+    block; 1 and 2 play `nbytes` commands or milliseconds from `offset` in the
+    concatenated type-0x04 bank (`block` is then ignored). `rate` is the 0x92
+    byte rate. `end` is the matching 0x94 sample, or 0 when the stream is not
+    stopped.
+    """
+
+    sample: int
+    chip_id: int
+    block: int
+    rate: int
+    loop: bool = False
+    reverse: bool = False
+    offset: int = 0
+    nbytes: int = 0
+    end: int = 0
+    step: int = 1
+    step_base: int = 0
+    length_mode: int = 3
+
+
+@dataclass
 class ChipWrite:
     sample: int
     chip: str  # "ym2151" | "ym2203" | "ym2612" | "k007232" | "msm6295" |
@@ -277,6 +304,11 @@ class VgmFile:
     # Extra-header volume mix: chip id -> (flags, raw value, 0x100 = 1.0).
     extra_volumes: dict[int, tuple[int, int]] = field(default_factory=dict)
     stream_setups: int = 0
+    # OKIM6258 ADPCM bank. Data-block type 0x04, in file order. 0x95 block ids
+    # index this list. Plays come from streams whose 0x90 chip type is 0x17;
+    # other streams stay on dac_block_plays.
+    adpcm_blocks: list[bytes] = field(default_factory=list)
+    msm6258_plays: list[Msm6258Play] = field(default_factory=list)
 
     def chip_volume(self, chip: int) -> float | None:
         """Relative output volume of a chip from the extra header, or None.
@@ -680,6 +712,16 @@ def load_vgm(path: Path | str) -> VgmFile:
     stray_ym2203_second = False
     stray_ym2612_second = False
     saw_end = False
+    saw_adpcm_compressed = False
+    # stream id -> setup recorded by 0x90/0x91/0x92
+    streams: dict[int, dict] = {}
+    active_adpcm: dict[int, Msm6258Play] = {}
+
+    def close_adpcm(sid: int, end_t: int) -> None:
+        play = active_adpcm.pop(sid, None)
+        if play is not None and play.end == 0 and end_t > play.sample:
+            play.end = end_t
+
     while pos < n:
         if loop_pos is not None and loop_sample is None and pos >= loop_pos:
             loop_sample = sample
@@ -701,6 +743,11 @@ def load_vgm(path: Path | str) -> VgmFile:
                 # one through 0x95 block ids.
                 vgm.dac_blocks.append(payload)
                 vgm.dac_data.extend(payload)
+            elif typ == 0x04:
+                # OKIM6258 ADPCM bank. 0x95 block ids index these in order.
+                vgm.adpcm_blocks.append(bytes(payload))
+            elif typ == 0x44:
+                saw_adpcm_compressed = True
             else:
                 kind = {
                     K007232_ROM_TYPE: "k007232",
@@ -747,30 +794,101 @@ def load_vgm(path: Path | str) -> VgmFile:
             continue
         if cmd == 0x92 and pos + 6 <= n:
             stream = buf[pos + 1]
-            vgm.dac_stream_rates[stream] = int.from_bytes(buf[pos + 2:pos + 6], "little")
+            rate = int.from_bytes(buf[pos + 2:pos + 6], "little")
+            vgm.dac_stream_rates[stream] = rate
+            st = streams.get(stream)
+            if st is not None:
+                st["rate"] = rate
             pos += 6
             continue
         if cmd == 0x95 and pos + 5 <= n:
             stream = buf[pos + 1]
             block = int.from_bytes(buf[pos + 2:pos + 4], "little")
-            rate = vgm.dac_stream_rates.get(stream, VGM_RATE)
-            vgm.dac_block_plays.append((sample, block, rate))
+            flags = buf[pos + 4]
+            st = streams.get(stream)
+            # A stream that was never set up stays on the YM2612 DAC path.
+            # Logs that emit 0x95 without 0x90 depend on that.
+            if st is not None and st["type"] == STREAM_OKIM6258:
+                close_adpcm(stream, sample)
+                play = Msm6258Play(
+                    sample=sample,
+                    chip_id=st["chip_id"],
+                    block=block,
+                    rate=st["rate"] or vgm.dac_stream_rates.get(stream, 0),
+                    loop=bool(flags & 0x01),
+                    reverse=bool(flags & 0x10),
+                    step=st["step"],
+                    step_base=st["base"],
+                    length_mode=3,
+                )
+                vgm.msm6258_plays.append(play)
+                active_adpcm[stream] = play
+            else:
+                rate = vgm.dac_stream_rates.get(stream, VGM_RATE)
+                vgm.dac_block_plays.append((sample, block, rate))
             pos += 5
             continue
         if cmd == 0x90 and pos + 5 <= n:
-            # Stream setup: stream id, chip type, chip id, register.
+            # ss tt pp cc. Bit 7 of tt selects the second chip.
+            sid = buf[pos + 1]
+            tt = buf[pos + 2]
+            streams[sid] = {
+                "type": tt & 0x7F,
+                "chip_id": (tt >> 7) & 1,
+                "port": buf[pos + 3],
+                "reg": buf[pos + 4],
+                "bank": 0,
+                "step": 1,
+                "base": 0,
+                "rate": vgm.dac_stream_rates.get(sid, 0),
+            }
+            vgm.stream_setups += 1
             pos += 5
             continue
         if cmd == 0x91 and pos + 5 <= n:
-            # Stream data source: bank, step size, step base.
+            # ss dd ll bb: bank id, step size, step base.
+            sid = buf[pos + 1]
+            st = streams.get(sid)
+            if st is not None:
+                st["bank"] = buf[pos + 2]
+                st["step"] = buf[pos + 3] or 1
+                st["base"] = buf[pos + 4]
             pos += 5
             continue
         if cmd == 0x93 and pos + 11 <= n:
-            # Play-from-start-position form.  The fast 0x95 form is the one
-            # Furnace uses; keep the stream running rather than desync.
+            # ss offset mode length. Mode 0 only moves the cursor.
+            sid = buf[pos + 1]
+            offset = int.from_bytes(buf[pos + 2:pos + 6], "little")
+            mode = buf[pos + 6]
+            length = int.from_bytes(buf[pos + 7:pos + 11], "little")
+            st = streams.get(sid)
+            kind = mode & 0x07
+            if st is not None and st["type"] == STREAM_OKIM6258 and kind != 0:
+                close_adpcm(sid, sample)
+                play = Msm6258Play(
+                    sample=sample,
+                    chip_id=st["chip_id"],
+                    block=-1,
+                    rate=st["rate"] or vgm.dac_stream_rates.get(sid, 0),
+                    loop=bool(mode & 0x80),
+                    reverse=bool(mode & 0x10),
+                    offset=0 if offset == 0xFFFFFFFF else offset,
+                    nbytes=length,
+                    step=st["step"],
+                    step_base=st["base"],
+                    length_mode=kind,
+                )
+                vgm.msm6258_plays.append(play)
+                active_adpcm[sid] = play
             pos += 11
             continue
         if cmd == 0x94 and pos + 2 <= n:
+            sid = buf[pos + 1]
+            if sid == 0xFF:
+                for key in list(active_adpcm):
+                    close_adpcm(key, sample)
+            else:
+                close_adpcm(sid, sample)
             pos += 2
             continue
         if cmd == CMD_DAC_WRITE and pos + 2 <= n:
@@ -914,14 +1032,9 @@ def load_vgm(path: Path | str) -> VgmFile:
             f"VGM writes to a sample chip this tool does not convert "
             f"({', '.join(names)}; first command {first:02X}); its samples are missing"
         )
-    if (
-        vgm.msm6258_clock
-        and vgm.stream_setups
-        and not any(w.chip == "msm6258" for w in vgm.writes)
-    ):
+    if saw_adpcm_compressed:
         vgm.warnings.append(
-            "MSM6258 clock is set but the log has no 0xB7 data bytes; "
-            "DAC streams (0x90-0x95) are not converted"
+            "compressed OKIM6258 data block (type 44) is not converted"
         )
     if any(w.chip == "c352" for w in vgm.writes) and not vgm.c352_clock:
         vgm.warnings.append("C352 clock is missing or out of range; using 24192000")

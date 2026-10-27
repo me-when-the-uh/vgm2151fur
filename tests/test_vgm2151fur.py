@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import struct
 import sys
+import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -27,8 +29,10 @@ from vgm2151fur.pcm import (
     PcmHit, PcmSample, k007232_rate, pcm7_to_s8, scale_pcm7,
 )
 from vgm2151fur.furio import fx_pan_amps, list_fur_samples, parse_fur
-from vgm2151fur.oki import msm6258_div_fx, oki_flag_text, oki_furnace_vol, oki_rate
-from vgm2151fur.vgm import ChipWrite, RomSlice, VgmFile
+from vgm2151fur.oki import (
+    msm6258_best_divider, msm6258_div_fx, oki_flag_text, oki_furnace_vol, oki_rate,
+)
+from vgm2151fur.vgm import ChipWrite, Msm6258Play, RomSlice, VgmFile, load_vgm
 
 
 class TestKC(unittest.TestCase):
@@ -482,10 +486,10 @@ def _oki_vgm() -> VgmFile:
 def _msm6258_vgm() -> VgmFile:
     writes = [
         ChipWrite(0, "msm6258", 0, 0, 0x02),
-        ChipWrite(10, "msm6258", 0, 1, 0x11),
-        ChipWrite(20, "msm6258", 0, 1, 0x22),
-        ChipWrite(30, "msm6258", 0, 1, 0x33),
-        ChipWrite(40, "msm6258", 0, 1, 0x44),
+        ChipWrite(10, "msm6258", 0, 1, 0x12),
+        ChipWrite(20, "msm6258", 0, 1, 0x34),
+        ChipWrite(30, "msm6258", 0, 1, 0x56),
+        ChipWrite(40, "msm6258", 0, 1, 0x78),
         ChipWrite(800, "msm6258", 0, 0, 0x01),
     ]
     return VgmFile(
@@ -513,9 +517,11 @@ class TestOkiVolumeAndFlags(unittest.TestCase):
         self.assertEqual(oki_furnace_vol(8), 0)
         self.assertIsNone(oki_furnace_vol(9))
         self.assertEqual(oki_rate(2_000_000, True), 15152)
-        self.assertEqual(msm6258_div_fx(1024), 2)
+        self.assertEqual(msm6258_div_fx(1024), 0)
         self.assertEqual(msm6258_div_fx(768), 1)
         self.assertIsNone(msm6258_div_fx(512))
+        self.assertEqual(msm6258_best_divider(8_000_000, 6, 7813), 512)
+        self.assertEqual(msm6258_best_divider(8_000_000, 0, 0), 1024)
         high = oki_flag_text(2_000_000, True, banked=False)
         self.assertIn("clockSel=8", high)
         self.assertNotIn("rateSel", high)
@@ -579,10 +585,10 @@ class TestMsm6258Burst(unittest.TestCase):
     def test_one_burst_and_divider_effect(self):
         song = analyze(_msm6258_vgm(), speed=1, pcm=True)
         self.assertEqual(len(song.msm6258_samples), 1)
-        self.assertEqual(song.msm6258_samples[0].data, bytes([0x11, 0x22, 0x33, 0x44]))
-        self.assertEqual(song.channel_fx, [(0, 8, 0x20, 2)])
+        self.assertEqual(song.msm6258_samples[0].data, bytes([0x12, 0x34, 0x56, 0x78]))
+        self.assertEqual(song.channel_fx, [(0, 8, 0x20, 0)])
         ons = [e for e in song.events if e.on and e.pcm]
-        self.assertEqual([(e.ch, e.note, e.vol) for e in ons], [(8, 108, 8)])
+        self.assertEqual([(e.ch, e.note, e.vol) for e in ons], [(8, 60, 8)])
         data = write_fur(song, include_pcm=True, include_fm=True)
         chips, gains, legacy = _chip_mix(data)
         self.assertEqual(chips, [CHIP_YM2151, CHIP_MSM6258])
@@ -592,17 +598,131 @@ class TestMsm6258Burst(unittest.TestCase):
         samples = list_fur_samples(data)
         self.assertEqual(len(samples), 1)
         self.assertEqual(samples[0].depth, 10)
-        self.assertEqual(samples[0].n_frames, 4)
+        self.assertEqual(samples[0].n_frames, 8)
+        self.assertEqual(samples[0].data, bytes([0x21, 0x43, 0x65, 0x87]))
         mod = parse_fur(data)
         self.assertEqual(mod.n_ch, 9)
         rows = _rows(mod, 8)
         notes = [row for _i, row in rows if 0 <= row.note < 180]
         self.assertEqual(len(notes), 1)
-        self.assertEqual(notes[0].note, 108)
+        self.assertEqual(notes[0].note, 60)
         self.assertEqual(notes[0].vol, 8)
-        self.assertIn((0x20, 2), notes[0].fx)
+        self.assertIn((0x20, 0), notes[0].fx)
         self.assertNotIn(0x08, [c for c, _v in notes[0].fx])
         self.assertTrue(any(row.note == NOTE_OFF for _i, row in rows))
+
+    def test_short_direct_burst_is_dropped(self):
+        vgm = replace(
+            _msm6258_vgm(),
+            writes=[ChipWrite(0, "msm6258", 0, 1, 0x02)],
+        )
+        song = analyze(vgm, speed=1, pcm=True)
+        self.assertEqual(song.msm6258_samples, [])
+        self.assertTrue(any("shorter than" in w for w in song.warnings))
+
+
+def _raw_adpcm(cmds: bytes, blocks: list[bytes], *, clock: int = 8_000_000,
+               flags: int = 6, total: int = 20000) -> bytes:
+    buf = bytearray(0x100)
+    buf[0:4] = b"Vgm "
+    buf[8:12] = (0x161).to_bytes(4, "little")
+    buf[0x18:0x1C] = total.to_bytes(4, "little")
+    buf[0x30:0x34] = (4_000_000).to_bytes(4, "little")
+    buf[0x34:0x38] = (0x100 - 0x34).to_bytes(4, "little")
+    buf[0x90:0x94] = clock.to_bytes(4, "little")
+    buf[0x94] = flags & 0xFF
+    body = bytearray()
+    for data in blocks:
+        body += bytes([0x67, 0x66, 0x04]) + len(data).to_bytes(4, "little") + data
+    body += cmds + b"\x66"
+    raw = bytes(buf) + bytes(body)
+    return raw[:4] + (len(raw) - 4).to_bytes(4, "little") + raw[8:]
+
+
+class TestMsm6258Stream(unittest.TestCase):
+    def test_block_plays_share_a_sample_and_ignore_dummy_bytes(self):
+        block_a = bytes([0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0])
+        block_b = bytes([0xAB, 0xCD, 0xEF, 0x01, 0x23, 0x45, 0x67, 0x89])
+        wait = lambda n: bytes([0x61]) + int(n).to_bytes(2, "little")
+        play = lambda blk: bytes([0x95, 0x00]) + int(blk).to_bytes(2, "little") + b"\x00"
+        cmds = b"".join([
+            bytes([0x90, 0x00, 0x17, 0x00, 0x01]),
+            bytes([0x91, 0x00, 0x04, 0x01, 0x00]),
+            bytes([0x92, 0x00]) + (7813).to_bytes(4, "little"),
+            bytes([0xB7, 0x01, 0x02]),
+            wait(100),
+            play(0),
+            wait(5000),
+            bytes([0x94, 0x00]),
+            wait(100),
+            play(0),
+            wait(100),
+            play(1),
+        ])
+        raw = _raw_adpcm(cmds, [block_a, block_b])
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "stream.vgm"
+            path.write_bytes(raw)
+            loaded = load_vgm(path)
+        self.assertEqual(loaded.adpcm_blocks, [block_a, block_b])
+        self.assertEqual(len(loaded.msm6258_plays), 3)
+        self.assertEqual(loaded.dac_block_plays, [])
+        self.assertEqual(loaded.msm6258_plays[0].end, 5100)
+        self.assertEqual(loaded.msm6258_plays[2].block, 1)
+        song = analyze(loaded, speed=1, pcm=True)
+        self.assertEqual(len(song.msm6258_samples), 2)
+        self.assertEqual(song.msm6258_samples[0].data, block_a)
+        self.assertEqual(len(song.msm6258_samples[0].hits), 2)
+        self.assertEqual(song.msm6258_samples[0].divider, 512)
+        self.assertEqual(song.channel_fx, [])
+        ons = [e for e in song.events if e.on and e.pcm]
+        self.assertEqual([(e.note, e.ins) for e in ons], [(60, 0), (60, 0), (61, 0)])
+        data = write_fur(song, include_pcm=True, include_fm=True)
+        self.assertEqual(_ins_types(data), [35])
+        samples = list_fur_samples(data)
+        self.assertEqual(samples[0].n_frames, 16)
+        self.assertEqual(samples[0].data, bytes([0x21, 0x43, 0x65, 0x87, 0xA9, 0xCB, 0xED, 0x0F]))
+        info = data.find(b"INFO")
+        self.assertEqual(struct.unpack_from("<H", data, info + 22)[0], 1)
+
+    def test_bare_95_stays_on_the_ym2612_path(self):
+        raw = _raw_adpcm(bytes([0x95, 0x00, 0x00, 0x00, 0x00]), [])
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "dac.vgm"
+            path.write_bytes(raw)
+            loaded = load_vgm(path)
+        self.assertEqual(loaded.msm6258_plays, [])
+        self.assertEqual(len(loaded.dac_block_plays), 1)
+
+    def test_note_map_keeps_a_long_bank_under_the_instrument_cap(self):
+        blocks = [
+            bytes([i & 0xFF, 0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x71])
+            for i in range(130)
+        ]
+        plays = [
+            Msm6258Play(sample=i * 100, chip_id=0, block=i, rate=7813)
+            for i in range(130)
+        ]
+        src = replace(
+            _msm6258_vgm(),
+            writes=[],
+            adpcm_blocks=blocks,
+            msm6258_plays=plays,
+            msm6258_clock=8_000_000,
+            msm6258_flags=6,
+        )
+        song = analyze(src, speed=1, pcm=True)
+        self.assertEqual(len(song.msm6258_samples), 130)
+        self.assertFalse(any("250-slot" in w for w in song.warnings))
+        ons = [e for e in song.events if e.on and e.pcm]
+        self.assertEqual((ons[0].note, ons[0].ins), (60, 0))
+        self.assertEqual((ons[120].note, ons[120].ins), (60, 1))
+        data = write_fur(song, include_pcm=True, include_fm=True)
+        self.assertEqual(_ins_types(data), [35, 35])
+        info = data.find(b"INFO")
+        self.assertEqual(struct.unpack_from("<H", data, info + 22)[0], 2)
+        self.assertEqual(len(list_fur_samples(data)), 130)
+
 
 class TestColumnFit(unittest.TestCase):
     """Effect columns per channel follow the channel's densest row.

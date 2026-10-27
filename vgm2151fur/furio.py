@@ -124,7 +124,18 @@ def parse_smp2_payload(payload: bytes) -> dict:
     presence = payload[pos:pos + 16]
     pos += 16
     width = 2 if depth == 16 else 1
-    nbytes = n_frames * width
+    rest = len(payload) - pos
+    if depth == 10:
+        # Legacy modules store a byte count in the samples field and write
+        # that many bytes. Furnace itself stores a nibble count and reads
+        # (count+1)/2 bytes. A field that matches the remaining payload is
+        # the legacy form.
+        if rest == n_frames:
+            nbytes = n_frames
+        else:
+            nbytes = (n_frames + 1) // 2
+    else:
+        nbytes = n_frames * width
     pcm = payload[pos:pos + nbytes]
     return {
         "name": name,

@@ -12,7 +12,7 @@ The operating guide is docs/operating.md.
 
 from __future__ import annotations
 
-__version__ = "0.9.43"
+__version__ = "0.9.44"
 
 from vgm2151fur.convert import convert_vgm, dump_pcm, report_vgm
 
