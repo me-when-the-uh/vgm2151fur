@@ -239,6 +239,9 @@ class NoteEvent:
     # Mid-note pitch writes: (sample, 1/64-semitone delta from the note pitch).
     # Encoders turn them into 01xx/02xx ramps.
     sweep: tuple[tuple[int, int], ...] = ()
+    # OPM PMS/AMS writes while the note is held: (sample, pms, ams). A phase-2
+    # pass turns each note's own ramp (including its lead-in) into a macro.
+    opm_pms_pts: tuple[tuple[int, int, int], ...] = ()
     # Mid-note volume steps: (sample, chip level, 08xy balance or None). On a
     # slide note the third value is the FA01/FA00 flag instead.
     vol_pts: tuple[tuple[int, int, int | None], ...] = ()
@@ -1579,6 +1582,91 @@ def _bind_fm_pitch(
     return made, fallbacks
 
 
+def _bind_late_pms(
+    events: list[NoteEvent],
+    patches: dict[tuple, FMPatch],
+    patch_order: list[tuple],
+    hz: float,
+    total_samples: int,
+    cap: int = 200,
+) -> tuple[int, int]:
+    """Per-note PMS macro only where vibrato starts well after key-on.
+
+    The per-instrument macro stays the default because replacing it wholesale
+    changed phase and timbre on dense-PMS tracks. A late onset needs the
+    leading quiet holds that the per-instrument macro threw away.
+    """
+    made = fallbacks = 0
+    tick_samples = VGM_RATE / hz if hz else VGM_RATE / 60.0
+    track_end = total_samples or max((e.sample for e in events), default=0)
+    by_ch: dict[int, list[NoteEvent]] = {}
+    for e in events:
+        if e.on:
+            by_ch.setdefault(e.ch, []).append(e)
+    idx_map: dict[tuple, int] = {}
+    for notes in by_ch.values():
+        for i, e in enumerate(notes):
+            if e.ins < 0 or len(e.opm_pms_pts) <= 1:
+                continue
+            pts = list(e.opm_pms_pts)
+            if pts[0][1] != 0:
+                continue
+            first = next(((t, p, a) for t, p, a in pts[1:] if p != 0), None)
+            if first is None or first[0] - e.sample <= 0.25 * VGM_RATE:
+                continue
+            end = e.end or (
+                notes[i + 1].sample if i + 1 < len(notes) else track_end
+            )
+            span = max(1, end - e.sample)
+            speed = max(1, min(255, math.ceil((span / tick_samples) / 255)))
+            while True:
+                steps = max(
+                    1,
+                    min(int((end - e.sample) / (speed * tick_samples)) + 1,
+                        65025),
+                )
+                pms_vals: list[int] = []
+                ams_vals: list[int] = []
+                j = 0
+                cur_p, cur_a = pts[0][1], pts[0][2]
+                for k in range(steps):
+                    t = e.sample + k * speed * tick_samples
+                    while j < len(pts) and pts[j][0] <= t:
+                        cur_p, cur_a = pts[j][1], pts[j][2]
+                        j += 1
+                    pms_vals.append(cur_p)
+                    ams_vals.append(cur_a)
+                while (len(pms_vals) > 1 and pms_vals[-1] == pms_vals[-2]
+                       and ams_vals[-1] == ams_vals[-2]):
+                    pms_vals.pop()
+                    ams_vals.pop()
+                if len(pms_vals) <= 255 or speed >= 255:
+                    break
+                speed = min(255, speed * 2)
+            if len(patch_order) >= cap:
+                fallbacks += 1
+                continue
+            base_key = patch_order[e.ins]
+            key = ("pms-late", base_key, tuple(pms_vals), tuple(ams_vals), speed)
+            idx = idx_map.get(key)
+            if idx is None:
+                base = patches[base_key]
+                copy = replace(
+                    base, fms_macro=tuple(pms_vals),
+                    ams_macro=tuple(ams_vals), macro_speed=speed,
+                    uses=1, name=f"{base.name}+late",
+                )
+                patches[key] = copy
+                patch_order.append(key)
+                idx = len(patch_order) - 1
+                idx_map[key] = idx
+            else:
+                patches[patch_order[idx]].uses += 1
+            e.ins = idx
+            made += 1
+    return made, fallbacks
+
+
 def _rebase_non_fm_ins(
     events: list[NoteEvent], old_count: int, new_count: int,
 ) -> None:
@@ -1742,10 +1830,11 @@ def analyze(
     # The OPM resets 0x19 to 0 and Furnace defaults PMD/AMD to 0x7F. Pin both
     # to zero before the first row.
     last_amd = last_pmd = 0
-    pms_acc: dict[int, list] = {}
     held_ins = [-1] * 8
     held_kon = [-1] * 8
-    held_ramp: list[list[tuple[int, int, int]]] = [[] for _ in range(8)]
+    pms_ev: list[int | None] = [None] * 8
+    held_ramp: list[list[tuple[int, int, int]] | None] = [None] * 8
+    held_lfo: dict[int, list] = {}
     # Mid-note KC/KF writes per held note (percussion sweeps).
     sweep_pts: list[list[tuple[int, int, int]]] = [[] for _ in range(8)]
     sweep_base: list[tuple[int, int]] = [(0, 0)] * 8
@@ -1765,6 +1854,17 @@ def analyze(
         if idx is not None:
             _finalize_sweep(events[idx], sweep_pts[ch], sweep_base[ch][0], sweep_base[ch][1])
             sweep_ev[ch] = None
+
+    def close_pms(ch: int) -> None:
+        idx = pms_ev[ch]
+        if idx is not None and held_ramp[ch]:
+            events[idx].opm_pms_pts = tuple(held_ramp[ch])
+            ins = held_ins[ch]
+            writes = list(held_ramp[ch])[1:]
+            if ins >= 0 and writes:
+                _flush_pms_ramp(held_lfo, ins, writes, held_kon[ch])
+        pms_ev[ch] = None
+        held_ramp[ch] = None
 
     def close_tl(ch: int) -> None:
         idx = tl_ev[ch]
@@ -1848,9 +1948,10 @@ def analyze(
             elif 0x38 <= w.reg <= 0x3F:
                 ch = w.reg - 0x38
                 ym.write(w.reg, w.val)
-                if ym.kon[ch] and held_ins[ch] >= 0:
-                    pa = w.val
-                    held_ramp[ch].append((w.sample, (pa >> 4) & 7, pa & 3))
+                if held_ramp[ch] is not None:
+                    held_ramp[ch].append(
+                        (w.sample, (w.val >> 4) & 7, w.val & 3)
+                    )
                 continue
             ym.write(w.reg, w.val)
             if 0x28 <= w.reg <= 0x37:
@@ -1876,8 +1977,7 @@ def analyze(
         op_mask[ch] = mask
         if mask and newly_on:
             pending_off[ch] = None
-            _flush_pms_ramp(pms_acc, held_ins[ch], held_ramp[ch], held_kon[ch])
-            held_ramp[ch] = []
+            close_pms(ch)
             close_sweep(ch)
             close_tl(ch)
             ins = intern_patch(ch, mask)
@@ -1895,6 +1995,9 @@ def analyze(
             sweep_base[ch] = (ym.kc[ch], ym.kf[ch])
             sweep_pts[ch] = []
             sweep_ev[ch] = len(events) - 1
+            pms_ev[ch] = len(events) - 1
+            pa = ym.pms_ams[ch]
+            held_ramp[ch] = [(w.sample, (pa >> 4) & 7, pa & 3)]
             tl_pts[ch] = []
             tl_last[ch] = ym.carrier_tl(ch)
             tl_ev[ch] = len(events) - 1
@@ -1910,14 +2013,19 @@ def analyze(
             pass
         elif ym.kon[ch]:
             pending_off[ch] = w.sample
-            _flush_pms_ramp(pms_acc, held_ins[ch], held_ramp[ch], held_kon[ch])
-            held_ramp[ch] = []
+            idx = sweep_ev[ch]
+            if (
+                idx is not None
+                and w.sample - events[idx].sample < int(0.05 * VGM_RATE)
+            ):
+                close_sweep(ch)
+            close_pms(ch)
             close_tl(ch)
             ym.kon[ch] = False
             held_ins[ch] = -1
 
     for ch in range(8):
-        _flush_pms_ramp(pms_acc, held_ins[ch], held_ramp[ch], held_kon[ch])
+        close_pms(ch)
         close_sweep(ch)
         close_tl(ch)
 
@@ -2874,7 +2982,7 @@ def analyze(
                     on=True,
                     note=note,
                     ins=ins,
-                    vol=8,
+                    vol=127,
                     e5=0x80,
                     pan=0,
                     pcm=True,
@@ -3417,8 +3525,23 @@ def analyze(
         + (len(audible) if pcm else 0) + len(oki_samples) + n_adpcm_ins
         + len(spcm_audible) + len(c140_audible) + len(c352_audible)
     )
+    for ins, ramps in held_lfo.items():
+        if not (0 <= ins < len(patch_order)):
+            continue
+        base_key = patch_order[ins]
+        fm_pms, ams, macro_speed = _pick_lfo_macros(ramps, VGM_RATE / hz)
+        if fm_pms:
+            patches[base_key] = replace(
+                patches[base_key], fms_macro=fm_pms, ams_macro=ams,
+                macro_speed=macro_speed,
+            )
+
     fm_pitch_clock = ym2612_clock if is_opn2 else ym_clock
     fm_before_pitch = len(patch_order)
+    _pms_copies, pms_lost = _bind_late_pms(
+        events, patches, patch_order, hz, vgm.total_samples or 0,
+        cap=max(len(patch_order), 250 - foreign_ins - 24),
+    )
     fm_pitch_copies, fm_pitch_lost = _bind_fm_pitch(
         events, patches, patch_order, fm_pitch_clock, hz, vgm.total_samples or 0,
         cap=max(len(patch_order), 250 - foreign_ins - 24),
@@ -3432,6 +3555,11 @@ def analyze(
             + (len(audible) if pcm else 0) + len(oki_samples)
             + n_adpcm_ins + len(spcm_audible) + len(c140_audible)
             + len(c352_audible)
+        )
+    if pms_lost:
+        warnings.append(
+            f"{pms_lost} YM2151 PMS/AMS ramps stayed on the base instrument: "
+            "instrument limit"
         )
     if fm_pitch_lost:
         warnings.append(
@@ -3474,13 +3602,6 @@ def analyze(
         # instrument. Keep it only when the module would otherwise be empty.
         if not has_sample_ins:
             fm_list = [FMPatch(7, 0, 0, 0, tuple(OpRegs(tl=0) for _ in range(4)), name="empty")]  # type: ignore[arg-type]
-    else:
-        for i, p in enumerate(fm_list):
-            fms, ams, mspeed = _pick_lfo_macros(pms_acc.get(i, []), VGM_RATE / hz)
-            p.fms_macro = fms
-            p.ams_macro = ams
-            p.macro_speed = mspeed
-
     # A power-of-two carrier MULT sounds an octave off the channel f-num. Label
     # the note at the loudest carrier's octave and cancel the move with a
     # constant pitch macro, leaving the source registers untouched.

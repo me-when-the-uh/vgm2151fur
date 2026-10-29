@@ -425,6 +425,13 @@ def convert_variants(
                 if loop_note and loop_note != "loop kept":
                     song.warnings.append(loop_note)
         warnings = list(song.warnings)
+        if factor > 1 and "low confidence" in song.grid_note:
+            # The source grid is already ambiguous; lengthening rows cannot
+            # preserve its note and modulation timing.  Keep the 1x module.
+            warnings.append(
+                f"condensed x{factor:g} skipped: low-confidence source grid"
+            )
+            continue
         stats: dict = {}
         name = f"{src.stem}.fur" if factor == 1 else f"{src.stem} x{factor:g}.fur"
         out_path = out_dir / name

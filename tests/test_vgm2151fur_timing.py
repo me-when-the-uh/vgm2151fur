@@ -249,6 +249,20 @@ class TestPercussionSweeps(unittest.TestCase):
         self.assertGreater(max(ramps), 0)
         self.assertTrue(stops, "no ramp stop written")
 
+    def test_short_setup_note_does_not_own_next_kc(self):
+        writes = [
+            ChipWrite(900, "ym2151", 0, 0x28 | 4, 0x40),
+            ChipWrite(1000, "ym2151", 0, 0x08, 0x78 | 4),
+            ChipWrite(1500, "ym2151", 0, 0x08, 4),
+            ChipWrite(1900, "ym2151", 0, 0x28 | 4, 0x30),
+            ChipWrite(2000, "ym2151", 0, 0x08, 0x78 | 4),
+        ]
+        song = analyze(_vgm_with_writes(writes), pcm=False)
+        notes = [e for e in song.events if e.on and e.ch == 4]
+        self.assertEqual(len(notes), 2)
+        self.assertEqual(notes[0].sweep, ())
+        self.assertEqual(notes[1].note, 97)
+
     def test_single_mid_note_step_is_a_sweep(self):
         # A driver that slams the octave writes one KC pair mid-note and
         # holds it, so there is no spread *between* the points. The old

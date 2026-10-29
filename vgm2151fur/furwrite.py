@@ -115,8 +115,8 @@ PAT_TAIL_ROWS = 10
 # SN76489 defaults to 0.500. Absolute extra-header entries override.
 _DEV_DEFAULT_VOLUME = {
     0x00: 0x80,
-    0x03: 0x100, 0x04: 0x180, 0x12: 0x100, 0x18: 0x100, 0x19: 0xA0,
-    0x1C: 0x100, 0x27: 0x40,
+    0x03: 0x100, 0x04: 0x180, 0x12: 0x100, 0x16: 0x11E, 0x18: 0x100,
+    0x19: 0xA0, 0x1C: 0x100, 0x27: 0x40,
 }
 _DEV_CORE_PATCH = {
     0x19: lambda v: v * 8 // 5,  # K051649 SCC core scale
@@ -126,14 +126,15 @@ _DEV_CORE_PATCH = {
 # (measured on two-chip modules: the player's overall-volume normalizer scales
 # a lone chip, and Furnace has no such step).
 _FURNACE_VOLUME_SCALE = {
-    0x00: 1.0, 0x03: 1.0, 0x04: 1.0, 0x12: 1.46, 0x18: 1.0, 0x1C: 0.7,
-    0x19: 1.04,
+    0x00: 1.0, 0x03: 1.0, 0x04: 1.0, 0x12: 1.46, 0x16: 0.61, 0x18: 1.0,
+    0x1C: 0.7, 0x19: 1.04,
 }
-# MSM6258 (0x17, the player default is 0x11E) keeps unity; its Furnace core is
-# uncalibrated. The MSM6295 (0x18) is unity as measured.
+# MSM6258's player default is 0x11E; its Furnace core is 1.64x louder, so
+# 0.61 lands the sample at the source level. The MSM6295 (0x18) is unity.
 _CHIP_DEV = {CHIP_YM2151: 0x03, CHIP_SEGAPCM: 0x04, CHIP_MSM6295: 0x18,
-             CHIP_C140: 0x1C, CHIP_C352: 0x27, CHIP_SMS: 0x00,
-             CHIP_K051649: 0x19, CHIP_K052539: 0x19, CHIP_AY8910: 0x12}
+             CHIP_MSM6258: 0x16, CHIP_C140: 0x1C, CHIP_C352: 0x27,
+             CHIP_SMS: 0x00, CHIP_K051649: 0x19, CHIP_K052539: 0x19,
+             CHIP_AY8910: 0x12}
 
 
 def _player_chip_volume(vgm, dev: int, instances: int) -> float:
@@ -2426,15 +2427,20 @@ def write_fur(
     for i, chip in enumerate(chips):
         # Twin16 K007232 sits under the OPM; the rip's mix says how far. Every
         # other sample chip uses the player's mix (defaults + extra-header
-        # entries) through _sample_chip_volume; FM keeps the reference unity.
+        # entries) through _sample_chip_volume.
         if chip == CHIP_K007232 and include_fm:
             cv = k_vol
         elif chip in _CHIP_DEV:
             cv = _sample_chip_volume(song, chip, chip_counts[chip])
         else:
             cv = 1.0
-        vols[i] = max(0, min(64, int(round(cv * 64))))
         chip_vols.append(cv)
+    # A chip volume above 1.0 (the MSM6258 player default is 0x11E) does not
+    # fit Furnace's 0-64 field. Raise the song master instead and scale every
+    # chip down by the same factor so the source mix is preserved exactly.
+    master_gain = max([1.0] + chip_vols)
+    for i, cv in enumerate(chip_vols):
+        vols[i] = max(0, min(64, int(round(cv / master_gain * 64))))
     b.raw(bytes(vols))
     b.pad(32)
     flag_ptr_off = len(b)
@@ -2472,7 +2478,7 @@ def write_fur(
     for name in names_short:
         b.strz(name)
     b.strz(comment)
-    b.f32(1.0)
+    b.f32(master_gain)
     _compat_phase2(b)
     b.u16(150)
     b.u16(150)

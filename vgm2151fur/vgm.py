@@ -240,6 +240,9 @@ class VgmFile:
     ym2151_clock: int
     k007232_clock: int
     gd3: dict[str, str]
+    # VGM header 0x7C: output volume of the first chip (0x100 = unity).
+    # 0.0 means the field is absent; the player default then applies.
+    main_volume: float = 0.0
     roms: list[RomSlice] = field(default_factory=list)
     writes: list[ChipWrite] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
@@ -666,6 +669,13 @@ def load_vgm(path: Path | str) -> VgmFile:
     if not k051_clock:
         k051_clock = _sane_clock(clocks.get(EXTRA_K051649, 0))
 
+    main_volume = 0.0
+    # Bytes past the declared command offset are not header fields. Synthetic
+    # test logs and old 0x40-byte headers leave this area as commands.
+    if ver >= 0x150 and data_offset(buf) >= 0x7E and len(buf) >= 0x7E:
+        raw_volume = int.from_bytes(buf[0x7C:0x7E], "little")
+        if 0 < raw_volume <= 0x800:
+            main_volume = raw_volume / 0x100
     vgm = VgmFile(
         path=path,
         buf=buf,
@@ -677,6 +687,7 @@ def load_vgm(path: Path | str) -> VgmFile:
         ym2151_clock=ym_clock,
         k007232_clock=k_clock,
         gd3=parse_gd3(buf),
+        main_volume=main_volume,
         ym2612_clock=ym2612_clock,
         ym2612_dual=ym2612_dual,
         sn76489_clock=sn76489_clock,

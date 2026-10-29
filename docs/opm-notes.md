@@ -74,13 +74,22 @@ that returns before later effects on the row are read).
 
 Several drivers script the LFO sensitivity: once a note is held, the driver
 rewrites `0x38+ch` every ~0.1 s, stepping PMS and AMS up, so the note
-starts steady and drifts over ~1 s and resets at the next key-on. The
-analyzer picks the most common per-instrument trajectory and the writer
-emits it as FMS/AMS macros (codes 10/11) with that step duration in ticks
-(`speed = median_step / (44100 / hz)`); a fixed 735-samples-per-tick frame
-would make every step ~9× too short, i.e. full vibrato the instant the note
-starts. One trajectory per instrument is a known approximation; see the
-gaps section.
+starts steady and drifts over ~1 s and resets at the next key-on.
+
+The encoder is a hybrid:
+
+- The default is one FMS/AMS macro per instrument, taken from the most
+  common note trajectory, with `speed = median_step / (44100 / hz)`. This
+  keeps phase and timbre stable on dense-PMS tracks.
+- A note gets its own macro only when PMS is zero at key-on and the first
+  non-zero write is more than 250 ms later. The macro includes the leading
+  holds, so a delayed vibrato onset stays delayed.
+- Notes whose PMS starts at key-on stay on the per-instrument macro.
+
+A per-note macro for every note, or PMS/AMS as channel effects at every
+source write, changes the phase and timbre of dense-PMS tracks. Keep the
+per-instrument macro as the default. See the gaps section for what is still
+lost.
 
 ## LFO re-anchoring (TEST register)
 
@@ -105,14 +114,22 @@ at the same pattern row, because a cell holds one `17xx`. The driver's
 following `0x01=00` is dropped within two samples of the pulse. The delayed
 restore already clears the bit, and a write at T would overwrite the `1700`.
 
-**Furnace must not elide same-value LFO writes.** The OPM reloads its LFO
-counter on every `0x18` write, including one that writes the same value.
-Drivers that rewrite `LFRQ` at each key-on rely on that. The local Furnace
-source carries the fix: `src/engine/platform/fmsharedbase.h` marks
-`0x01/0x18/0x19/0x1B` writes dirty, and `arcade.cpp` writes them even when
-unchanged. A stock Furnace build still plays the module, but drops the
-same-value reloads and the LFO phase drifts as before. The `.fur` uses only
-standard effects and remains portable.
+**Furnace must not elide same-value LFO writes.** The core behaviour is
+split and easy to misread:
+
+- ymfm's OPM resets `m_lfo_counter` only while TEST bit 1 (`0x01` bit 1)
+  is active. A write to `0x18` does not rewind the waveform phase.
+- Furnace's bundled Nuked-OPM (`extern/opm/opm.c`) sets `lfo_frq_update`
+  on every `0x18` write and reloads the divider (`lfo_counter2`). That is
+  the reload drivers such as Willow depend on, not a phase reset.
+- `0x18` also restarts the divider when the value is unchanged, so the
+  local Furnace source must write same-value `0x18` writes.
+  `src/engine/platform/fmsharedbase.h` marks `0x01/0x18/0x19/0x1B` dirty,
+  and `arcade.cpp` writes them even when unchanged. A stock Furnace build
+  drops those writes and the LFO phase drifts.
+
+The `.fur` still uses only standard effects. The converter cannot write
+`0x01` directly, so the TEST pulse is approximated as described above.
 
 ## Percussion pitch sweeps
 
@@ -122,7 +139,11 @@ captures those writes per held note (merging the driver's KC/KF write pairs
 a few samples apart), takes the note's pitch from the first pair when it
 lands right after the key-on, and `furwrite._emit_sweep` encodes the
 source's step trajectory (each merged KC/KF pair is a step) as per-row
-01xx/02xx ramps plus E5 steps:
+01xx/02xx ramps plus E5 steps.
+
+A note shorter than 50 ms is a setup blip, not a release tail: its sweep is
+closed at key-off so the next note's KC/KF write is not attached to it.
+Longer notes keep the release-tail trajectory until the next key-on.
 
 - each row gets the rate that takes the pitch (after any E5 step on that
   row) to the trajectory's value at the row's end: boundary sampling, not a
@@ -208,15 +229,22 @@ check.
 
 ## Known gaps and edge cases
 
-- **Vibrato varies per note, but the file carries one trajectory per
-  instrument.** Notes that deviate from the common PMS/AMS trajectory get
-  the common one. `vgmdiff.py` cannot see this; export the track and
-  compare `0x38`–`0x3F` writes, or listen.
+- **Vibrato still varies between notes.** The per-instrument macro is
+  exact for the common trajectory; a late onset (PMS 0 at key-on, first
+  non-zero write after 250 ms) gets a per-note copy with leading holds.
+  Notes that change trajectory mid-note still share the instrument macro.
+  `vgmdiff.py` cannot see this; compare `0x38`–`0x3F` writes, or listen.
+- **Condensed variants are suppressed on low-confidence grids.** A source
+  whose note unit changes between sections cannot be lengthened into
+  `x2`/`x3`/... without moving notes and modulation. `convert_variants`
+  keeps the 1x module and does not write the condensed factors.
 - **The LFO register stream is carried at row resolution.** The TEST pulse
   and every `0x18` write reach the module (see "LFO re-anchoring"), but a
   write between row boundaries lands on the row's tick. At audio rate
   (LFRQ FF) that placement error is a large phase change. Very fast vibrato
   still differs note by note. Slow LFRQ values are reproduced faithfully.
+  On a coarse `xN` grid a fast PMS cadence cannot be represented at all;
+  that is why the low-confidence guard exists.
 - **Operator-level key tricks are partly flattened.** The KON mask is
   tracked per operator (an envelope restarts only on a 0→1 bit transition,
   matching ymfm), so redundant key-on writes and per-operator changes while
@@ -234,6 +262,12 @@ check.
   survives; a step *louder* than the instrument cannot (the column's
   ceiling is the instrument TL). A region that also changes the modulator
   stays static.
+- **CBT TL writes at note boundaries become the next instrument snapshot.**
+  The edge-case VGM rewrites carrier TL every 16 ms. A rewrite immediately
+  before a key-on is not a held-note fade: the new note starts with that TL,
+  so the raw set of TL values in the export is not the target. Key-on TL
+  levels, unkeyed-operator muting and held-note volume steps are the checks;
+  `tests/test_cbt_litmus.py` covers the first two.
 - **The OPM LFO depth is seeded with the hardware reset.** Furnace's
   arcade core defaults PMD/AMD to `0x7f`, the OPM resets them to 0. A
   driver that never writes `0x19` but loads PMS/AMS into its instruments
