@@ -336,6 +336,18 @@ class TestYm2610Writer(unittest.TestCase):
         ]
         self.assertTrue(offs)
 
+    def test_adjusted_loop_keeps_source_tail(self):
+        song = analyze(_vgm(_adpcm_writes(), bytes(1024), total_samples=3000))
+        song.loop_sample = 1000
+        song.loop_end_sample = 1500
+        song.loop_cut_sample = 1800
+        m = parse_fur(write_fur(song))
+        notes = [
+            row.note for (ch, _idx), rows in m.patterns.items() if ch == 13
+            for row in rows if 0 <= row.note < 180
+        ]
+        self.assertIn(60, notes)  # B trigger at 2000, after the bar trim
+
     @unittest.skipUnless(HAVE_FURNACE, "Furnace is not installed")
     def test_furnace_round_trip(self):
         song = self._song(b=True)

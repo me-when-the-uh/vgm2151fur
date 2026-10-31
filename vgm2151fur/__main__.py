@@ -459,8 +459,8 @@ def _add_convert_flags(parser: argparse.ArgumentParser, *, bare: bool) -> None:
     )
     parser.add_argument(
         "--dirs", action="store_true",
-        help="write variants as default/ and xN optimised/ subfolders (only the "
-             "lossless factors) plus a condense.tsv manifest, instead of the "
+        help="write variants as default/ and xN optimised/ subfolders (the "
+             "kept factors) plus a condense.tsv manifest, instead of the "
              "flat '<name> xN.fur' siblings",
     )
     parser.add_argument("--workers", type=int, default=None, help=_WORKERS_HELP)

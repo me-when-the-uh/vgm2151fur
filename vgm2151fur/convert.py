@@ -353,7 +353,7 @@ def default_factors(condense: float) -> tuple[float, ...]:
 def _place_dirs(results: list[dict], out_dir: Path, keep: set) -> None:
     """Move each kept factor into its subfolder; delete the ones that lost.
 
-    The `keep` set is every factor the lossless gate accepted (always 1).
+    `keep` lists the factors to retain. 1x is always kept.
     """
     for r in results:
         path = Path(r["dst"])
@@ -413,10 +413,10 @@ def convert_variants(
 ) -> list[dict]:
     """Write one .fur per condense factor and pick one.
 
-    Factor 1 is the canonical `<stem>.fur`; factor N adds ` xN`. `mode`
-    chooses the pick: none -> 1x, lossless -> largest accepted factor, all ->
-    largest factor. With `layout="dirs"` accepted factors move to
-    `default/` and `xN optimised/`.
+    Factor 1 is the canonical `<stem>.fur`; factor N adds ` xN`, and `all`
+    adds ` (lossy)`. `mode` chooses the pick: none -> 1x, lossless -> largest
+    accepted factor, all -> largest factor. With `layout="dirs"` the kept
+    factors move to `default/` and `xN optimised/`.
     """
     vgm = load_vgm(path)
     src = Path(path)
@@ -449,7 +449,8 @@ def convert_variants(
             )
             continue
         stats: dict = {}
-        name = f"{src.stem}.fur" if factor == 1 else f"{src.stem} x{factor:g}.fur"
+        lossy = " (lossy)" if mode == "all" else ""
+        name = f"{src.stem}.fur" if factor == 1 else f"{src.stem} x{factor:g}{lossy}.fur"
         out_path = out_dir / name
         data, peak, gain = _emit(
             song, out_path, pcm=pcm, include_fm=include_fm,
@@ -746,7 +747,7 @@ def convert_folder(
     Yields (src, info, None) as each file finishes, or (src, None, error) for
     a file that raised. The rest still convert. With `variants`, each file is
     written as the 1x..`condense`x set and `info` carries the whole set plus
-    the pick; `layout="dirs"` lands the accepted factors in `default/` and
+    the pick; `layout="dirs"` lands the kept factors in `default/` and
     `xN optimised/` with a `condense.tsv` manifest.
     """
     try:

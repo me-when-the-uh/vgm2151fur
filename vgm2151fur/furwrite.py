@@ -1484,42 +1484,39 @@ def _assign_pcm_rows(
             row, delay = ideals[i]
             if row < 0 or row >= total_rows:
                 continue
-            if row in placed and ons[placed[row]].sample == ev.sample:
-                out.pop(id(ons[placed[row]]), None)
-                _bump(stats, "pcm_evicted")
-                placed[row] = i
-                out[id(ev)] = (row, delay)
-                continue
-            next_row = ideals[i + 1][0] if i + 1 < len(ons) else limit
-            if next_row <= row:
-                next_row = row
-            ceiling = min(limit, next_row)
-            if row not in placed and row < limit:
-                placed[row] = i
-                out[id(ev)] = (row, delay)
-                continue
-            dest = row + 1
-            found = False
-            while dest < ceiling and dest < total_rows:
-                if dest not in placed:
+            if row in placed:
+                prev = ons[placed[row]]
+                if prev.sample == ev.sample or (prev.ins, prev.note) == (ev.ins, ev.note):
+                    # Two writes at one source sample, or one sample retriggered
+                    # within a row. The later start wins and the first is under
+                    # a row away, so it cannot be heard as a separate note.
+                    out.pop(id(prev), None)
+                    _bump(stats, "pcm_merged")
+                    placed[row] = i
+                    out[id(ev)] = (row, delay)
+                    continue
+                dest = row + 1
+                while dest < total_rows and dest in placed:
+                    dest += 1
+                if dest < total_rows:
                     placed[dest] = i
                     out[id(ev)] = (dest, 0)
-                    found = True
-                    break
-                dest += 1
-            if found:
-                continue
-            if row >= total_rows:
-                continue
-            victim = placed.get(row)
-            if victim is not None:
-                out.pop(id(ons[victim]), None)
+                    _bump(stats, "pcm_shifted")
+                    continue
+                out.pop(id(prev), None)
                 _bump(stats, "pcm_evicted")
+                placed[row] = i
+                out[id(ev)] = (row, delay)
+                continue
+            if row >= limit:
+                continue
             placed[row] = i
             out[id(ev)] = (row, delay)
         played = [e for e in ons if id(e) in out]
         for off in (e for e in evs if not e.on):
-            before = [e for e in played if e.sample <= off.sample]
+            # A trigger at the same sample retriggers the voice. The off
+            # belongs to the note before it and is redundant.
+            before = [e for e in played if e.sample < off.sample]
             if not before:
                 continue
             on = before[-1]
@@ -1719,21 +1716,18 @@ def _build_patterns(song: Song, n_ch: int, pat_len_max: int, fx_cols: int,
         loop_row = song.row_of(song.loop_sample)
     if loop_row < 0:
         loop_row = 0
-    # An adjusted loop ends on loop_end_sample. Content past that row is the
-    # old tail Bxx would skip, so it is not written. The order walk below
-    # reuses the name end_row for each order's bound, so this one keeps its
-    # own name.
+    # The loop finder trims the loop end to a bar, but the source continues to
+    # the VGM total. Keep that tail: it can hold post-bar A/B gates, and the
+    # module loops at the source total. The order walk below reuses the name
+    # end_row for each order's bound, so this one keeps its own name.
     content_end = None
     content_cut = None
     if adjusted:
-        content_end = song.place(song.loop_end_sample)[0]
+        content_end = song.place(
+            max(song.loop_end_sample, song.vgm.total_samples)
+        )[0]
         if content_end < loop_row:
             content_end = None
-        else:
-            # Notes at or past the wrap sample belong to the copy of the head
-            # that follows the loop in the recording, however a condensed
-            # grid would fold them back onto the wrap row.
-            content_cut = song.loop_cut_sample
     if content_end is not None:
         total_rows = content_end + 1
     else:
@@ -1790,12 +1784,12 @@ def _build_patterns(song: Song, n_ch: int, pat_len_max: int, fx_cols: int,
         if ev.pcm:
             assigned = pcm_pos.get(id(ev))
             if assigned is None:
-                if ev.on:
-                    _bump(stats, "pcm_unplaced")
-                    continue
-                row, delay = song.place(ev.sample, stats)
-            else:
-                row, delay = assigned
+                # An off with no assigned row is the back-to-back retrigger
+                # case: the next key-on stops the sample. Writing a NOTE_OFF
+                # here can land after that key-on and cut the new note.
+                _bump(stats, "pcm_unplaced" if ev.on else "pcm_off_skipped")
+                continue
+            row, delay = assigned
         else:
             row, delay = song.place(ev.sample, stats)
         if row < 0 or row >= total_rows:

@@ -279,6 +279,34 @@ class TestMenu(unittest.TestCase):
             self.assertEqual(state["browse_root"], str(root))
             self.assertEqual(state["pack"], str(pack))
 
+    def test_optimise_prompt_is_yes_no_and_defaults_to_all(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            pack = _make_pack(root)
+            reader = Reader(
+                ["1", str(root), "1", "c", "1", "", "", "n", "b", "", "q"]
+            )
+            with redirect_stdout(io.StringIO()):
+                rc = run_menu(
+                    read=reader, out=print, state_path=root / "state.json"
+                )
+            self.assertEqual(rc, 0)
+            prompt = next(p for p in reader.prompts if p.startswith("optimise"))
+            self.assertIn("(Y/n)", prompt)
+            self.assertNotIn("lossless", prompt)
+            fur = pack / "fur" / "x2 optimised" / "03 Song 3 x2 (lossy).fur"
+            self.assertTrue(fur.is_file())
+
+    def test_optimise_no_writes_only_the_1x_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            pack = _make_pack(root)
+            _run_menu(
+                ["1", str(root), "1", "c", "1", "", "n", "b", "", "q"], root
+            )
+            self.assertTrue((pack / "fur" / "03 Song 3.fur").is_file())
+            self.assertFalse((pack / "fur" / "x2 optimised").exists())
+
     def test_pack_convert_a_range(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

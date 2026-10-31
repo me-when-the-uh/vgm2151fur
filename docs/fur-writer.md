@@ -138,8 +138,10 @@ the sample center rate, corrected by `8363/8372` for Furnace's
 `oldCenterRate` default, and plays the sample map's C-4 slot.
 
 PCM gates carry explicit note-offs. An off that would run into the next
-key-on is omitted because that key-on stops the sample. A gate still
-sounding at the loop cut gets an off on the last content row.
+key-on is omitted because that key-on stops the sample. A different
+sample whose trigger shares a row moves to the next free row, and a
+same-sample repeat within a row keeps the later start. The adjusted
+loop's content runs to the VGM total, so a post-bar A/B gate is not cut.
 
 SCC instruments (`DIV_INS_SCC`, type 18) carry one 32-byte waveform through
 the `WS` wave-synth feature; the wave itself lives in the module's wavetable
@@ -260,7 +262,8 @@ Condensing is not free. A row carries one note cell and one slide rate:
 `LOSS_KEYS`/`loss_total` sum the structural ones and `dev_max` reads the
 fidelity number. `convert_variants` writes the 1x..Nx set and, in `lossless`
 mode, marks the largest factor with no added structural loss and no more than
-6 units (0.1 st) more deviation than 1x, else falls back to 1x.
+6 units (0.1 st) more deviation than 1x, else falls back to 1x. In `all` mode
+the pick is the largest factor and the condensed names end in ` (lossy)`.
 
 `dev_max` saturates on sweep-heavy tracks, so it cannot always separate a
 good coarser grid from a bad one. With `verify` (CLI `--verify`, always on in
@@ -273,7 +276,7 @@ overrides it. The counters are structural: sub-semitone shimmer that
 survives as amplitude or timbre is invisible to them, which is exactly what
 `--verify` exists to catch.
 
-`layout="dirs"` (menu default, CLI `--dirs`) moves each accepted factor to
+`layout="dirs"` (menu default, CLI `--dirs`) moves each kept factor to
 `<out_dir>/default/` or `<out_dir>/xN optimised/` and deletes the rest, and
 `convert_folder` appends a `condense.tsv` row per factor so the folder records
 which renditions were kept and why. The placement happens after the verdict,

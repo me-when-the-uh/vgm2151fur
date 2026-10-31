@@ -139,9 +139,25 @@ class TestConvertVariants(unittest.TestCase):
     def test_fractional_factor_names_the_file(self):
         res = self._run((1, 1.5), "all")
         names = {Path(r["dst"]).name for r in res}
-        self.assertEqual(names, {"synthetic.fur", "synthetic x1.5.fur"})
+        self.assertEqual(
+            names, {"synthetic.fur", "synthetic x1.5 (lossy).fur"}
+        )
         by = {r["factor"]: r for r in res}
         self.assertAlmostEqual(by[1.5]["bpm"], by[1]["bpm"] / 1.5, delta=by[1]["bpm"] * 0.05)
+
+    def test_all_mode_marks_every_condensed_file_lossy(self):
+        res = self._run((1, 2, 4), "all")
+        names = {r["factor"]: Path(r["dst"]).name for r in res}
+        self.assertEqual(names[1], "synthetic.fur")
+        self.assertEqual(names[2], "synthetic x2 (lossy).fur")
+        self.assertEqual(names[4], "synthetic x4 (lossy).fur")
+
+    def test_lossless_mode_leaves_the_names_plain(self):
+        res = self._run((1, 2, 4), "lossless")
+        names = {r["factor"]: Path(r["dst"]).name for r in res}
+        self.assertEqual(names[1], "synthetic.fur")
+        self.assertEqual(names[2], "synthetic x2.fur")
+        self.assertEqual(names[4], "synthetic x4.fur")
 
     def test_dirs_layout_files_default_and_optimised(self):
         res = self._run((1, 2, 3, 4), "all", layout="dirs")
