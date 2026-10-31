@@ -18,6 +18,7 @@ Use `report` before a pack conversion, convert one track before the pack, and ch
 Accuracy workflow:
 
 - Read the actual core source before changing LFO or volume behaviour. ymfm resets the OPM LFO phase only through TEST bit 1; Furnace's Nuked-OPM reloads the LFO divider on every `0x18` write. Do not infer either from register traces alone.
+- YM2610 ADPCM-A `0x100` is a strobe. Every non-stop write retriggers its selected channels, and drivers often set the real channel level or pan a few samples after the gate. The collector's 64-sample update window is deliberate (`docs/ym2610.md`).
 - Use the ten-track gate in `portable-context.md` first. Do not rebuild a pack, and never the collection, until the gate and the old module comparison agree.
 - Use a temporary git worktree of the committed converter to separate a pre-existing regression from a new one.
 - Preserve the old module's master and chip mix when applying a batch. Copying only the master is not enough: the YM2151/MSM6258 balance is part of the old level.

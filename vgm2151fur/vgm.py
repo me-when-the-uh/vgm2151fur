@@ -1,7 +1,7 @@
 """VGM / VGZ loader and command walker.
 
 Chips: YM2151, YM2203, YM2612, K007232, MSM6295, MSM6258, SegaPCM, C140,
-C352, AY-3-8910, K051649/K052539 (SCC).
+C352, K053260, AY-3-8910, K051649/K052539 (SCC).
 """
 
 from __future__ import annotations
@@ -21,6 +21,13 @@ CMD_YM2612_P0 = 0x52
 CMD_YM2612_P1 = 0x53
 CMD_YM2612_B_P0 = 0xA2
 CMD_YM2612_B_P1 = 0xA3
+# 0x58/0x59 are the YM2610's two register ports; 0xA8/0xA9 are the second
+# instance.  Port 0 holds SSG, ADPCM-B and the first two FM channels; port 1
+# holds ADPCM-A and the remaining FM channels.
+CMD_YM2610_P0 = 0x58
+CMD_YM2610_P1 = 0x59
+CMD_YM2610_B_P0 = 0xA8
+CMD_YM2610_B_P1 = 0xA9
 CMD_SN76489 = 0x50
 CMD_DAC_WRITE = 0x2A
 CMD_DAC_ENABLE = 0x2B
@@ -37,6 +44,7 @@ CMD_SEGAPCM = 0xC0
 CMD_SCC = 0xD2
 CMD_C140 = 0xD4
 CMD_C352 = 0xE1
+CMD_K053260 = 0xBA
 CMD_DATA_BLOCK = 0x67
 CMD_END = 0x66
 CMD_STREAM_SETUP = 0x90
@@ -47,16 +55,21 @@ OKI_ROM_TYPE = 0x8B  # OKIM6295 ROM
 SEGAPCM_ROM_TYPE = 0x80  # SegaPCM ROM
 C140_ROM_TYPE = 0x8D  # Namco C140 ROM
 C352_ROM_TYPE = 0x92  # Namco C352 ROM
+YM2610_ADPCM_ROM_TYPE = 0x82  # YM2610 ADPCM-A/B ROM
+YM2610_DELTAT_ROM_TYPE = 0x83  # YM2610 delta-T ROM
+K053260_ROM_TYPE = 0x8E  # Konami K053260 ROM
 K007232_TRIGGER_REG = 0x1F
 # Extra-header chip ids (libvgm device index). 0x02 is YM2612, 0x2A K007232.
 EXTRA_MSM6258 = 0x16
 EXTRA_MSM6295 = 0x17
 EXTRA_YM2612 = 0x02
 EXTRA_YM2203 = 0x06
+EXTRA_YM2610 = 0x08
 EXTRA_SEGAPCM = 0x04
 EXTRA_AY8910 = 0x12
 EXTRA_K051649 = 0x19
 EXTRA_C140 = 0x1C
+EXTRA_K053260 = 0x1D
 EXTRA_C352 = 0x27
 EXTRA_K007232 = 0x2A
 # Main-header clocks (VGMFile.h layout, spec v1.71). 0x98 is MSM6295, 0x90
@@ -82,6 +95,12 @@ SN76489_DEFAULT_CLOCK = 3579545
 YM2203_CLOCK_OFF = 0x44
 YM2203_DUAL_BIT = 0x40000000
 YM2203_DEFAULT_CLOCK = 3579545
+# YM2610 clock at 0x4C.  Bit 31 selects the YM2610B (six FM channels), bit 30
+# marks the dual-instance cheat.  The B bit is part of the same field.
+YM2610_CLOCK_OFF = 0x4C
+YM2610_B_BIT = 0x80000000
+YM2610_DUAL_BIT = 0x40000000
+YM2610_DEFAULT_CLOCK = 8000000
 AY8910_CLOCK_OFF = 0x74
 AY8910_TYPE_OFF = 0x78
 AY8910_FLAGS_OFF = 0x79
@@ -91,6 +110,8 @@ K051649_CLOCK_OFF = 0x9C
 K007232_EXTRA_CLOCK_OFF = 0xE8
 C140_CLOCK_OFF = 0xA8
 C140_TYPE_OFF = 0x96
+K053260_CLOCK_OFF = 0xAC  # VGM 1.61+, one clock for both instances
+K053260_DEFAULT_CLOCK = 3579545
 C352_CLOCK_OFF = 0xDC  # VGM 1.71 crystal; bit 31 mutes the rear pair
 C352_DIV_OFF = 0xD6  # hardware divider / 4; 72 means a divider of 288
 SEGAPCM_CLOCK_X = 4000000  # X board / Hang-On
@@ -186,7 +207,8 @@ class RomSlice:
     rom_size: int
     start: int
     data: bytes
-    kind: str = "k007232"  # "k007232" | "msm6295" | "segapcm" | "c140" | "c352"
+    kind: str = "k007232"  # "k007232" | "msm6295" | "segapcm" | "c140" |
+    #                      "c352" | "k053260"
 
 
 @dataclass
@@ -218,8 +240,8 @@ class Msm6258Play:
 class ChipWrite:
     sample: int
     chip: str  # "ym2151" | "ym2203" | "ym2612" | "k007232" | "msm6295" |
-    #            "msm6258" | "segapcm" | "c140" | "c352" | "ay8910" |
-    #            "k051649"
+    #            "msm6258" | "segapcm" | "c140" | "c352" | "k053260" |
+    #            "ay8910" | "k051649"
     chip_id: int
     reg: int
     val: int
@@ -251,6 +273,11 @@ class VgmFile:
     # kept flat as bank << 8 | register.
     ym2612_clock: int = 0
     ym2612_dual: bool = False
+    # YM2610 header 0x4C.  Bit 31 selects the B variant, bit 30 the second
+    # instance.  Port 1 registers are stored as 0x100 | register.
+    ym2610_clock: int = 0
+    ym2610_dual: bool = False
+    ym2610_b: bool = False
     # Genesis SN76489 header 0x0C.  The data bytes arrive as 0x50 writes;
     # they are a serial register stream, not address/data pairs.
     sn76489_clock: int = 0
@@ -286,6 +313,9 @@ class VgmFile:
     segapcm_bankmask: int = 0
     c140_clock: int = 0
     c140_type: int = 0
+    # K053260 header 0xAC (VGM 1.61+); bit 7 of a 0xBA register selects the
+    # second instance, which shares this clock.
+    k053260_clock: int = 0
     # C352 header 0xDC / divider byte 0xD6 (VGM 1.71). 0 means the chip is absent;
     # the analyzer supplies 24192000 only when it is actually converting C352.
     c352_clock: int = 0
@@ -499,8 +529,9 @@ def head_bytes(path: Path, want: int) -> bytes:
 def chips_in_head(buf: bytes) -> set[str]:
     """Chip kinds visible in a VGM header, no command stream read.
 
-    Names match the converter's chips: ym2151, msm6295, segapcm, c140, c352,
-    ay8910, k051649 (plus "scc_plus" for the K052539 variant), k007232.
+    Names match the converter's chips: ym2151, ym2610, msm6295, segapcm, c140,
+    c352, k053260, ay8910, k051649 (plus "scc_plus" for the K052539 variant),
+    k007232.
     C219 is the C140-family part the converter does not support. It is reported
     apart from c140, and those packs should not be batch-converted. C352 is
     its own chip (32 voices); it is not folded into c140 or c219.
@@ -525,6 +556,14 @@ def chips_in_head(buf: bytes) -> set[str]:
             kinds.add("ym2203")
             if ym2203_raw & YM2203_DUAL_BIT:
                 kinds.add("ym2203_dual")
+    if version >= 0x151 and _field_in_header(buf, YM2610_CLOCK_OFF, 4):
+        ym2610_raw = _header_raw(buf, YM2610_CLOCK_OFF)
+        if 100_000 <= (ym2610_raw & 0x3FFFFFFF) <= 40_000_000:
+            kinds.add("ym2610")
+            if ym2610_raw & YM2610_B_BIT:
+                kinds.add("ym2610_b")
+            if ym2610_raw & YM2610_DUAL_BIT:
+                kinds.add("ym2610_dual")
     if version >= 0x151 and 100_000 <= _header_clock(buf, SEGAPCM_CLOCK_OFF) <= 40_000_000:
         kinds.add("segapcm")
     if version >= 0x151 and 100_000 <= _header_clock(buf, AY8910_CLOCK_OFF) <= 40_000_000:
@@ -542,6 +581,8 @@ def chips_in_head(buf: bytes) -> set[str]:
     if ctype == 2:
         kinds.discard("c140")
         kinds.add("c219")
+    if version >= 0x161 and 100_000 <= _header_clock(buf, K053260_CLOCK_OFF) <= 40_000_000:
+        kinds.add("k053260")
     if version >= 0x161 and 100_000 <= _header_clock(buf, MSM6295_CLOCK_OFF) <= 40_000_000:
         kinds.add("msm6295")
     if version >= 0x161 and 100_000 <= _header_clock(buf, MSM6258_CLOCK_OFF) <= 40_000_000:
@@ -554,6 +595,8 @@ def chips_in_head(buf: bytes) -> set[str]:
             kinds.add("ym2612")
         if clocks.get(EXTRA_YM2203, 0):
             kinds.add("ym2203")
+        if clocks.get(EXTRA_YM2610, 0):
+            kinds.add("ym2610")
         if clocks.get(EXTRA_SEGAPCM, 0):
             kinds.add("segapcm")
         if clocks.get(EXTRA_AY8910, 0):
@@ -562,6 +605,8 @@ def chips_in_head(buf: bytes) -> set[str]:
             kinds.add("k051649")
         if clocks.get(EXTRA_C140, 0):
             kinds.add("c140")
+        if clocks.get(EXTRA_K053260, 0):
+            kinds.add("k053260")
         if clocks.get(EXTRA_MSM6295, 0):
             kinds.add("msm6295")
         if clocks.get(EXTRA_MSM6258, 0):
@@ -613,6 +658,13 @@ def load_vgm(path: Path | str) -> VgmFile:
     ym2203_clock = _sane_clock(ym2203_raw)
     if not ym2203_clock:
         ym2203_clock = _sane_clock(clocks.get(EXTRA_YM2203, 0))
+    # YM2610: bit 31 selects the B variant, bit 30 the second instance.
+    ym2610_raw = _header_raw(buf, YM2610_CLOCK_OFF)
+    ym2610_b = bool(ym2610_raw & YM2610_B_BIT)
+    ym2610_dual = bool(ym2610_raw & YM2610_DUAL_BIT)
+    ym2610_clock = _sane_clock(ym2610_raw)
+    if not ym2610_clock:
+        ym2610_clock = _sane_clock(clocks.get(EXTRA_YM2610, 0))
     sn76489_clock = _clock_or_zero(buf, SN76489_CLOCK_OFF)
     k_clock = _k007232_clock(buf, clocks, ym_clock, ver)
     oki_raw = _header_raw(buf, 0x98) if ver >= 0x161 else 0
@@ -629,6 +681,11 @@ def load_vgm(path: Path | str) -> VgmFile:
     if not c140_raw:
         c140_raw = clocks.get(EXTRA_C140, 0) & 0x3FFFFFFF
     c140_clock = _c140_effective_clock(c140_raw)
+    k053260_clock = (
+        _clock_or_zero(buf, K053260_CLOCK_OFF) if ver >= 0x161 else 0
+    )
+    if not k053260_clock:
+        k053260_clock = _sane_clock(clocks.get(EXTRA_K053260, 0))
     c140_type = 0
     if ver >= 0x161 and _field_in_header(buf, C140_TYPE_OFF, 1):
         c140_type = buf[C140_TYPE_OFF] & 0x03
@@ -693,6 +750,9 @@ def load_vgm(path: Path | str) -> VgmFile:
         sn76489_clock=sn76489_clock,
         ym2203_clock=ym2203_clock,
         ym2203_dual=ym2203_dual,
+        ym2610_clock=ym2610_clock,
+        ym2610_dual=ym2610_dual,
+        ym2610_b=ym2610_b,
         msm6295_clock=oki_raw & 0x3FFFFFFF,
         msm6295_pin7=bool(oki_raw & 0x80000000),
         msm6295_dual=bool(oki_raw & 0x40000000),
@@ -703,6 +763,7 @@ def load_vgm(path: Path | str) -> VgmFile:
         segapcm_bankmask=spcm_mask,
         c140_clock=c140_clock,
         c140_type=c140_type,
+        k053260_clock=k053260_clock,
         c352_clock=c352_clock,
         c352_divider=c352_divider,
         c352_mute_rear=c352_mute_rear,
@@ -722,6 +783,7 @@ def load_vgm(path: Path | str) -> VgmFile:
     skipped_sample_cmds: set[int] = set()
     stray_ym2203_second = False
     stray_ym2612_second = False
+    stray_ym2610_second = False
     saw_end = False
     saw_adpcm_compressed = False
     # stream id -> setup recorded by 0x90/0x91/0x92
@@ -766,6 +828,9 @@ def load_vgm(path: Path | str) -> VgmFile:
                     SEGAPCM_ROM_TYPE: "segapcm",
                     C140_ROM_TYPE: "c140",
                     C352_ROM_TYPE: "c352",
+                    K053260_ROM_TYPE: "k053260",
+                    YM2610_ADPCM_ROM_TYPE: "ym2610_adpcm",
+                    YM2610_DELTAT_ROM_TYPE: "ym2610_deltat",
                 }.get(typ) if len(payload) >= 8 else None
                 if kind:
                     rom_size = int.from_bytes(payload[0:4], "little")
@@ -958,6 +1023,27 @@ def load_vgm(path: Path | str) -> VgmFile:
             vgm.writes.append(ChipWrite(sample, name, cid, reg, val))
             pos += 3
             continue
+        if (
+            cmd in (CMD_YM2610_P0, CMD_YM2610_P1, CMD_YM2610_B_P0, CMD_YM2610_B_P1)
+            and pos + 3 <= n
+        ):
+            # 0x58/0x59 are the first chip's two ports, 0xA8/0xA9 the second.
+            # Port 1 is stored as 0x100 | register.  Port 0 registers 0x00-0x0F
+            # are the built-in SSG; everything else is FM, ADPCM or global.
+            cid = 0
+            if cmd in (CMD_YM2610_B_P0, CMD_YM2610_B_P1):
+                if ym2610_dual:
+                    cid = 1
+                else:
+                    stray_ym2610_second = True
+            port1 = cmd in (CMD_YM2610_P1, CMD_YM2610_B_P1)
+            reg = buf[pos + 1]
+            name = "ym2610_ssg" if (not port1 and reg < 0x10) else "ym2610"
+            vgm.writes.append(ChipWrite(
+                sample, name, cid, (0x100 if port1 else 0) | reg, buf[pos + 2],
+            ))
+            pos += 3
+            continue
         if cmd == CMD_K007232 and pos + 3 <= n:
             aa = buf[pos + 1]
             vgm.writes.append(ChipWrite(sample, "k007232", (aa >> 7) & 1, aa & 0x7F, buf[pos + 2]))
@@ -1008,6 +1094,15 @@ def load_vgm(path: Path | str) -> VgmFile:
             ))
             pos += 5
             continue
+        if cmd == CMD_K053260 and pos + 3 <= n:
+            # 0xBA: register, data. Bit 7 of the register selects the second
+            # instance; the register space is six bits.
+            aa = buf[pos + 1]
+            vgm.writes.append(ChipWrite(
+                sample, "k053260", (aa >> 7) & 1, aa & 0x3F, buf[pos + 2],
+            ))
+            pos += 3
+            continue
         if cmd == CMD_STREAM_SETUP:
             vgm.stream_setups += 1
         if cmd == 0x68:
@@ -1053,8 +1148,36 @@ def load_vgm(path: Path | str) -> VgmFile:
         vgm.warnings.append("AY-3-8910 clock is missing or out of range; using 1789772")
     if any(w.chip == "k051649" for w in vgm.writes) and not vgm.k051649_clock:
         vgm.warnings.append("K051649 clock is missing or out of range; using 1789772")
+    if any(w.chip == "k053260" for w in vgm.writes) and not vgm.k053260_clock:
+        vgm.warnings.append(
+            "K053260 clock is missing or out of range; using 3579545"
+        )
     if any(w.chip in ("ym2203", "ym2203_ssg") for w in vgm.writes) and not vgm.ym2203_clock:
         vgm.warnings.append("YM2203 clock is missing or out of range; using 3579545")
+    if any(w.chip in ("ym2610", "ym2610_ssg") for w in vgm.writes) and not vgm.ym2610_clock:
+        vgm.warnings.append(
+            f"YM2610 clock is missing or out of range; using {YM2610_DEFAULT_CLOCK}"
+        )
+    ym2610_adpcm_a = any(
+        w.chip == "ym2610" and (w.reg & 0x100) and (w.reg & 0xFF) <= 0x2D
+        for w in vgm.writes
+    )
+    ym2610_adpcm_b = any(
+        w.chip == "ym2610" and not (w.reg & 0x100) and 0x10 <= (w.reg & 0xFF) <= 0x1B
+        for w in vgm.writes
+    )
+    if (ym2610_adpcm_a or ym2610_adpcm_b) and not any(
+        r.kind == "ym2610_adpcm" for r in vgm.roms
+    ):
+        vgm.warnings.append(
+            "YM2610 ADPCM writes but no ADPCM ROM block (0x82); "
+            "the sample channels will be silent"
+        )
+    if stray_ym2610_second:
+        vgm.warnings.append(
+            "0xA8/0xA9 YM2610 writes without the dual-instance header bit; "
+            "they were treated as the first chip"
+        )
     if any(w.chip == "ym2612" for w in vgm.writes) and not vgm.ym2612_clock:
         vgm.warnings.append(
             f"YM2612 clock is missing or out of range; using {YM2612_DEFAULT_CLOCK}"

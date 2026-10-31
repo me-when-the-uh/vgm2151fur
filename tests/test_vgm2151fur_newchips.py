@@ -517,7 +517,12 @@ class TestChipVolumes(unittest.TestCase):
     def test_segapcm_fur_volume_is_the_player_default(self):
         song = TestSegapcm()._song()
         data = write_fur(song, include_pcm=True, include_fm=True)
-        self.assertIn(struct.pack("<fff", 1.5, 0.0, 0.0), data)
+        # The player default is 1.5. A master of 1.5 carries the boost, so the
+        # per-chip float is the master-relative share.
+        from vgm2151fur.furio import master_volume
+        self.assertEqual(master_volume(data), 1.5)
+        self.assertIn(struct.pack("<fff", 1.0, 0.0, 0.0), data)
+        self.assertIn(struct.pack("<fff", 1.0 / 1.5, 0.0, 0.0), data)
 
     def test_dual_msm6295_instances_are_halved(self):
         from types import SimpleNamespace

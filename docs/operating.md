@@ -71,7 +71,7 @@ columns.
 
 The grid is measured from a lattice of note starts. The YM2151, YM2203 or
 YM2612 key-on register supplies it when the rip has a usable FM stream. When
-it does not - the C352 and SegaPCM-only board rips have no FM chip at all -
+it does not - the C352, K053260 and SegaPCM-only board rips have no FM chip at all -
 the sample-chip trigger times are measured the same way, which keeps those
 rips off the 60 Hz frame fallback. That fallback reads as exactly 900 BPM
 (60 rows/s) and carries no musical information. A rip whose FM lattice
@@ -201,7 +201,7 @@ they can be run from anywhere.
 - `tools/pitch_shift.py <a.wav> <b.wav>`: the chroma-rotation table one pair
   of renders at a time, used by the soundcheck.
 - `tools/vgm_scan.py [root ...]`: which VGM packs use SegaPCM, C140, C352,
-  C219, SCC/SCC+, AY-8910, YM2203 or YM2612 and at which clock. C219 is a
+  K053260, C219, SCC/SCC+, AY-8910, YM2203 or YM2612 and at which clock. C219 is a
   C140-family part the converter does not support; never batch-convert those
   into the C140 target. C352 converts as chip 0xD0; a Furnace build with a
   C352 core can play it. YM2203 converts as chip 0x8D (3 FM + 3 SSG voices

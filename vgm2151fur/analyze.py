@@ -30,6 +30,16 @@ from vgm2151fur.c352 import (
     merge_step_writes as c352_merge_steps,
 )
 from vgm2151fur.fm import CARRIERS, FMPatch, OpRegs, OPN_CARRIERS
+from vgm2151fur.k053260 import (
+    K053260_REFIT_SAMPLES,
+    K053260Sample,
+    collect_k053260,
+    hit_played_pitch as k053260_played_pitch,
+    hit_played_volume as k053260_played_volume,
+    k053260_pan_fx,
+    k053260_rate,
+    merge_step_writes as k053260_merge_steps,
+)
 from vgm2151fur.oki import (
     ADPCM_MAP_SLOTS,
     FURNACE_C4,
@@ -71,7 +81,17 @@ from vgm2151fur.timing import (
     place_tick,
     refine_pcm_grid,
 )
-from vgm2151fur.vgm import VGM_RATE, VgmFile
+from vgm2151fur.vgm import VGM_RATE, VgmFile, assemble_rom
+from vgm2151fur.ym2610 import (
+    ADPCM_MAP_SLOTS as YM2610_MAP_SLOTS,
+    YM2610_DEFAULT_CLOCK,
+    YM2610_SSG_DIVIDER,
+    YM2610State,
+    AdpcmASample,
+    AdpcmBSample,
+    collect_ym2610_adpcm,
+    ym2610_note_for,
+)
 from vgm2151fur.ym2203 import (
     YM2203_DEFAULT_CLOCK,
     YM2203_SSG_DIVIDER,
@@ -346,6 +366,7 @@ class Song:
     segapcm_samples: list[SegapcmSample] = field(default_factory=list)
     c140_samples: list[C140Sample] = field(default_factory=list)
     c352_samples: list[C352Sample] = field(default_factory=list)
+    k053260_samples: list[K053260Sample] = field(default_factory=list)
     # (sample, channel, effect, value) placed before notes. MSM6258 divider.
     channel_fx: list[tuple[int, int, int, int]] = field(default_factory=list)
     # Chip-wide YM2151 LFO effects: (sample, effect, value[, tick offset]).
@@ -388,6 +409,15 @@ class Song:
     # The source entered CSM mode.  The per-operator frequencies still map to
     # the Ext layout; the timer-generated key-ons are not synthesized.
     ym2612_csm: bool = False
+    # YM2610 (OPNB) instances.  Each one owns 14 channels (4 FM + 3 SSG +
+    # 6 ADPCM-A + 1 ADPCM-B) or 16 on the B variant (6 FM).
+    ym2610_ids: list[int] = field(default_factory=list)
+    ym2610_b: bool = False
+    ym2610_ssg_count: int = 0
+    ym2610_a_samples: list[AdpcmASample] = field(default_factory=list)
+    ym2610_b_samples: list[AdpcmBSample] = field(default_factory=list)
+    ym2610_a_count: int = 0
+    ym2610_b_count: int = 0
     # K007232 output level relative to the YM2151, from the rip's own mix
     # (extra header) when present. Written to the .fur chip output.
     k007232_volume: float = 0.20
@@ -1582,7 +1612,7 @@ def _bind_fm_pitch(
     return made, fallbacks
 
 
-def _bind_late_pms(
+def _bind_pms_macros(
     events: list[NoteEvent],
     patches: dict[tuple, FMPatch],
     patch_order: list[tuple],
@@ -1590,11 +1620,11 @@ def _bind_late_pms(
     total_samples: int,
     cap: int = 200,
 ) -> tuple[int, int]:
-    """Per-note PMS macro only where vibrato starts well after key-on.
+    """Per-note PMS/AMS macro when the instrument's common ramp does not fit.
 
-    The per-instrument macro stays the default because replacing it wholesale
-    changed phase and timbre on dense-PMS tracks. A late onset needs the
-    leading quiet holds that the per-instrument macro threw away.
+    A short note whose source never moves PMS must not inherit the ramp. A
+    ramp that starts at a different time needs its own lead-in. Notes that do
+    match the common macro keep the shared instrument.
     """
     made = fallbacks = 0
     tick_samples = VGM_RATE / hz if hz else VGM_RATE / 60.0
@@ -1604,16 +1634,24 @@ def _bind_late_pms(
         if e.on:
             by_ch.setdefault(e.ch, []).append(e)
     idx_map: dict[tuple, int] = {}
-    for notes in by_ch.values():
-        for i, e in enumerate(notes):
-            if e.ins < 0 or len(e.opm_pms_pts) <= 1:
-                continue
-            pts = list(e.opm_pms_pts)
-            if pts[0][1] != 0:
-                continue
-            first = next(((t, p, a) for t, p, a in pts[1:] if p != 0), None)
-            if first is None or first[0] - e.sample <= 0.25 * VGM_RATE:
-                continue
+    work = [
+        (notes, i, e)
+        for notes in by_ch.values()
+        for i, e in enumerate(notes)
+        if (e.ins >= 0 and not e.pcm and not e.dac and not e.tone_chip
+            and e.opm_pms_pts)
+    ]
+    # Cover the notes with no PMS writes first: they would otherwise inherit
+    # a ramp they never had. A late ramp that cannot get a slot still lands
+    # on the base instrument, which at least has vibrato.
+    work.sort(key=lambda item: len(item[2].opm_pms_pts) > 1)
+    for notes, i, e in work:
+        pts = list(e.opm_pms_pts)
+        if len(pts) <= 1:
+            pms_vals = (pts[0][1] if pts else 0,)
+            ams_vals = (pts[0][2] if pts else 0,)
+            speed = 1
+        else:
             end = e.end or (
                 notes[i + 1].sample if i + 1 < len(notes) else track_end
             )
@@ -1625,8 +1663,8 @@ def _bind_late_pms(
                     min(int((end - e.sample) / (speed * tick_samples)) + 1,
                         65025),
                 )
-                pms_vals: list[int] = []
-                ams_vals: list[int] = []
+                pms_series: list[int] = []
+                ams_series: list[int] = []
                 j = 0
                 cur_p, cur_a = pts[0][1], pts[0][2]
                 for k in range(steps):
@@ -1634,36 +1672,52 @@ def _bind_late_pms(
                     while j < len(pts) and pts[j][0] <= t:
                         cur_p, cur_a = pts[j][1], pts[j][2]
                         j += 1
-                    pms_vals.append(cur_p)
-                    ams_vals.append(cur_a)
-                while (len(pms_vals) > 1 and pms_vals[-1] == pms_vals[-2]
-                       and ams_vals[-1] == ams_vals[-2]):
-                    pms_vals.pop()
-                    ams_vals.pop()
-                if len(pms_vals) <= 255 or speed >= 255:
+                    pms_series.append(cur_p)
+                    ams_series.append(cur_a)
+                while (len(pms_series) > 1
+                       and pms_series[-1] == pms_series[-2]
+                       and ams_series[-1] == ams_series[-2]):
+                    pms_series.pop()
+                    ams_series.pop()
+                if len(pms_series) <= 255 or speed >= 255:
                     break
                 speed = min(255, speed * 2)
+            pms_vals = tuple(pms_series)
+            ams_vals = tuple(ams_series)
+            if len(set(pms_vals)) == 1 and len(set(ams_vals)) == 1:
+                pms_vals = pms_vals[:1]
+                ams_vals = ams_vals[:1]
+                speed = 1
+        base_key = patch_order[e.ins]
+        base = patches[base_key]
+        if not base.fms_macro:
+            if (len(pms_vals) == 1 and len(ams_vals) == 1
+                    and pms_vals[0] == base.pms
+                    and ams_vals[0] == base.ams):
+                continue
+        elif (pms_vals, ams_vals, speed) == (
+            base.fms_macro, base.ams_macro, base.macro_speed
+        ):
+            continue
+        key = ("pms-note", base_key, pms_vals, ams_vals, speed)
+        idx = idx_map.get(key)
+        if idx is None:
             if len(patch_order) >= cap:
                 fallbacks += 1
                 continue
-            base_key = patch_order[e.ins]
-            key = ("pms-late", base_key, tuple(pms_vals), tuple(ams_vals), speed)
-            idx = idx_map.get(key)
-            if idx is None:
-                base = patches[base_key]
-                copy = replace(
-                    base, fms_macro=tuple(pms_vals),
-                    ams_macro=tuple(ams_vals), macro_speed=speed,
-                    uses=1, name=f"{base.name}+late",
-                )
-                patches[key] = copy
-                patch_order.append(key)
-                idx = len(patch_order) - 1
-                idx_map[key] = idx
-            else:
-                patches[patch_order[idx]].uses += 1
-            e.ins = idx
-            made += 1
+            copy = replace(
+                base, fms_macro=pms_vals,
+                ams_macro=ams_vals, macro_speed=speed,
+                uses=1, name=f"{base.name}+pms",
+            )
+            patches[key] = copy
+            patch_order.append(key)
+            idx = len(patch_order) - 1
+            idx_map[key] = idx
+        else:
+            patches[patch_order[idx]].uses += 1
+        e.ins = idx
+        made += 1
     return made, fallbacks
 
 
@@ -1763,7 +1817,13 @@ def analyze(
     has_ym2203 = "ym2203" in chips or "ym2203_ssg" in chips
     has_ym2151 = "ym2151" in chips
     has_ym2612 = "ym2612" in chips
+    has_ym2610 = "ym2610" in chips or "ym2610_ssg" in chips
     has_sn76489 = "sn76489" in chips
+    if has_ym2610 and (has_ym2151 or has_ym2203 or has_ym2612):
+        warnings.append(
+            "YM2610 and another FM chip write in one log; only the YM2610 "
+            "was converted"
+        )
     if has_ym2203 and has_ym2151:
         warnings.append(
             "YM2151 and YM2203 writes in one log are not supported together; "
@@ -1782,8 +1842,9 @@ def analyze(
             "YM2612 and YM2203 writes in one log are not supported together; "
             "only the YM2612 was converted"
         )
-    is_opn2 = has_ym2612
-    is_opn = has_ym2203 and not has_ym2151 and not is_opn2
+    is_opnb = has_ym2610
+    is_opn2 = has_ym2612 and not is_opnb
+    is_opn = has_ym2203 and not has_ym2151 and not is_opn2 and not is_opnb
     ym_ids = (
         sorted({w.chip_id for w in vgm.writes if w.chip in ("ym2203", "ym2203_ssg")})
         if is_opn else []
@@ -1808,14 +1869,43 @@ def analyze(
     }
     ym2612_ext = is_opn2 and bool(ym2612_modes & {1, 2})
     ym2612_csm = is_opn2 and 2 in ym2612_modes
+    ym2610_ids = (
+        sorted({
+            w.chip_id for w in vgm.writes
+            if w.chip in ("ym2610", "ym2610_ssg")
+        })
+        if is_opnb else []
+    )
+    ym2610_clock = vgm.ym2610_clock or YM2610_DEFAULT_CLOCK
+    ym2610_b = bool(vgm.ym2610_b)
+    ym2610_fm_count = 6 if ym2610_b else 4
+    ym2610_modes = {
+        (w.val >> 6) & 0x03
+        for w in vgm.writes
+        if is_opnb and w.chip == "ym2610" and (w.reg & 0xFF) == 0x27
+    }
+    if is_opnb and ym2610_modes & {1, 2}:
+        warnings.append(
+            "YM2610 channel-2 special/CSM mode is converted with the base "
+            "14/16-channel layout; per-operator FM3 frequencies are not split"
+        )
     multi_ext = ym2203_ext or ym2612_ext
     ym_chunk = 9 if multi_ext else 6
-    ym_base = {
-        cid: ym_chunk * i
-        for i, cid in enumerate(ym_ids if is_opn else ym2612_ids)
-    }
+    if is_opnb:
+        ym_chunk = ym2610_fm_count + 3 + 6 + 1
+        ym_base = {cid: ym_chunk * i for i, cid in enumerate(ym2610_ids)}
+    else:
+        ym_base = {
+            cid: ym_chunk * i
+            for i, cid in enumerate(ym_ids if is_opn else ym2612_ids)
+        }
     ym2203_ssg_count = 0
-    fm_end = ym_chunk * len(ym_ids if is_opn else ym2612_ids) if (is_opn or is_opn2) else 8
+    if is_opnb:
+        fm_end = ym_chunk * len(ym2610_ids)
+    elif is_opn or is_opn2:
+        fm_end = ym_chunk * len(ym_ids if is_opn else ym2612_ids)
+    else:
+        fm_end = 8
     # A Genesis log carries the SN76489 beside the YM2612.  The module uses a
     # second (SMS) system for it, so its four channels follow every FM instance.
     psg_ids = [0] if (has_sn76489 and is_opn2) else []
@@ -2771,6 +2861,298 @@ def analyze(
                 "but timer-generated key-ons are not synthesized"
             )
 
+    ym2610_ssg_count = 0
+    ym2610_a_samples: list[AdpcmASample] = []
+    ym2610_b_samples: list[AdpcmBSample] = []
+    ym2610_a_count = 0
+    ym2610_b_count = 0
+    # Events whose instrument index depends on the DAC maps, which are only
+    # grouped after the row grid is known: (event, 0=A/1=B, sample index).
+    ym2610_events: list[tuple[NoteEvent, int, int]] = []
+    if is_opnb:
+        states = {cid: YM2610State(ym2610_b) for cid in ym2610_ids}
+        held_idx: dict[tuple[int, int, int], int] = {}
+        pitch_pts: dict[tuple[int, int, int], list[tuple[int, int, int]]] = {}
+        pitch_base: dict[tuple[int, int, int], tuple[int, int]] = {}
+        opn_tl_pts: dict[tuple[int, int, int], list[tuple[int, int]]] = {}
+        opn_tl_last: dict[tuple[int, int, int], int] = {}
+        opn_offs: list[int] = []
+        lfo_last: dict[int, int] = {}
+
+        def opn_event_ch(cid: int, ch: int) -> int:
+            return ym_base[cid] + ch
+
+        def normalized_patch(snap):
+            carriers = OPN_CARRIERS.get(snap.alg & 7, (3,))
+            ops = list(snap.ops)
+            tls = [ops[i].tl & 0x7F for i in carriers]
+            floor = min(tls) if tls else 0x7F
+            for i in carriers:
+                ops[i] = replace(ops[i], tl=(ops[i].tl & 0x7F) - floor)
+            return replace(snap, ops=tuple(ops)), 127 - floor
+
+        def intern_opn_patch(cid: int, ch: int, mask: int) -> tuple[int, int]:
+            snap, vol = normalized_patch(states[cid].snapshot(ch, mask))
+            key = snap.identity() + (mask,)
+            if key not in patches:
+                snap.name = f"OPN {len(patch_order):02d}"
+                patches[key] = snap
+                patch_order.append(key)
+            p = patches[key]
+            p.uses += 1
+            return patch_order.index(key), vol
+
+        def close_opn_note(
+            key: tuple[int, int, int], sample: int, *, off: bool,
+        ) -> None:
+            idx = held_idx.pop(key, None)
+            if idx is None:
+                return
+            ev = events[idx]
+            pts = pitch_pts.pop(key, [])
+            if pts:
+                merged: list[tuple[int, int, int]] = []
+                for p in pts:
+                    if merged and p[0] - merged[-1][0] <= 16:
+                        merged[-1] = p
+                    else:
+                        merged.append(p)
+                if merged and merged[0][0] - ev.sample <= 120:
+                    if merged[0][1:] != pitch_base[key]:
+                        ev.note, ev.e5 = ym2610_note_for(
+                            merged[0][1], merged[0][2], ym2610_clock
+                        )
+                        merged = [(ev.sample, *merged[0][1:])] + merged[1:]
+                        pitch_base[key] = merged[0][1:]
+                distinct: list[tuple[int, int, int]] = []
+                for p in merged:
+                    if not distinct or p[1:] != distinct[-1][1:]:
+                        distinct.append(p)
+                if len(distinct) > 1:
+                    ev.fm_pitch_pts = tuple(distinct)
+            tl = opn_tl_pts.pop(key, [])
+            if tl:
+                ev.tl_pts = tuple(tl)
+            if off:
+                ev.end = sample
+                events.append(NoteEvent(
+                    sample=sample,
+                    ch=ev.ch,
+                    on=False,
+                    note=180,
+                    ins=-1,
+                    vol=-1,
+                    e5=0x80,
+                    pan=0,
+                ))
+                opn_offs.append(len(events) - 1)
+
+        def kon_last(writes):
+            ordered = []
+            i = 0
+            while i < len(writes):
+                j = i + 1
+                while j < len(writes) and writes[j].sample == writes[i].sample:
+                    j += 1
+                group = writes[i:j]
+
+                def is_kon(w):
+                    return (
+                        w.chip == "ym2610"
+                        and not (w.reg & 0x100)
+                        and (w.reg & 0xFF) == 0x28
+                    )
+
+                ordered.extend(w for w in group if not is_kon(w))
+                ordered.extend(w for w in group if is_kon(w))
+                i = j
+            return ordered
+
+        for w in kon_last(vgm.writes):
+            if w.chip != "ym2610":
+                continue
+            cid = w.chip_id
+            st = states.get(cid)
+            if st is None:
+                continue
+            reg, val = w.reg, w.val
+            r = reg & 0xFF
+            bank = bool(reg & 0x100)
+            if not bank and r == 0x22:
+                st.write(reg, val)
+                fx = (0x10 if val & 0x08 else 0x00) | (val & 0x07)
+                if lfo_last.get(cid) != fx:
+                    chip_fx.append((w.sample, 0x10, fx))
+                    lfo_last[cid] = fx
+                continue
+            if not bank and r == 0x27:
+                st.write(reg, val)
+                continue
+            if (bank and r <= 0x2D) or (not bank and 0x10 <= r <= 0x1F):
+                # ADPCM-A/B.  The sample collector owns these registers; the
+                # FM state keeps a copy only for the report.
+                st.write(reg, val)
+                continue
+            if not bank and r == 0x28:
+                ch = st.kon_map.get(val & 7)
+                if ch is None:
+                    st.write(reg, val)
+                    continue
+                prev = st.op_mask[ch]
+                mask = (val >> 4) & 0x0F
+                st.write(reg, val)
+                newly_on = mask & ~prev
+                key = (cid, ch, -1)
+                if mask and newly_on:
+                    close_opn_note(key, w.sample, off=False)
+                    block, fnum = st.frequency(ch)
+                    note, e5 = ym2610_note_for(block, fnum, ym2610_clock)
+                    ins, vol = intern_opn_patch(cid, ch, mask)
+                    events.append(NoteEvent(
+                        sample=w.sample,
+                        ch=opn_event_ch(cid, ch),
+                        on=True,
+                        note=note,
+                        ins=ins,
+                        vol=vol,
+                        e5=e5,
+                        pan=st.pan_byte_ch(ch),
+                        sweep_div=2.0,
+                        e5_lo=0x00,
+                        e5_hi=0xFF,
+                    ))
+                    held_idx[key] = len(events) - 1
+                    pitch_base[key] = (block, fnum)
+                    pitch_pts[key] = [(w.sample, block, fnum)]
+                    opn_tl_pts[key] = []
+                    opn_tl_last[key] = st.carrier_tl(ch)
+                    keyon_times.append(w.sample)
+                    st.kon[ch] = True
+                elif not mask and st.kon[ch]:
+                    st.kon[ch] = False
+                    close_opn_note(key, w.sample, off=True)
+                continue
+
+            ch = st.channel_of(reg)
+            if ch is None:
+                st.write(reg, val)
+                continue
+            before = st.frequency(ch)
+            b4 = st.pan_pms_ams[ch]
+            st.write(reg, val)
+            after = st.frequency(ch)
+            key = (cid, ch, -1)
+            if key in held_idx and after != before:
+                pitch_pts[key].append((w.sample, *after))
+            if 0x40 <= r <= 0x4E and key in held_idx:
+                cur = st.carrier_tl(ch)
+                if cur != opn_tl_last.get(key, 0x7F):
+                    opn_tl_pts[key].append((w.sample, cur))
+                    opn_tl_last[key] = cur
+            if 0xB4 <= r <= 0xB6:
+                new_b4 = st.pan_pms_ams[ch]
+                if new_b4 != b4:
+                    target = ym_base[cid] + ch
+                    pan = st.pan_byte_ch(ch)
+                    if (b4 ^ new_b4) & 0xC0:
+                        channel_fx.append((w.sample, target, 0x08, pan))
+                    if (b4 ^ new_b4) & 0x30:
+                        channel_fx.append(
+                            (w.sample, target, 0x63, (new_b4 >> 4) & 0x03)
+                        )
+                    if (b4 ^ new_b4) & 0x07:
+                        channel_fx.append(
+                            (w.sample, target, 0x62, new_b4 & 0x07)
+                        )
+
+        for key in list(held_idx):
+            close_opn_note(key, vgm.total_samples or 0, off=False)
+
+        ons_by_ch: dict[int, list[int]] = {}
+        for e in events:
+            if e.on:
+                ons_by_ch.setdefault(e.ch, []).append(e.sample)
+        drop = {
+            idx for idx in opn_offs
+            if any(abs(t - events[idx].sample) <= 2
+                   for t in ons_by_ch.get(events[idx].ch, ()))
+        }
+        if drop:
+            events = [e for i, e in enumerate(events) if i not in drop]
+
+        rom_a = assemble_rom(vgm, "ym2610_adpcm") if pcm else b""
+        rom_b = assemble_rom(vgm, "ym2610_deltat") if pcm else b""
+        if pcm:
+            if rom_a or rom_b:
+                ym2610_a_samples, ym2610_b_samples, ym_warn = (
+                    collect_ym2610_adpcm(vgm, rom_a, rom_b or rom_a)
+                )
+                warnings.extend(ym_warn)
+                for i, smp in enumerate(ym2610_a_samples):
+                    for h in smp.hits:
+                        ev = NoteEvent(
+                            sample=h.sample_time,
+                            ch=ym_base[h.chip_id] + ym2610_fm_count + 3 + h.channel,
+                            on=True,
+                            note=60 + (i % YM2610_MAP_SLOTS),
+                            ins=-1,
+                            vol=max(0, min(31, h.vol)),
+                            e5=0x80,
+                            pan=h.pan,
+                            pcm=True,
+                            end=h.end_time,
+                        )
+                        events.append(ev)
+                        ym2610_events.append((ev, 0, i))
+                        ym2610_a_count += 1
+                        if h.end_time and h.end_time > h.sample_time:
+                            events.append(NoteEvent(
+                                sample=h.end_time,
+                                ch=ev.ch,
+                                on=False,
+                                note=180,
+                                ins=-1,
+                                vol=-1,
+                                e5=0x80,
+                                pan=0,
+                                pcm=True,
+                            ))
+                for i, smp in enumerate(ym2610_b_samples):
+                    for h in smp.hits:
+                        ev = NoteEvent(
+                            sample=h.sample_time,
+                            ch=ym_base[h.chip_id] + ym2610_fm_count + 9,
+                            on=True,
+                            note=60 + (i % YM2610_MAP_SLOTS),
+                            ins=-1,
+                            # ADPCM-B's channel volume is 8-bit (255 max),
+                            # wider than the usual 0-127 pattern column.
+                            vol=max(0, min(255, h.vol)),
+                            e5=0x80,
+                            pan=h.pan,
+                            pcm=True,
+                            end=h.end_time,
+                        )
+                        events.append(ev)
+                        ym2610_events.append((ev, 1, i))
+                        ym2610_b_count += 1
+                        if h.end_time and h.end_time > h.sample_time:
+                            events.append(NoteEvent(
+                                sample=h.end_time,
+                                ch=ev.ch,
+                                on=False,
+                                note=180,
+                                ins=-1,
+                                vol=-1,
+                                e5=0x80,
+                                pan=0,
+                                pcm=True,
+                            ))
+            else:
+                warnings.append(
+                    "YM2610 ADPCM ROM block missing; sample channels skipped"
+                )
+
     # Collect DAC runs now; group them after the row grid is known.
     dac_samples: list[DacSample] = []
     dac_plays: list[DacPlay] = []
@@ -2903,6 +3285,7 @@ def analyze(
     spcm_audible: list[SegapcmSample] = []
     c140_audible: list[C140Sample] = []
     c352_audible: list[C352Sample] = []
+    k053260_audible: list[K053260Sample] = []
     # Set where the C352 runs and the source drives its rear pair.
     c352_quad_events = False
     if pcm:
@@ -3231,6 +3614,94 @@ def analyze(
                 pan=0,
                 pcm=True,
             ))
+
+        # Konami K053260: four voices per instance. The source rate is
+        # clock/(4096-pitch), one step a frame; KADPCM frames are nibbles.
+        k053260_clock = vgm.k053260_clock or 3579545
+        _k053260_rom, k053260_samples, k053260_offs, k053260_warn = (
+            collect_k053260(vgm)
+        )
+        warnings.extend(k053260_warn)
+        k053260_audible = [s for s in k053260_samples if s.length >= 8]
+        k053260_ids: list[int] = []
+        for smp in k053260_audible:
+            for h in smp.hits:
+                if h.chip_id not in k053260_ids:
+                    k053260_ids.append(h.chip_id)
+        k053260_base = c352_base + 32 * len(c352_ids)
+        k053260_at = {
+            cid: k053260_base + 4 * i for i, cid in enumerate(k053260_ids)
+        }
+        ins5 = ins4 + len(c352_audible)
+        for i, smp in enumerate(k053260_audible):
+            ins = ins5 + i
+            ref = k053260_rate(k053260_clock, smp.mode_pitch())
+            for h in smp.hits:
+                base_pitch = k053260_played_pitch(h)
+                steps = k053260_merge_steps(h.freq_pts)
+                note, e5 = rate_to_note(
+                    k053260_rate(k053260_clock, base_pitch), ref,
+                )
+                sweep: tuple[tuple[int, int], ...] = ()
+                if steps and base_pitch:
+                    base_rate = k053260_rate(k053260_clock, base_pitch)
+                    deltas = tuple(
+                        (t, int(round(64.0 * 12.0 * math.log2(
+                            k053260_rate(k053260_clock, f) / base_rate
+                        ))))
+                        for t, f in steps if f
+                    )
+                    vals = [d for _t, d in deltas]
+                    if deltas and max(vals + [0]) - min(vals + [0]) >= 4:
+                        sweep = deltas
+                init_vol, init_pan = k053260_played_volume(h)
+                pts: list[tuple[int, int, int | None]] = []
+                last_pan_fx = (
+                    None if init_pan == 0 else k053260_pan_fx(init_pan)
+                )
+                for t, vol_now, pan_now in h.state_pts:
+                    if t - h.sample_time <= K053260_REFIT_SAMPLES:
+                        continue
+                    if pan_now == 0:
+                        pts.append((t, 0, None))
+                        last_pan_fx = None
+                        continue
+                    fx = k053260_pan_fx(pan_now)
+                    pts.append((t, vol_now & 0x7F, fx if fx != last_pan_fx else None))
+                    last_pan_fx = fx
+                pan_zero = init_pan == 0
+                vol = 0 if pan_zero else init_vol & 0x7F
+                pan = 0 if pan_zero else k053260_pan_fx(init_pan)
+                events.append(NoteEvent(
+                    sample=h.sample_time,
+                    ch=k053260_at.get(h.chip_id, k053260_base) + h.voice,
+                    on=True,
+                    note=note,
+                    ins=ins,
+                    vol=vol,
+                    e5=e5,
+                    pan=pan,
+                    pcm=True,
+                    end=h.off_sample,
+                    sweep=sweep,
+                    vol_pts=tuple(pts),
+                    no_pan=pan_zero,
+                ))
+        for off in k053260_offs:
+            base = k053260_at.get(off.chip_id)
+            if base is None:
+                continue
+            events.append(NoteEvent(
+                sample=off.sample_time,
+                ch=base + off.voice,
+                on=False,
+                note=180,
+                ins=-1,
+                vol=-1,
+                e5=0x80,
+                pan=0,
+                pcm=True,
+            ))
     else:
         audible = []
 
@@ -3238,14 +3709,24 @@ def analyze(
     # channels follow the FM block and every sample chip.
     tone_base = (
         fm_end + (2 if audible else 0) + 4 * len(oki_samples) + n_adpcm_ch
-        + (16 if spcm_audible else 0) + 24 * len(c140_audible) + 32 * len(c352_audible)
+        + (16 if spcm_audible else 0) + 24 * len(c140_audible)
+        + 32 * len(c352_audible) + 4 * len(k053260_audible)
     )
     # Count the final DAC maps once, below; the collector's list is transient.
+    n_ym2610_a_ins = (len(ym2610_a_samples) + YM2610_MAP_SLOTS - 1) // YM2610_MAP_SLOTS
+    n_ym2610_b_ins = (len(ym2610_b_samples) + YM2610_MAP_SLOTS - 1) // YM2610_MAP_SLOTS
     tone_ins_base = (
         len(patch_order)
         + (len(audible) if pcm else 0) + len(oki_samples)
-        + n_adpcm_ins + len(spcm_audible) + len(c140_audible) + len(c352_audible)
+        + n_adpcm_ins + len(spcm_audible) + len(c140_audible)
+        + len(c352_audible) + len(k053260_audible)
+        + n_ym2610_a_ins + n_ym2610_b_ins
     )
+    ym2610_b_ins_base = tone_ins_base - n_ym2610_b_ins
+    ym2610_a_ins_base = ym2610_b_ins_base - n_ym2610_a_ins
+    for ev, kind, idx in ym2610_events:
+        base = ym2610_a_ins_base if kind == 0 else ym2610_b_ins_base
+        ev.ins = base + idx // YM2610_MAP_SLOTS
     scc_ids: list[int] = []
     scc_waves: list[bytes] = []
     scc_ins: list[ToneIns] = []
@@ -3374,6 +3855,23 @@ def analyze(
         # other PSG notes so the placeholder logic and reports see them.
         ay_count += ym2203_ssg_count
 
+    # The YM2610's SSG is inside the same system, after the FM block.
+    ym2610_ssg_hits, ym2610_ssg_offs, ym2610_ssg_warn = collect_ay8910(
+        vgm, chip="ym2610_ssg", clock=ym2610_clock,
+        divider=YM2610_SSG_DIVIDER,
+    )
+    warnings.extend(ym2610_ssg_warn)
+    if ym2610_ssg_hits and ym2610_ids:
+        ssg_at = {
+            cid: ym_base[cid] + ym2610_fm_count for cid in ym2610_ids
+        }
+        ym2610_ssg_count = _emit_ay_notes(
+            events, channel_fx, ym2610_ssg_hits, ym2610_ssg_offs, ssg_at,
+            ym2610_clock, YM2610_SSG_DIVIDER,
+            tone_ins_base + len(scc_ins), vgm.total_samples or 0,
+        )
+        ay_count += ym2610_ssg_count
+
     events.sort(key=lambda e: (e.sample, e.ch, 0 if e.on else 1))
 
     # Prefer the measured lattice: EDxx places events at their true write
@@ -3461,6 +3959,14 @@ def analyze(
         for times in by_c352.values():
             times.sort()
             pcm_gaps.extend(b - a for a, b in zip(times, times[1:]) if b > a)
+    if k053260_audible:
+        by_k053: dict[tuple[int, int], list[int]] = {}
+        for smp in k053260_audible:
+            for h in smp.hits:
+                by_k053.setdefault((h.chip_id, h.voice), []).append(h.sample_time)
+        for times in by_k053.values():
+            times.sort()
+            pcm_gaps.extend(b - a for a, b in zip(times, times[1:]) if b > a)
     if pcm_gaps:
         extent = vgm.total_samples or max((e.sample for e in events), default=0)
         new_hz, new_speed, new_sub, pcm_note = refine_pcm_grid(
@@ -3524,6 +4030,7 @@ def analyze(
         n_dac_ins
         + (len(audible) if pcm else 0) + len(oki_samples) + n_adpcm_ins
         + len(spcm_audible) + len(c140_audible) + len(c352_audible)
+        + len(k053260_audible) + n_ym2610_a_ins + n_ym2610_b_ins
     )
     for ins, ramps in held_lfo.items():
         if not (0 <= ins < len(patch_order)):
@@ -3536,16 +4043,18 @@ def analyze(
                 macro_speed=macro_speed,
             )
 
-    fm_pitch_clock = ym2612_clock if is_opn2 else ym_clock
+    fm_pitch_clock = (
+        ym2610_clock if is_opnb else (ym2612_clock if is_opn2 else ym_clock)
+    )
     fm_before_pitch = len(patch_order)
-    _pms_copies, pms_lost = _bind_late_pms(
+    _pms_copies, pms_lost = _bind_pms_macros(
         events, patches, patch_order, hz, vgm.total_samples or 0,
         cap=max(len(patch_order), 250 - foreign_ins - 24),
     )
     fm_pitch_copies, fm_pitch_lost = _bind_fm_pitch(
         events, patches, patch_order, fm_pitch_clock, hz, vgm.total_samples or 0,
         cap=max(len(patch_order), 250 - foreign_ins - 24),
-        allow_steps=is_opn2,
+        allow_steps=is_opn2 or is_opnb,
     )
     _rebase_non_fm_ins(events, fm_before_pitch, len(patch_order))
     if fm_pitch_copies:
@@ -3554,7 +4063,8 @@ def analyze(
             len(patch_order) + n_dac_ins
             + (len(audible) if pcm else 0) + len(oki_samples)
             + n_adpcm_ins + len(spcm_audible) + len(c140_audible)
-            + len(c352_audible)
+            + len(c352_audible) + len(k053260_audible)
+            + n_ym2610_a_ins + n_ym2610_b_ins
         )
     if pms_lost:
         warnings.append(
@@ -3562,8 +4072,9 @@ def analyze(
             "instrument limit"
         )
     if fm_pitch_lost:
+        pitch_chip = "YM2610" if is_opnb else ("YM2612" if is_opn2 else "YM2203")
         warnings.append(
-            f"{fm_pitch_lost} {'YM2612' if is_opn2 else 'YM2203'} pitch sweeps "
+            f"{fm_pitch_lost} {pitch_chip} pitch sweeps "
             "encoded as row ramps: instrument limit"
         )
 
@@ -3585,7 +4096,9 @@ def analyze(
     fm_list = [patches[k] for k in patch_order]
     has_sample_ins = bool(
         oki_samples or adpcm_samples or spcm_audible or c140_audible
-        or c352_audible or any(s.length >= 8 for s in pcm_samples)
+        or c352_audible or k053260_audible
+        or ym2610_a_samples or ym2610_b_samples
+        or any(s.length >= 8 for s in pcm_samples)
         or scc_waves or ay_count or dac_samples or psg_count
     )
     if not fm_list:
@@ -3593,6 +4106,8 @@ def analyze(
             warnings.append("no YM2203 FM key-ons found; converting the SSG only")
         elif is_opn2:
             warnings.append("no YM2612 key-ons found")
+        elif is_opnb:
+            warnings.append("no YM2610 FM key-ons found")
         else:
             warnings.append(
                 "no YM2203 key-ons found" if is_opn
@@ -3623,6 +4138,7 @@ def analyze(
         len(fm_list) + n_dac_ins
         + (len(audible) if pcm else 0) + len(oki_samples) + n_adpcm_ins
         + len(spcm_audible) + len(c140_audible) + len(c352_audible)
+        + len(k053260_audible) + n_ym2610_a_ins + n_ym2610_b_ins
         + len(scc_ins) + len(ay_ins) + len(psg_ins)
     )
     if n_total_ins > 250:
@@ -3633,14 +4149,15 @@ def analyze(
     n_total_smp = (
         len(pcm_samples if pcm else []) + len(oki_samples) + len(adpcm_samples)
         + len(spcm_audible) + len(c140_audible) + len(c352_audible)
-        + len(dac_samples)
+        + len(k053260_audible) + len(dac_samples)
+        + len(ym2610_a_samples) + len(ym2610_b_samples)
     )
     if n_total_smp > 65535:
         warnings.append(
             f"{n_total_smp} samples exceed the 16-bit sample-map index range"
         )
 
-    if not is_opn and not is_opn2:
+    if not is_opn and not is_opn2 and not is_opnb:
         transpose_opm_events(events, vgm.ym2151_clock)
 
     k007232_volume = vgm.chip_volume(0x2A)
@@ -3667,16 +4184,27 @@ def analyze(
         segapcm_samples=spcm_audible,
         c140_samples=c140_audible,
         c352_samples=c352_audible,
+        k053260_samples=k053260_audible,
         channel_fx=channel_fx,
         k007232_volume=k007232_volume,
         c352_quad=c352_quad_events,
-        fm_chip="ym2203" if is_opn else ("ym2612" if is_opn2 else "ym2151"),
+        fm_chip=(
+            "ym2610" if is_opnb else
+            ("ym2203" if is_opn else ("ym2612" if is_opn2 else "ym2151"))
+        ),
         ym2203_ids=ym_ids,
         ym2203_ext=ym2203_ext,
         ym2203_ssg_count=ym2203_ssg_count,
         ym2612_ids=ym2612_ids,
         ym2612_ext=ym2612_ext,
         ym2612_csm=ym2612_csm,
+        ym2610_ids=ym2610_ids,
+        ym2610_b=ym2610_b,
+        ym2610_ssg_count=ym2610_ssg_count,
+        ym2610_a_samples=ym2610_a_samples,
+        ym2610_b_samples=ym2610_b_samples,
+        ym2610_a_count=ym2610_a_count,
+        ym2610_b_count=ym2610_b_count,
         scc_ids=scc_ids,
         scc_waves=scc_waves,
         scc_ins=scc_ins,
@@ -3724,6 +4252,14 @@ def format_report(song: Song) -> str:
             f"FM chip     YM2612{layout}{csm} x{len(song.ym2612_ids)} @ "
             f"{(v.ym2612_clock or YM2612_DEFAULT_CLOCK) / 1e6:.6g} MHz"
         ))
+    elif song.fm_chip == "ym2610":
+        variant = "YM2610B" if song.ym2610_b else "YM2610"
+        lines.insert(-1, (
+            f"FM chip     {variant} x{len(song.ym2610_ids)} @ "
+            f"{(v.ym2610_clock or YM2610_DEFAULT_CLOCK) / 1e6:.6g} MHz, "
+            f"{song.ym2610_ssg_count} SSG notes, "
+            f"{song.ym2610_a_count} ADPCM-A, {song.ym2610_b_count} ADPCM-B"
+        ))
     for i, p in enumerate(song.fm_patches):
         lfo = ""
         if p.fms_macro:
@@ -3736,7 +4272,7 @@ def format_report(song: Song) -> str:
         lines.append("  (carrier TL is relative; the key-on level rides the volume column)")
     if song.chip_fx:
         lfo_n = sum(1 for _s, c, _v in song.chip_fx if c in (0x10, 0x17, 0x18, 0x1E, 0x1F))
-        if song.fm_chip == "ym2612":
+        if song.fm_chip in ("ym2612", "ym2610"):
             lines.append(f"LFO fx      {lfo_n} chip writes (10xx)")
         else:
             lines.append(f"LFO fx      {lfo_n} chip writes (17/18/1E/1F)")
@@ -3747,6 +4283,12 @@ def format_report(song: Song) -> str:
         )
     elif song.fm_chip == "ym2612":
         fm_end = (9 if song.ym2612_ext else 6) * len(song.ym2612_ids)
+        fm_ons = sum(
+            1 for e in song.events
+            if e.on and not e.pcm and not e.dac and 0 <= e.ch < fm_end
+        )
+    elif song.fm_chip == "ym2610":
+        fm_end = (6 if song.ym2610_b else 4) * len(song.ym2610_ids)
         fm_ons = sum(
             1 for e in song.events
             if e.on and not e.pcm and not e.dac and 0 <= e.ch < fm_end
@@ -3791,7 +4333,8 @@ def format_report(song: Song) -> str:
         )
     n_regions = (
         len(song.pcm_samples) + len(song.segapcm_samples) + len(song.c140_samples)
-        + len(song.c352_samples)
+        + len(song.c352_samples) + len(song.k053260_samples)
+        + len(song.ym2610_a_samples) + len(song.ym2610_b_samples)
     )
     lines.append(f"PCM notes   {pcm_ons}  ({n_regions} sample regions)")
     if song.scc_ids:
@@ -3835,6 +4378,7 @@ def format_report(song: Song) -> str:
         ("SegaPCM", song.segapcm_samples),
         ("C140", song.c140_samples),
         ("C352", song.c352_samples),
+        ("K053260", song.k053260_samples),
     ):
         if not smps:
             continue

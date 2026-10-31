@@ -8,6 +8,9 @@ half does the same for its volume-gated notes.  Only effective bits count:
 
 from __future__ import annotations
 
+from bisect import bisect_left, bisect_right
+from collections import defaultdict
+
 from vgm2151fur.fm import OPN_OP_TO_MASK
 from vgm2151fur.sn76489 import collect_sn76489
 from vgm2151fur.vgm import VgmFile
@@ -239,14 +242,106 @@ def compare_dac(src: VgmFile, exp: VgmFile) -> dict:
     }
 
 
+def compare_ym2610_samples(src: VgmFile, exp: VgmFile) -> dict:
+    """Match every source ADPCM-A/B gate to the export and compare it.
+
+    The export writes the ADPCM-A memory as block 0x82 and the ADPCM-B
+    memory as block 0x83.  The source uses 0x82 for A and 0x83 for B when
+    that block is present.  Matching uses the time window and the extracted
+    payload, so a repacked sample memory does not affect the result.
+    """
+    from vgm2151fur.vgm import assemble_rom
+    from vgm2151fur.ym2610 import collect_ym2610_adpcm
+
+    if not any(w.chip in ("ym2610", "ym2610_ssg") for w in src.writes):
+        return {}
+
+    def hits(vgm):
+        rom_a = assemble_rom(vgm, "ym2610_adpcm")
+        rom_b = assemble_rom(vgm, "ym2610_deltat")
+        a_s, b_s, _w = collect_ym2610_adpcm(vgm, rom_a, rom_b or rom_a)
+        return (
+            [(h, s) for s in a_s for h in s.hits],
+            [(h, s) for s in b_s for h in s.hits],
+        )
+
+    def match(src_hits, exp_hits, key):
+        groups = defaultdict(list)
+        for eh, esmp in exp_hits:
+            groups[key(eh)].append((eh.sample_time, eh, esmp))
+        times = {}
+        for k, v in groups.items():
+            v.sort(key=lambda x: x[0])
+            times[k] = [x[0] for x in v]
+        used: set[int] = set()
+        pairs = []
+        for h, smp in src_hits:
+            k = key(h)
+            cand = groups.get(k, [])
+            ts = times.get(k, [])
+            lo = bisect_left(ts, h.sample_time - WINDOW)
+            hi = bisect_right(ts, h.sample_time + WINDOW)
+            best = None
+            for i in range(lo, hi):
+                _t, eh, esmp = cand[i]
+                if id(eh) in used:
+                    continue
+                score = (
+                    0 if smp.data == esmp.data else 1,
+                    abs(eh.sample_time - h.sample_time),
+                )
+                if best is None or score < best[0]:
+                    best = (score, eh, esmp)
+            if best is None:
+                pairs.append((h, smp, None, None))
+            else:
+                used.add(id(best[1]))
+                pairs.append((h, smp, best[1], best[2]))
+        return pairs, len(exp_hits) - len(used)
+
+    def tally(pairs, extra, kind):
+        out = {
+            "matched": 0, "missed": 0, "extra": extra,
+            "data": 0, "length": 0, "vol": 0, "pan": 0, "rate": 0,
+        }
+        for h, smp, eh, esmp in pairs:
+            if eh is None:
+                out["missed"] += 1
+                continue
+            out["matched"] += 1
+            if len(smp.data) != len(esmp.data):
+                out["length"] += 1
+            if smp.data != esmp.data:
+                out["data"] += 1
+            if h.vol != eh.vol:
+                out["vol"] += 1
+            if h.pan != eh.pan:
+                # A zero-volume gate is silent on both sides.
+                if h.vol or eh.vol:
+                    out["pan"] += 1
+            if kind == "B" and abs(h.rate - eh.rate) > 4:
+                out["rate"] += 1
+        return out
+
+    sa, sb = hits(src)
+    ea, eb = hits(exp)
+    pa, a_extra = match(sa, ea, key=lambda h: h.channel)
+    pb, b_extra = match(sb, eb, key=lambda h: 0)
+    return {
+        "a": tally(pa, a_extra, "A"),
+        "b": tally(pb, b_extra, "B"),
+    }
+
+
 def compare_keyons(src: VgmFile, exp: VgmFile) -> dict:
     fm = compare_fm(src, exp)
     psg = compare_psg(src, exp)
     dac = compare_dac(src, exp)
+    ym2610 = compare_ym2610_samples(src, exp)
     fields = dict(fm["fields"])
     missed = fm["missed"] + psg["missed"]
     matched = fm["matched"] + psg["matched"]
-    return {
+    out = {
         "matched": matched,
         "missed": missed,
         "fields": fields,
@@ -261,3 +356,6 @@ def compare_keyons(src: VgmFile, exp: VgmFile) -> dict:
         "dac_extra": dac["extra"],
         "dac_rate_bad": dac["rate_bad"],
     }
+    if ym2610:
+        out["ym2610"] = ym2610
+    return out

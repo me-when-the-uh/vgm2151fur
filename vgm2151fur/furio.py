@@ -14,8 +14,9 @@ from pathlib import Path
 
 from vgm2151fur.furwrite import (
     CHIP_AY8910, CHIP_C140, CHIP_C352, CHIP_K007232, CHIP_K051649, CHIP_K052539,
-    CHIP_MSM6258, CHIP_MSM6295, CHIP_SEGAPCM, CHIP_YM2612, CHIP_YM2612_CSM,
-    CHIP_YM2612_EXT, FUR_MAGIC, decompress_fur,
+    CHIP_K053260, CHIP_MSM6258, CHIP_MSM6295, CHIP_SEGAPCM, CHIP_YM2610,
+    CHIP_YM2610B, CHIP_YM2612, CHIP_YM2612_CSM, CHIP_YM2612_EXT, FUR_MAGIC,
+    decompress_fur,
 )
 
 
@@ -28,12 +29,15 @@ CHIP_CHANNELS = {
     CHIP_YM2612: 6,  # YM2612: 6 FM voices (channel 6 may play samples)
     CHIP_YM2612_EXT: 9,  # YM2612 Ext: 2 FM + 4 channel-3 operators + FM4-6
     CHIP_YM2612_CSM: 10,  # YM2612 CSM: Ext + the CSM timer channel
+    CHIP_YM2610: 14,  # YM2610: 4 FM + 3 SSG + 6 ADPCM-A + 1 ADPCM-B
+    CHIP_YM2610B: 16,  # YM2610B: 6 FM + 3 SSG + 6 ADPCM-A + 1 ADPCM-B
     CHIP_MSM6295: 4,  # MSM6295
     CHIP_MSM6258: 1,  # MSM6258
     CHIP_K007232: 2,  # K007232
     CHIP_SEGAPCM: 16,  # SegaPCM
     CHIP_C140: 24,  # Namco C140
     CHIP_C352: 32,  # Namco C352
+    CHIP_K053260: 4,  # Konami K053260
     CHIP_K051649: 5,  # Konami SCC
     CHIP_K052539: 5,  # Konami SCC+
     CHIP_AY8910: 3,  # AY-3-8910
@@ -43,7 +47,9 @@ CHIP_CHANNELS = {
 }
 
 # Chips whose samples carry playable 8-bit bodies (VOX depths stay out).
-_PCM_BODY_CHIPS = (CHIP_K007232, CHIP_SEGAPCM, CHIP_C140, CHIP_C352)
+_PCM_BODY_CHIPS = (
+    CHIP_K007232, CHIP_SEGAPCM, CHIP_C140, CHIP_C352, CHIP_K053260,
+)
 
 
 def load_fur_bytes(path: Path) -> bytes:
@@ -125,12 +131,10 @@ def parse_smp2_payload(payload: bytes) -> dict:
     pos += 16
     width = 2 if depth == 16 else 1
     rest = len(payload) - pos
-    if depth == 10:
-        # Legacy modules store a byte count in the samples field and write
-        # that many bytes. Furnace itself stores a nibble count and reads
-        # (count+1)/2 bytes. A field that matches the remaining payload is
-        # the legacy form.
-        if rest == n_frames:
+    if depth in (5, 6, 7, 10):
+        # ADPCM depths store a nibble count in the samples field; the payload
+        # holds (count+1)/2 bytes. VOX also has the legacy byte-count form.
+        if depth == 10 and rest == n_frames:
             nbytes = n_frames
         else:
             nbytes = (n_frames + 1) // 2

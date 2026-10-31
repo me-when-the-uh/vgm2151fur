@@ -75,6 +75,20 @@ def _keyons_by_channel(vgm: VgmFile) -> dict[int, list[int]]:
                 continue
             ch = raw if raw < 3 else raw - 1
             out.setdefault(2000 + w.chip_id * 6 + ch, []).append(w.sample)
+        elif (
+            w.chip == "ym2610" and not (w.reg & 0x100)
+            and (w.reg & 0xFF) == 0x28 and (w.val & 0xF0)
+        ):
+            # YM2610 uses 2+2 FM channels (B: 3+3); the 0x28 channel field
+            # follows the same reserved-slot encoding.
+            raw = w.val & 0x07
+            if getattr(vgm, "ym2610_b", False):
+                ch = {0: 0, 1: 1, 2: 2, 4: 3, 5: 4, 6: 5}.get(raw)
+            else:
+                ch = {1: 0, 2: 1, 5: 2, 6: 3}.get(raw)
+            if ch is None:
+                continue
+            out.setdefault(3000 + w.chip_id * 6 + ch, []).append(w.sample)
     for v in out.values():
         v.sort()
     return out

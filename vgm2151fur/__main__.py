@@ -117,8 +117,11 @@ def _sample_counts(info: dict) -> str:
         ("segapcm_samples", "SEGA"),
         ("c140_samples", "C140"),
         ("c352_samples", "C352"),
+        ("k053260_samples", "K053260"),
         ("oki_samples", "OKI"),
         ("msm6258_samples", "ADPCM"),
+        ("ym2610_a_samples", "ADPCM-A"),
+        ("ym2610_b_samples", "ADPCM-B"),
     ):
         if info.get(key):
             samples += f"  {info[key]} {label}"
@@ -363,13 +366,33 @@ def _compare(args) -> int:
         print(f"ERROR: {fur} not found", file=sys.stderr)
         return 1
     try:
-        runs, _exported = compare_fur_to_source(source, fur, args.channel)
+        runs, exported = compare_fur_to_source(source, fur, args.channel)
     except FurnaceError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
+    from vgm2151fur.audit import compare_ym2610_samples
+    from vgm2151fur.vgm import load_vgm
+
+    src_vgm = load_vgm(source)
+    field_bad = 0
+    if any(w.chip in ("ym2610", "ym2610_ssg") for w in src_vgm.writes):
+        samples = compare_ym2610_samples(src_vgm, load_vgm(exported))
+        for kind in ("a", "b"):
+            d = samples.get(kind) or {}
+            if not d:
+                continue
+            total = d["matched"] + d["missed"]
+            print(
+                f"ADPCM-{kind.upper()}: {d['matched']}/{total} matched, "
+                f"data {d['data']}, length {d['length']}, vol {d['vol']}, "
+                f"pan {d['pan']}, rate {d['rate']}"
+            )
+            field_bad += sum(
+                d[k] for k in ("data", "length", "vol", "pan", "rate")
+            )
     if not runs:
         print(f"channel {args.channel}: no sustained divergence above 0.5 st")
-        return 0
+        return 1 if field_bad else 0
     print(f"channel {args.channel}: {len(runs)} run(s) of divergence")
     for run in runs:
         print(" ", run)
@@ -450,7 +473,7 @@ def _add_convert_flags(parser: argparse.ArgumentParser, *, bare: bool) -> None:
     )
     parser.add_argument("--melody-only", action="store_true", help="skip sample chips")
     parser.add_argument("--pcm-only", action="store_true",
-                        help="skip the YM2151/YM2203/YM2612")
+                        help="skip the YM2151/YM2203/YM2612/YM2610")
     parser.add_argument(
         "--no-normalize",
         action="store_true",
@@ -476,7 +499,8 @@ def build_parser() -> argparse.ArgumentParser:
         prog="vgm2151fur",
         description=(
             "Transcribe YM2151 (OPM), YM2203 (OPN) and YM2612 (OPN2) + "
-            "sample-chip (K007232, MSM6295, MSM6258, SegaPCM, C140, C352) "
+            "sample-chip (K007232, MSM6295, MSM6258, SegaPCM, C140, C352, "
+            "K053260) "
             "VGMs into Furnace .fur files, and edit the result."
         ),
         epilog=EPILOG,

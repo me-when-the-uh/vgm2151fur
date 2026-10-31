@@ -26,8 +26,8 @@ YM2612_DEFAULT_CLOCK = 7670453
 # the note's block out of it.
 YM2612_FREQ_BASE = 9437184.0
 
-_FNUM_CACHE: dict[tuple[int, int, int], tuple[int, int]] = {}
-_NOTE_CACHE: dict[tuple[int, int, int], tuple[int, int]] = {}
+_FNUM_CACHE: dict[tuple[int, int, int, float], tuple[int, int]] = {}
+_NOTE_CACHE: dict[tuple[int, int, int, float], tuple[int, int]] = {}
 _MAX_FNUM = 2047
 
 # Furnace's ext columns write their frequency to operator (1,2,0,3)[c]:
@@ -38,17 +38,20 @@ _MAX_FNUM = 2047
 EXT_FREQ_OP = (1, 2, 0, 3)
 
 
-def ym2612_note_fnum(note: int, clock: int, e5: int = 0x80) -> tuple[int, int]:
+def ym2612_note_fnum(
+    note: int, clock: int, e5: int = 0x80, freq_base: float = YM2612_FREQ_BASE,
+) -> tuple[int, int]:
     """Furnace's (block, fnum) for a pattern note and E5 byte.
 
     A literal port of ``NOTE_FNUM_BLOCK(note, 11, 0)`` through
-    ``calcFreq`` with the Genesis platform's frequency base: the E5 value
-    joins the note in ``nbase`` before the exponential, which is also why
-    negative fine tune can move the block down.
+    ``calcFreq`` with the platform's frequency base: the E5 value joins the
+    note in ``nbase`` before the exponential, which is also why negative fine
+    tune can move the block down.  The YM2610 shares the formula with a
+    different base.
     """
     note = max(0, min(179, int(note)))
     clock = clock or YM2612_DEFAULT_CLOCK
-    key = (note, clock, e5)
+    key = (note, clock, e5, freq_base)
     hit = _FNUM_CACHE.get(key)
     if hit is not None:
         return hit
@@ -56,15 +59,15 @@ def ym2612_note_fnum(note: int, clock: int, e5: int = 0x80) -> tuple[int, int]:
     fbase = 440.0 * 2.0 ** ((nbase + 384 - 7680) / 1536.0)
     # The module keeps Furnace's default linear pitch mode, where the note is
     # converted with round() rather than the legacy f-num path's truncation.
-    bf = int(round(fbase * (YM2612_FREQ_BASE / clock)))
+    bf = int(round(fbase * (freq_base / clock)))
     nnote = nbase >> 7
     block = (nnote - 60) // 12
     block = max(0, min(7, block))
     bf >>= block
     if bf < 0:
         bf = 0
-    boundary_bottom = int(440.0 * 2.0 ** 0.25 * (YM2612_FREQ_BASE / clock))
-    boundary_top = int(2.0 * 440.0 * 2.0 ** 0.25 * (YM2612_FREQ_BASE / clock))
+    boundary_bottom = int(440.0 * 2.0 ** 0.25 * (freq_base / clock))
+    boundary_top = int(2.0 * 440.0 * 2.0 ** 0.25 * (freq_base / clock))
     # CONVERT_FNUM_BLOCK scales both boundaries down until the top one fits
     # the 11-bit f-num; the block shift then chooses the same octave.
     while boundary_top > _MAX_FNUM:
@@ -84,24 +87,27 @@ def ym2612_note_fnum(note: int, clock: int, e5: int = 0x80) -> tuple[int, int]:
     return out
 
 
-def ym2612_note_for(block: int, fnum: int, clock: int) -> tuple[int, int]:
+def ym2612_note_for(
+    block: int, fnum: int, clock: int, freq_base: float = YM2612_FREQ_BASE,
+) -> tuple[int, int]:
     """Source (block, fnum) -> (pattern note, E5 fine-tune byte).
 
     The note search uses the platform's forward mapping, so the pair
     (note, E5) reproduces the source's frequency to the E5 resolution of
-    1/128 semitone (one semitone of range).
+    1/128 semitone (one semitone of range).  The YM2610 passes its own
+    frequency base.
     """
     clock = clock or YM2612_DEFAULT_CLOCK
     block = max(0, min(7, int(block)))
     fnum = max(1, min(_MAX_FNUM, int(fnum)))
-    key = (block, fnum, clock)
+    key = (block, fnum, clock, freq_base)
     hit = _NOTE_CACHE.get(key)
     if hit is not None:
         return hit
     best: tuple[float, int, int, int] | None = None
     want = ym2612_pitch_units(block, fnum)
     for note in range(180):
-        b, f = ym2612_note_fnum(note, clock)
+        b, f = ym2612_note_fnum(note, clock, freq_base=freq_base)
         if f <= 0:
             continue
         # fnum the source would have at this note's block
@@ -114,7 +120,7 @@ def ym2612_note_for(block: int, fnum: int, clock: int) -> tuple[int, int]:
         off = max(-128, min(127, off))
         # Score the pair through the platform's own formula, not the
         # un-rounded ratio, so the exported byte is the predicted one.
-        ab, af = ym2612_note_fnum(note, clock, 0x80 + off)
+        ab, af = ym2612_note_fnum(note, clock, 0x80 + off, freq_base)
         err = abs(ym2612_pitch_units(ab, af) - want)
         cand = (err, abs(off), note, off)
         if best is None or cand < best:

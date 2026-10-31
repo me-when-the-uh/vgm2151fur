@@ -2,7 +2,7 @@
 
 `vgm2151fur` is a Python 3.11+ converter from VGM/VGZ rips to Furnace Tracker modules on Windows and Linux. Furnace is needed for the volume fit and for `render`, `compare` and `--verify`; put it in `furnace/` or set `VGM2151FUR_FURNACE`.
 
-Layout: `vgm.py` parses commands and data blocks; `analyze.py` contains the chip state machines; `ym2612dac.py` builds DAC samples; `furwrite.py` writes the `.fur`; `furio.py`, `audit.py` and `diag.py` read and verify it. Helpers are in `tools/`, tests in `tests/`, chip notes in `docs/`.
+Layout: `vgm.py` parses commands and data blocks; `analyze.py` contains the chip state machines; `ym2610.py` holds the OPNB FM/SSG state and the ADPCM-A/B collectors; `ym2612dac.py` builds DAC samples; `furwrite.py` writes the `.fur`; `furio.py`, `audit.py` and `diag.py` read and verify it. Helpers are in `tools/`, tests in `tests/`, chip notes in `docs/`.
 
 Current behavior:
 
@@ -12,6 +12,7 @@ Current behavior:
 - The YM2151 module volume is unity. Do not apply VGM header `0x7C` to the OPM; on some packs it is `0x18`-`0x30` and would make the module 5x too quiet. Header volume is still parsed for diagnostics. The MSM6258 player default is `0x11E`; its Furnace core is 1.64x louder, so the converter uses 0.61.
 - Finished packs keep the old per-module master and chip mix when they are rebuilt from a batch; the converter only supplies chip defaults. The 288 tracks without an old module were gain-matched to their source render and use YM2151 chip 0.5 to keep the old new-pack FM/sample balance.
 - Condensed `xN` variants are not emitted when the measured source grid is low-confidence. Keep the 1x module.
+- YM2610 support covers the base 14-channel layout and the 16-channel B variant. The FM pitch model uses `fmFreqBase = 9440540`. ADPCM-A uses a fixed `clock/432` rate. ADPCM-B stores the source rate with the `8363/8372` correction. The reference packs are Night Striker, Viewpoint and Metal Slug 3; `docs/ym2610.md` has the audit method and residuals.
 
 Commands:
 

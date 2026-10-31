@@ -176,8 +176,18 @@ def _verify_runs(
     ym2612_ids = {
         w.chip_id for w in src_vgm.writes if w.chip == "ym2612"
     }
+    ym2610_ids = {
+        w.chip_id for w in src_vgm.writes
+        if w.chip in ("ym2610", "ym2610_ssg")
+    }
     has_opm = any(w.chip == "ym2151" for w in src_vgm.writes)
-    if ym2612_ids and not has_opm:
+    if ym2610_ids and not has_opm:
+        # 14 channels, 16 on the B variant.  ADPCM channels have no pitch
+        # stream, so pitch_runs returns nothing for them.
+        channels = (16 if getattr(src_vgm, "ym2610_b", False) else 14) * len(
+            ym2610_ids
+        )
+    elif ym2612_ids and not has_opm:
         ext = any(
             w.chip == "ym2612" and (w.reg & 0xFF) == 0x27 and (w.val & 0xC0)
             for w in src_vgm.writes
@@ -299,6 +309,12 @@ def convert_vgm(
         "segapcm_samples": len(song.segapcm_samples) if pcm else 0,
         "c140_samples": len(song.c140_samples) if pcm else 0,
         "c352_samples": len(song.c352_samples) if pcm else 0,
+        "k053260_samples": len(song.k053260_samples) if pcm else 0,
+        "ym2610_a_samples": len(song.ym2610_a_samples) if pcm else 0,
+        "ym2610_b_samples": len(song.ym2610_b_samples) if pcm else 0,
+        "ym2610_a_notes": song.ym2610_a_count,
+        "ym2610_b_notes": song.ym2610_b_count,
+        "ym2610_ssg_notes": song.ym2610_ssg_count,
         "scc_notes": song.scc_count,
         "ay_notes": song.ay_count,
         "ym2203_chips": len(song.ym2203_ids),
@@ -588,17 +604,32 @@ def format_variant_lines(variants: list[dict], dest: Path) -> list[str]:
         audit = v.get("audit") or {}
         check = ""
         if audit:
-            nfields = sum((audit.get("fields") or {}).values())
-            check = (
-                f"  aud {audit.get('matched', 0)}/"
-                f"{audit.get('matched', 0) + audit.get('missed', 0)}"
-                f" miss {audit.get('missed', 0)} fld {nfields}"
-            )
+            matched = audit.get("matched", 0)
+            missed = audit.get("missed", 0)
+            if matched + missed:
+                nfields = sum((audit.get("fields") or {}).values())
+                check += (
+                    f"  aud {matched}/{matched + missed}"
+                    f" miss {missed} fld {nfields}"
+                )
             if audit.get("psg_missed"):
                 check += f" psgmiss {audit['psg_missed']}"
             dac_total = audit.get("dac_matched", 0) + audit.get("dac_missed", 0)
             if dac_total:
                 check += f" dac {audit.get('dac_matched', 0)}/{dac_total}"
+            ym = audit.get("ym2610") or {}
+            for kind in ("a", "b"):
+                d = ym.get(kind) or {}
+                mt = d.get("matched", 0)
+                ms = d.get("missed", 0)
+                if mt + ms:
+                    check += f" {kind} {mt}/{mt + ms}"
+                    nf = sum(
+                        d.get(k, 0) for k in
+                        ("data", "length", "vol", "pan", "rate")
+                    )
+                    if nf:
+                        check += f" fld {nf}"
         lines.append(
             f"{factor:<{factor_w}}  BPM {v['bpm']:7.0f}  {where:<{where_w}}  "
             f"loss {v['loss_total']:>4}{keep}{check}  dev {v['dev_max']:>4}"

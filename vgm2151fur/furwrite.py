@@ -60,6 +60,10 @@ CHIP_YM2203_EXT = 0xB6
 CHIP_YM2612 = 0x83
 CHIP_YM2612_EXT = 0xA0
 CHIP_YM2612_CSM = 0xC1
+# Furnace's YM2610 (4 FM + 3 SSG + 6 ADPCM-A + 1 ADPCM-B = 14 channels) and
+# YM2610B (6 FM, 16 channels).
+CHIP_YM2610 = 0xA5
+CHIP_YM2610B = 0x9E
 # TI SN76489 (the SMS platform): three square voices then noise.  A Genesis
 # module carries it as a second system after the YM2612.
 CHIP_SMS = 0x03
@@ -68,6 +72,7 @@ CHIP_MSM6258 = 0xAB
 CHIP_K007232 = 0xC6
 CHIP_SEGAPCM = 0x9B
 CHIP_C140 = 0xCE
+CHIP_K053260 = 0xCC
 # Furnace format.md reserves 0xD0 for Namco C352, 32 channels, and marks it
 # unavailable. 0.6.8.3 has no C352 core and no C352 instrument type.
 CHIP_C352 = 0xD0
@@ -82,8 +87,11 @@ INS_OPM = 33
 INS_FM = 1
 INS_MSM6258 = 35
 INS_MSM6295 = 36
+INS_ADPCMA = 37
+INS_ADPCMB = 38
 INS_SEGAPCM = 39
 INS_K007232 = 45
+INS_K053260 = 50
 INS_C140 = 53
 # DIV_INS_AMIGA. C140 channels already accept this sample type, so a future
 # C352 core copied from c140.cpp can play the bodies. There is no DIV_INS_C352.
@@ -93,6 +101,9 @@ INS_C352 = 4
 INS_AY = 6
 INS_STD = 0
 INS_SCC = 18
+SMP_DEPTH_ADPCM_K = 7
+SMP_DEPTH_ADPCM_A = 5
+SMP_DEPTH_ADPCM_B = 6
 SMP_DEPTH_8BIT = 8
 SMP_DEPTH_16BIT = 16
 SMP_DEPTH_VOX = 10
@@ -100,6 +111,10 @@ SMP_DEPTH_VOX = 10
 # engine's C-4 reference is a hair sharp, so a 22050 Hz sample exports as
 # 22073.  Compensate at write time so the DAC clock matches the source.
 DAC_RATE_COMPENSATION = 22050.0 / 22073.0
+# Furnace keeps oldCenterRate=true (8363 Hz), while the linear-pitch C-4
+# reference is 440 * 2^(4.25) = 8372.  ADPCM-B's rate is derived through
+# calcFreq, so its stored centerRate needs the 8372/8363 correction.
+ADPCM_B_RATE_COMPENSATION = 8363.0 / 8372.0
 # Furnace system defaults used to decide when to send customClock.
 SEGAPCM_CLOCK_X = 4000000
 SEGAPCM_CLOCK_Y = 4026987
@@ -115,8 +130,8 @@ PAT_TAIL_ROWS = 10
 # SN76489 defaults to 0.500. Absolute extra-header entries override.
 _DEV_DEFAULT_VOLUME = {
     0x00: 0x80,
-    0x03: 0x100, 0x04: 0x180, 0x12: 0x100, 0x16: 0x11E, 0x18: 0x100,
-    0x19: 0xA0, 0x1C: 0x100, 0x27: 0x40,
+    0x03: 0x100, 0x04: 0x180, 0x08: 0x100, 0x12: 0x100, 0x16: 0x11E,
+    0x18: 0x100, 0x19: 0xA0, 0x1C: 0x100, 0x1D: 0x100, 0x27: 0x40,
 }
 _DEV_CORE_PATCH = {
     0x19: lambda v: v * 8 // 5,  # K051649 SCC core scale
@@ -128,13 +143,18 @@ _DEV_CORE_PATCH = {
 _FURNACE_VOLUME_SCALE = {
     0x00: 1.0, 0x03: 1.0, 0x04: 1.0, 0x12: 1.46, 0x16: 0.61, 0x18: 1.0,
     0x1C: 0.7, 0x19: 1.04,
+    # MAME shifts the voice product by 6 bits, the Furnace core by 7, so the
+    # module needs twice the player's system volume to reach the same level.
+    0x1D: 2.0,
 }
 # MSM6258's player default is 0x11E; its Furnace core is 1.64x louder, so
 # 0.61 lands the sample at the source level. The MSM6295 (0x18) is unity.
 _CHIP_DEV = {CHIP_YM2151: 0x03, CHIP_SEGAPCM: 0x04, CHIP_MSM6295: 0x18,
              CHIP_MSM6258: 0x16, CHIP_C140: 0x1C, CHIP_C352: 0x27,
+             CHIP_K053260: 0x1D,
              CHIP_SMS: 0x00, CHIP_K051649: 0x19, CHIP_K052539: 0x19,
-             CHIP_AY8910: 0x12}
+             CHIP_AY8910: 0x12,
+             CHIP_YM2610: 0x08, CHIP_YM2610B: 0x08}
 
 
 def _player_chip_volume(vgm, dev: int, instances: int) -> float:
@@ -674,6 +694,66 @@ def _write_sample_s8(
     b.end_block(size_off, start)
 
 
+def _write_sample_k(
+    b: Buf, name: str, data: bytes, c4_rate: int, loop: bool,
+) -> None:
+    """K053260 KADPCM. SMP2 stores a nibble count; two nibbles per byte."""
+    nibbles = len(data) * 2
+    size_off, start = b.begin_block(b"SMP2")
+    b.strz(name)
+    b.u32(nibbles)
+    b.u32(c4_rate)
+    b.u32(c4_rate)
+    b.u8(SMP_DEPTH_ADPCM_K)
+    b.u8(0)
+    b.u8(0)
+    b.u8(0)
+    b.s32(0 if loop else -1)
+    b.s32(nibbles if loop else -1)
+    for _ in range(4):
+        b.u32(0xFFFFFFFF)
+    b.raw(data)
+    b.end_block(size_off, start)
+
+
+def _write_sample_adpcm(
+    b: Buf,
+    name: str,
+    data: bytes,
+    c4_rate: int,
+    depth: int,
+    render_masks: tuple[int, int, int, int],
+    loop: bool = False,
+) -> None:
+    """YM2610 ADPCM-A/B body.
+
+    The file's sample count is nibbles; the loader allocates
+    ``((count+1)/2 + 255) & ~0xff`` bytes, so the body is already padded to
+    the 256-byte boundary the chip addresses.  render_masks selects the
+    sample memory bank: ADPCM-A is bank 0, ADPCM-B bank 1.
+    """
+    samples = len(data) * 2
+    size_off, start = b.begin_block(b"SMP2")
+    b.strz(name)
+    b.u32(samples)
+    b.u32(c4_rate)
+    b.u32(c4_rate)
+    b.u8(depth)
+    b.u8(0)
+    b.u8(0)
+    b.u8(0)
+    if loop:
+        b.s32(0)
+        b.s32(samples)
+    else:
+        b.s32(-1)
+        b.s32(-1)
+    for mask in render_masks:
+        b.u32(mask)
+    b.raw(data)
+    b.end_block(size_off, start)
+
+
 def segapcm_flag_text(clock: int, rom_size: int) -> str:
     """SegaPCM system flags: clock select / custom clock and ROM size."""
     parts: list[str] = []
@@ -719,6 +799,16 @@ def k051649_flag_text(clock: int) -> str:
     if module_clock(clock) != FURNACE_CLOCK_DEFAULT:
         return f"customClock={clock}"
     return ""
+
+
+def k053260_flag_text(clock: int) -> str:
+    """K053260 clock select: 3.579545 MHz or 4 MHz, otherwise a custom clock."""
+    clk = clock or 3579545
+    if abs(clk - 3579545) <= 2:
+        return "clockSel=0"
+    if clk == 4000000:
+        return "clockSel=1"
+    return f"customClock={clk}"
 
 
 def c352_flag_text(clock: int, quad: bool = False) -> str:
@@ -1372,32 +1462,35 @@ def _emit_sweep(
 def _assign_pcm_rows(
     song: Song, total_rows: int, last_sample: int, stats: dict | None = None,
 ) -> dict[int, tuple[int, int]]:
-    """Row and delay for each playable PCM note-on.
+    """Row and delay for each playable PCM note-on and its note-off.
 
     A free row is taken. A taken row pushes the trigger forward until the
-    next trigger, or keeps the later write.
+    next trigger, or keeps the later write. A note-off moves after its
+    trigger and before the next trigger. When a later trigger comes first,
+    its key-on stops the previous sample and the off is redundant.
     """
     by_ch: dict[int, list] = {}
     for ev in song.events:
-        if ev.on and ev.pcm and ev.ch >= 0:
+        if ev.pcm and ev.ch >= 0:
             by_ch.setdefault(ev.ch, []).append(ev)
-    limit = min(total_rows, song.row_of(last_sample) + 1)
+    limit = min(total_rows, song.place(last_sample, stats)[0] + 1)
     out: dict[int, tuple[int, int]] = {}
     for evs in by_ch.values():
-        evs.sort(key=lambda e: e.sample)
-        ideals = [song.place(e.sample, stats) for e in evs]
+        evs.sort(key=lambda e: (e.sample, 0 if e.on else 1))
+        ons = [e for e in evs if e.on]
+        ideals = [song.place(e.sample, stats) for e in ons]
         placed: dict[int, int] = {}
-        for i, ev in enumerate(evs):
+        for i, ev in enumerate(ons):
             row, delay = ideals[i]
             if row < 0 or row >= total_rows:
                 continue
-            if row in placed and evs[placed[row]].sample == ev.sample:
-                out.pop(id(evs[placed[row]]), None)
+            if row in placed and ons[placed[row]].sample == ev.sample:
+                out.pop(id(ons[placed[row]]), None)
                 _bump(stats, "pcm_evicted")
                 placed[row] = i
                 out[id(ev)] = (row, delay)
                 continue
-            next_row = ideals[i + 1][0] if i + 1 < len(evs) else limit
+            next_row = ideals[i + 1][0] if i + 1 < len(ons) else limit
             if next_row <= row:
                 next_row = row
             ceiling = min(limit, next_row)
@@ -1420,10 +1513,29 @@ def _assign_pcm_rows(
                 continue
             victim = placed.get(row)
             if victim is not None:
-                out.pop(id(evs[victim]), None)
+                out.pop(id(ons[victim]), None)
                 _bump(stats, "pcm_evicted")
             placed[row] = i
             out[id(ev)] = (row, delay)
+        played = [e for e in ons if id(e) in out]
+        for off in (e for e in evs if not e.on):
+            before = [e for e in played if e.sample <= off.sample]
+            if not before:
+                continue
+            on = before[-1]
+            on_row = out[id(on)][0]
+            nxt = next((e for e in played if e.sample > on.sample), None)
+            next_row = out[id(nxt)][0] if nxt is not None else total_rows
+            off_row, off_delay = song.place(off.sample, stats)
+            if off_row >= next_row:
+                continue
+            if off_row <= on_row:
+                off_row, off_delay = on_row + 1, 0
+            if off_row >= next_row or off_row >= total_rows:
+                continue
+            if off_row in placed:
+                continue
+            out[id(off)] = (off_row, off_delay)
     return out
 
 
@@ -1589,6 +1701,8 @@ def _build_patterns(song: Song, n_ch: int, pat_len_max: int, fx_cols: int,
             last_sample = max(last_sample, ev.vol_pts[-1][0])
         if ev.quad_pts:
             last_sample = max(last_sample, ev.quad_pts[-1][0])
+        if ev.on and ev.pcm and ev.end:
+            last_sample = max(last_sample, ev.end)
     for entry in (getattr(song, "channel_fx", ()) or ()):
         last_sample = max(last_sample, entry[0])
     for entry in (getattr(song, "chip_fx", ()) or ()):
@@ -1623,8 +1737,8 @@ def _build_patterns(song: Song, n_ch: int, pat_len_max: int, fx_cols: int,
     if content_end is not None:
         total_rows = content_end + 1
     else:
-        total_rows = max(1, song.row_of(last_sample) + 2)
-        content_end = song.row_of(last_sample)
+        content_end = song.place(last_sample, stats)[0]
+        total_rows = max(1, content_end + 2)
 
     grid: list[dict[int, Row]] = [dict() for _ in range(n_ch)]
     if stats is not None:
@@ -1673,12 +1787,15 @@ def _build_patterns(song: Song, n_ch: int, pat_len_max: int, fx_cols: int,
             continue
         if ev.on:
             _bump(stats, "keyons")
-        if ev.on and ev.pcm:
+        if ev.pcm:
             assigned = pcm_pos.get(id(ev))
             if assigned is None:
-                _bump(stats, "pcm_unplaced")
-                continue
-            row, delay = assigned
+                if ev.on:
+                    _bump(stats, "pcm_unplaced")
+                    continue
+                row, delay = song.place(ev.sample, stats)
+            else:
+                row, delay = assigned
         else:
             row, delay = song.place(ev.sample, stats)
         if row < 0 or row >= total_rows:
@@ -1688,6 +1805,14 @@ def _build_patterns(song: Song, n_ch: int, pat_len_max: int, fx_cols: int,
             cell = _blank_row()
             grid[ev_ch][row] = cell
         if not ev.on:
+            if ev.pcm:
+                if cell.note >= 0 and cell.note != NOTE_OFF:
+                    _bump(stats, "pcm_off_collision")
+                    continue
+                cell.note = NOTE_OFF
+                if delay:
+                    _add_fx(cell, 0xED, delay, fx_cols, stats)
+                continue
             # A note-off on the note's own row is a cut (ECxx). An off at or
             # before that row is the previous note releasing, and the new
             # note wins.
@@ -1733,6 +1858,43 @@ def _build_patterns(song: Song, n_ch: int, pat_len_max: int, fx_cols: int,
             _add_quad_fx(cell, ev.quad, fx_cols, stats)
         elif (ev.pcm or ev.pan) and not ev.no_pan:
             _add_fx(cell, 0x08, ev.pan & 0xFF, fx_cols, stats)
+
+    # A PCM note still sounding at the loop cut or the last content row gets
+    # an explicit off. The source stop write can be in the skipped tail.
+    for ch in range(n_ch):
+        last = None
+        for ev in song.events:
+            if (ev.on and ev.pcm and ev.ch + ch_offset == ch
+                    and id(ev) in pcm_pos):
+                if content_cut is not None and ev.sample >= content_cut:
+                    continue
+                last = ev
+        if last is None:
+            continue
+        on_row = pcm_pos[id(last)][0]
+        has_off = any(
+            not ev.on and ev.pcm and ev.ch + ch_offset == ch
+            and ev.sample > last.sample
+            and (content_cut is None or ev.sample < content_cut)
+            and id(ev) in pcm_pos and pcm_pos[id(ev)][0] > on_row
+            for ev in song.events
+        )
+        if has_off:
+            continue
+        target = content_end if content_end is not None else total_rows - 1
+        if last.end:
+            target = min(target, song.place(last.end, stats)[0])
+        if target <= on_row:
+            target = on_row + 1
+        if target >= total_rows:
+            continue
+        cell = grid[ch].get(target)
+        if cell is None:
+            cell = _blank_row()
+            grid[ch][target] = cell
+        if cell.note >= 0 and cell.note != NOTE_OFF:
+            continue
+        cell.note = NOTE_OFF
 
     _place_chip_fx(
         grid, song, getattr(song, "chip_fx", ()) or (), fx_cols,
@@ -2049,19 +2211,28 @@ def write_fur(
     fm_family = getattr(song, "fm_chip", "ym2151")
     ym2203 = fm_family == "ym2203"
     ym2612 = fm_family == "ym2612"
-    ym_chip = ym2203 or ym2612
+    ym2610 = fm_family == "ym2610"
+    ym_chip = ym2203 or ym2612 or ym2610
     ym_ext = bool(
         (getattr(song, "ym2203_ext", False) if ym2203 else
          getattr(song, "ym2612_ext", False))
-    ) if ym_chip else False
-    ym_ids = list(
-        (getattr(song, "ym2203_ids", ()) if ym2203 else
-         getattr(song, "ym2612_ids", ())) or ()
-    ) if ym_chip else []
+    ) if (ym2203 or ym2612) else False
+    if ym2203:
+        ym_ids = list(getattr(song, "ym2203_ids", ()) or ())
+    elif ym2612:
+        ym_ids = list(getattr(song, "ym2612_ids", ()) or ())
+    elif ym2610:
+        ym_ids = list(getattr(song, "ym2610_ids", ()) or ())
+    else:
+        ym_ids = []
     # A YM2612 system stays when the log had the chip, even with no FM notes.
-    # A YM2203 system likewise owns its three SSG voices.
-    fm_present = include_fm and (bool(ym_ids) if ym_chip else True)
-    fm_ins = song.fm_patches if fm_present else []
+    # A YM2203 system likewise owns its three SSG voices.  A YM2610 system
+    # owns FM, SSG and the two ADPCM engines, so either half keeps it.
+    if ym2610:
+        fm_present = (include_fm or include_pcm) and bool(ym_ids)
+    else:
+        fm_present = include_fm and (bool(ym_ids) if ym_chip else True)
+    fm_ins = song.fm_patches if (fm_present and include_fm) else []
     pcm_smps = [s for s in song.pcm_samples if s.length >= 8] if include_pcm else []
     oki_smps = list(song.oki_samples) if include_pcm else []
     adpcm_smps = list(song.msm6258_samples) if include_pcm else []
@@ -2069,12 +2240,26 @@ def write_fur(
     spcm_smps = [s for s in song.segapcm_samples if s.length >= 8] if include_pcm else []
     c140_smps = [s for s in song.c140_samples if s.length >= 8] if include_pcm else []
     c352_smps = [s for s in song.c352_samples if s.length >= 8] if include_pcm else []
+    k053260_smps = (
+        [s for s in song.k053260_samples if s.length >= 8] if include_pcm else []
+    )
     dac_smps = list(getattr(song, "dac_samples", ()) or ()) if include_pcm else []
     n_dac_ins = (len(dac_smps) + 119) // 120
     dac_smp_base = (
         len(pcm_smps) + len(oki_smps) + len(adpcm_smps)
         + len(spcm_smps) + len(c140_smps) + len(c352_smps)
+        + len(k053260_smps)
     )
+    ym2610_a_smps = (
+        list(getattr(song, "ym2610_a_samples", ()) or ()) if include_pcm else []
+    )
+    ym2610_b_smps = (
+        list(getattr(song, "ym2610_b_samples", ()) or ()) if include_pcm else []
+    )
+    n_ym2610_a_ins = (len(ym2610_a_smps) + 119) // 120
+    n_ym2610_b_ins = (len(ym2610_b_smps) + 119) // 120
+    ym2610_a_smp_base = dac_smp_base + len(dac_smps)
+    ym2610_b_smp_base = ym2610_a_smp_base + len(ym2610_a_smps)
     oki_ids, oki_groups = _grouped(oki_smps)
     adpcm_ids, adpcm_groups = _grouped(adpcm_smps)
     c140_ids: list[int] = []
@@ -2087,6 +2272,11 @@ def write_fur(
         for h in smp.hits:
             if h.chip_id not in c352_ids:
                 c352_ids.append(h.chip_id)
+    k053260_ids: list[int] = []
+    for smp in k053260_smps:
+        for h in smp.hits:
+            if h.chip_id not in k053260_ids:
+                k053260_ids.append(h.chip_id)
     # Pitched (non-sample) chips: SCC voices and the AY-8910. Their events
     # carry the channels and instruments, so an empty list means the chip is
     # absent from the source.
@@ -2104,20 +2294,27 @@ def write_fur(
     # K007232 appears only when the source carried usable samples for it, and
     # never beside another sample chip.
     want_k007 = bool(pcm_smps)
-    n_fm = (
-        (
-            (9 if ym_ext else 6) * len(ym_ids) if ym2612
-            else (6 if ym_ext else 3) * len(ym_ids)
-        )
-        if ym_chip else 8
-    ) if fm_present else 0
-    # The SSG is part of each YM2203 system, not a separate AY chip.
-    n_ssg = 3 * len(ym_ids) if (ym2203 and fm_present) else 0
+    if fm_present:
+        if ym2610:
+            n_fm = (6 if song.ym2610_b else 4) * len(ym_ids)
+        elif ym2612:
+            n_fm = (9 if ym_ext else 6) * len(ym_ids)
+        elif ym2203:
+            n_fm = (6 if ym_ext else 3) * len(ym_ids)
+        else:
+            n_fm = 8
+    else:
+        n_fm = 0
+    # The SSG is part of each YM2203/YM2610 system, not a separate AY chip.
+    n_ssg = 3 * len(ym_ids) if ((ym2203 or ym2610) and fm_present) else 0
+    n_adpcm_a = 6 * len(ym_ids) if (ym2610 and fm_present) else 0
+    n_adpcm_b = len(ym_ids) if (ym2610 and fm_present) else 0
     n_k007 = 2 if want_k007 else 0
     n_ch = (
-        n_fm + n_ssg + n_psg + n_k007 + 4 * len(oki_ids) + len(adpcm_ids)
+        n_fm + n_ssg + n_adpcm_a + n_adpcm_b + n_psg + n_k007
+        + 4 * len(oki_ids) + len(adpcm_ids)
         + (16 if spcm_smps else 0) + 24 * len(c140_ids) + 32 * len(c352_ids)
-        + n_scc + n_ay
+        + 4 * len(k053260_ids) + n_scc + n_ay
     )
     if n_ch == 0:
         raise ValueError("write_fur: need include_fm and/or include_pcm")
@@ -2126,22 +2323,28 @@ def write_fur(
     spcm_clock = song.vgm.segapcm_clock or SEGAPCM_CLOCK_X
     c140_clock = song.vgm.c140_clock or 12288000
     c352_clock = song.vgm.c352_clock or C352_DEFAULT_CLOCK
+    k053260_clock = song.vgm.k053260_clock or 3579545
 
     n_ins = (
         len(fm_ins) + n_dac_ins + len(pcm_smps) + len(oki_smps) + n_adpcm_ins
-        + len(spcm_smps) + len(c140_smps) + len(c352_smps)
+        + len(spcm_smps) + len(c140_smps) + len(c352_smps) + len(k053260_smps)
+        + n_ym2610_a_ins + n_ym2610_b_ins
         + len(scc_specs) + len(ay_specs) + len(psg_specs)
     )
     n_smp = (
         len(pcm_smps) + len(oki_smps) + len(adpcm_smps)
         + len(spcm_smps) + len(c140_smps) + len(c352_smps)
-        + len(dac_smps)
+        + len(k053260_smps) + len(dac_smps)
+        + len(ym2610_a_smps) + len(ym2610_b_smps)
     )
     n_wav = len(scc_waves)
 
     # Analysis numbers sample-chip channels after the FM block. With no FM
     # they shift down to stay inside n_ch.
-    fm_analysis_block = ((9 if ym_ext else 6) * len(ym_ids)) if ym_chip else 8
+    if ym2610:
+        fm_analysis_block = (6 if song.ym2610_b else 4) + 3 + 6 + 1
+    else:
+        fm_analysis_block = ((9 if ym_ext else 6) * len(ym_ids)) if ym_chip else 8
     orders, patterns, _loop_ord, pat_len = _build_patterns(
         song, n_ch, PAT_LEN_MAX, fx_cols,
         0 if fm_present else -fm_analysis_block,
@@ -2153,7 +2356,22 @@ def write_fur(
 
     names_long: list[str] = []
     names_short: list[str] = []
-    if ym2612 and fm_present:
+    if ym2610 and fm_present:
+        fm_count = 6 if song.ym2610_b else 4
+        for cid in range(len(ym_ids)):
+            suffix = f" ({cid + 1})" if len(ym_ids) > 1 else ""
+            for voice in range(fm_count):
+                names_long.append(f"FM {voice + 1}{suffix}")
+                names_short.append(f"F{cid + 1}-{voice + 1}")
+            for voice in range(3):
+                names_long.append(f"PSG {voice + 1}{suffix}")
+                names_short.append(f"P{cid + 1}-{voice + 1}")
+            for voice in range(6):
+                names_long.append(f"ADPCM-A {voice + 1}{suffix}")
+                names_short.append(f"A{cid + 1}-{voice + 1}")
+            names_long.append(f"ADPCM-B{suffix}")
+            names_short.append(f"B{cid + 1}")
+    elif ym2612 and fm_present:
         for cid in range(len(ym_ids)):
             suffix = f" ({cid + 1})" if len(ym_ids) > 1 else ""
             if ym_ext:
@@ -2235,6 +2453,10 @@ def write_fur(
         for voice in range(32):
             names_long.append(f"C352 {cid + 1}-{voice + 1}")
             names_short.append(f"Z{cid + 1}-{voice + 1}")
+    for cid in k053260_ids:
+        for voice in range(4):
+            names_long.append(f"K053260 {cid + 1}-{voice + 1}")
+            names_short.append(f"Q{cid + 1}-{voice + 1}")
     for cid in scc_ids:
         for voice in range(5):
             names_long.append(f"SCC {cid + 1}-{voice + 1}")
@@ -2246,7 +2468,10 @@ def write_fur(
 
     label_parts: list[str] = []
     if fm_present:
-        if ym2612:
+        if ym2610:
+            base = "YM2610B" if song.ym2610_b else "YM2610"
+            label_parts.append(f"{base} x{len(ym_ids)}" if len(ym_ids) > 1 else base)
+        elif ym2612:
             base = "YM2612" + (" Ext" if ym_ext else "")
             label_parts.append(f"{base} x{len(ym_ids)}" if len(ym_ids) > 1 else base)
         elif ym2203:
@@ -2269,6 +2494,8 @@ def write_fur(
         label_parts.append("C140")
     if c352_ids:
         label_parts.append("C352")
+    if k053260_ids:
+        label_parts.append("K053260")
     if scc_ids:
         label_parts.append("SCC+" if song.vgm.k051649_plus else "SCC")
     if ay_ids:
@@ -2287,6 +2514,11 @@ def write_fur(
         comment += (
             "\nNamco C352 is chip 0xD0. Furnace 0.6.8.3 does not emulate it, "
             "so these channels stay silent in that build.\n"
+        )
+    if k053260_ids:
+        comment += (
+            f"\nKonami K053260 at {k053260_clock} Hz; KADPCM samples are "
+            "stored as sample type 7 and loop the whole body.\n"
         )
     if scc_ids:
         comment += (
@@ -2314,6 +2546,14 @@ def write_fur(
             "square voices then noise. The volume column is the 4-bit "
             "attenuation (15 = loudest) and 20xy selects the noise mode.\n"
         )
+    elif ym2610:
+        comment += (
+            f"\nYM2610{'B' if song.ym2610_b else ''} at "
+            f"{song.vgm.ym2610_clock or 8000000} Hz; each system has the FM "
+            "voices, three SSG voices, six ADPCM-A channels and one ADPCM-B "
+            "channel. ADPCM-A plays at clock/432; ADPCM-B uses the source "
+            "rate register.\n"
+        )
     elif ym_chip:
         comment += (
             f"\nYM2203 at {song.vgm.ym2203_clock or 3579545} Hz; each system "
@@ -2331,12 +2571,16 @@ def write_fur(
 
     chips: list[int] = []
     flag_texts: list[str] = []
+    ym2610_sys: dict[int, int] = {}
     if fm_present:
-        for _cid in (ym_ids or [0]):
+        for cid in (ym_ids or [0]):
             if ym2612:
                 chips.append(CHIP_YM2612_EXT if ym_ext else CHIP_YM2612)
             elif ym2203:
                 chips.append(CHIP_YM2203_EXT if ym_ext else CHIP_YM2203)
+            elif ym2610:
+                chips.append(CHIP_YM2610B if song.ym2610_b else CHIP_YM2610)
+                ym2610_sys[cid] = len(chips) - 1
             else:
                 chips.append(CHIP_YM2151)
             if ym2612:
@@ -2348,6 +2592,9 @@ def write_fur(
             elif ym2203:
                 fm_clock = song.vgm.ym2203_clock
                 fm_default = 3579545
+            elif ym2610:
+                fm_clock = song.vgm.ym2610_clock
+                fm_default = 8000000
             else:
                 fm_clock = song.vgm.ym2151_clock
                 fm_default = 3579545
@@ -2394,6 +2641,9 @@ def write_fur(
         flag_texts.append(
             c352_flag_text(song.vgm.c352_clock, getattr(song, "c352_quad", False))
         )
+    for cid in k053260_ids:
+        chips.append(CHIP_K053260)
+        flag_texts.append(k053260_flag_text(song.vgm.k053260_clock))
     for cid in scc_ids:
         chips.append(scc_chip)
         flag_texts.append(k051649_flag_text(song.vgm.k051649_clock))
@@ -2493,9 +2743,11 @@ def write_fur(
     b.strz(gd3.get("system_jp") or "")
     b.strz(gd3.get("game_jp") or "")
 
-    # extra chip output (>=135), one (vol, panL, panR) triple per chip
+    # extra chip output (>=135), one (vol, panL, panR) triple per chip. The
+    # player multiplies this by the master, exactly like the byte field, so a
+    # boosted chip stores its share of the raised master.
     for cv in chip_vols:
-        b.f32(cv)
+        b.f32(cv / master_gain)
         b.f32(0.0)
         b.f32(0.0)
     b.u32(0)  # patchbay connections
@@ -2572,6 +2824,33 @@ def write_fur(
         _write_ins_pcm(
             b, f"C352 {smp.start:06x}", c352_ins_base + i, INS_C352,
         )
+    k053260_ins_base = c352_ins_base + len(c352_smps)
+    for i, smp in enumerate(k053260_smps):
+        ins_ptrs.append(len(b))
+        _write_ins_pcm(
+            b, f"K053260 {smp.start:06x}", k053260_ins_base + i,
+            INS_K053260,
+        )
+    for group in range(n_ym2610_a_ins):
+        ins_ptrs.append(len(b))
+        first = ym2610_a_smp_base + group * 120
+        maps = [
+            first + slot
+            for slot in range(min(120, len(ym2610_a_smps) - group * 120))
+        ]
+        _write_ins_sample_map(
+            b, f"ADPCM-A {group + 1}", 0, maps, INS_ADPCMA,
+        )
+    for group in range(n_ym2610_b_ins):
+        ins_ptrs.append(len(b))
+        first = ym2610_b_smp_base + group * 120
+        maps = [
+            first + slot
+            for slot in range(min(120, len(ym2610_b_smps) - group * 120))
+        ]
+        _write_ins_sample_map(
+            b, f"ADPCM-B {group + 1}", 0, maps, INS_ADPCMB,
+        )
     for i, spec in enumerate(scc_specs):
         ins_ptrs.append(len(b))
         wave = scc_waves[spec.wave] if spec.wave < len(scc_waves) else b""
@@ -2628,10 +2907,46 @@ def write_fur(
             depth=smp.depth,
             loop_mode=smp.loop_mode,
         )
+    for smp in k053260_smps:
+        smp_ptrs.append(len(b))
+        name = f"k053260_{smp.start:06x}"
+        if smp.depth == SMP_DEPTH_ADPCM_K:
+            _write_sample_k(
+                b, name, smp.data, smp.c4_rate(k053260_clock),
+                loop=smp.loop_start is not None,
+            )
+        else:
+            _write_sample_s8(
+                b, name, smp.data, smp.c4_rate(k053260_clock),
+                loop=(smp.loop_start, smp.loop_end),
+            )
     for i, smp in enumerate(dac_smps):
         smp_ptrs.append(len(b))
         rate = max(1, int(round(smp.c4_rate * DAC_RATE_COMPENSATION)))
         _write_sample_s8(b, f"dac_{i:03d}", smp.data, rate)
+    ym2610_clock = song.vgm.ym2610_clock or 8000000
+    ym2610_a_rate = max(1, int(round(ym2610_clock / 432)))
+    for smp in ym2610_a_smps:
+        sys = ym2610_sys.get(smp.chip_id, 0)
+        smp_ptrs.append(len(b))
+        _write_sample_adpcm(
+            b, f"adpcmA_{smp.start:06x}", smp.data, ym2610_a_rate,
+            SMP_DEPTH_ADPCM_A, (1 << sys, 0, 0, 0),
+        )
+    for smp in ym2610_b_smps:
+        sys = ym2610_sys.get(smp.chip_id, 0)
+        rate = max(
+            1, int(round(
+                ym2610_clock / 144 * (smp.rate & 0xFFFF) / 65535
+                * ADPCM_B_RATE_COMPENSATION
+            )),
+        )
+        loop = any(h.loop for h in smp.hits)
+        smp_ptrs.append(len(b))
+        _write_sample_adpcm(
+            b, f"adpcmB_{smp.start:06x}_{smp.rate:04x}", smp.data, rate,
+            SMP_DEPTH_ADPCM_B, (0, 1 << sys, 0, 0), loop=loop,
+        )
 
     pat_ptrs: list[int] = []
     for ch, idx, rows in patterns:

@@ -56,8 +56,10 @@ triples start 31 bytes plus 12 per chip before the first ADIR pointer.
 ## Chip IDs and flags
 
 - `0x82` YM2151, `0x8D` YM2203, `0x83` YM2612 (`0xA0` Ext, `0xC1` CSM),
+  `0xA5` YM2610, `0x9E` YM2610B,
   `0x03` SN76489 (SMS), `0xC6` K007232, `0xAA` MSM6295, `0xAB` MSM6258,
-  `0x9B` SegaPCM, `0xCE` C140, `0xD0` C352, `0xA1` Konami SCC (K051649),
+  `0x9B` SegaPCM, `0xCE` C140, `0xCC` Konami K053260, `0xD0` C352,
+  `0xA1` Konami SCC (K051649),
   `0xB4` Konami SCC+ (K052539), `0x80` AY-3-8910. A module lists
   the chips the source had usable samples for: a melody-only track opens with
   the YM2151 alone, with no K007232 pair and no PCM channels it never plays.
@@ -75,6 +77,9 @@ triples start 31 bytes plus 12 per chip before the first ADIR pointer.
   this keeps the exported f-num/block identical to the source.
 - The K007232 flag carries `stereo=true` and a clock when it differs from the
   default.
+- The K053260 flag selects `clockSel=0` (COLOR_NTSC) or `clockSel=1` (4 MHz)
+  and otherwise carries `customClock=`. The chip shares one clock between its
+  two possible VGM instances.
 - The OKI flag encodes pin 7 and banking; the C140 flag carries the clock and
   the type. The C352 flag is `customClock` set to the crystal a core that
   divides by 288 should run. A core that ticks at `clock/288` takes this
@@ -91,6 +96,11 @@ triples start 31 bytes plus 12 per chip before the first ADIR pointer.
   (2/3) and instance division. `_FURNACE_VOLUME_SCALE` corrects the Furnace
   cores against measured renders (AY 1.46, SCC 1.04; measured on two-chip
   modules because the player normalizes a lone chip and Furnace does not).
+  The K053260 core is exactly half the reference core: MAME shifts the voice
+  product by 6 bits and the Furnace core by 7. The desired gain is 2.0. The
+  writer raises the master to 2.0, stores the K053260 at 1.0 and scales the
+  other chips down. The float chip level is master-relative, like the byte
+  field, and the player multiplies it by the master once.
 
 ## Instruments
 
@@ -107,10 +117,29 @@ E5 carries the key-on remainder.
 
 YM2612 instruments use the same type 1 and OPN operator layout. They also carry the channel's PMS/AMS in the FM feature, and the carrier TLs are stored relative to the loudest carrier while the note's volume column carries the absolute level (Furnace's `newVolumeScaling` makes that exact). The DAC uses `DIV_INS_AMIGA` sample maps of 120 slots with `first_sample=0`; pattern note `60+slot` selects a release-capped PCM chunk. `collect_dac(..., slices=True)` is the explicit per-run slice mode. The SN76489 uses a plain `DIV_INS_STD` instrument (pitch macro only), a 0-15 volume column, and effect `20xy` for noise mode; its system volume defaults to 0.500, and an absolute extra-header volume entry overrides it. The FM feature's four operator columns of the Ext system share one timbre instrument.
 
-PCM instruments bind one sample each: K007232 two channels, MSM6295 four
-voices per chip, MSM6258 one, SegaPCM sixteen, C140 twenty-four, C352
-thirty-two. Sample bodies are stored 8-bit signed (C140 and C352 mulaw are
-16-bit linear).
+PCM instruments bind one sample each: K007232 two channels, K053260 four
+voices per chip, MSM6295 four voices per chip, MSM6258 one, SegaPCM sixteen,
+C140 twenty-four, C352 thirty-two. Sample bodies are stored 8-bit signed
+(C140 and C352 mulaw are 16-bit linear). K053260 KADPCM uses sample depth 7
+and stores the raw nibble bytes; the SMP2 count is the nibble count.
+
+A YM2610 system carries its FM and SSG voices plus six ADPCM-A and one
+ADPCM-B channel. ADPCM-A instruments are type 37 with sample depth 5,
+ADPCM-B instruments are type 38 with depth 6. Both use the same 120-slot
+note map as the DAC. The file stores a nibble count and 256-byte-padded
+bodies. The SMP2 presence masks select the memory bank: ADPCM-A sets bank
+0 for the system, ADPCM-B sets bank 1, and the other banks stay clear.
+Furnace's VGM export writes the A bank as data block `0x82` and the B bank
+as `0x83`. The source's B payload also comes from `0x83` when that block
+exists; `0x82` is the ADPCM-A ROM.
+
+ADPCM-A plays at the chip's fixed rate. ADPCM-B stores its source rate as
+the sample center rate, corrected by `8363/8372` for Furnace's
+`oldCenterRate` default, and plays the sample map's C-4 slot.
+
+PCM gates carry explicit note-offs. An off that would run into the next
+key-on is omitted because that key-on stops the sample. A gate still
+sounding at the loop cut gets an off on the last content row.
 
 SCC instruments (`DIV_INS_SCC`, type 18) carry one 32-byte waveform through
 the `WS` wave-synth feature; the wave itself lives in the module's wavetable
@@ -129,7 +158,7 @@ envelope state - plus the pitch macro when the note's driver wrote one.
 
 The YM2151 and the per-row sweep model work in kc/kf units: 1/64 semitone.
 One key-code step is 64 units, and the YM2151 KF register contributes its top
-six bits (`kf >> 2`). The YM2203 and YM2612 are the exception: Furnace's OPN
+six bits (`kf >> 2`). The YM2203, YM2612 and YM2610 are the exception: Furnace's OPN
 platforms run in **linear pitch** mode, so a pattern note is 128 units per
 semitone, E5 is 1/128 semitone, and the per-tick pitch macro uses the same
 units. The note is chosen by inverting Furnace's linear note -> block/f-num
@@ -213,7 +242,7 @@ and Furnace's status-bar BPM stays the quarter-note tempo.
 `estimate_grid` reads its lattice from `vgm.writes` by default (the YM2151
 key-on register, reg 0x08). `analyze` can hand it an `onsets` mapping instead,
 `{channel: [sample, ...]}`, when the FM stream is too thin to measure. The
-C352 and SegaPCM-only board rips have no YM2151 at all, and their only lattice
+C352, K053260 and SegaPCM-only board rips have no YM2151 at all, and their only lattice
 is the sample-chip trigger times the chip modules already extracted. Triggers
 100 samples apart on one voice merge first, because one trigger is often a
 key-on followed by its own pitch and volume writes. The FM lattice wins

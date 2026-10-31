@@ -5,9 +5,11 @@ Supported chips:
 - Yamaha YM2151 (OPM)
 - Yamaha YM2203 (OPN)
 - Yamaha YM2612 (OPN2), including channel-3 special/CSM frequency layouts
+- Yamaha YM2610 / YM2610B (OPNB) (experimental)
 - Namco C140
 - Namco C352 (requires a development build of Furnace from a compatible fork. A build with C352 support (built from https://github.com/me-when-the-uh/furnace-ports) is located in `./furnace-c352` - use at your own risk, since it's always a good idea to build from source instead of relying on someone else's builds)
 - Konami K007232 (experimental)
+- Konami K053260
 - Konami SCC / SCC+ (K051649/K052539) (experimental)
 - OKI MSM6295
 - OKI MSM6258 (Sharp X68000 ADPCM)
@@ -84,15 +86,17 @@ tests/          pytest suite
 docs/           operating guide, format notes, chip notes
 ```
 
-Project state and workflow are in `docs/portable-context.md` and `docs/implementation-notes.md`. Chip details are in `docs/opm-notes.md`, `docs/ym2203.md` and `docs/ym2612.md`.
+Project state and workflow are in `docs/portable-context.md` and `docs/implementation-notes.md`. Chip details are in `docs/opm-notes.md`, `docs/ym2203.md`, `docs/ym2612.md`, `docs/ym2610.md` and `docs/k053260.md`.
 
 ## Known limits
 
-- The YM2151, YM2203 and YM2612 models cover the OPM/OPN/OPN2 register sets the arcade and Genesis drivers use. Other chips (YM3812, YM2608, ...) are not supported.
+- The YM2151, YM2203, YM2612 and YM2610 models cover the OPM/OPN/OPN2/OPNB register sets the arcade and Genesis drivers use. Other chips (YM3812, YM2608, ...) are not supported.
 - YM2203 notes are labelled at the highest carrier's octave when a patch uses a power-of-two carrier MULT. A constant pitch macro on the instrument keeps the source f-num/block/audio unchanged, so the pattern note matches the audible carrier.
 - The YM2203's channel-3 3-slot chord is reduced to one operator, CSM timer key-ons are not synthesized, and LFO writes are skipped; the report throws a warning when it sees them. Very fast SSG ornaments shorter than a pattern row are simplified (`docs/ym2203.md`).
 - The Genesis SN76489 PSG is converted as four extra channels (three tone + noise). Extreme periods below the musical table range and two PSG notes on the same channel/row are approximated. The converter's default `.fur` SN76489 system volume is 0.500; an absolute VGM extra-header volume entry still overrides it.
 - The YM2612 DAC is converted from the type-0 PCM bank, direct `0x2A` writes and modern `0x92`/`0x95` blocks. The default is release-capped PCM chunks: one FM6 note per chunk, split at every `0xB6` pan change and at most every 0.25 s, with a small sample budget so release Furnace loads the module. Silence-only chunks and leading silence get no note. The per-run slice representation remains available as `collect_dac(..., slices=True)` for editing, and `timeline=True` is the old 22.05 kHz comparison body. A source that writes `0x2B` without setting bit 7 has no DAC audio, so its FM6 key-ons stay FM notes. Channel-3 special and CSM per-operator frequencies are converted (the Ext system); CSM timer key-ons are not synthesized. LFO, PMS/AMS, pan and SSG-EG are converted (`docs/ym2612.md`).
-- Furnace 0.6.8.3 has no C352 core; a build with the ported core can play those modules (`docs/c352.md`).
+- The YM2610 uses the base 14-channel layout (16 on the B variant). Channel-2 special/CSM mode is not split into per-operator FM3 columns, and timer key-ons are not synthesized. ADPCM-B uses the source's `0x83` block, a source with 8-bit delta-T mode would need a transcode. ADPCM-A/B gates carry explicit note-offs, and a gate still sounding at the loop cut stops on the last content row. ADPCM-A/B retriggers that land on one pattern row collide, like the other sample channels (`docs/ym2610.md`).
+- Furnace 0.6.8.3 has no C352 core. A build with the ported core can play those modules (`docs/c352.md`).
+- K053260 loops the whole sample. A source loop maps to the full body. Mid-note loop, KADPCM or direction changes use the key-on value. A voice keyed with pan 0 is written silent and raised when its pan moves (`docs/k053260.md`).
 - Chip volumes above unity only exist in INF2 files.
-- Patterns are 256 rows; the row grid is estimated per track and very fine pitch motion is approximated with per-row ramps (`docs/fur-writer.md`).
+- Patterns are 256 rows in size. The row grid is estimated per track and very fine pitch motion is approximated with per-row ramps (`docs/fur-writer.md`).
