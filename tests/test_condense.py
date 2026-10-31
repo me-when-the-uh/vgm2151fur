@@ -136,6 +136,41 @@ class TestConvertVariants(unittest.TestCase):
             self.assertIn("dev_max", r)
             self.assertIn("loss_total", r)
 
+    def test_low_confidence_grid_still_writes_the_factor(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        out_dir = Path(tmp)
+        song = convert.analyze(note_song(), pcm=False)
+        song.grid_note = "low confidence"
+        with mock.patch.object(convert, "load_vgm", return_value=note_song()), \
+                mock.patch.object(convert, "analyze", return_value=song):
+            res = convert.convert_variants(
+                Path("synthetic.vgz"), out_dir, factors=(1, 2), mode="all",
+                pcm=False, loop_find=False,
+            )
+        self.assertEqual({r["factor"] for r in res}, {1.0, 2.0})
+        self.assertTrue(any(
+            "low-confidence" in w for r in res for w in r["warnings"]
+        ))
+        self.assertTrue((out_dir / "synthetic x2 (lossy).fur").exists())
+
+    def test_all_mode_skips_furnace_verification(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        out_dir = Path(tmp)
+        with mock.patch.object(convert, "load_vgm", return_value=note_song()), \
+                mock.patch.object(convert, "_verify_runs") as verify_runs:
+            res = convert.convert_variants(
+                Path("synthetic.vgz"), out_dir, factors=(1, 2), mode="all",
+                pcm=False, loop_find=False, verify=True,
+            )
+        verify_runs.assert_not_called()
+        self.assertTrue(all(r["div_ms"] is None for r in res))
+        self.assertTrue(all(
+            not Path(r["dst"]).with_suffix(".verify.vgm").exists()
+            for r in res
+        ))
+
     def test_fractional_factor_names_the_file(self):
         res = self._run((1, 1.5), "all")
         names = {Path(r["dst"]).name for r in res}

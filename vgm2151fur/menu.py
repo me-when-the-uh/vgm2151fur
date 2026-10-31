@@ -432,7 +432,7 @@ def _pack_view(read, out, pack: Pack, state: dict, state_path: Path) -> str:
 
 def _run_convert(
     out, files: list[Path], dest: Path, speed: int | None,
-    optimize: str = "all", verify: bool = True,
+    optimize: str = "all", verify: bool = False,
 ) -> int:
     if optimize != "none":
         return _run_variants(out, files, dest, 4, optimize, verify)
@@ -465,10 +465,11 @@ def _run_convert(
 
 def _run_variants(
     out, files: list[Path], dest: Path, factor: int, mode: str,
-    verify: bool = True, layout: str = "dirs",
+    verify: bool = False, layout: str = "dirs",
 ) -> int:
     done = rc = 0
-    if verify:
+    use_verify = verify and mode != "all"
+    if use_verify:
         out("  verifying each variant through Furnace...")
     for src, info, error in convert_folder(
         files, dest, variants=True, condense=factor, optimize=mode,
@@ -509,8 +510,8 @@ def cmd_condense(read, out, state, state_path):
     factor = _ask(read, "max condense factor (2-4)", "4")
     mode = _ask_optimise(read)
     verify = _ask(
-        read, "verify through Furnace? (Y/n)", "y"
-    ).lower() not in ("n", "no")
+        read, "verify through Furnace? (y/N)", "n"
+    ).lower() in ("y", "yes")
     rc = _run_variants(
         out, vgms, dst, int(factor) if factor.isdigit() else 4, mode, verify
     )
@@ -531,8 +532,8 @@ def _pack_convert(read, out, pack, tracks, default_dir: Path, state, state_path)
     verify = False
     if optimize != "none":
         verify = _ask(
-            read, "verify variants through Furnace? (Y/n)", "y"
-        ).lower() not in ("n", "no")
+            read, "verify variants through Furnace? (y/N)", "n"
+        ).lower() in ("y", "yes")
     _run_convert(out, [tracks[i] for i in picks], dst, None, optimize, verify)
     state.setdefault("out_dirs", {})[str(pack.path)] = str(dst)
     state["pack"] = str(pack.path)
@@ -638,8 +639,8 @@ def cmd_convert_file(read, out, state, state_path):
     verify = False
     if optimize != "none":
         verify = _ask(
-            read, "verify variants through Furnace? (Y/n)", "y"
-        ).lower() not in ("n", "no")
+            read, "verify variants through Furnace? (y/N)", "n"
+        ).lower() in ("y", "yes")
     return _convert_now(
         out, vgms, dst, int(speed) if speed.isdigit() else None, optimize, verify
     )

@@ -441,13 +441,17 @@ def convert_variants(
                 if loop_note and loop_note != "loop kept":
                     song.warnings.append(loop_note)
         warnings = list(song.warnings)
-        if factor > 1 and "low confidence" in song.grid_note:
-            # The source grid is already ambiguous; lengthening rows cannot
-            # preserve its note and modulation timing.  Keep the 1x module.
+        use_verify = verify and mode != "all"
+        if verify and mode == "all":
             warnings.append(
-                f"condensed x{factor:g} skipped: low-confidence source grid"
+                "verification skipped: --optimize all keeps the largest factor"
             )
-            continue
+        if factor > 1 and "low confidence" in song.grid_note:
+            # The row grid is ambiguous, but the user asked for the factor
+            # anyway. Keep the structural loss counters as the only warning.
+            warnings.append(
+                f"condensed x{factor:g}: low-confidence source grid"
+            )
         stats: dict = {}
         lossy = " (lossy)" if mode == "all" else ""
         name = f"{src.stem}.fur" if factor == 1 else f"{src.stem} x{factor:g}{lossy}.fur"
@@ -462,13 +466,13 @@ def convert_variants(
         row_ms = song.samples_per_row / 44.1
         # Furnace rejects a module over its instrument limit.
         over_limit = any("250-slot" in w for w in warnings)
-        verify_failed = bool(verify and over_limit)
+        verify_failed = bool(use_verify and over_limit)
         verdict = None
-        if verify and over_limit:
+        if use_verify and over_limit:
             warnings.append(
                 "verification skipped: the module exceeds Furnace's instrument limit"
             )
-        elif verify:
+        elif use_verify:
             try:
                 verdict = _verify_runs(
                     vgm, out_path,
@@ -522,7 +526,7 @@ def convert_variants(
     div_cap = play_ms * DIVERGENCE_SHARE
 
     def _lossless(r: dict) -> bool:
-        if verify:
+        if use_verify:
             # An uninspected rendition is not lossless.
             if r.get("verify_failed"):
                 return False

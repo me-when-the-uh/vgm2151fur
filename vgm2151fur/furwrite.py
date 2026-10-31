@@ -1486,10 +1486,9 @@ def _assign_pcm_rows(
                 continue
             if row in placed:
                 prev = ons[placed[row]]
-                if prev.sample == ev.sample or (prev.ins, prev.note) == (ev.ins, ev.note):
-                    # Two writes at one source sample, or one sample retriggered
-                    # within a row. The later start wins and the first is under
-                    # a row away, so it cannot be heard as a separate note.
+                if prev.sample == ev.sample:
+                    # Two writes at one source sample. The later start wins;
+                    # a separate row cannot reproduce the same instant.
                     out.pop(id(prev), None)
                     _bump(stats, "pcm_merged")
                     placed[row] = i
