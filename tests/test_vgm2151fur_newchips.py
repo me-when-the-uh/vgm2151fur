@@ -552,7 +552,7 @@ class TestC140FadesAndSlides(unittest.TestCase):
                 rows.extend(pat)
         return rows
 
-    def test_mid_note_volume_steps_and_pitch_slide(self):
+    def test_mid_note_volume_steps_and_hard_pitch_jump(self):
         tail = [
             ChipWrite(80000, "c140", 0, 0x01, 0x90),   # L 200 -> 144
             ChipWrite(84000, "c140", 0, 0x01, 0x30),   # L 144 -> 48 (R holds 100)
@@ -578,22 +578,18 @@ class TestC140FadesAndSlides(unittest.TestCase):
         rows = self._all_rows(mod, 8)
         self.assertIn(144, [r.vol for r in rows])
         self.assertIn(48, [r.vol for r in rows])
-        self.assertTrue(any(c in (0x01, 0x02) for r in rows for c, _v in r.fx))
-        # The note row keeps its own pitch: the pitch ramp must start on a
-        # later row, or the key-on write inherits part of the slide.
+        # The octave is one hard step with still rows around it, so it lands at
+        # once: a whole-semitone transpose, never a rate-limited slur that would
+        # spend the rest of the sample climbing toward a pitch already heard.
+        jump = [v for r in rows for c, v in r.fx if c == 0xE9]
+        self.assertEqual(jump, [12])
+        rates = [v for r in rows for c, v in r.fx if c in (0x01, 0x02) and v]
+        self.assertEqual(rates, [])
+        # The note row keeps its own pitch: nothing rides on the key-on.
         note_row = next(r for r in rows if 0 <= r.note < 180)
-        self.assertFalse(any(c in (0x01, 0x02) for c, _v in note_row.fx))
-        self.assertTrue(any(
-            c in (0x01, 0x02)
-            for r in rows if r is not note_row
-            for c, _v in r.fx
-        ))
-        # PCM slide parameters are doubled: one parameter unit moves 1/128 st
-        # per tick, so the octave drop asks for 1536/speed units, clamped to
-        # the engine's 255.
-        speed = song.speed or 1
-        params = [v for r in rows for c, v in r.fx if c in (0x01, 0x02)]
-        self.assertIn(round(min(255.0, 1536.0 / speed)), [abs(v) for v in params])
+        self.assertFalse(
+            any(c in (0x01, 0x02, 0xE8, 0xE9) for c, _v in note_row.fx)
+        )
 
     def test_big_jump_lands_as_quick_legato(self):
         # A move bigger than the slide can deliver inside a row must land as an

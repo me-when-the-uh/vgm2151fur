@@ -1064,6 +1064,11 @@ def _add_quad_fx(
         _add_fx(row, cmd, val & 0xFF, fx_cols, stats)
 
 
+# Furnace row effect codes used by the writer.
+FX_PORTA_UP = 0x01
+FX_PORTA_DOWN = 0x02
+
+
 def _encode_patn_row(row: Row, fx_cols: int) -> bytes:
     """One PATN row. Empty → 0x00 (skip 1)."""
     if row.is_empty():
@@ -1324,6 +1329,128 @@ def _emit_steps(
             e5w = new_e5
 
 
+def _fx_keep(cell: Row, drop: tuple[int, ...] = ()) -> None:
+    """Rebuild a row's effect list without the `drop` codes, keeping order."""
+    if cell.fx:
+        cell.fx = [(c, v) for c, v in cell.fx if c not in drop]
+
+
+# A step of this many 1/64-semitone units between two held KC/KF values is a
+# hard pitch change (a legato note), not the start of a slide. Real slides and
+# hand-written vibrato move in small steps per row and keep their 01xx/02xx
+# ramps; only jumps of about a semitone and more become legato.
+_SWEEP_JUMP_UNITS = 56
+
+
+def _emit_jump_row(
+    grid: list[dict[int, Row]], ch: int, fx_cols: int, total_rows: int,
+    row: int, note_row: int, target_abs: float, div: float,
+    e5_note: int, chunks: dict[int, int],
+    e5_lo: int, e5_hi: int,
+    e5_writes: dict[tuple[int, int], int],
+    note_rows: list[int] | None = None,
+    stats: dict | None = None, last_rate: int = 0,
+    max_rows: int | None = None,
+) -> tuple[float, int] | None:
+    """Land a hard pitch jump (a legato note change) on `row`.
+
+    Whole semitones go through E8xx/E9xx (quick legato, cumulative until the
+    next note), and the fine remainder through E5xx. `target_abs` is the
+    absolute pitch offset the row should reach, and `chunks` maps the rows
+    this note's earlier jumps used to the semitones they carry.
+
+    E8xx resets the engine's accumulated slide displacement (measured: a jump
+    after a glide lands on note + transpose + fine, not on what the glide had
+    reached), so the target is measured against the transpose alone; a running
+    01xx/02xx is stopped on the same row or it would resume under the jump.
+
+    A jump bigger than +-15 semitones needs several rows. `max_rows` is how
+    many the trajectory leaves it before the next step owns one; a transpose
+    that cannot land in time is not placed at all. When a later jump lands
+    inside the span an earlier one still occupies, its chunks are picked up
+    again from that row: what the transpose delivered before `row` stays, the
+    rest is re-planned, so a quick reversal cannot strand the voice on the
+    first jump's target.
+
+    The note's own key-on row is always allowed; a later note's row is not.
+    Returns (the transposition this note carries once every chunk has landed,
+    in units, and the new E5 byte) when the jump was placed, or None when no
+    usable row was found (nothing is written in that case).
+    """
+    if row < 0 or row >= total_rows:
+        return None
+    # The semitones the transpose has already delivered before this row.
+    held = sum(v for r, v in chunks.items() if r < row)
+    # What E5 has to carry once E8xx/E9xx have done the whole semitones. The
+    # E5 byte is absolute (e5_note is the note's own fine tune), so its range
+    # does not depend on any earlier E5 write.
+    off = target_abs - 64.0 * held
+    w = int(round(off / 64.0))
+    lo_u = (e5_lo - e5_note) / div
+    hi_u = (e5_hi - e5_note) / div
+    fine = off - 64.0 * w
+    # Move a whole semitone from E5 into the transpose when the rest does not
+    # fit the E5 byte. Raising w lowers fine, and vice versa.
+    if fine > hi_u:
+        w += int(math.ceil((fine - hi_u) / 64.0))
+    elif fine < lo_u:
+        w -= int(math.ceil((lo_u - fine) / 64.0))
+    fine = off - 64.0 * w
+    # The E8 writes move at most +-15 semitones each and may need several
+    # rows. Check every row before writing anything.
+    if note_rows:
+        limit = next((r for r in sorted(note_rows) if r > row), total_rows)
+    else:
+        limit = total_rows
+    plan: list[tuple[int, int]] = []
+    cur_row = row
+    rem = w
+    while True:
+        step = max(-15, min(15, rem)) if rem else 0
+        plan.append((cur_row, step))
+        rem -= step
+        if not rem:
+            break
+        cur_row += 1
+    for jrow, _step in plan:
+        if jrow < 0 or jrow >= total_rows or jrow >= limit:
+            return None
+        if max_rows is not None and jrow - row + 1 > max_rows:
+            # The next step owns a row this transpose would still need, and a
+            # half-landed jump is worse than leaving the row to that step.
+            return None
+        cell = grid[ch].get(jrow)
+        if jrow != note_row and cell is not None and 0 <= cell.note < 180:
+            return None
+    # Drop the chunks this jump replaces, both from the grid and from the
+    # bookkeeping, so a reversal does not leave the old transpose in force.
+    for jrow in [r for r in chunks if r >= row]:
+        del chunks[jrow]
+        cell = grid[ch].get(jrow)
+        if cell is not None and cell.fx:
+            cell.fx = [(c, v) for c, v in cell.fx if c not in (0xE8, 0xE9)]
+    new_e5 = max(e5_lo, min(e5_hi, int(round(e5_note + fine * div))))
+    for idx, (jrow, step) in enumerate(plan):
+        cell = grid[ch].get(jrow)
+        if cell is None:
+            cell = _blank_row()
+            grid[ch][jrow] = cell
+        if idx == 0 and last_rate:
+            # The glide dies here: a rate left running would move the pitch
+            # after the jump.
+            _fx_keep(cell, (0x01, 0x02))
+            _add_fx(cell, 0x01 if last_rate > 0 else 0x02, 0,
+                    fx_cols, stats)
+        if step:
+            chunks[jrow] = step
+            _add_fx(cell, 0xE8 if step > 0 else 0xE9, abs(step),
+                    fx_cols, stats)
+    # Record even when the byte equals the note's own: the replay walks a
+    # running value, so an unchanged request is deduplicated there.
+    e5_writes[(ch, row)] = new_e5
+    return 64.0 * sum(chunks.values()), new_e5
+
+
 def _emit_sweep(
     grid: list[dict[int, Row]],
     song: Song,
@@ -1335,41 +1462,52 @@ def _emit_sweep(
     chan: int | None = None,
     stats: dict | None = None,
 ) -> None:
-    """Encode a key-on pitch trajectory as per-row ramps and E5 steps.
+    """Encode a key-on pitch trajectory into row effects.
 
-    Rows are sampled at their boundaries: jumps become E5 steps, drift
-    becomes the row rate, and the final row is rated against the held value.
+    The source's KC/KF stream mixes two kinds of motion, read one row at a time:
+    a row renders a single straight line, so only its last write can sound. A run
+    of small steps is a real slide or hand-written vibrato and keeps its per-row
+    01xx/02xx ramp, and so does a chain of big steps that carries on row after
+    row. A step of about a semitone or more with still rows around it is the next
+    note under legato: an instant jump on its own row, E8xx/E9xx for the whole
+    semitones and E5xx for the remainder. Jump and slide are segmented, and
+    either may follow the other inside one note.
     """
     if chan is not None and chan != ev.ch:
         ev = replace(ev, ch=chan)
     pts = list(ev.sweep)
     if not pts or ev.ch >= len(grid):
         return
-    step_times = [s for s, _d in pts]
     row_len = song.samples_per_row
     tick = row_len / max(1, song.speed)
     start = ev.sample
     # The release tail keeps gliding. The trajectory runs to its last KC/KF
     # write. A later note's row clips it below.
     end = pts[-1][0]
+    # E5 and 01xx/02xx move the platform's pitch value, 1/128 semitone in
+    # linear mode. The trajectory is in 1/64 semitones. OPN and PCM events
+    # (sweep_div 2) need two engine units per trajectory unit. OPM keeps its
+    # historical one-unit mapping.
+    div = 2.0 if (ev.pcm or ev.sweep_div >= 2.0) else 1.0
+
+    def e5_byte(offset: float) -> int:
+        # E5xx is the note's fine tune; fine-tune bytes and slide units
+        # advance the same pitch value.
+        return max(ev.e5_lo, min(ev.e5_hi, int(round(ev.e5 + offset * div))))
+
+    row0, _d0 = song.place(start, stats)
     if end - start < tick:
         # Shorter than a tick: no room to ramp. The driver's jump still has to
         # land, and an instant transpose on the next row is the closest the
         # engine can get.
         final = float(_traj_at(pts, int(end)))
-        y = max(-15, min(15, int(round(final / 64.0))))
-        if abs(y) >= 1:
-            row0, _d = song.place(start, stats)
-            row1 = row0 + 1
-            if row1 < total_rows:
-                cell = grid[ev.ch].get(row1)
-                if cell is None or not (0 <= cell.note < 180):
-                    if cell is None:
-                        cell = _blank_row()
-                        grid[ev.ch][row1] = cell
-                    _add_fx(cell, 0xE8 if y > 0 else 0xE9, abs(y), fx_cols, stats)
+        if _emit_jump_row(
+            grid, ev.ch, fx_cols, total_rows, row0 + 1, row0,
+            final, div, ev.e5, {}, ev.e5_lo, ev.e5_hi,
+            e5_writes, note_rows.get(ev.ch), stats,
+        ) is None:
+            _bump(stats, "legato_skipped")
         return
-    row0, _d0 = song.place(start, stats)
     cell0 = grid[ev.ch].get(row0)
     if cell0 is None:
         return
@@ -1387,183 +1525,265 @@ def _emit_sweep(
             crossed = True
             _bump(stats, "sweep_clipped")
 
-    # E5 and 01xx/02xx move the platform's pitch value, 1/128 semitone in
-    # linear mode. The trajectory is in 1/64 semitones. OPN and PCM events
-    # (sweep_div 2) need two engine units per trajectory unit. OPM keeps its
-    # historical one-unit mapping.
-    div = 2.0 if (ev.pcm or ev.sweep_div >= 2.0) else 1.0
+    # Row-level view of the trajectory. Two writes inside one row cannot be
+    # told apart by the engine (a row renders a single straight line), so each
+    # row keeps its last value. Classifying on rows also collapses a one-row
+    # glitch, a hard step reversed before the row ends, into no movement.
+    per_row: list[list[int]] = []  # [row, first pts index, last pts index]
+    for idx, (s, _d) in enumerate(pts):
+        r = song.place(s, stats)[0]
+        if per_row and per_row[-1][0] == r:
+            per_row[-1][2] = idx
+        else:
+            per_row.append([r, idx, idx])
 
-    def e5_byte(offset: float) -> int:
-        # E5xx is the note's fine tune; fine-tune bytes and slide units
-        # advance the same pitch value.
-        return max(ev.e5_lo, min(ev.e5_hi, int(round(ev.e5 + offset * div))))
+    # Classify each row's value against the one held before it. A step of about a
+    # semitone or more is a note change under legato when the rows around it stay
+    # still; when the row next door travels the same way and as far, the driver is
+    # gliding. Hand-written vibrato moves in smaller steps than either. Jumps are
+    # their own one-row segment; the other rows share a slide run anchored at the
+    # pitch held before the run.
+    def val(e: int) -> float:
+        """The pitch one row's last write left; 0 outside the trajectory."""
+        return float(pts[per_row[e][2]][1]) if 0 <= e < len(per_row) else 0.0
 
+    # Segment: kind, first row index into per_row, last one, and the pitch held
+    # before the segment starts.
+    segs: list[tuple[str, int, int, float]] = []
+    prev_held = 0.0
+    run_first = -1
+    anchor = 0.0
+    for e, entry in enumerate(per_row):
+        row = entry[0]
+        step = val(e) - val(e - 1)
+        # A neighbour continues this row's motion only when it moves the very
+        # next row: separate notes leave rows of silence between their steps.
+        ahead = (
+            val(e + 1) - val(e)
+            if e + 1 < len(per_row) and per_row[e + 1][0] == row + 1 else 0.0
+        )
+        behind = (
+            val(e - 1) - val(e - 2)
+            if e >= 1 and per_row[e - 1][0] == row - 1 else 0.0
+        )
+        big = abs(step) >= _SWEEP_JUMP_UNITS
+        chain = (abs(ahead) >= _SWEEP_JUMP_UNITS and ahead * step > 0
+                 or abs(behind) >= _SWEEP_JUMP_UNITS and behind * step > 0)
+        hard = big and not chain
+        d = val(e)
+        if hard:
+            if run_first >= 0:
+                segs.append(("slide", run_first, e - 1, anchor))
+                run_first = -1
+            segs.append(("jump", e, e, prev_held))
+        elif run_first < 0:
+            run_first = e
+            anchor = prev_held
+        prev_held = d
+    if run_first >= 0:
+        segs.append(("slide", run_first, len(per_row) - 1, anchor))
+
+    # The engine's pitch value is (E5 - note fine tune) / div + xpose. slide
+    # accrues what the written 01xx/02xx parameter actually delivers; a jump
+    # resets it to zero (E8xx relearns the note's own pitch).
     e5w = ev.e5
-    slide = 0.0  # ramp accumulation in trajectory units
-    xpose = 0.0  # quick-legato transpose applied via E8xx/E9xx (units)
+    xpose = 0.0
+    slide = 0.0
     last_rate = 0
-    last_k = 0
-    k = 0
-    # The row walk samples the trajectory in time order. A moving index beats
-    # restarting at the first point for every row.
-    main_i = 0
+    # The rows this note's jumps put a transpose on, with the semitones each
+    # carries. A jump landing inside an earlier jump's span re-plans from its
+    # own row, so a quick reversal cannot strand the voice on the first target.
+    chunks: dict[int, int] = {}
 
-    def traj(t: int) -> int:
-        nonlocal main_i
-        while main_i < len(pts) and pts[main_i][0] <= t:
-            main_i += 1
-        return pts[main_i - 1][1] if main_i else 0
+    def pitch_now() -> float:
+        return (e5w - ev.e5) / div + xpose + slide
 
-    dev_i = 0
-    while True:
-        rs = base + k * row_len
-        if rs >= end:
-            break
-        re_full = base + (k + 1) * row_len
-        re = min(re_full, end)
-        # A row carries one slide rate. Steps inside it collapse into it.
-        _bump(stats, "sweep_rate_merged",
-              max(0, bisect_left(step_times, re_full) - bisect_left(step_times, rs) - 1))
-        t_eff = start if k == 0 else rs
-        if k == 0:
-            # The first driver step lands inside this row and is covered by
-            # its ramp.
-            want = 0.0
-        else:
-            # A jump just past the boundary still snaps onto this row.
-            want = float(traj(int(rs + tick)))
-        cur = (e5w - ev.e5) / div + slide + xpose
-        cell_k = grid[ev.ch].get(row0 + k)
-        if abs(want - cur) >= 6:
-            if cell_k is None or not (0 <= cell_k.note < 180):
-                # A later note's E5 sets its own attack and wins its row.
-                e5w = e5_byte(want - slide - xpose)
-                e5_writes[(ev.ch, row0 + k)] = e5w
-                cur = (e5w - ev.e5) / div + slide + xpose
-            else:
-                _bump(stats, "e5_skipped")
-        # The engine slides for the whole row. The last row is rated over its
-        # full span against the held final value.
-        is_last = re_full > end
-        span = (re_full - t_eff) / tick if is_last else (re - t_eff) / tick
-        if k == 0 and ev.pcm:
-            # A PCM key-on write would apply a slice of the row's travel.
-            want_end = 0.0
-        else:
-            want_end = float(traj(int(re_full if is_last else re)))
-        rate = 0
-        if span > 0:
-            # FM advances one kc_kf unit per tick per parameter unit. PCM
-            # moves 1/128 st per unit, and its written parameter is doubled.
-            limit = 255.0 / div
-            # Whatever the slide cannot deliver lands as a quick-legato
-            # transpose (E8xx/E9xx, held until the next key-on).
-            full = limit * span
-            need = want_end - cur
-            if abs(need) > full and k > 0:
-                cell = grid[ev.ch].get(row0 + k)
-                if cell is None or not (0 <= cell.note < 180):
-                    if ev.pcm:
-                        shift = int(round(xpose / 64.0))
-                        y = int(round(want_end / 64.0)) - shift
-                        y = max(-15, min(15, y))
-                        if y:
-                            if cell is None:
-                                cell = _blank_row()
-                                grid[ev.ch][row0 + k] = cell
-                            _add_fx(cell, 0xE8 if y > 0 else 0xE9, abs(y), fx_cols, stats)
-                            xpose += 64.0 * y
-                            slide = 0.0
-                            cur = (e5w - ev.e5) / 2.0 + xpose
-                    else:
-                        # FM adds the transpose to the note until the next one.
-                        short = need - (full if need > 0 else -full)
-                        y = max(-15, min(15, int(round(short / 64.0))))
-                        if y:
-                            if cell is None:
-                                cell = _blank_row()
-                                grid[ev.ch][row0 + k] = cell
-                            _add_fx(cell, 0xE8 if y > 0 else 0xE9, abs(y), fx_cols, stats)
-                            xpose += 64.0 * y
-                            cur += 64.0 * y
+    # A multi-row jump leaves its later E8 chunks on following rows; a slide
+    # must not start until they have all landed.
+    jump_last_row = row0 - 1
+
+    for seg_i, (kind, a, b, anchor) in enumerate(segs):
+        if kind == "jump":
+            jrow = per_row[a][0]
+            s = pts[per_row[a][1]][0]
+            d = float(pts[per_row[a][2]][1])
+            if crossed and s >= end:
+                continue
+            if jrow <= row0:
+                # The step is the note's own key-on write, or a stray write in
+                # front of it: that row already sounds the note's pitch.
+                continue
+            if jrow >= total_rows:
+                _bump(stats, "legato_skipped")
+                continue
+            c = grid[ev.ch].get(jrow)
+            if c is not None and 0 <= c.note < 180:
+                # Rounding put this step on a later note's row; that note
+                # re-keys with its own pitch, so the step is inaudible.
+                continue
+            # Rows this jump may spend before the next segment owns one. A
+            # transpose of more than +-15 semitones per row has no room here,
+            # and half a jump is worse than none.
+            nxt = (per_row[segs[seg_i + 1][1]][0]
+                   if seg_i + 1 < len(segs) else total_rows)
+            res = _emit_jump_row(
+                grid, ev.ch, fx_cols, total_rows, jrow, row0,
+                float(d), div, ev.e5, chunks,
+                ev.e5_lo, ev.e5_hi, e5_writes,
+                note_rows.get(ev.ch), stats,
+                last_rate=last_rate, max_rows=max(1, nxt - jrow),
+            )
+            if res is None:
+                _bump(stats, "legato_skipped")
+                continue
+            xpose, e5w = res
+            # E8xx resets the engine's accumulated slide displacement.
+            slide = 0.0
+            last_rate = 0
+            jump_last_row = max([jump_last_row, jrow] + sorted(chunks))
+            continue
+
+        # A slide run: ramp from the held anchor through this run's points.
+        i_from = per_row[a][1]
+        i_to = per_row[b][2]
+        first_s = pts[i_from][0]
+        if crossed and first_s >= end:
+            continue
+        run_pts = [
+            (pts[j][0], float(pts[j][1])) for j in range(i_from, i_to + 1)
+        ]
+        step_times = [s for s, _d in run_pts]
+
+        def traj_run(t: int) -> float:
+            v = anchor
+            for s, d in run_pts:
+                if s > t:
+                    break
+                v = d
+            return v
+
+        k = per_row[a][0] - row0
+        k = max(k, jump_last_row - row0 + 1, 0)
+        k_last = per_row[b][0] - row0
+        if b + 1 < len(per_row):
+            # Never run under the next segment; its jump owns that row.
+            k_last = min(k_last, per_row[b + 1][0] - row0 - 1)
+        if k_last < k:
+            continue
+        run_last: int | None = None
+        while k <= k_last:
+            rs = base + k * row_len
+            if rs >= end:
+                break
+            re_full = base + (k + 1) * row_len
+            re = min(re_full, end)
+            _bump(stats, "sweep_rate_merged",
+                  max(0, bisect_left(step_times, re_full)
+                      - bisect_left(step_times, rs) - 1))
+            first_row = seg_i == 0 and k == 0
+            t_eff = start if first_row else rs
+            want = 0.0 if first_row else traj_run(int(rs + tick))
+            cur = pitch_now()
+            cell_k = grid[ev.ch].get(row0 + k)
+            if abs(want - cur) >= 6:
+                if cell_k is None or not (0 <= cell_k.note < 180):
+                    # A later note's E5 sets its own attack and wins its row.
+                    e5w = e5_byte(want - xpose - slide)
+                    e5_writes[(ev.ch, row0 + k)] = e5w
+                    cur = pitch_now()
                 else:
-                    _bump(stats, "legato_skipped")
-            rate = max(-limit, min(limit, (want_end - cur) / span))
-        param = int(round(rate * div))
-        param = max(-255, min(255, param))
-        if param != last_rate or param != 0:
-            # The effect must be written on every row or the glide freezes.
-            cell = grid[ev.ch].get(row0 + k)
+                    _bump(stats, "e5_skipped")
+            # The engine slides for the whole row. The last row of the run is
+            # rated over its full span against the held value.
+            is_last = k == k_last
+            span = (re_full - t_eff) / tick if is_last else (re - t_eff) / tick
+            want_end = (
+                0.0 if (first_row and ev.pcm)
+                else traj_run(int(re_full if is_last else re))
+            )
+            rate = 0.0
+            if span > 0:
+                # FM advances one kc_kf unit per tick per parameter unit. PCM
+                # moves 1/128 st per unit, and its written parameter is
+                # doubled.
+                limit = 255.0 / div
+                rate = max(-limit, min(limit, (want_end - cur) / span))
+            param = max(-255, min(255, int(round(rate * div))))
+            if param != last_rate or param != 0:
+                # The effect must be written on every row or the glide freezes.
+                cell = grid[ev.ch].get(row0 + k)
+                if cell is None:
+                    cell = _blank_row()
+                    grid[ev.ch][row0 + k] = cell
+                # Drop the opposite-direction slide first, or both survive and
+                # the net slide depends on column order.
+                cell.fx = [(c, v) for c, v in
+                           (cell.fx or [(EMPTY, EMPTY)] * fx_cols)
+                           if c not in (0x01, 0x02)]
+                if param:
+                    _add_fx(cell, 0x01 if param > 0 else 0x02,
+                            min(255, abs(param)), fx_cols, stats)
+                else:
+                    _add_fx(cell, 0x01 if last_rate > 0 else 0x02, 0,
+                            fx_cols, stats)
+                last_rate = param
+            # Accrue the movement the written parameter actually makes.
+            # Rounding error compounds over long glides.
+            engine_rate = param / div
+            # Fidelity: compare the row's straight line with the driver's steps.
+            if stats is not None and span > 0:
+                bad_here = False
+                for j in range(4):
+                    t = int(rs + (re_full - rs) * (2 * j + 1) / 8.0)
+                    if t <= start:
+                        continue
+                    actual = traj_run(t)
+                    model = cur + engine_rate * span * (2 * j + 1) / 8.0
+                    dev = abs(model - actual)
+                    if dev > 6:
+                        bad_here = True
+                        _bump(stats, "sweep_dev_bad")
+                    if dev > stats.get("sweep_dev_max", 0):
+                        stats["sweep_dev_max"] = int(round(dev))
+                if bad_here:
+                    _bump(stats, "sweep_dev_rows")
+            slide += engine_rate * span
+            run_last = k
+            k += 1
+
+        if run_last is None:
+            continue
+        # Freeze the ramp once the run is over, or it would keep gliding
+        # under the next jump or through the hold that follows.
+        stop_row = row0 + run_last + 1
+        cell = None
+        foreign = False
+        if 0 <= stop_row < total_rows:
+            cell = grid[ev.ch].get(stop_row)
+            foreign = cell is not None and 0 <= cell.note < 180
+        if last_rate and 0 <= stop_row < total_rows:
             if cell is None:
                 cell = _blank_row()
-                grid[ev.ch][row0 + k] = cell
-            # Drop the opposite-direction slide first, or both survive and
-            # the net slide depends on column order.
-            cell.fx = [(c, v) for c, v in (cell.fx or [(EMPTY, EMPTY)] * fx_cols)
-                       if c not in (0x01, 0x02)]
-            if param:
-                _add_fx(cell, 0x01 if param > 0 else 0x02, min(255, abs(param)), fx_cols, stats)
-            else:
-                _add_fx(cell, 0x01 if last_rate > 0 else 0x02, 0, fx_cols, stats)
-            last_rate = param
-        # Accrue the movement the written parameter actually makes. Rounding
-        # error compounds over long glides.
-        engine_rate = param / div
-        # Fidelity: compare the row's straight line with the driver's steps.
-        if stats is not None and span > 0:
-            while dev_i < len(pts) and pts[dev_i][0] <= rs:
-                dev_i += 1
-            bad_here = False
-            for j in range(4):
-                t = int(rs + (re_full - rs) * (2 * j + 1) / 8.0)
-                if t <= start:
-                    continue
-                while dev_i < len(pts) and pts[dev_i][0] <= t:
-                    dev_i += 1
-                actual = pts[dev_i - 1][1] if dev_i else 0
-                model = cur + engine_rate * span * (2 * j + 1) / 8.0
-                dev = abs(model - actual)
-                if dev > 6:
-                    bad_here = True
-                    stats["sweep_dev_bad"] = stats.get("sweep_dev_bad", 0) + 1
-                if dev > stats.get("sweep_dev_max", 0):
-                    stats["sweep_dev_max"] = int(round(dev))
-            if bad_here:
-                stats["sweep_dev_rows"] = stats.get("sweep_dev_rows", 0) + 1
-        slide += engine_rate * span
-        last_k = k
-        k += 1
-
-    # Stop the ramp on the row after the last one and pin the final pitch
-    # with E5. The final row was rated over its full span. This corrects
-    # rounding residue only.
-    final = float(_traj_at(pts, int(end)))
-    stop_row = row0 + last_k + 1
-    if crossed:
-        # The later note reads its own pitch. The stop may sit on its row.
-        cell = grid[ev.ch].get(stop_row)
+                grid[ev.ch][stop_row] = cell
+            if not any(c in (0x01, 0x02) for c, _v in (cell.fx or ())):
+                _add_fx(cell, 0x01 if last_rate > 0 else 0x02, 0,
+                        fx_cols, stats)
+            last_rate = 0
+        if seg_i != len(segs) - 1:
+            continue
+        # The final run pins the last held value. Ramp rounding can leave a
+        # few units of error, and the E5 byte corrects it.
+        if foreign or not (0 <= stop_row < total_rows):
+            continue
+        final = float(pts[per_row[b][2]][1])
+        pin = e5_byte(final - xpose - slide)
+        if pin == e5w:
+            continue
         if cell is None:
             cell = _blank_row()
             grid[ev.ch][stop_row] = cell
-        if last_rate and not any(c in (0x01, 0x02) for c, _v in (cell.fx or ())):
-            _add_fx(cell, 0x01 if last_rate > 0 else 0x02, 0, fx_cols, stats)
-        return
-    if stop_row >= total_rows:
-        return
-    cell = grid[ev.ch].get(stop_row)
-    foreign = cell is not None and 0 <= cell.note < 180
-    pin = e5_byte(final - slide - xpose)
-    if not last_rate and (foreign or pin == e5w):
-        return
-    if cell is None:
-        cell = _blank_row()
-        grid[ev.ch][stop_row] = cell
-    if last_rate:
-        cell.fx = [(c, v) for c, v in (cell.fx or [(EMPTY, EMPTY)] * fx_cols)
-                   if c not in (0x01, 0x02)]
-        _add_fx(cell, 0x01 if last_rate > 0 else 0x02, 0, fx_cols, stats)
-    if not foreign and pin != e5w:
         e5_writes[(ev.ch, stop_row)] = pin
+        e5w = pin
 
 
 def _assign_pcm_rows(

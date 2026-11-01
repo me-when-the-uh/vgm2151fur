@@ -206,7 +206,9 @@ Two effects move pitch, and their scales differ per platform:
 
 E8xx/E9xx quick legato adds semitones to the playing note in one write. It is
 cumulative (`note += y`), applies one tick after the row, and resets at the
-next note. Checked against Furnace 0.6.8.3 on all three platforms.
+next note. It also re-learns the pitch: a slide the voice had accumulated is
+discarded, so the row sounds note + transpose + fine tune and not where the
+glide had got to. Checked against Furnace 0.6.8.3 on all three platforms.
 
 A held period step of about a semitone is a new note. Vibrato and pitch
 slides are the instrument's **pitch macro** (code 4), one value per tick in
@@ -227,8 +229,26 @@ resolution.
 
 ## The sweep model
 
-A driver's pitch motion is a staircase of register writes. The writer turns
-the staircase into per-row slides:
+A driver's pitch motion is a staircase of register writes, and the writer reads
+it **one row at a time**: a row renders one straight line, so where several
+writes land on the same row only the last of them can sound. That collapse also
+erases a one-row glitch, a step the driver takes back before the row ends.
+
+Each row's value is then either a **slide** or a **hard step**:
+
+- A step of less than `_SWEEP_JUMP_UNITS` (56 units, seven eighths of a
+  semitone) is vibrato or a glide. So is a bigger step whose neighbour row goes
+  on the same way, as far and in the same direction: a driver that slides an
+  octave keeps writing one key code per row, and chopping that into legatos
+  loses the glide. Runs of such rows share one 01xx/02xx ramp.
+- A big step with still rows around it is the next note under legato, and it has
+  to be heard at once: whole semitones go through E8xx/E9xx on its row, the
+  remainder through E5xx, and a rate still running is stopped there or it would
+  carry on under the jump. A transpose of more than +-15 semitones is split over
+  rows; when the next step owns a row it would still need, nothing is placed and
+  that step's target carries the pitch instead.
+
+Inside a ramp:
 
 - Each row samples the trajectory at its start (one tick in, to catch jumps
   that land just after the boundary) and at its end.
@@ -239,8 +259,23 @@ the staircase into per-row slides:
   exactly what the engine will do: `param` per tick on FM, `param / 2` per
   tick on PCM. Accruing the ideal rate instead compounds a
   fraction-of-a-unit error into semitones over long climbs.
-- Moves the slide cannot deliver inside a row become E8/E9 transposes, with
-  the slide covering the remainder.
+
+Two measured engine facts hold the model together. E8xx resets the slide
+displacement the voice had accumulated: a jump after a glide lands on note plus
+transpose plus fine tune, not where the glide had got to, so a jump's target is
+computed against the transpose alone. And a jump that lands inside rows an
+earlier jump of the same note still occupies picks those chunks up again from
+its own row, keeping what has already been delivered.
+
+Persistent legato mode (`EA01`, off with `EA00`) was tried and rejected for the
+same job: it needs a matching write on every row that must not be a legato, and
+one missed reset bends the rest of the channel. E8xx/E9xx is a single write,
+resets at the next note, and does not re-key the voice. On a test track whose
+lead is 100 ms staccato with ten-to-nineteen-semitone steps, the export puts
+each of its 714 held hard jumps on pitch within 1.4 ms (median 0) and its
+worst per-row deviation drops from nineteen semitones to a quarter tone, while
+key-ons still match the source one for one on every channel.
+
 - Sub-semitone residue is pinned with E5 on the row after the rate stops.
   The E5 value is an absolute byte around the note's own fine tune, so the
   pin only ever expresses a small correction.
@@ -294,8 +329,12 @@ mode, marks the largest factor with no added structural loss and no more than
 6 units (0.1 st) more deviation than 1x, else falls back to 1x. In `all` mode
 the pick is the largest factor and the condensed names end in ` (lossy)`.
 
-`dev_max` saturates on sweep-heavy tracks, so it cannot always separate a
-good coarser grid from a bad one. With `verify` (CLI `--verify`, always on in
+`dev_max` used to saturate on legato-heavy tracks, where every semitone-sized
+note change was left to a ramp that could not cross the distance inside its
+row. Those steps are transposes now, so `dev_max` reports only the residual of
+the ramps that stay - on a staccato lead track, nineteen semitones down to a
+quarter tone. That matters for the pick, because `lossless` compares deviation
+as well as structural loss. With `verify` (CLI `--verify`, always on in
 the menu) `convert_variants` instead renders every candidate through Furnace
 and counts pitch runs against the source at 0.25 st / 60 ms, accepting a
 factor only up to `baseline + 1` runs. A factor is a row-length multiplier,
