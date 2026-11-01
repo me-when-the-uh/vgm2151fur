@@ -28,6 +28,8 @@ CHIP_LABELS = (
     ("ym2151", "YM2151"),
     ("ym2203", "YM2203"),
     ("ym2612", "YM2612"),
+    ("ym2610", "YM2610"),
+    ("ym2610_b", "YM2610B"),
     # The OPL family: an AdLib-style log names its chip by command byte, and
     # rhythm mode is reported apart because it changes the channel layout.
     ("opl", "OPL"),
@@ -37,6 +39,7 @@ CHIP_LABELS = (
     ("segapcm", "SegaPCM"),
     ("c140", "C140"),
     ("c352", "C352"),
+    ("k053260", "K053260"),
     ("c219", "C219 (unsupported)"),
     ("msm6295", "MSM6295"),
     ("msm6258", "MSM6258"),
@@ -62,6 +65,8 @@ class Pack:
         kinds = set(self.chips)
         if "scc_plus" in kinds:
             kinds.discard("k051649")
+        if "ym2610_b" in kinds:
+            kinds.discard("ym2610")
         names = [label for kind, label in CHIP_LABELS if kind in kinds]
         return ", ".join(names)
 

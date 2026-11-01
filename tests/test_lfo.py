@@ -43,6 +43,49 @@ class TestPmsRamp(unittest.TestCase):
         self.assertEqual(deltas[0], 300)
 
 
+class TestPerNotePmsMacro(unittest.TestCase):
+    """A note without PMS writes must not inherit another note's ramp."""
+
+    def _song(self):
+        writes = []
+        for reg, val in _synth.PATCH:
+            writes.append(ChipWrite(0, "ym2151", 0, reg, val))
+        writes += [
+            ChipWrite(0, "ym2151", 0, 0x18, 0xD0),
+            ChipWrite(0, "ym2151", 0, 0x19, 0x88),
+            ChipWrite(0, "ym2151", 0, 0x1B, 0x02),
+            ChipWrite(59000, "ym2151", 0, 0x28, 0x48),
+            ChipWrite(59000, "ym2151", 0, 0x30, 0x00),
+            ChipWrite(60000, "ym2151", 0, 0x08, 0x78),
+            ChipWrite(100000, "ym2151", 0, 0x08, 0x00),
+            ChipWrite(159000, "ym2151", 0, 0x28, 0x4A),
+            ChipWrite(159000, "ym2151", 0, 0x30, 0x00),
+            ChipWrite(160000, "ym2151", 0, 0x08, 0x78),
+        ]
+        for k, val in enumerate((0x10, 0x21, 0x31, 0x42, 0x52, 0x63, 0x73)):
+            writes.append(ChipWrite(200000 + 200 * k, "ym2151", 0, 0x38, val))
+        writes.append(ChipWrite(260000, "ym2151", 0, 0x08, 0x00))
+        writes.sort(key=lambda w: w.sample)
+        return analyze(_synth.vgm(writes))
+
+    def test_constant_note_gets_its_own_zero_macro(self):
+        song = self._song()
+        notes = [e for e in song.events if e.on and e.ch == 0]
+        self.assertEqual(len(notes), 2)
+        first, second = notes
+        self.assertEqual(song.fm_patches[first.ins].fms_macro, (0,))
+        self.assertEqual(song.fm_patches[first.ins].ams_macro, (0,))
+        self.assertNotEqual(first.ins, second.ins)
+
+    def test_late_ramp_keeps_its_lead_in(self):
+        song = self._song()
+        notes = [e for e in song.events if e.on and e.ch == 0]
+        patch = song.fm_patches[notes[1].ins]
+        self.assertEqual(max(patch.fms_macro), 7)
+        self.assertGreater(len(patch.fms_macro), 8)
+        self.assertEqual(patch.fms_macro[0], 0)
+
+
 class TestOpmTestPulse(unittest.TestCase):
     """The TEST-register pulse the driver uses to re-seed the OPM LFO."""
 

@@ -43,7 +43,8 @@ python -m vgm2151fur convert "pack/02 Track.vgz" -o out --variants --optimize lo
 - `lossless`: pick the largest factor that adds no structural loss and no more
   than 0.1 st of pitch-model deviation over 1x; fall back to 1x when condensing
   is not safe (some dense rips are already lossy at 1x).
-- `all`: keep the largest factor.
+- `all`: keep the largest factor and write the condensed files as
+  `<name> xN (lossy).fur`.
 
 `--verify` makes `lossless` authoritative: every candidate is rendered through
 Furnace and rejected if it adds a sustained pitch divergence over 1x (0.25 st /
@@ -83,7 +84,7 @@ call by hand on a pack (`docs/opl.md`).
 
 The grid is measured from a lattice of note starts. The YM2151, YM2203 or
 YM2612 key-on register supplies it when the rip has a usable FM stream. When
-it does not - the C352 and SegaPCM-only board rips have no FM chip at all -
+it does not - the C352, K053260 and SegaPCM-only board rips have no FM chip at all -
 the sample-chip trigger times are measured the same way, which keeps those
 rips off the 60 Hz frame fallback. That fallback reads as exactly 900 BPM
 (60 rows/s) and carries no musical information. A rip whose FM lattice
@@ -91,15 +92,16 @@ already measures uses it alone. A YM2203 or YM2612 whose driver writes pitch
 faster than the resulting tick gets `hz` and `speed` raised together (same
 row length and BPM), so the pitch macro still sees each write.
 
-The TUI runs this by default: a plain `c convert` writes the 1x file to
-`default/` and each lossless factor to `x2 optimised/`, `x3 optimised/`, ...,
-drops the factors that would lose detail, and records every verdict in
-`condense.tsv`. Each manifest row names the grid it came from, which tells a
-measured lattice from a frame fallback at a glance. The CLI keeps the
-flat `<name> xN.fur` siblings unless you pass `--dirs`. The verdict is
-re-derived from the source on every run, so a reconversion
-(`tools/reconvert_all.py --optimize lossless [--verify]`) reaches the same set
-with or without the manifest - the manifest just lets you read it.
+The TUI asks `optimise? (Y/n)` and defaults to yes, the `all` pick: a plain
+`c convert` writes the 1x file to `default/` and every condensed factor to
+`x2 optimised/`, `x3 optimised/`, ..., with ` (lossy)` in the condensed
+names, and records every verdict in `condense.tsv`. Each manifest row names
+the grid it came from, which tells a measured lattice from a frame fallback
+at a glance. The CLI keeps the flat `<name> xN.fur` siblings unless you pass
+`--dirs`. The verdict is re-derived from the source on every run, so a
+reconversion (`tools/reconvert_all.py --optimize lossless [--verify]`)
+reaches the same set with or without the manifest - the manifest just lets
+you read it.
 
 Genesis PSG notes are converted automatically; `--melody-only` keeps the DAC (and other sample-chip) data out, while the FM/PSG side still converts. The YM2612 DAC default is release-capped PCM chunks: one FM6 note per chunk, split at every `0xB6` pan change and at most every 0.25 s, with a small sample budget so release Furnace loads the module. Silence-only chunks and leading silence get no note. `collect_dac(..., slices=True)` is the explicit per-run slice mode; `timeline=True` is the old comparison body. The SN76489 system volume defaults to 0.500; an absolute VGM extra-header volume entry overrides it.
 
@@ -213,7 +215,7 @@ they can be run from anywhere.
 - `tools/pitch_shift.py <a.wav> <b.wav>`: the chroma-rotation table one pair
   of renders at a time, used by the soundcheck.
 - `tools/vgm_scan.py [root ...]`: which VGM packs use SegaPCM, C140, C352,
-  C219, SCC/SCC+, AY-8910, YM2203 or YM2612 and at which clock. C219 is a
+  K053260, C219, SCC/SCC+, AY-8910, YM2203 or YM2612 and at which clock. C219 is a
   C140-family part the converter does not support; never batch-convert those
   into the C140 target. C352 converts as chip 0xD0; a Furnace build with a
   C352 core can play it. YM2203 converts as chip 0x8D (3 FM + 3 SSG voices

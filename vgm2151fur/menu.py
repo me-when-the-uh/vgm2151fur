@@ -196,6 +196,12 @@ def _ask(read, prompt: str, default: str = "") -> str:
     return answer or default
 
 
+def _ask_optimise(read) -> str:
+    """`all` on yes, `none` on no. The prompt defaults to yes."""
+    answer = _ask(read, "optimise? (Y/n)", "y").lower()
+    return "none" if answer in ("n", "no") else "all"
+
+
 def _ask_existing(read, out, prompt: str) -> list[Path] | None:
     """Paths that exist. Blank cancels. Quotes and globs are accepted."""
     while True:
@@ -426,7 +432,7 @@ def _pack_view(read, out, pack: Pack, state: dict, state_path: Path) -> str:
 
 def _run_convert(
     out, files: list[Path], dest: Path, speed: int | None,
-    optimize: str = "lossless", verify: bool = True,
+    optimize: str = "all", verify: bool = False,
 ) -> int:
     if optimize != "none":
         return _run_variants(out, files, dest, 4, optimize, verify)
@@ -459,10 +465,11 @@ def _run_convert(
 
 def _run_variants(
     out, files: list[Path], dest: Path, factor: int, mode: str,
-    verify: bool = True, layout: str = "dirs",
+    verify: bool = False, layout: str = "dirs",
 ) -> int:
     done = rc = 0
-    if verify:
+    use_verify = verify and mode != "all"
+    if use_verify:
         out("  verifying each variant through Furnace...")
     for src, info, error in convert_folder(
         files, dest, variants=True, condense=factor, optimize=mode,
@@ -501,12 +508,10 @@ def cmd_condense(read, out, state, state_path):
         return None
     dst = Path(_ask(read, "output folder", str(vgms[0].parent / FUR_FOLDER)))
     factor = _ask(read, "max condense factor (2-4)", "4")
-    mode = _ask(read, "pick (none, lossless, all)", "lossless").strip().lower()
-    if mode not in ("none", "lossless", "all"):
-        mode = "lossless"
+    mode = _ask_optimise(read)
     verify = _ask(
-        read, "verify through Furnace? (Y/n)", "y"
-    ).lower() not in ("n", "no")
+        read, "verify through Furnace? (y/N)", "n"
+    ).lower() in ("y", "yes")
     rc = _run_variants(
         out, vgms, dst, int(factor) if factor.isdigit() else 4, mode, verify
     )
@@ -523,14 +528,12 @@ def _pack_convert(read, out, pack, tracks, default_dir: Path, state, state_path)
         out(f"  {exc}")
         return
     dst = Path(_ask(read, "output folder", str(default_dir)))
-    optimize = _ask(read, "optimise (none, lossless, all)", "lossless").strip().lower()
-    if optimize not in ("none", "lossless", "all"):
-        optimize = "lossless"
+    optimize = _ask_optimise(read)
     verify = False
     if optimize != "none":
         verify = _ask(
-            read, "verify variants through Furnace? (Y/n)", "y"
-        ).lower() not in ("n", "no")
+            read, "verify variants through Furnace? (y/N)", "n"
+        ).lower() in ("y", "yes")
     _run_convert(out, [tracks[i] for i in picks], dst, None, optimize, verify)
     state.setdefault("out_dirs", {})[str(pack.path)] = str(dst)
     state["pack"] = str(pack.path)
@@ -598,7 +601,7 @@ def _pack_render(read, out, tracks, fur_dir: Path, *, spec: str | None = None) -
 
 def _convert_now(
     out, files: list[Path], dest: Path, speed: int | None,
-    optimize: str = "lossless", verify: bool = True,
+    optimize: str = "all", verify: bool = True,
 ) -> int:
     return _run_convert(out, files, dest, speed, optimize, verify)
 
@@ -632,14 +635,12 @@ def cmd_convert_file(read, out, state, state_path):
     default_out = str(vgms[0].parent / FUR_FOLDER)
     dst = Path(_ask(read, "output folder", default_out))
     speed = _ask(read, "ticks per row (blank = auto)")
-    optimize = _ask(read, "optimise (none, lossless, all)", "lossless").strip().lower()
-    if optimize not in ("none", "lossless", "all"):
-        optimize = "lossless"
+    optimize = _ask_optimise(read)
     verify = False
     if optimize != "none":
         verify = _ask(
-            read, "verify variants through Furnace? (Y/n)", "y"
-        ).lower() not in ("n", "no")
+            read, "verify variants through Furnace? (y/N)", "n"
+        ).lower() in ("y", "yes")
     return _convert_now(
         out, vgms, dst, int(speed) if speed.isdigit() else None, optimize, verify
     )

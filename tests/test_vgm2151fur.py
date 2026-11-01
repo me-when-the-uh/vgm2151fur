@@ -244,16 +244,16 @@ class TestPcmRowCollisions(unittest.TestCase):
         self.assertIn(110, notes)
         self.assertEqual(len(notes), 3)
 
-    def test_tight_pair_does_not_steal_the_next_row(self):
-        # 4410 samples/row. 100 and 200 share row 0; 4500 is row 1.
-        # Pushing 200 onto row 1 would shift every later note on the voice.
+    def test_tight_pair_keeps_both_triggers(self):
+        # 4410 samples/row. 100 and 200 share row 0. The later trigger moves
+        # to row 1 and the next trigger follows it, so no sample is dropped.
         song = _pcm_song([
             NoteEvent(sample=100, ch=8, on=True, note=100, ins=0, vol=12, e5=0x80, pan=0xFF, pcm=True),
             NoteEvent(sample=200, ch=8, on=True, note=110, ins=0, vol=12, e5=0x80, pan=0xFF, pcm=True),
             NoteEvent(sample=4500, ch=8, on=True, note=120, ins=0, vol=12, e5=0x80, pan=0xFF, pcm=True),
         ])
         found = [(row_i, row.note) for row_i, row in _pcm_notes(song)]
-        self.assertEqual(found, [(0, 110), (1, 120)])
+        self.assertEqual(found, [(0, 100), (1, 110), (2, 120)])
 
     def test_same_timestamp_keeps_the_later_trigger(self):
         song = _pcm_song([
@@ -266,6 +266,27 @@ class TestPcmRowCollisions(unittest.TestCase):
         self.assertEqual(early[0].note, 110)
         self.assertEqual(early[0].vol, 8)
         self.assertIn((0x08, 0xF0), early[0].fx)
+
+    def test_retrigger_off_does_not_cut_the_new_note(self):
+        # The old sample's key-off lands on the same sample as the next
+        # trigger. The trigger wins and the off must not become a row.
+        song = _pcm_song([
+            NoteEvent(sample=100, ch=8, on=True, note=100, ins=0, vol=12, e5=0x80, pan=0xFF, pcm=True),
+            NoteEvent(sample=5000, ch=8, on=True, note=110, ins=0, vol=12, e5=0x80, pan=0xFF, pcm=True),
+            NoteEvent(sample=5000, ch=8, on=False, note=180, ins=-1, vol=-1, e5=0x80, pan=0, pcm=True),
+            NoteEvent(sample=15000, ch=8, on=True, note=120, ins=0, vol=12, e5=0x80, pan=0xFF, pcm=True),
+            NoteEvent(sample=15000, ch=8, on=False, note=180, ins=-1, vol=-1, e5=0x80, pan=0, pcm=True),
+            NoteEvent(sample=25000, ch=8, on=True, note=130, ins=0, vol=12, e5=0x80, pan=0xFF, pcm=True),
+            NoteEvent(sample=35000, ch=8, on=False, note=180, ins=-1, vol=-1, e5=0x80, pan=0, pcm=True),
+        ])
+        mod = parse_fur(write_fur(song, include_pcm=True, include_fm=True))
+        offs = [
+            i
+            for pat in mod.orders[8]
+            for i, row in enumerate(mod.patterns[(8, pat)])
+            if row.note == NOTE_OFF
+        ]
+        self.assertEqual(offs, [song.place(35000)[0]])
 
     def test_equal_volumes_write_both_speakers(self):
         song = _pcm_song([
