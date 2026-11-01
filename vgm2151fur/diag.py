@@ -518,6 +518,13 @@ def opl_keyed_intervals(vgm, ch: int) -> list[tuple[int, int]]:
         elif not now and on:
             out.append((start, w.sample))
             on = False
+    if on:
+        end = vgm.total_samples or (
+            max((w.sample for w in vgm.writes), default=start) + 1
+        )
+        out.append((start, end))
+    return out
+
 
 def _ym2610_chip_ids(vgm) -> list[int]:
     return sorted({

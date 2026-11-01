@@ -2909,9 +2909,13 @@ def write_fur(
 
     # extra chip output (>=135), one (vol, panL, panR) triple per chip. The
     # player multiplies this by the master, exactly like the byte field, so a
-    # boosted chip stores its share of the raised master.
-    for cv in chip_vols:
+    # boosted chip stores its share of the raised master. All three floats must
+    # be written: Furnace reads vol, pan and front/rear per chip in order, and a
+    # short array leaves every later offset out of step (its loader then fails on
+    # a directory pointer and reports "couldn't read wavetable directory").
+    for i, cv in enumerate(chip_vols):
         b.f32(cv / master_gain)
+        b.f32(chip_pans[i] if i < len(chip_pans) else 0.0)
         b.f32(0.0)
     b.u32(0)  # patchbay connections
     b.u8(1)  # automatic patchbay (>=136), required or the song is silent
