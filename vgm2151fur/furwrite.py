@@ -14,10 +14,13 @@ from collections import Counter
 from dataclasses import dataclass, replace
 
 from vgm2151fur.analyze import Song, ToneIns
-from vgm2151fur.fm import CARRIERS, OPN_CARRIERS
 from vgm2151fur.c140 import c140_furnace_clock
 from vgm2151fur.c352 import C352_DEFAULT_CLOCK
+from vgm2151fur.fm import CARRIERS, OPN_CARRIERS
 from vgm2151fur.oki import msm6258_flag_text, oki_flag_text, oki_needs_banked
+from vgm2151fur.opl import (
+    FURNACE_CLOCK, FURNACE_CLOCK_OPL3, opl_module_clock,
+)
 from vgm2151fur.pcm import pcm7_to_s8, scale_pcm7
 from vgm2151fur.pitch import FURNACE_CLOCK_DEFAULT, module_clock
 
@@ -81,10 +84,73 @@ CHIP_C352 = 0xD0
 CHIP_K051649 = 0xA1
 CHIP_K052539 = 0xB4
 CHIP_AY8910 = 0x80
+# The OPL family. Furnace gives the rhythm mode its own system: the drums
+# layout turns the last melodic channels into kick, snare, tom, cymbal and
+# hi-hat columns (9 -> 11 channels on OPL/OPL2, 18 -> 20 on OPL3).
+CHIP_OPL = 0x8F
+CHIP_OPL2 = 0x90
+CHIP_OPL3 = 0x91
+CHIP_OPL_DRUMS = 0xA2
+CHIP_OPL2_DRUMS = 0xA3
+CHIP_OPL3_DRUMS = 0xA4
+# Channels per OPL system and how many of them are melodic. The rhythm systems
+# give the kick the first former FM channel and snare, tom, cymbal and hi-hat
+# the next four (sysDef.cpp); the kick keeps its two operators, so it plays a
+# normal OPL voice.
+OPL_CHIP = {("opl", False): CHIP_OPL, ("opl2", False): CHIP_OPL2,
+            ("opl3", False): CHIP_OPL3, ("opl", True): CHIP_OPL_DRUMS,
+            ("opl2", True): CHIP_OPL2_DRUMS, ("opl3", True): CHIP_OPL3_DRUMS}
+OPL_CHANNELS = {("opl", False): 9, ("opl2", False): 9, ("opl3", False): 18,
+                ("opl", True): 11, ("opl2", True): 11, ("opl3", True): 20}
+OPL_MELODIC = {("opl", False): 9, ("opl2", False): 9, ("opl3", False): 18,
+               ("opl", True): 6, ("opl2", True): 6, ("opl3", True): 15}
+# Furnace's channel labels. An OPL3 pair whose first channel is even can head a
+# four-operator voice, and the system names it that way whether or not a note
+# uses it.
+OPL_DRUM_LABELS = (
+    ("Kick/FM 7", "BD"), ("Snare", "SD"), ("Tom", "TM"), ("Top", "TP"),
+    ("HiHat", "HH"),
+)
+
+
+def opl_channel_names(kind: str, drums: bool) -> tuple[list[str], list[str]]:
+    """The long and short channel names of one OPL system (sysDef.cpp).
+
+    The kick is the FM channel rhythm mode takes over, so its label keeps both
+    names. An OPL3 shortens every channel to its number and marks the pairs
+    that can head a four-operator voice.
+    """
+    total = OPL_CHANNELS[(kind, drums)]
+    melodic = OPL_MELODIC[(kind, drums)]
+    long_names: list[str] = []
+    short_names: list[str] = []
+    for ch in range(total):
+        if drums and ch >= melodic:
+            where = min(ch - melodic, len(OPL_DRUM_LABELS) - 1)
+            long_name = (
+                f"Kick/FM {melodic + 1}" if where == 0 else OPL_DRUM_LABELS[where][0]
+            )
+            short_name = OPL_DRUM_LABELS[where][1]
+        elif kind == "opl3":
+            long_name = (
+                f"4OP {ch + 1}" if ch < 12 and not (ch & 1) else f"FM {ch + 1}"
+            )
+            short_name = str(ch + 1)
+        else:
+            long_name, short_name = f"FM {ch + 1}", f"F{ch + 1}"
+        long_names.append(long_name)
+        short_names.append(short_name)
+    return long_names, short_names
+
 INS_OPM = 33
 # DIV_INS_FM: the generic OPN instrument used by the YM2203.  Furnace reads
 # its 0x70/0x90 fields from the same INS2 "FM" feature.
 INS_FM = 1
+# DIV_INS_OPL and its drums sibling. The OPL editor shows two operators per
+# voice, and the drums instrument carries the snare/tom/cymbal/hi-hat
+# operators in its operator slots.
+INS_OPL = 14
+INS_OPL_DRUMS = 32
 INS_MSM6258 = 35
 INS_MSM6295 = 36
 INS_ADPCMA = 37
@@ -246,12 +312,18 @@ def _write_fm_feature(b: Buf, patch) -> None:
     """INS2 'FM' feature.
 
     Operator order matches YM2151/YM2203 register order and Furnace's
-    internal order.
+    internal order. An OPL patch takes the same feature with its own bit
+    layout: no detune, a 6-bit level, and AM/vibrato/sustain/key-scale-rate on
+    the operator instead of PMS/AMS on the channel.
     """
     b.raw(b"FM")
     size_off = len(b.b)
     b.u16(0)
     start = len(b.b)
+    if getattr(patch, "opl", False):
+        _write_opl_fm_feature_body(b, patch)
+        b.b[size_off:size_off + 2] = int(len(b.b) - start).to_bytes(2, "little")
+        return
     flags = 4 | 0x10 | 0x20 | 0x40 | 0x80
     b.u8(flags)
     b.u8(((patch.alg & 7) << 4) | (patch.fb & 7))
@@ -282,6 +354,32 @@ def _write_fm_feature(b: Buf, patch) -> None:
             dt2 = (op.dt2_d2r >> 6) & 3
             b.u8((dt2 & 3) << 3)
     b.b[size_off:size_off + 2] = int(len(b.b) - start).to_bytes(2, "little")
+
+
+def _write_opl_fm_feature_body(b: Buf, patch) -> None:
+    """The 'FM' feature payload of a DIV_INS_OPL or DIV_INS_OPL_DRUMS voice."""
+    four = bool(getattr(patch, "four", False)) or getattr(patch, "drum", False)
+    # Four operator entries always: the reader takes its count from opCount, and
+    # a drums instrument needs all four (snare, tom, cymbal, hi-hat).
+    b.u8(4 | 0x10 | 0x20 | (0x40 | 0x80 if four else 0))
+    b.u8(((patch.alg & 3) << 4) | (patch.fb & 7))
+    # No channel LFO depth: the OPL sets AM and vibrato per operator, so the
+    # tremolo/AMS/FMS byte stays 0. The 4-op instrument flag is the only other
+    # bit the platform reads here, and it selects the pair layout on OPL3.
+    b.u8(0)
+    b.u8(32 if getattr(patch, "four", False) else 0)
+    carriers = set(patch.carriers())
+    for idx in range(4):
+        op = patch.ops[idx]
+        kvs = 2 if idx in carriers else 0
+        b.u8(((op.ksr & 1) << 7) | (op.mult & 15))
+        b.u8(((op.sus & 1) << 7) | (op.tl & 63))
+        b.u8(((op.vib & 1) << 5) | (op.ar & 31))
+        b.u8(((op.am & 1) << 7) | ((op.ksl & 3) << 5) | (op.dr & 31))
+        b.u8(kvs << 5)
+        b.u8(((op.sl & 15) << 4) | (op.rr & 15))
+        b.u8(0)  # deep vibrato and SSG-EG are not OPL fields
+        b.u8(op.ws & 7)
 
 
 def _write_macro(
@@ -351,9 +449,18 @@ def _write_ma(b: Buf, patch=None) -> None:
 
 
 def _write_ins_opm(b: Buf, name: str, patch) -> None:
+    """INS2 for an FM instrument of any family.
+
+    Only the type differs: DIV_INS_OPL and its drums sibling read the same
+    feature, whose payload `_write_fm_feature` picks from the patch.
+    """
+    opl = bool(getattr(patch, "opl", False))
+    ins_type = (
+        INS_OPL_DRUMS if getattr(patch, "drum", False) else INS_OPL
+    ) if opl else (INS_FM if getattr(patch, "opn", False) else INS_OPM)
     size_off, start = b.begin_block(b"INS2")
     b.u16(FUR_VERSION)
-    b.u16(INS_FM if getattr(patch, "opn", False) else INS_OPM)
+    b.u16(ins_type)
     b.raw(b"NA")
     na_size = len(b.b)
     b.u16(0)
@@ -1762,8 +1869,10 @@ def _build_patterns(song: Song, n_ch: int, pat_len_max: int, fx_cols: int,
     # E5 is channel state. Collect it per row and replay in row order, back
     # to the neutral 0x80. One note's fine tune cannot leak into the next.
     note_e5: dict[tuple[int, int], int] = {}
-    # Mid-note carrier-TL fades ride the volume column as (127 - vol) against
-    # the instrument TL. Every FM note-on re-asserts 127 when any note fades.
+    # Mid-note carrier-TL fades ride the volume column as (max - vol) against
+    # the instrument TL. Every FM note-on re-asserts the top of the column when
+    # any note fades. The OPL family's column tops out at 63 (GET_VOLMAX).
+    fm_vol_max = max(1, int(getattr(song, "fm_vol_max", 127)))
     fm_tl = any(
         ev.on and not ev.pcm and ev.tl_pts and 0 <= ev.ch + ch_offset < n_ch
         for ev in song.events
@@ -1918,7 +2027,7 @@ def _build_patterns(song: Song, n_ch: int, pat_len_max: int, fx_cols: int,
                 if cell.note >= 0:
                     _bump(stats, "vol_step_dropped")
                     continue
-                cell.vol = max(0, min(127, 127 - (tl - t0)))
+                cell.vol = max(0, min(fm_vol_max, fm_vol_max - (tl - t0)))
 
     # Pitch sweeps run after every event is placed, so the ramps can share
     # the note-off rows and their ED delays. Note rows are known by now, so
@@ -2204,6 +2313,13 @@ def write_fur(
     fm_family = getattr(song, "fm_chip", "ym2151")
     ym2203 = fm_family == "ym2203"
     ym2612 = fm_family == "ym2612"
+    # The OPL family is one module system per chip: an OPL3 owns both register
+    # banks and all eighteen channels, while a dual YM3812 log adds a second
+    # OPL2 system the way a dual YM2612 log adds a second OPN2.
+    opl_kind = fm_family if fm_family in ("opl", "opl2", "opl3") else None
+    opl = opl_kind is not None
+    opl_drums = bool(getattr(song, "opl_drums", False))
+    opl_ids = list(getattr(song, "opl_ids", ()) or ()) if opl else []
     ym2610 = fm_family == "ym2610"
     ym_chip = ym2203 or ym2612 or ym2610
     ym_ext = bool(
@@ -2223,9 +2339,12 @@ def write_fur(
     # owns FM, SSG and the two ADPCM engines, so either half keeps it.
     if ym2610:
         fm_present = (include_fm or include_pcm) and bool(ym_ids)
+    elif opl:
+        fm_present = include_fm and bool(opl_ids)
     else:
         fm_present = include_fm and (bool(ym_ids) if ym_chip else True)
     fm_ins = song.fm_patches if (fm_present and include_fm) else []
+    
     pcm_smps = [s for s in song.pcm_samples if s.length >= 8] if include_pcm else []
     oki_smps = list(song.oki_samples) if include_pcm else []
     adpcm_smps = list(song.msm6258_samples) if include_pcm else []
@@ -2287,6 +2406,7 @@ def write_fur(
     # K007232 appears only when the source carried usable samples for it, and
     # never beside another sample chip.
     want_k007 = bool(pcm_smps)
+
     if fm_present:
         if ym2610:
             n_fm = (6 if song.ym2610_b else 4) * len(ym_ids)
@@ -2294,6 +2414,8 @@ def write_fur(
             n_fm = (9 if ym_ext else 6) * len(ym_ids)
         elif ym2203:
             n_fm = (6 if ym_ext else 3) * len(ym_ids)
+        elif opl:
+            n_fm = OPL_CHANNELS[(opl_kind, opl_drums)] * len(opl_ids)
         else:
             n_fm = 8
     else:
@@ -2336,8 +2458,11 @@ def write_fur(
     # they shift down to stay inside n_ch.
     if ym2610:
         fm_analysis_block = (6 if song.ym2610_b else 4) + 3 + 6 + 1
+    elif opl:
+        fm_analysis_block = OPL_CHANNELS[(opl_kind, opl_drums)] * len(opl_ids)
     else:
         fm_analysis_block = ((9 if ym_ext else 6) * len(ym_ids)) if ym_chip else 8
+
     orders, patterns, _loop_ord, pat_len = _build_patterns(
         song, n_ch, PAT_LEN_MAX, fx_cols,
         0 if fm_present else -fm_analysis_block,
@@ -2409,6 +2534,22 @@ def write_fur(
             for voice in range(3):
                 names_long.append(f"PSG {cid + 1}-{voice + 1}")
                 names_short.append(f"P{cid + 1}-{voice + 1}")
+    elif opl and fm_present:
+        multi = len(opl_ids) > 1
+        for cid in range(len(opl_ids)):
+            for long_name, short_name in zip(*opl_channel_names(opl_kind, opl_drums)):
+                if not multi:
+                    names_long.append(long_name)
+                    names_short.append(short_name)
+                    continue
+                names_long.append(f"{long_name} ({cid + 1})")
+                # A second system needs a distinct column tag: F2-3 is chip 2's
+                # FM 3, and a rhythm column just carries the instance number.
+                names_short.append(
+                    f"F{cid + 1}-{short_name[1:]}"
+                    if short_name.startswith("F") and short_name[1:].isdigit()
+                    else f"{short_name}{cid + 1}"
+                )
     elif n_fm:
         names_long += [f"FM {i + 1}" for i in range(n_fm)]
         names_short += [f"F{i + 1}" for i in range(n_fm)]
@@ -2461,7 +2602,14 @@ def write_fur(
 
     label_parts: list[str] = []
     if fm_present:
-        if ym2610:
+        if opl:
+            base = {"opl": "OPL", "opl2": "OPL2", "opl3": "OPL3"}[opl_kind]
+            if opl_drums:
+                base += " drums"
+            label_parts.append(
+                f"{base} x{len(opl_ids)}" if len(opl_ids) > 1 else base
+            )
+        elif ym2610:
             base = "YM2610B" if song.ym2610_b else "YM2610"
             label_parts.append(f"{base} x{len(ym_ids)}" if len(ym_ids) > 1 else base)
         elif ym2612:
@@ -2566,8 +2714,10 @@ def write_fur(
     flag_texts: list[str] = []
     ym2610_sys: dict[int, int] = {}
     if fm_present:
-        for cid in (ym_ids or [0]):
-            if ym2612:
+        for _cid in (opl_ids or ym_ids or [0]):
+            if opl:
+                chips.append(OPL_CHIP[(opl_kind, opl_drums)])
+            elif ym2612:
                 chips.append(CHIP_YM2612_EXT if ym_ext else CHIP_YM2612)
             elif ym2203:
                 chips.append(CHIP_YM2203_EXT if ym_ext else CHIP_YM2203)
@@ -2576,6 +2726,19 @@ def write_fur(
                 ym2610_sys[cid] = len(chips) - 1
             else:
                 chips.append(CHIP_YM2151)
+            if opl:
+                # An OPL core defaults to COLOR_NTSC and an OPL3 to four times
+                # it. Outside that tolerance the clock decides every f-num, so
+                # it has to travel with the module.
+                fm_clock = song.vgm.opl3_clock if opl_kind == "opl3" else (
+                    song.vgm.opl2_clock if opl_kind == "opl2" else song.vgm.opl_clock
+                )
+                default = FURNACE_CLOCK_OPL3 if opl_kind == "opl3" else FURNACE_CLOCK
+                module = opl_module_clock(fm_clock, opl_kind == "opl3")
+                flag_texts.append(
+                    "" if module == default else f"customClock={fm_clock}"
+                )
+                continue
             if ym2612:
                 fm_clock = song.vgm.ym2612_clock
                 # Furnace's Genesis default is COLOR_NTSC*15/7 truncated to
@@ -2665,6 +2828,9 @@ def write_fur(
     b.raw(bytes(chips) + bytes(32 - n_chips))
     vols = bytearray([64] * 32)
     chip_vols: list[float] = []
+    # Per-chip balance. Only a Sound Blaster Pro YM3812 pair sets it: the board
+    # wires one chip to each speaker, and the log says so in header bit 31.
+    chip_pans: list[float] = []
     k_vol = min(1.0, max(0.0, song.k007232_volume))
     chip_counts = Counter(chips)
     for i, chip in enumerate(chips):
@@ -2678,6 +2844,11 @@ def write_fur(
         else:
             cv = 1.0
         chip_vols.append(cv)
+        pan = 0.0
+        if (opl and opl_kind == "opl2" and len(opl_ids) > 1
+                and getattr(song.vgm, "opl2_pan", False)):
+            pan = -1.0 if i == 0 else 1.0
+        chip_pans.append(pan)
     # A chip volume above 1.0 (the MSM6258 player default is 0x11E) does not
     # fit Furnace's 0-64 field. Raise the song master instead and scale every
     # chip down by the same factor so the source mix is preserved exactly.
@@ -2738,10 +2909,13 @@ def write_fur(
 
     # extra chip output (>=135), one (vol, panL, panR) triple per chip. The
     # player multiplies this by the master, exactly like the byte field, so a
-    # boosted chip stores its share of the raised master.
-    for cv in chip_vols:
+    # boosted chip stores its share of the raised master. All three floats must
+    # be written: Furnace reads vol, pan and front/rear per chip in order, and a
+    # short array leaves every later offset out of step (its loader then fails on
+    # a directory pointer and reports "couldn't read wavetable directory").
+    for i, cv in enumerate(chip_vols):
         b.f32(cv / master_gain)
-        b.f32(0.0)
+        b.f32(chip_pans[i] if i < len(chip_pans) else 0.0)
         b.f32(0.0)
     b.u32(0)  # patchbay connections
     b.u8(1)  # automatic patchbay (>=136), required or the song is silent
@@ -2769,7 +2943,10 @@ def write_fur(
     ins_ptrs: list[int] = []
     for i, patch in enumerate(fm_ins):
         ins_ptrs.append(len(b))
-        fam = "OPN" if getattr(patch, "opn", False) else "OPM"
+        if getattr(patch, "opl", False):
+            fam = "OPL3" if getattr(patch, "four", False) else "OPL"
+        else:
+            fam = "OPN" if getattr(patch, "opn", False) else "OPM"
         _write_ins_opm(b, patch.name or f"{fam} {i:02d}", patch)
 
     for group in range(n_dac_ins):

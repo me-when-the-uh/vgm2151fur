@@ -181,7 +181,22 @@ def _verify_runs(
         if w.chip in ("ym2610", "ym2610_ssg")
     }
     has_opm = any(w.chip == "ym2151" for w in src_vgm.writes)
-    if ym2610_ids and not has_opm:
+    
+    opl_kind = next(
+        (k for k in ("opl3", "opl2", "opl")
+         if any(w.chip == k for w in src_vgm.writes)), None)
+    if opl_kind:
+        # A rhythm module keeps the kick and four kit columns past the melodic
+        # ones; an OPL3 owns both register banks in one system.
+        from vgm2151fur.opl import channel_count as opl_channels
+
+        drums = any(
+            w.chip == opl_kind and (w.reg & 0xFF) == 0xBD and (w.val & 0x20)
+            for w in src_vgm.writes
+        )
+        ids = {w.chip_id for w in src_vgm.writes if w.chip == opl_kind}
+        channels = opl_channels(opl_kind, drums) * max(1, len(ids))
+    elif ym2610_ids and not has_opm:
         # 14 channels, 16 on the B variant.  ADPCM channels have no pitch
         # stream, so pitch_runs returns nothing for them.
         channels = (16 if getattr(src_vgm, "ym2610_b", False) else 14) * len(

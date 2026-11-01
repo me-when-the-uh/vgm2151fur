@@ -22,7 +22,11 @@ from pathlib import Path
 from vgm2151fur.analyze import kc_kf_units
 from vgm2151fur.ay8910 import ay_min_period
 from vgm2151fur.furnace import export_vgm
-from vgm2151fur.vgm import load_vgm
+from vgm2151fur.opl import (
+    N as OPL_N, SLOT_ADDR, OPLState, channel_count, is_drum_channel,
+    opl_pitch_units,
+)
+from vgm2151fur.vgm import VGM_RATE, load_vgm
 from vgm2151fur.ym2203 import opn_pitch_units
 from vgm2151fur.ym2610 import (
     CHAN_OFF_4,
@@ -422,6 +426,106 @@ def ym2612_keyed_intervals(vgm, ch: int) -> list[tuple[int, int]]:
     return out
 
 
+def _opl_kind(vgm) -> str | None:
+    """The OPL family this log drives, if any."""
+    for kind in ("opl3", "opl2", "opl"):
+        if any(w.chip == kind for w in vgm.writes):
+            return kind
+    return None
+
+
+def _opl_channel(vgm, ch: int) -> tuple[str, int, int] | None:
+    """(kind, chip_id, column) of a module channel.
+
+    Returns None when the channel is not an OPL voice it can measure: past the
+    last chip, or one of a rhythm module's kit columns. Two percussion voices
+    share one frequency register there - snare with hi-hat, tom and cymbal with
+    each other - so the byte at a hit belongs to whichever was written last and
+    says nothing about the voice being compared.
+    """
+    kind = _opl_kind(vgm)
+    if kind is None:
+        return None
+    drums = any(
+        w.chip == kind and (w.reg & 0xFF) == 0xBD and (w.val & 0x20)
+        for w in vgm.writes
+    )
+    chunk = channel_count(kind, drums)
+    ids = sorted({w.chip_id for w in vgm.writes if w.chip == kind}) or [0]
+    index, col = divmod(ch, chunk)
+    if index >= len(ids):
+        return None
+    if drums and is_drum_channel(kind, True, col):
+        return None
+    return kind, ids[index], col
+
+
+def opl_pitch_stream(vgm, ch: int) -> list[tuple[int, int]]:
+    """(sample, pitch units) for one OPL-family voice channel.
+
+    The unit is ``fnum << block`` expressed in 1/64 semitone, so a comparison
+    between two streams of the same chip is a pitch difference. Only the channel
+    that owns the frequency register is followed: on an OPL3 four-operator pair
+    that is the head, whose partner stays silent.
+    """
+    mapped = _opl_channel(vgm, ch)
+    if mapped is None:
+        return []
+    kind, cid, col = mapped
+    st = OPLState(kind, False)
+    cm = st.chan_map[col]
+    port = ((cm >> 8) & 1) if st.opl3 else 0
+    off = cm & 0xFF
+    lo: int | None = None
+    out: list[tuple[int, int]] = []
+    for w in vgm.writes:
+        if w.chip != kind or w.chip_id != cid:
+            continue
+        if st.opl3 and ((w.reg >> 8) & 1) != port:
+            continue
+        r = w.reg & 0xFF
+        if r == 0xA0 + off:
+            lo = w.val
+        elif r == 0xB0 + off and lo is not None:
+            block = (w.val >> 2) & 7
+            out.append((w.sample, int(round(opl_pitch_units(
+                block, ((w.val & 3) << 8) | lo)))))
+    return out
+
+
+def opl_keyed_intervals(vgm, ch: int) -> list[tuple[int, int]]:
+    """Spans where one OPL-family voice holds its key bit."""
+    mapped = _opl_channel(vgm, ch)
+    if mapped is None:
+        return []
+    kind, cid, col = mapped
+    st = OPLState(kind, False)
+    cm = st.chan_map[col]
+    port = ((cm >> 8) & 1) if st.opl3 else 0
+    target = (port, 0xB0 + (cm & 0xFF))
+    out: list[tuple[int, int]] = []
+    on = False
+    start = 0
+    for w in vgm.writes:
+        if w.chip != kind or w.chip_id != cid:
+            continue
+        addr = (((w.reg >> 8) & 1) if st.opl3 else 0, w.reg & 0xFF)
+        if addr != target:
+            continue
+        now = bool(w.val & 0x20)
+        if now and not on:
+            start, on = w.sample, True
+        elif not now and on:
+            out.append((start, w.sample))
+            on = False
+    if on:
+        end = vgm.total_samples or (
+            max((w.sample for w in vgm.writes), default=start) + 1
+        )
+        out.append((start, end))
+    return out
+
+
 def _ym2610_chip_ids(vgm) -> list[int]:
     return sorted({
         w.chip_id for w in vgm.writes if w.chip in ("ym2610", "ym2610_ssg")
@@ -571,12 +675,93 @@ def ym2610_keyed_intervals(vgm, ch: int) -> list[tuple[int, int]]:
                 on = False
     else:
         return []
+
     if on:
         end = vgm.total_samples or (
             max((w.sample for w in vgm.writes), default=start) + 1
         )
         out.append((start, end))
     return out
+
+
+def opl_attacks(vgm, kind: str | None = None, drums: bool | None = None):
+    """[(chip_id, column, sample, register image)] at each key-on, folded per sample.
+
+    A driver that re-attacks quickly writes the new voice's operator levels and
+    its key bit in one sample, interleaved with the previous note's release. The
+    chip applies those in stream order; a tracker row holds one value, so the
+    state that matters - and the state :mod:`vgm2151fur.analyze` snapshots when
+    it opens a note - is the register set once that sample is finished. This walk
+    gives exactly that: every write of a sample is applied, then its key edges
+    emit an image. Comparing two streams this way says whether a converted module
+    hands the chip the same registers the rip did.
+
+    Bank B of an OPL3 keeps its number in bit 8, and the keys it reports are
+    columns of Furnace's own table, so a four-operator voice and the kit's shared
+    frequency registers are named as the engine names them.
+    """
+    if kind is None:
+        kind = _opl_kind(vgm)
+        if kind is None:
+            return []
+    st = OPLState(kind, bool(drums) if drums is not None else any(
+        w.chip == kind and (w.reg & 0xFF) == 0xBD and (w.val & 0x20)
+        for w in vgm.writes))
+    chan_of: dict[tuple[int, int], list[int]] = {}
+    for fch, cm in enumerate(st.chan_map):
+        chan_of.setdefault((((cm >> 8) & 1) if st.opl3 else 0, cm & 0xFF),
+                           []).append(fch)
+    per: dict[int, list] = {}
+    for w in vgm.writes:
+        if w.chip == kind:
+            per.setdefault(w.chip_id, []).append(w)
+    out = []
+    for cid, ws in per.items():
+        image: dict[tuple[int, int], int] = {}
+        keyed: dict[tuple[int, int], bool] = {}
+        trig = 0
+        i, n = 0, len(ws)
+        while i < n:
+            sample = ws[i].sample
+            j = i + 1
+            while j < n and ws[j].sample == sample:
+                j += 1
+            edges: list[tuple[int, int]] = []
+            for w in ws[i:j]:
+                port = ((w.reg >> 8) & 1) if st.opl3 else 0
+                r = w.reg & 0xFF
+                image[(port, r)] = w.val
+                if 0xB0 <= r <= 0xB8:
+                    on = bool(w.val & 0x20)
+                    if on and not keyed.get((port, r), False):
+                        for fch in chan_of.get((port, r - 0xB0), ()):
+                            if not st.drums or fch < st.melodic:
+                                edges.append((fch, -1))
+                    keyed[(port, r)] = on
+                elif r == 0xBD and not st.opl3:
+                    bits = (w.val & 0x1F) if (w.val & 0x20) else 0
+                    for k in range(5):
+                        bit = 1 << (4 - k)
+                        if (bits & bit) and not (trig & bit):
+                            edges.append((st.melodic + k, bit))
+                    trig = bits
+            for fch, _bit in edges:
+                out.append((cid, fch, sample, dict(image)))
+            i = j
+    return out
+
+
+def opl_voice_addrs(kind: str, drums: bool, col: int, image) -> list[int]:
+    """Operator addresses of the voice a column owns in one register image.
+
+    Four when the sample's ``0x104`` pairs the column with its neighbour: such a
+    voice takes two operators from each hardware channel of the pair.
+    """
+    st = OPLState(kind, drums)
+    four = (st.opl3 and col < 12 and not (col & 1)
+            and bool((image.get((1, 0x04), 0) >> (col // 2)) & 1))
+    return [SLOT_ADDR[st.slots[row][col]] for row in range(4 if four else 2)
+            if col < len(st.slots[row]) and st.slots[row][col] != OPL_N]
 
 
 def pitch_runs(
@@ -593,19 +778,24 @@ def pitch_runs(
     samples both states. A short mismatch inside a glide is ignored while a
     held wrong pitch is reported with its full span.  For YM2203 chips the
     driver keeps writing f-num during the gaps between notes, so the
-    comparison only counts samples where the source has a keyed operator.
+    comparison only counts samples where the source has a keyed operator. An
+    OPL-family voice additionally trims its key, because a row-tick note and the
+    sample the driver used do not coincide.
     """
     opnb = any(
         w.chip in ("ym2610", "ym2610_ssg") for w in src_vgm.writes
     )
     opn = any(w.chip == "ym2203" for w in src_vgm.writes)
     opn2 = any(w.chip == "ym2612" for w in src_vgm.writes)
+    opl = _opl_kind(src_vgm) is not None
     if opnb:
         stream = ym2610_pitch_stream
     elif opn2:
         stream = ym2612_pitch_stream
     elif opn:
         stream = opn_pitch_stream
+    elif opl:
+        stream = opl_pitch_stream
     else:
         stream = kc_kf_stream
     a = stream(src_vgm, ch)
@@ -638,6 +828,22 @@ def pitch_runs(
             return any(s <= t < e for s, e in intervals)
     elif opn:
         intervals = opn_keyed_intervals(src_vgm, ch)
+        times |= {s for s, _e in intervals}
+        times |= {e for _s, e in intervals}
+
+        def keyed_at(t: int) -> bool:
+            return any(s <= t < e for s, e in intervals)
+    elif opl:
+        # The OPL keeps the last f-num in its register after a release, and a
+        # rhythm column shares one register with another drum, so only the spans
+        # where this voice itself held the key are compared. A module places a
+        # note on a row tick while the driver wrote it at an exact sample, so the
+        # two agree only a few milliseconds apart at each boundary: comparing
+        # there would measure that drift as wrong pitch. Trim the ends, and a
+        # note shorter than the trim drops out - grace notes carry no evidence.
+        trim = int(0.035 * VGM_RATE)
+        intervals = [(s + trim, e - trim) for s, e in opl_keyed_intervals(src_vgm, ch)
+                     if e - s > 2 * trim]
         times |= {s for s, _e in intervals}
         times |= {e for _s, e in intervals}
 

@@ -13,6 +13,7 @@ Current behavior:
 - Finished packs keep the old per-module master and chip mix when they are rebuilt from a batch; the converter only supplies chip defaults. The 288 tracks without an old module were gain-matched to their source render and use YM2151 chip 0.5 to keep the old new-pack FM/sample balance.
 - Condensed `xN` variants are not emitted when the measured source grid is low-confidence. Keep the 1x module.
 - YM2610 support covers the base 14-channel layout and the 16-channel B variant. The FM pitch model uses `fmFreqBase = 9440540`. ADPCM-A uses a fixed `clock/432` rate. ADPCM-B stores the source rate with the `8363/8372` correction. The reference packs are Night Striker, Viewpoint and Metal Slug 3; `docs/ym2610.md` has the audit method and residuals.
+- The OPL family (YM3526/OPL, YM3812/OPL2, YMF262/OPL3) is converted with Furnace's own channel and slot tables; `docs/opl.md` has the details. Rhythm mode is its own system (`0xA2`/`0xA3`/`0xA4`) because bank A's last FM channels become the kit, and four-operator voices stay inside `0x91`: an OPL3's `chanMap` interleaves each pair, so only an even column heads a voice and its algorithm is read from two `0xCn` registers. Key bits are deferred to the end of a same-sample group (as on the YM2612) - an attack comparison that reads registers inside a sample reports diffs that are not there, which `diag.opl_attacks()` exists to avoid.
 
 Commands:
 
@@ -25,7 +26,7 @@ python tools/fur2vgm.py out/track.fur -o out/track.vgm
 python tools/fur_soundcheck.py "track.vgz" out/track.fur
 ```
 
-Read `implementation-notes.md` before changing the pipeline and the relevant chip note before changing a state machine. The test suite is `python -m pytest -q` (394 passed, 1 skipped in the current tree). Regenerate affected packs after a converter change; do not commit generated modules or `.fur` files unless asked.
+Read `implementation-notes.md` before changing the pipeline and the relevant chip note before changing a state machine. Run the tests with `python -m unittest discover -s tests` (455 passed, 4 skipped in the current tree; no test-runner package is installed - a bare `pytest` fails, and `python -m unittest tests.test_vgm2151fur_opl` is the OPL-family subset). Furnace is needed for the round-trip tests; without it those skip. Regenerate affected packs after a converter change; do not commit generated modules or `.fur` files unless asked.
 
 ## Accuracy gate
 

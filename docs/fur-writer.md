@@ -56,7 +56,8 @@ triples start 31 bytes plus 12 per chip before the first ADIR pointer.
 ## Chip IDs and flags
 
 - `0x82` YM2151, `0x8D` YM2203, `0x83` YM2612 (`0xA0` Ext, `0xC1` CSM),
-  `0xA5` YM2610, `0x9E` YM2610B,
+  `0x8F` OPL (YM3526), `0x90` OPL2 (YM3812), `0x91` OPL3 (YMF262) and their
+  rhythm variants `0xA2`, `0xA3`, `0xA4`, `0xA5` YM2610, `0x9E` YM2610B,
   `0x03` SN76489 (SMS), `0xC6` K007232, `0xAA` MSM6295, `0xAB` MSM6258,
   `0x9B` SegaPCM, `0xCE` C140, `0xCC` Konami K053260, `0xD0` C352,
   `0xA1` Konami SCC (K051649),
@@ -69,12 +70,18 @@ triples start 31 bytes plus 12 per chip before the first ADIR pointer.
   with channel 3 split into its four operator columns. A Genesis source adds
   a second `0x03` system after it: four SN76489 channels (three tone then
   noise), for ten channels total. A dual source writes two systems in chip
-  order.
+  order. An OPL is nine channels, an OPL3 eighteen; rhythm mode is its own
+  system with the kit's columns after the melodic ones (eleven, or twenty).
 - The YM2151 flag carries `customClock=` when the source clock is not
   3579545: a 4 MHz OPM plays flat otherwise. Each YM2203 system carries the
   same flag for its own clock (default 3579545). The YM2612 default is the
   Genesis clock truncated to 7670454, so a 7670453 header also gets the flag;
-  this keeps the exported f-num/block identical to the source.
+  this keeps the exported f-num/block identical to the source. An OPL and an
+  OPL2 use the same default as the YM2151; the OPL3's is `COLOR_NTSC * 4`,
+  which a header rounded to 14318180 misses by two hertz - so it keeps the
+  flag, while a value that is the default to within about 2 Hz does not:
+  identical phase steps either way, and writing the crystal keeps a shared
+  module in tune with its own log.
 - The K007232 flag carries `stereo=true` and a clock when it differs from the
   default.
 - The K053260 flag selects `clockSel=0` (COLOR_NTSC) or `clockSel=1` (4 MHz)
@@ -116,6 +123,19 @@ macro (code 4) on an instrument copy reproduces later f-num writes; the note's
 E5 carries the key-on remainder.
 
 YM2612 instruments use the same type 1 and OPN operator layout. They also carry the channel's PMS/AMS in the FM feature, and the carrier TLs are stored relative to the loudest carrier while the note's volume column carries the absolute level (Furnace's `newVolumeScaling` makes that exact). The DAC uses `DIV_INS_AMIGA` sample maps of 120 slots with `first_sample=0`; pattern note `60+slot` selects a release-capped PCM chunk. `collect_dac(..., slices=True)` is the explicit per-run slice mode. The SN76489 uses a plain `DIV_INS_STD` instrument (pitch macro only), a 0-15 volume column, and effect `20xy` for noise mode; its system volume defaults to 0.500, and an absolute extra-header volume entry overrides it. The FM feature's four operator columns of the Ext system share one timbre instrument.
+
+OPL-family instruments are `DIV_INS_OPL` (type 14) for a voice and
+`DIV_INS_OPL_DRUMS` (type 32) for a single-operator percussion column, both with
+the `FM` feature and eight bytes per operator: `(ksr<<7)|mult`, the level with
+the sustain flag, attack rate with the vibrato flag, decay rate with key-scale
+level and am, a key-scale/output byte, sustain level with release, a reserved
+byte (an OPL has no SSG envelope) and the waveform. Only the YM3526 leaves that
+last byte out of the log, since it has no waveform register. A carrier is marked
+by `kvs`, which routes the volume column to it; that column's maximum is 63, an
+operator level being six bits. As on the YM2612 a carrier's logged attenuation is
+stored relative, so notes of one patch share an instrument and the absolute level
+comes from the note; a kit cannot, because its four columns read one instrument,
+so a percussion note writes the column move directly.
 
 PCM instruments bind one sample each: K007232 two channels, K053260 four
 voices per chip, MSM6295 four voices per chip, MSM6258 one, SegaPCM sixteen,
@@ -167,6 +187,15 @@ units. The note is chosen by inverting Furnace's linear note -> block/f-num
 conversion; it does not use the per-row sweep model. The YM2612's
 `fmFreqBase` is 9437184, twice the YM2203's, so the same note number plays an
 octave above a YM2203 and the inverse uses that platform's own formula.
+
+The OPL family runs in linear pitch mode too, on a frequency table whose base is
+`32768 * 72` for an OPL or OPL2 and `32768 * 288` for an OPL3 (`COLOR_NTSC` and
+`COLOR_NTSC * 4`, so both give the same phase step). One E5 unit is again
+1/128 semitone: `calcFreq`'s multiplier only scales the legacy non-linear path,
+never the table. `toFreq` takes `(unit / 686).bit_length()` as the block -
+Furnace's `bsr` counts bits, so it names one higher than the highest set bit -
+and shifts the rest into the f-num, which is why a converted note may reach the
+chip as another split of the same `fnum << block` (`docs/opl.md`).
 
 Two effects move pitch, and their scales differ per platform:
 

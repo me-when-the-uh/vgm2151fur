@@ -473,7 +473,8 @@ def _add_convert_flags(parser: argparse.ArgumentParser, *, bare: bool) -> None:
     )
     parser.add_argument("--melody-only", action="store_true", help="skip sample chips")
     parser.add_argument("--pcm-only", action="store_true",
-                        help="skip the YM2151/YM2203/YM2612/YM2610")
+                        help="skip the YM2151/YM2203/YM2612/YM2610 and "
+                             "OPL-family FM")
     parser.add_argument(
         "--no-normalize",
         action="store_true",
@@ -498,7 +499,8 @@ def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
         prog="vgm2151fur",
         description=(
-            "Transcribe YM2151 (OPM), YM2203 (OPN) and YM2612 (OPN2) + "
+            "Transcribe YM2151 (OPM), YM2203 (OPN), YM2612 (OPN2), YM2610 and "
+            "OPL-family (YM3526/YM3812/YMF262) + "
             "sample-chip (K007232, MSM6295, MSM6258, SegaPCM, C140, C352, "
             "K053260) "
             "VGMs into Furnace .fur files, and edit the result."
