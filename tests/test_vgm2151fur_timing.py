@@ -267,10 +267,11 @@ class TestPercussionSweeps(unittest.TestCase):
         self.assertEqual(notes[0].sweep, ())
         self.assertEqual(notes[1].note, 97)
 
-    def test_single_mid_note_step_is_a_legato_transpose(self):
-        # A driver that slams the octave writes one KC pair mid-note and
-        # holds it. That is a retune, not a glide: E8/E9 plus the fine-tune
-        # remainder carries it exactly instead of smearing it over a row.
+    def test_single_mid_note_step_lands_at_once(self):
+        # A driver that slams the octave mid-note and holds it is a hard pitch
+        # change, not a glide: it lands as an instant transpose on its own row.
+        # The old ramp could not cross an octave inside a row, so the note
+        # arrived late and stayed flat until the next key-on.
         writes = [
             ChipWrite(sample=k * 5000, chip="ym2151", chip_id=0, reg=0x08, val=0x78)
             for k in range(60)
@@ -285,6 +286,14 @@ class TestPercussionSweeps(unittest.TestCase):
         self.assertEqual(note.sweep, ())
         data = write_fur(song, include_pcm=False, include_fm=True)
         m = parse_fur(data)
+        rows = [
+            row for (ch, _i), pat in m.patterns.items() if ch == 4
+            for row in pat
+        ]
+        down = [v for r in rows for c, v in r.fx if c == 0xE9]
+        self.assertEqual(down, [12], "the octave should land as one hard transpose")
+        rates = [v for r in rows for c, v in r.fx if c in (0x01, 0x02) and v]
+        self.assertEqual(rates, [])
         fx = [
             (c, v) for (ch, _i), rows in m.patterns.items() if ch == 4
             for r in rows for c, v in r.fx
@@ -368,11 +377,13 @@ def _traj_at(pts, t):
 class TestSweepEncoder(unittest.TestCase):
     """Structural guarantees of furwrite._emit_sweep.
 
-    The writer samples the driver's step trajectory at row boundaries: the
-    last (partial) row must be rated over its full span so the ramp lands on
-    the trajectory's held final value instead of overshooting; a later note's
-    own row may carry this sweep's stop but never a nonzero rate or fine tune;
-    jumps that land on a row boundary become E5 steps.
+    The writer samples the driver's step trajectory at row boundaries: a chain
+    of steps that keeps going in one direction is a slide and gets a per-row
+    ramp, whose last (partial) row must be rated over its full span so the ramp
+    lands on the trajectory's held final value instead of overshooting; a hard
+    step with still rows around it is a note change and lands at once on its own
+    row; a later note's row may carry this sweep's stop but never a nonzero rate
+    or fine tune.
     """
 
     HZ = 510.2018127441406  # speed 7 -> 605.1-sample rows
@@ -444,9 +455,11 @@ class TestSweepEncoder(unittest.TestCase):
         # The tail still travels on the last row this sweep owns.
         self.assertNotEqual(self._rate(rows[next_row - 1]), 0)
 
-    def test_jump_after_row_start_becomes_e5(self):
-        # A driver jump just after a row start is snapped with E5 (clamped to
-        # the fine-tune range) instead of being left to the ramp.
+    def test_hard_step_inside_a_row_lands_at_once(self):
+        # A hard step with still rows around it is a note change, not the start
+        # of a slur: its row takes an E9xx transpose plus the remainder E5 can
+        # carry, and no ramp. Clamping an isolated jump to the fine-tune range
+        # left the pitch most of a semitone short until the next key-on.
         row_len = 44100.0 * 7 / self.HZ
         pts = ((int(2 * row_len), 0), (int(2 * row_len) + 86, -300), (12000, -300))
         ev = NoteEvent(sample=1000, ch=2, on=True, note=108, ins=0, vol=-1,
@@ -454,33 +467,63 @@ class TestSweepEncoder(unittest.TestCase):
         song = self._song([ev, NoteEvent(sample=20000, ch=2, on=False, note=180,
                                          ins=-1, vol=-1, e5=0x80, pan=0)])
         rows = self._rows(song, 2)
-        e5 = [v for c, v in rows[2].fx if c == 0xE5]
-        self.assertEqual(e5, [0x40])  # -300 clamped to -64 (fine-tune range)
+        fx = rows[2].fx
+        self.assertEqual([v for c, v in fx if c == 0xE9], [5])
+        # Five semitones down is -320, so the fine tune owes the row +20.
+        self.assertEqual([v for c, v in fx if c == 0xE5], [0x80 + 20])
+        self.assertFalse([v for c, v in fx if c in (0x01, 0x02) and v])
 
-    def test_tail_pin_does_not_double_count(self):
-        # A riser that reaches its held value inside the last row. The last
-        # row is already rated over its full span, so the E5 pin only fixes
-        # the rounding residue; subtracting the tail's travel again dropped
-        # the pitch by up to a whole tone and E5 could not express it,
-        # leaving the note flat until the next key-on.
+    def test_isolated_jump_lands_on_transpose_plus_fine(self):
+        # The transpose and the E5 remainder have to add up to the driver's
+        # step: -6 whole semitones would leave the note a semitone flat, and an
+        # E5 of its own beyond +-64 units cannot be expressed at all.
         row_len = 44100.0 * 7 / self.HZ
-        pts = ((1000 + int(2 * row_len), 0), (1000 + int(3.3 * row_len), 400))
+        pts = ((1000 + int(2 * row_len), 0), (1000 + int(3.3 * row_len), -420))
         ev = NoteEvent(sample=1000, ch=2, on=True, note=108, ins=0, vol=-1,
                        e5=0x80, pan=0, end=20000, sweep=pts)
         song = self._song([ev, NoteEvent(sample=20000, ch=2, on=False, note=180,
                                          ins=-1, vol=-1, e5=0x80, pan=0)])
         rows = self._rows(song, 2)
-        # A single steady ramp: its rows need no E5 steps, and the trajectory
-        # ends *inside* the last ramping row, which is rated over its full span
-        # so the ramp lands on the held value at the row end.  The pin must
-        # therefore be the note's own fine tune (no write at all): the old
-        # double-counted tail term wrote a bogus offset here.
-        e5 = [(r, v) for r, cell in sorted(rows.items()) for c, v in cell.fx if c == 0xE5]
-        # Only the ramp's rounding residue may be corrected: the old tail term
-        # subtracted the travel the last row had already been rated for, which
-        # clamped E5 to its limit and left the held note a semitone flat.
-        for row, val in e5:
-            self.assertLessEqual(abs(val - 0x80), 4, f"row {row}: E5 {val:02X}")
+        cell = next(
+            r for r in rows.values()
+            if any(c == 0xE9 and v for c, v in r.fx)
+        )
+        up = sum(v for c, v in cell.fx if c == 0xE8)
+        down = sum(v for c, v in cell.fx if c == 0xE9)
+        e5 = [v for c, v in cell.fx if c == 0xE5]
+        self.assertEqual(down - up, 7)  # the whole semitones it can spend
+        self.assertTrue(e5, "the remainder needs a fine tune")
+        # Transpose plus fine tune have to add up to the driver's step.
+        self.assertEqual((up - down) * 64 + (e5[0] - 0x80), -420)
+
+    def test_glides_keep_their_ramp(self):
+        # A chain of steps that carries on in the same direction is a slide: it
+        # must stay a per-row ramp, however big each row's move is. Turning the
+        # driver's glides into legatos was the bug this whole split guards. The
+        # E5 writes are only the ramp's rounding residue, so they stay near the
+        # note's own fine tune: a pin that double-counted the row's travel used
+        # to leave the held note a semitone flat.
+        row_len = 44100.0 * 7 / self.HZ
+        pts = tuple(
+            (1000 + int(k * row_len / 2), -80.0 * k) for k in range(1, 9)
+        )
+        ev = NoteEvent(sample=1000, ch=2, on=True, note=108, ins=0, vol=-1,
+                       e5=0x80, pan=0, end=20000, sweep=pts)
+        song = self._song([ev, NoteEvent(sample=20000, ch=2, on=False, note=180,
+                                         ins=-1, vol=-1, e5=0x80, pan=0)])
+        rows = self._rows(song, 2)
+        self.assertFalse(
+            [v for r in rows.values() for c, v in r.fx if c in (0xE8, 0xE9)],
+            "a glide must not be chopped into quick legatos",
+        )
+        self.assertTrue([self._rate(r) for r in rows.values()], "no ramp written")
+        for row, val in (
+            (r, v) for r, cell in sorted(rows.items())
+            for c, v in cell.fx if c == 0xE5
+        ):
+            self.assertLessEqual(
+                abs(val - 0x80), 16, f"row {row}: E5 {val:02X}"
+            )
 
 
 class TestKeyOnOperatorMask(unittest.TestCase):

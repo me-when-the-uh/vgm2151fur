@@ -314,7 +314,10 @@ class TestK053260RegisterModel(unittest.TestCase):
             [(40, None), (40, 0xF0), (40, 0xF7)],
         )
 
-    def test_pitch_change_becomes_a_sweep(self):
+    def test_pitch_change_becomes_a_hard_jump(self):
+        # Halving the sample rate mid-note is one step of an octave that then
+        # holds, so it lands as an instant transpose. A 02xx slur down there
+        # whistles through every pitch in between, which the driver never wrote.
         writes = self._key_writes(pitch=0xFC0)
         writes += _regs(80000, pitch_lo=0x80, pitch_hi=0x0F)  # 0xF80, half rate
         song = self._song(writes)
@@ -326,11 +329,14 @@ class TestK053260RegisterModel(unittest.TestCase):
             row for (ch, _idx), pat in mod.patterns.items() if ch == 8
             for row in pat
         ]
-        speed = song.speed or 1
-        params = [v for r in rows for c, v in r.fx if c == 0x02]
-        self.assertIn(round(min(255.0, 1536.0 / speed)), params)
+        down = [v for r in rows for c, v in r.fx if c == 0xE9]
+        self.assertEqual(down, [12])
+        rates = [v for r in rows for c, v in r.fx if c in (0x01, 0x02) and v]
+        self.assertEqual(rates, [])
         note_row = next(r for r in rows if 0 <= r.note < 180)
-        self.assertFalse(any(c in (0x01, 0x02) for c, _v in note_row.fx))
+        self.assertFalse(
+            any(c in (0x01, 0x02, 0xE8, 0xE9) for c, _v in note_row.fx)
+        )
 
     def test_second_instance_uses_its_own_channels(self):
         body = _body()
