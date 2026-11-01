@@ -1628,8 +1628,9 @@ def _bind_fm_pitch(
     """Turn YM2203/YM2612 f-num trajectories into instrument pitch macros.
 
     `pitch2` is a 1/128-semitone offset. A macro carries the driver's
-    motion without row quantization. `allow_steps` (YM2612) encodes short
-    steps as row effects instead. Returns (copies made, row-ramp fallbacks).
+    motion without row quantization. `allow_steps` (the OPN and OPL
+    families) encodes short steps as row effects instead. Returns (copies
+    made, row-ramp fallbacks).
     """
     moving = [e for e in events if e.on and e.fm_pitch_pts]
     if not moving:
@@ -4884,7 +4885,7 @@ def analyze(
     fm_pitch_copies, fm_pitch_lost = _bind_fm_pitch(
         events, patches, patch_order, fm_pitch_clock, hz, vgm.total_samples or 0,
         cap=max(len(patch_order), 250 - foreign_ins - 24),
-        allow_steps=is_opn2 or is_opl or is_opnb,
+        allow_steps=is_opn or is_opn2 or is_opl or is_opnb,
     )
     _rebase_non_fm_ins(events, fm_before_pitch, len(patch_order))
     if fm_pitch_copies:

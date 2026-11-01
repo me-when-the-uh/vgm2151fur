@@ -234,7 +234,7 @@ class TestYm2203Analyze(unittest.TestCase):
         offs = [e for e in song.events if not e.on and e.ch == 0]
         self.assertEqual(offs, [])
 
-    def test_mid_note_fnum_becomes_pitch_macro(self):
+    def test_mid_note_fnum_becomes_pitch_step(self):
         ws = _fm_note(4, 1204, off=60000)
         ws += [
             ChipWrite(30000, "ym2203", 0, 0xA4, (4 << 3) | ((1250 >> 8) & 7)),
@@ -243,11 +243,15 @@ class TestYm2203Analyze(unittest.TestCase):
         song = analyze(_vgm(ws, ym2203_clock=CLOCK))
         ev = next(e for e in song.events if e.on)
         self.assertGreaterEqual(len(ev.fm_pitch_pts), 2)
-        self.assertNotEqual(ev.ins, 0)
-        macro = song.fm_patches[ev.ins].pitch_macro
-        self.assertTrue(macro)
-        self.assertEqual(macro[0], 0)
-        self.assertGreater(max(macro), 0)
+        self.assertTrue(ev.pitch_steps)
+        self.assertEqual(ev.ins, 0)
+        self.assertFalse(song.fm_patches[ev.ins].pitch_macro)
+        mod = parse_fur(write_fur(song, include_pcm=False, include_fm=True))
+        fx = [
+            (cmd, value) for (_ch, _idx), rows in mod.patterns.items()
+            for row in rows for cmd, value in (row.fx or ())
+        ]
+        self.assertTrue(any(cmd in (0xE5, 0xE8, 0xE9) for cmd, _v in fx), fx)
 
     def test_long_pitch_sweep_becomes_pitch_macro(self):
         ws = _fm_note(4, 1204, off=60000)
