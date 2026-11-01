@@ -1134,7 +1134,9 @@ def _compat_phase1(b: Buf) -> None:
     """20 bytes, version >= 69. Modern (non-broken) defaults; linear pitch = full."""
     b.u8(0)  # limit slides
     b.u8(2)  # linear pitch: full linear (<237)
-    b.u8(0)  # loop modality
+    # Keep channel state across the loop. Reset-on-loop cuts every held voice
+    # and sample at the seam, which is not what the source VGM does.
+    b.u8(2)  # loop modality: do nothing
     b.u8(1)  # proper noise layout
     b.u8(0)  # wave duty is volume
     b.u8(0)  # reset macro on porta
@@ -1206,6 +1208,7 @@ def _emit_steps(
     e5_writes: dict[tuple[int, int], int],
     chan: int | None = None,
     stats: dict | None = None,
+    note_row: int | None = None,
 ) -> None:
     """Encode a short held-step pitch trajectory as row effects.
 
@@ -1218,7 +1221,8 @@ def _emit_steps(
     if ch >= len(grid):
         return
     div = 2.0 if (ev.pcm or ev.sweep_div >= 2.0) else 1.0
-    note_row = song.place(ev.sample, stats)[0]
+    if note_row is None:
+        note_row = song.place(ev.sample, stats)[0]
     # One row can carry one transpose and one fine-tune step.  If the driver
     # wrote several f-nums inside one row, the last one is the row's pitch;
     # the intermediate values are shorter than a row and cannot be heard.
@@ -1568,13 +1572,16 @@ def _emit_sweep(
 
 def _assign_pcm_rows(
     song: Song, total_rows: int, last_sample: int, stats: dict | None = None,
+    clip_row: int | None = None, clip_cut: int | None = None,
 ) -> dict[int, tuple[int, int]]:
     """Row and delay for each playable PCM note-on and its note-off.
 
     A free row is taken. A taken row pushes the trigger forward until the
     next trigger, or keeps the later write. A note-off moves after its
     trigger and before the next trigger. When a later trigger comes first,
-    its key-on stops the previous sample and the off is redundant.
+    its key-on stops the previous sample and the off is redundant. A trigger
+    just before the loop wrap that rolls past the last row moves back onto
+    it, the same way a note event does.
     """
     by_ch: dict[int, list] = {}
     for ev in song.events:
@@ -1582,6 +1589,16 @@ def _assign_pcm_rows(
             by_ch.setdefault(ev.ch, []).append(ev)
     limit = min(total_rows, song.place(last_sample, stats)[0] + 1)
     out: dict[int, tuple[int, int]] = {}
+
+    def wrapped(row: int, delay: int, sample: int) -> tuple[int, int]:
+        if (
+            clip_row is not None and clip_cut is not None
+            and row >= total_rows and row <= clip_row + 1
+            and sample < clip_cut
+        ):
+            return clip_row, 0
+        return row, delay
+
     for evs in by_ch.values():
         evs.sort(key=lambda e: (e.sample, 0 if e.on else 1))
         ons = [e for e in evs if e.on]
@@ -1589,6 +1606,7 @@ def _assign_pcm_rows(
         placed: dict[int, int] = {}
         for i, ev in enumerate(ons):
             row, delay = ideals[i]
+            row, delay = wrapped(row, delay, ev.sample)
             if row < 0 or row >= total_rows:
                 continue
             if row in placed:
@@ -1630,6 +1648,7 @@ def _assign_pcm_rows(
             nxt = next((e for e in played if e.sample > on.sample), None)
             next_row = out[id(nxt)][0] if nxt is not None else total_rows
             off_row, off_delay = song.place(off.sample, stats)
+            off_row, off_delay = wrapped(off_row, off_delay, off.sample)
             if off_row >= next_row:
                 continue
             if off_row <= on_row:
@@ -1649,6 +1668,30 @@ def _pattern_len(last_row: int, cap: int = PAT_LEN_MAX) -> int:
     for an empty module.
     """
     return max(1, min(cap, last_row + 1 + PAT_TAIL_ROWS))
+
+
+def _phrase_pattern_len(song, last_row: int, total_rows: int) -> int:
+    """A pattern length that is a whole musical phrase when the budget allows.
+
+    Eight quarter notes is 32 pulses. On a grid of `pulse` rows per 16th
+    that is `32 * pulse` rows. The golden covers use one 8/4 or 16/4
+    phrase per pattern. An order boundary is then also a musical boundary.
+    Longer tracks step up to 16/4 and beyond to stay inside 256 orders.
+    """
+    pulse = max(1.0, float(getattr(song, "row_subdiv", 1) or 1))
+    base = min(PAT_LEN_MAX, int(round(32 * pulse)))
+    if total_rows <= 0:
+        return _pattern_len(last_row, PAT_LEN_MAX)
+    # Leave room for the loop split and a Bxx-only order. The hard limit is
+    # 256 orders.
+    for mult in range(1, 9):
+        cand = min(PAT_LEN_MAX, base * mult)
+        orders = (total_rows + cand - 1) // cand
+        if orders <= 250:
+            return _pattern_len(last_row, cand)
+        if cand == PAT_LEN_MAX:
+            break
+    return _pattern_len(last_row, PAT_LEN_MAX)
 
 
 def _cell_ed(cell: Row | None) -> int:
@@ -1810,11 +1853,12 @@ def _build_patterns(song: Song, n_ch: int, pat_len_max: int, fx_cols: int,
         last_sample = max(last_sample, entry[0])
     for entry in (getattr(song, "chip_fx", ()) or ()):
         last_sample = max(last_sample, entry[0])
-    # An adjusted loop carries crafted sample points, read with the writer's
-    # own cell placement so every row rate opens on the same row. A raw VGM
-    # marker keeps the nearest-row reading.
+    # An adjusted loop carries the chosen rows. A raw VGM marker is read with
+    # the writer's own cell placement. The row fields win when present.
     adjusted = song.loop_sample is not None and song.loop_end_sample is not None
-    if song.loop_sample is None:
+    if song.loop_start_row is not None:
+        loop_row = song.loop_start_row
+    elif song.loop_sample is None:
         loop_row = 0
     elif adjusted:
         loop_row = song.place(song.loop_sample)[0]
@@ -1822,18 +1866,19 @@ def _build_patterns(song: Song, n_ch: int, pat_len_max: int, fx_cols: int,
         loop_row = song.row_of(song.loop_sample)
     if loop_row < 0:
         loop_row = 0
-    # The loop finder trims the loop end to a bar, but the source continues to
-    # the VGM total. Keep that tail: it can hold post-bar A/B gates, and the
-    # module loops at the source total. The order walk below reuses the name
-    # end_row for each order's bound, so this one keeps its own name.
+    # The adjusted loop end is the last row the module plays. Rows past it
+    # belong to the next iteration, and keeping the source tail would play
+    # them before the jump and strike the head twice at the seam.
     content_end = None
     content_cut = None
     if adjusted:
-        content_end = song.place(
-            max(song.loop_end_sample, song.vgm.total_samples)
-        )[0]
+        content_end = song.loop_end_row
+        if content_end is None:
+            content_end = song.place(song.loop_end_sample)[0]
         if content_end < loop_row:
             content_end = None
+        else:
+            content_cut = song.loop_cut_sample
     if content_end is not None:
         total_rows = content_end + 1
     else:
@@ -1843,6 +1888,42 @@ def _build_patterns(song: Song, n_ch: int, pat_len_max: int, fx_cols: int,
     grid: list[dict[int, Row]] = [dict() for _ in range(n_ch)]
     if stats is not None:
         stats["rows"] = max(stats.get("rows", 0), total_rows)
+
+    def loop_clip(row: int, delay: int, sample: int) -> tuple[int, int]:
+        """Keep a pre-wrap event on the last loop row when its ED would roll.
+
+        The row after the loop end is the next iteration's first row. The
+        events just before the wrap belong to the end of this one. Playing
+        them a fraction of a row early keeps them in the loop instead of
+        dropping them for good.
+        """
+        if (
+            content_cut is not None and content_end is not None
+            and sample < content_cut and row > content_end
+            and row <= content_end + 1
+        ):
+            speed = max(1, song.speed)
+            tick = song.samples_per_row / speed
+            offset = (sample - song.t0) / tick - content_end * speed
+            return content_end, min(speed - 1, max(0, int(round(offset))))
+        return row, delay
+
+    def loop_start(row: int, delay: int, sample: int) -> tuple[int, int]:
+        """Keep a post-marker event on the loop's first row.
+
+        The source marker can fall inside the row before the chosen start
+        when the grid is coarse. That row belongs to the intro. Leaving the
+        event there drops it after the first iteration. Moving it to the
+        loop start keeps it in every iteration.
+        """
+        marker = song.loop_marker_sample
+        if (
+            content_cut is not None and marker is not None
+            and sample >= marker and row < loop_row
+            and row >= loop_row - 1
+        ):
+            return loop_row, 0
+        return row, delay
 
     # Chip-wide effects are placed after the notes: the LFO speed/pulse has
     # to ride the tick of the key-on it belongs to (see _place_chip_fx).
@@ -1855,7 +1936,8 @@ def _build_patterns(song: Song, n_ch: int, pat_len_max: int, fx_cols: int,
         # Same placement as the note on this sample, including its ED delay.
         # row_of() rounds to the nearest row and would land an effect on a
         # different row from the note whenever speed is more than 1.
-        row, delay = song.place(sample, stats)
+        row, delay = loop_clip(*song.place(sample, stats), sample)
+        row, delay = loop_start(row, delay, sample)
         if row < 0 or row >= total_rows:
             continue
         cell = grid[ch].get(row)
@@ -1880,7 +1962,9 @@ def _build_patterns(song: Song, n_ch: int, pat_len_max: int, fx_cols: int,
     # One cell holds one PCM note. A later trigger moves to the next free row
     # when that row is still before the following trigger. When it is not,
     # the later trigger keeps the row: it is the cursor the channel plays.
-    pcm_pos = _assign_pcm_rows(song, total_rows, last_sample, stats)
+    pcm_pos = _assign_pcm_rows(
+        song, total_rows, last_sample, stats, content_end, content_cut,
+    )
     for ev in song.events:
         ev_ch = ev.ch + ch_offset
         if ev_ch < 0 or ev_ch >= n_ch:
@@ -1900,6 +1984,8 @@ def _build_patterns(song: Song, n_ch: int, pat_len_max: int, fx_cols: int,
             row, delay = assigned
         else:
             row, delay = song.place(ev.sample, stats)
+        row, delay = loop_clip(row, delay, ev.sample)
+        row, delay = loop_start(row, delay, ev.sample)
         if row < 0 or row >= total_rows:
             continue
         cell = grid[ev_ch].get(row)
@@ -1961,8 +2047,9 @@ def _build_patterns(song: Song, n_ch: int, pat_len_max: int, fx_cols: int,
         elif (ev.pcm or ev.pan) and not ev.no_pan:
             _add_fx(cell, 0x08, ev.pan & 0xFF, fx_cols, stats)
 
-    # A PCM note still sounding at the loop cut or the last content row gets
-    # an explicit off. The source stop write can be in the skipped tail.
+    # A PCM note still sounding at the last content row gets an explicit off.
+    # At a loop seam a note whose source stop lies past the wrap keeps
+    # sounding into the next iteration. No off is written.
     for ch in range(n_ch):
         last = None
         for ev in song.events:
@@ -1972,6 +2059,10 @@ def _build_patterns(song: Song, n_ch: int, pat_len_max: int, fx_cols: int,
                     continue
                 last = ev
         if last is None:
+            continue
+        if content_cut is not None and (
+            not last.end or last.end >= content_cut
+        ):
             continue
         on_row = pcm_pos[id(last)][0]
         has_off = any(
@@ -2036,6 +2127,18 @@ def _build_patterns(song: Song, n_ch: int, pat_len_max: int, fx_cols: int,
         ch: sorted(r for r, cell in grid[ch].items() if 0 <= cell.note < 180)
         for ch in range(n_ch)
     }
+    def placed_note_row(ev) -> int:
+        if ev.pcm:
+            assigned = pcm_pos.get(id(ev))
+            if assigned is None:
+                return -1
+            row, delay = assigned
+        else:
+            row, delay = song.place(ev.sample, stats)
+        row, delay = loop_clip(row, delay, ev.sample)
+        row, delay = loop_start(row, delay, ev.sample)
+        return row
+
     sweep_e5: dict[tuple[int, int], int] = {}
     if song.events:
         for ev in song.events:
@@ -2049,11 +2152,12 @@ def _build_patterns(song: Song, n_ch: int, pat_len_max: int, fx_cols: int,
                     _emit_steps(
                         grid, song, ev, fx_cols, total_rows, sweep_e5,
                         chan=ev.ch + ch_offset, stats=stats,
+                        note_row=placed_note_row(ev),
                     )
                 else:
                     _emit_steps(
                         grid, song, ev, fx_cols, total_rows, sweep_e5,
-                        stats=stats,
+                        stats=stats, note_row=placed_note_row(ev),
                     )
     if song.events:
         for ev in song.events:
@@ -2176,12 +2280,13 @@ def _build_patterns(song: Song, n_ch: int, pat_len_max: int, fx_cols: int,
             _add_fx(cell, 0xE5, val, fx_cols, stats)
             cur_e5 = val
 
-    # The pattern window: last content row plus a ten-row tail, capped at
-    # Furnace's 256. One length serves every order.
+    # The pattern window: a whole musical phrase when the order budget
+    # allows, otherwise the largest phrase that fits. One length serves
+    # every order.
     last_content = max(
         (row for ch in range(n_ch) for row in grid[ch]), default=-1
     )
-    pat_len = _pattern_len(last_content, pat_len_max)
+    pat_len = min(pat_len_max, _phrase_pattern_len(song, last_content, total_rows))
 
     # Walk pat_len-row chunks, but force an order boundary at the VGM loop so
     # Bxx can jump there. A long intro must not become one giant order; only
@@ -2216,6 +2321,21 @@ def _build_patterns(song: Song, n_ch: int, pat_len_max: int, fx_cols: int,
             loop_order = oi
             break
 
+    # A delay on the jump row is a pre-effect and returns before Bxx is read.
+    # The jump therefore rides a channel whose row has no ED. The delayed
+    # notes on the others still land just before the wrap.
+    jump_ed: set[int] = set()
+    if content_end is not None and song.loop_sample is not None:
+        for ch in range(n_ch):
+            cell = grid[ch].get(content_end)
+            if cell is not None and any(
+                c == 0xED for c, _v in (cell.fx or ())
+            ):
+                jump_ed.add(ch)
+    jump_carrier: int | None = next(
+        (ch for ch in range(n_ch) if ch not in jump_ed), None
+    )
+
     orders: list[list[int]] = [[] for _ in range(n_ch)]
     patterns: list[tuple[int, int, list[Row | None]]] = []
     for ch in range(n_ch):
@@ -2239,20 +2359,27 @@ def _build_patterns(song: Song, n_ch: int, pat_len_max: int, fx_cols: int,
             # order end, or every loop restart inserts silence. Jingles with
             # no VGM loop must not Bxx.
             if oi == n_ord - 1 and song.loop_sample is not None:
-                # EDxx is a pre-effect and returns before later effects on the
-                # row are read, so a delay on the jump row swallows Bxx and
-                # that note never sounds.
                 jump_row = min(pat_len, max(0, content_end - start_row + 1)) - 1
                 if jump_row < 0:
                     jump_row = 0
-                cell = rows[jump_row]
-                if cell is None:
-                    cell = rows[jump_row] = _blank_row()
-                if any(c == 0xED for c, _v in (cell.fx or ())):
-                    _bump(stats, "ed_stripped_loop")
-                cell.fx = [(c, v) for c, v in (cell.fx or [(EMPTY, EMPTY)] * fx_cols)
-                           if c != 0xED]
-                _add_fx(cell, 0x0B, loop_order, fx_cols, stats)
+                # One carrier is enough. With a free channel present only
+                # that one jumps. When every row is delayed, channel 0 gives
+                # up its delay and the rest keep theirs.
+                carry = (ch == 0) if jump_carrier is None else (ch == jump_carrier)
+                if carry:
+                    cell = rows[jump_row]
+                    if cell is None:
+                        cell = rows[jump_row] = _blank_row()
+                    if any(c == 0xED for c, _v in (cell.fx or ())):
+                        # Every channel is delayed on the jump row: one of
+                        # them has to give up its delay to carry the jump.
+                        _bump(stats, "ed_stripped_loop")
+                        cell.fx = [
+                            (c, v) for c, v in
+                            (cell.fx or [(EMPTY, EMPTY)] * fx_cols)
+                            if c != 0xED
+                        ]
+                    _add_fx(cell, 0x0B, loop_order, fx_cols, stats)
             orders[ch].append(oi)
             patterns.append((ch, oi, rows))
 

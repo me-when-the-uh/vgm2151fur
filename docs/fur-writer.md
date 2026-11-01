@@ -37,16 +37,21 @@ from that count, so a module opens with columns matched to its content
 instead of the 8-column build capacity. The count never drops below the
 busiest row, or a load-and-re-save in Furnace would drop effects.
 
-The pattern window follows the content: the last row that carries anything
-plus ten empty rows, capped at Furnace's 256-row maximum, which a long track
-still reaches. Furnace holds one pattern length for the whole module, so a
-short jingle opens as a short pattern instead of one padded to 256 - every
-order is that long, which is why the window is fitted to the whole module and
-not to one order. The loop row starts its own order (the short order before it
-ends with `D00`), which is what keeps loop points precise, and the last
-order's `Bxx` loop jump sits on its last content row, not on the padded end.
-Loop finding can set that end earlier than the last note; the rows after it
-are not written.
+The pattern window follows the music. A short track gets its last content row
+plus ten empty rows. A longer one gets a whole 8/4 or 16/4 phrase: 32 or 64
+pulses of the measured 16th, capped at Furnace's 256-row maximum, stepping up
+when 256 orders would not hold the track. Furnace holds one pattern length for
+the whole module. Every order is that long, and order boundaries fall on
+musical phrase boundaries. The loop row starts its own order (the short order
+before it ends with `D00`), which keeps loop points precise. The last order's
+`Bxx` loop jump sits on the last row of the loop, not on the padded end. The
+rows after it belong to the next iteration and are not written.
+
+The module stores loop modality 2 ("do nothing"). Furnace keeps held voices
+and samples across the jump. Reset-on-loop is what cut them at the seam. A
+delayed note on the jump row keeps its `EDxx`. The `Bxx` rides a channel whose
+row has no delay. That note still lands just before the wrap. When every
+channel is delayed, channel 0 gives up its delay to carry the jump.
 
 `edit.py` patches both volume copies, so every reader agrees. The float
 triples are located from the payload tail, anchored on the ADIR pointers: the
@@ -160,8 +165,11 @@ the sample center rate, corrected by `8363/8372` for Furnace's
 PCM gates carry explicit note-offs. An off that would run into the next
 key-on is omitted because that key-on stops the sample. A different
 sample whose trigger shares a row moves to the next free row, and a
-same-sample repeat within a row keeps the later start. The adjusted
-loop's content runs to the VGM total, so a post-bar A/B gate is not cut.
+same-sample repeat within a row keeps the later start. A gate whose source
+stop lies past the loop wrap gets no off at the seam: the player never
+reaches that stop before jumping, and the sample must keep sounding into the
+next iteration. A gate before the wrap that the writer would round past the
+last row stays on that row with a delay.
 
 SCC instruments (`DIV_INS_SCC`, type 18) carry one 32-byte waveform through
 the `WS` wave-synth feature; the wave itself lives in the module's wavetable
@@ -247,6 +255,10 @@ the staircase into per-row slides:
 - A sweep stops on the row after its last rated row. When a later note's
   key-on row comes first, the stop lands there instead; the key-on still
   reads its own pitch.
+- A held one- or two-step retune is not a sweep. `_classify_legato` hands it
+  to `_emit_steps`, which writes E8xx/E9xx plus the E5 remainder on the row
+  after the change. Staircases, reversing moves and release-tail retunes stay
+  ramps.
 
 The row grid (`hz` and `speed`) is estimated from key-on spacing and printed
 by `--report`. Finer pitch motion than the grid can express is approximated;
@@ -292,7 +304,8 @@ Condensing is not free. A row carries one note cell and one slide rate:
 fidelity number. `convert_variants` writes the 1x..Nx set and, in `lossless`
 mode, marks the largest factor with no added structural loss and no more than
 6 units (0.1 st) more deviation than 1x, else falls back to 1x. In `all` mode
-the pick is the largest factor and the condensed names end in ` (lossy)`.
+the pick is the largest factor and the names of the rejected factors end in
+` (lossy)`.
 
 `dev_max` saturates on sweep-heavy tracks, so it cannot always separate a
 good coarser grid from a bad one. With `verify` (CLI `--verify`, always on in

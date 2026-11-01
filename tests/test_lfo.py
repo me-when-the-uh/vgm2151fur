@@ -17,7 +17,7 @@ sys.path.insert(0, str(ROOT / "tests"))
 import _synth  # noqa: E402
 
 from vgm2151fur import furwrite as fw  # noqa: E402
-from vgm2151fur.analyze import _flush_pms_ramp, analyze  # noqa: E402
+from vgm2151fur.analyze import _flush_pms_ramp, analyze, format_report  # noqa: E402
 from vgm2151fur.vgm import ChipWrite  # noqa: E402
 
 
@@ -113,6 +113,12 @@ class TestOpmTestPulse(unittest.TestCase):
                             for e in fx),
                         "the restore must carry the LFO speed one tick later")
         self.assertTrue(all(e[0] <= key_on + 2 for e in fx))
+
+    def test_report_handles_the_tick_offset_restore(self):
+        # The restore entry is a 4-tuple with the tick offset. Report's LFO
+        # count must not unpack it as a 3-tuple.
+        song, _key_on = self._song()
+        self.assertIn("LFO fx", format_report(song))
 
     def test_restore_lands_one_tick_after_the_pulse(self):
         song, _key_on = self._song()

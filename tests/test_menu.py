@@ -294,8 +294,8 @@ class TestMenu(unittest.TestCase):
             prompt = next(p for p in reader.prompts if p.startswith("optimise"))
             self.assertIn("(Y/n)", prompt)
             self.assertNotIn("lossless", prompt)
-            fur = pack / "fur" / "x2 optimised" / "03 Song 3 x2 (lossy).fur"
-            self.assertTrue(fur.is_file())
+            x2 = pack / "fur" / "x2 optimised"
+            self.assertEqual(len(list(x2.glob("03 Song 3 x2*.fur"))), 1)
 
     def test_optimise_no_writes_only_the_1x_file(self):
         with tempfile.TemporaryDirectory() as tmp:

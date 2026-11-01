@@ -792,7 +792,10 @@ class TestOplFurnaceRoundTrip(unittest.TestCase):
         vgm = self._export(song, "opl2_high")
         units = [u for cid, fch, _t, u in keyon_events(vgm, KIND_OPL2, False)
                  if (cid, fch) == (0, 3)]
-        self.assertEqual(len(units), 1, units)
+        # The module loops. The exporter writes the first note once at the
+        # top and once again when the loop comes round. Both must agree.
+        self.assertTrue(units)
+        self.assertEqual(set(units), {units[0]})
         cents = abs(1200.0 * math.log2(units[0] / (977 << 6)))
         self.assertLess(cents, 4.0, units)
 
@@ -848,7 +851,10 @@ class TestOplFurnaceRoundTrip(unittest.TestCase):
                         "the voice never keyed")
         units = [u for cid, fch, _t, u in keyon_events(vgm, KIND_OPL3, False)
                  if (cid, fch) == (0, 0)]
-        self.assertEqual(len(units), 1, units)
+        # The module loops. The exporter writes the first note once at the
+        # top and once again when the loop comes round. Both must agree.
+        self.assertTrue(units)
+        self.assertEqual(set(units), {units[0]})
         # One f-num step at block 4 is a cent, and the table cannot promise more.
         self.assertLess(abs(1200.0 * math.log2(units[0] / (977 << 4))), 4.0,
                         units)
@@ -891,6 +897,9 @@ METAL = Path(r"F:\NASbackup\JamesAlan\_devspace\grbsd\ripwip"
              r"\metalace-opl3\main_010a.vgm")
 KXEMI = Path(r"F:\NASbackup\JamesAlan\_devspace\grbsd\ripwip\_finished"
              r"\knightsofxentar-opl3\KXEMI1_opl2.vgm")
+ROOT = Path(__file__).resolve().parents[2]
+BUBBLE = (ROOT / "VGM_collection" / "old" / "Bubble_Bobble_(Arcade)"
+          / "02 Hurry! ~ Main Theme (faster).vgz")
 # A YM3526 that really latches the kit. Rhythm mode is identical to a YM3812's -
 # same $BD register, same five percussion voices - the chip only lacks waveform
 # select, so this is what proves the family was not special-cased out of it.
@@ -1093,6 +1102,68 @@ class TestOplRealRips(unittest.TestCase):
         m = parse_fur(write_fur(song, include_pcm=False))
         self.assertEqual(m.chips, [CHIP_OPL2, CHIP_OPL2])
         self.assertEqual(m.n_ch, 18)
+
+
+class TestMixedFamilySelection(unittest.TestCase):
+    """A mixed OPL + arcade log converts the family that plays it."""
+
+    @staticmethod
+    def _mixed(opl_notes: int, ym_notes: int):
+        writes: list[ChipWrite] = []
+        for i in range(opl_notes):
+            writes += voice(1000 + i * 5000, KIND_OPL2, i % 9,
+                            block=4, fnum=500 + i, off_time=0)
+        for i in range(ym_notes):
+            t = 2000 + i * 6000
+            ch = i % 3
+            writes.append(ChipWrite(t, "ym2203", 0, 0x28, 0xF0 | ch))
+            writes.append(ChipWrite(t + 100, "ym2203", 0, 0x28, ch))
+        writes.sort(key=lambda w: w.sample)
+        return _vgm(writes, total_samples=200000, ym2203_clock=3579545)
+
+    def test_the_dominant_family_is_selected(self):
+        song = analyze(self._mixed(8, 2))
+        self.assertEqual(song.fm_chip, KIND_OPL2)
+        self.assertEqual(song.opl_ids, [0])
+        self.assertEqual(song.ym2203_ids, [])
+        self.assertTrue(any("OPL has more key-ons (8)" in w for w in song.warnings),
+                        song.warnings)
+
+    def test_a_dominant_opn_log_drops_the_opl_side(self):
+        song = analyze(self._mixed(2, 8))
+        self.assertEqual(song.fm_chip, "ym2203")
+        self.assertEqual(song.ym2203_ids, [0])
+        self.assertEqual(song.opl_ids, [])
+        self.assertTrue(any("YM2203 has more key-ons (8)" in w for w in song.warnings),
+                        song.warnings)
+
+    def test_two_opl_kinds_pick_the_denser_side(self):
+        writes: list[ChipWrite] = []
+        for i in range(2):
+            writes += voice(1000 + i * 5000, KIND_OPL2, i,
+                            block=4, fnum=500, off_time=0)
+        for i in range(5):
+            writes += voice(1500 + i * 5000, KIND_OPL3, i,
+                            block=4, fnum=600, off_time=0)
+        src = _vgm(writes, kind=KIND_OPL2, total_samples=200000)
+        src.opl3_clock = 14400000
+        song = analyze(src)
+        self.assertEqual(song.fm_chip, KIND_OPL3)
+        self.assertTrue(any("more than one OPL family" in w
+                            for w in song.warnings), song.warnings)
+
+    @unittest.skipUnless(BUBBLE.is_file(), "Bubble Bobble rip missing")
+    def test_real_mixed_rip_keeps_the_dominant_opl_theme(self):
+        song = analyze(load_vgm(BUBBLE))
+        self.assertEqual(song.fm_chip, KIND_OPL)
+        self.assertEqual(song.opl_ids, [0])
+        self.assertEqual(song.ym2203_ids, [])
+        self.assertGreater(song.fm_notes, 1000)
+        self.assertTrue(
+            any("OPL has more key-ons" in w and "YM2203" in w
+                for w in song.warnings),
+            song.warnings,
+        )
 
 
 class TestOplVerify(unittest.TestCase):

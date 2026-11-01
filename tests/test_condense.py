@@ -152,7 +152,7 @@ class TestConvertVariants(unittest.TestCase):
         self.assertTrue(any(
             "low-confidence" in w for r in res for w in r["warnings"]
         ))
-        self.assertTrue((out_dir / "synthetic x2 (lossy).fur").exists())
+        self.assertTrue(Path(next(r for r in res if r["factor"] == 2)["dst"]).exists())
 
     def test_all_mode_skips_furnace_verification(self):
         tmp = tempfile.mkdtemp()
@@ -174,16 +174,15 @@ class TestConvertVariants(unittest.TestCase):
     def test_fractional_factor_names_the_file(self):
         res = self._run((1, 1.5), "all")
         names = {Path(r["dst"]).name for r in res}
-        self.assertEqual(
-            names, {"synthetic.fur", "synthetic x1.5 (lossy).fur"}
-        )
+        self.assertEqual(names, {"synthetic.fur", "synthetic x1.5.fur"})
         by = {r["factor"]: r for r in res}
         self.assertAlmostEqual(by[1.5]["bpm"], by[1]["bpm"] / 1.5, delta=by[1]["bpm"] * 0.05)
 
-    def test_all_mode_marks_every_condensed_file_lossy(self):
-        res = self._run((1, 2, 4), "all")
+    def test_all_mode_marks_only_the_rejected_factors(self):
+        res = self._run((1, 1.5, 2, 4), "all")
         names = {r["factor"]: Path(r["dst"]).name for r in res}
         self.assertEqual(names[1], "synthetic.fur")
+        self.assertEqual(names[1.5], "synthetic x1.5.fur")
         self.assertEqual(names[2], "synthetic x2 (lossy).fur")
         self.assertEqual(names[4], "synthetic x4 (lossy).fur")
 
@@ -241,7 +240,7 @@ class TestVariantsShareTheLoop(unittest.TestCase):
             return None
         return bases[target], end
 
-    def test_the_loop_is_found_once_on_the_1x_grid(self):
+    def test_each_grid_finds_its_own_loop_rows(self):
         tmp = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
         out_dir = Path(tmp)
@@ -261,21 +260,18 @@ class TestVariantsShareTheLoop(unittest.TestCase):
                 Path("synthetic.vgz"), out_dir,
                 factors=(1, 2, 4), mode="all", pcm=False, layout="dirs",
             )
-        # One find for the whole set, on the 1x song
-        self.assertEqual(len(calls), 1)
-        loop_sample = calls[0].loop_sample
-        self.assertIsNotNone(loop_sample)
-        for r in res:
+        self.assertEqual(len(calls), 3)
+        for r, source in zip(res, calls):
             module = parse_fur(Path(r["dst"]).read_bytes())
             loop = self._fur_loop(module)
             self.assertIsNotNone(loop, f"x{r['factor']:g}: no Bxx")
+            start, end = loop
+            self.assertEqual(start, source.loop_start_row)
+            self.assertEqual(end, source.loop_end_row)
             row_samples = 44100.0 * module.speed / module.hz
-            expected = round(loop_sample / row_samples)
-            start, _end = loop
-            self.assertLessEqual(
-                abs(start - expected), 1,
-                f"x{r['factor']:g}: loop starts at {start}, "
-                f"the shared point sits at {expected}",
+            self.assertAlmostEqual(
+                (end - start + 1) * row_samples, song.loop_samples, delta=1.0,
+                msg=f"x{r['factor']:g}: loop length drifted",
             )
 
 

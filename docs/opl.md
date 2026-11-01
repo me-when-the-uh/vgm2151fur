@@ -38,9 +38,11 @@ uses. A `0xAA` write is only accepted when header bit 30 says a second YM3812
 exists - otherwise the bytes are dropped and reported, because writing to a chip
 that is not there would silently invent a stereo pair.
 
-A log that mixes families (`$5A` and `$5E`, or two different crystals for the
-same core) is converted on the family that plays most of it and the report says
-so. Chips whose clock field is missing fall back to the family standard
+A log that mixes an OPL family with an arcade FM chip is converted on the side
+with more rising key-ons, and the report names both counts and the dropped
+side. A log mixing OPL2 and OPL3 picks the kind with more key-ons and warns.
+Two crystals of the same core still share one system and the header clock.
+Chips whose clock field is missing fall back to the family standard
 (3579545 Hz, or 14318180 Hz for a YMF262) with a warning; the `.fur` then
 carries `customClock` only when the rip's crystal really differs from Furnace's
 default for that system (`COLOR_NTSC`, or `COLOR_NTSC * 4` - within about 2 Hz,

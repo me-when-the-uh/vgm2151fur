@@ -56,24 +56,28 @@ def raw_vgm(cmds: bytes, *, ym_clock: int = 3579545) -> bytes:
 
 
 def note_song(key_on: int = 60000, key_off: int = 160000, *,
-              kc: int = 0x00, kf: int = 0x00, pitch_writes=None) -> VgmFile:
-    """A heartbeat plus a ch0 note, optionally with mid-note KC/KF writes."""
+              kc: int = 0x00, kf: int = 0x00, pitch_writes=None,
+              ch: int = 0) -> VgmFile:
+    """A heartbeat plus a note, optionally with mid-note KC/KF writes."""
     writes = lattice(int(key_off / 5000) + 6)
     for reg, val in PATCH:
+        if ch and reg in (0x28, 0x30):
+            reg |= ch
         writes.append(ChipWrite(key_on - 1000, "ym2151", 0, reg, val))
-    writes.append(ChipWrite(key_on, "ym2151", 0, 0x28, kc))
-    writes.append(ChipWrite(key_on, "ym2151", 0, 0x30, kf))
-    writes.append(ChipWrite(key_on, "ym2151", 0, 0x08, 0x78))
+    writes.append(ChipWrite(key_on, "ym2151", 0, 0x28 | ch, kc))
+    writes.append(ChipWrite(key_on, "ym2151", 0, 0x30 | ch, kf))
+    writes.append(ChipWrite(key_on, "ym2151", 0, 0x08, 0x78 | ch))
     for entry in pitch_writes or []:
         sample, reg, val = entry
         writes.append(ChipWrite(sample, "ym2151", 0, reg, val))
-    writes.append(ChipWrite(key_off, "ym2151", 0, 0x08, 0x00))
+    writes.append(ChipWrite(key_off, "ym2151", 0, 0x08, ch))
     writes.sort(key=lambda w: w.sample)
     return vgm(writes)
 
 
 def staircase(start: int, steps: int = 20, *, step_samples: int = 500,
-              kc: int = 0x42, kf: int = 0x14) -> list[tuple[int, int, int]]:
+              kc: int = 0x42, kf: int = 0x14,
+              ch: int = 0) -> list[tuple[int, int, int]]:
     """KC/KF writes of one 0.25 st step each."""
     out: list[tuple[int, int, int]] = []
     kc_v, kf_v = kc, kf
@@ -83,8 +87,8 @@ def staircase(start: int, steps: int = 20, *, step_samples: int = 500,
             kf_v -= 0x100
             kc_v += 1
         t = start + i * step_samples
-        out.append((t, 0x28, kc_v))
-        out.append((t + 10, 0x30, kf_v))
+        out.append((t, 0x28 | ch, kc_v))
+        out.append((t + 10, 0x30 | ch, kf_v))
     return out
 
 

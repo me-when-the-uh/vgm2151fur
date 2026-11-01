@@ -62,13 +62,16 @@ change unit`, and every note is still placed at its true write time via
 
 ## Loop point
 
-The `.fur` ends with `Bxx` on the last row that carries content in the
-final order, not on the last row of the padded order. The final order is
-only as long as the music, so jumping at the padded end would insert
-silence before every loop restart. Jingles with no VGM loop get no `Bxx`.
-The jump row is derived from the last event's row, and `EDxx` is stripped
-from it because a delay on the jump row swallows `Bxx` (it is a pre-effect
-that returns before later effects on the row are read).
+The loop start is the VGM marker. A marker placed after a pickup keeps that
+pickup at the end of each iteration, where the source plays it. Opening the
+loop on the pickup would strike it twice per repeat. The end is the marker
+plus the header's loop length, rounded to rows. The row length is re-derived
+from that length. One repeat is sample exact, and the correction stays under
+1%. The `.fur` ends with `Bxx` on the last loop row, not on the padded order
+end. Jingles with no VGM loop get no `Bxx`. `EDxx` on the jump row is kept.
+The jump rides a channel whose row has no delay. The delayed notes still land
+before the wrap. The module uses loop modality 2. Furnace keeps held voices
+across the jump.
 
 ## Vibrato onset (FMS/AMS macros)
 
@@ -187,6 +190,18 @@ channel's last one, *including back to the neutral 0x80*, and sweep steps
 are recorded per row so the replay emits all E5 changes in row order.
 Writing it only for non-neutral values leaks one note's fine tune into
 every following note on that channel.
+
+## Held retunes (legato steps)
+
+A driver that retunes a sounding note once and holds it is not writing a
+glide. `_classify_legato` turns a one- or two-step same-direction trajectory
+into `pitch_steps` when the last step holds for at least a row before the
+key-off and the move is at least half a semitone. `_emit_steps` writes the
+step as E8xx/E9xx plus the E5 remainder on the row after the change. A
+staircase, a move that reverses, a short final step and a write in the release
+tail stay 01xx/02xx ramps. `report` shows both counts as
+`pitch N legato steps, M single-step ramps`. The ramps are the slurs that are
+still modelled as slides.
 
 ## Verifying against Furnace
 
