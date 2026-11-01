@@ -5,16 +5,16 @@ Supported chips:
 - Yamaha YM2151 (OPM)
 - Yamaha YM2203 (OPN)
 - Yamaha YM2612 (OPN2), including channel-3 special/CSM frequency layouts
-- Yamaha YM2610 / YM2610B (OPNB) (experimental)
+- Yamaha YM2610 / YM2610B (OPNB)
 - Yamaha YM3526 (OPL), YM3812 (OPL2) and YMF262 (OPL3), including rhythm mode
   as its own system and OPL3 four-operator voices
-- Namco C140
-- Namco C352 (requires a development build of Furnace from a compatible fork. A build with C352 support (built from https://github.com/me-when-the-uh/furnace-ports) is located in `./furnace-c352` - use at your own risk, since it's always a good idea to build from source instead of relying on someone else's builds)
 - Konami K007232 (experimental)
 - Konami K053260
 - Konami SCC / SCC+ (K051649/K052539) (experimental)
 - OKI MSM6295
 - OKI MSM6258 (Sharp X68000 ADPCM)
+- Namco C140
+- Namco C352 (requires a development build of Furnace from a compatible fork. A build with C352 support (built from https://github.com/me-when-the-uh/furnace-ports) is located in `./furnace-c352` - use at your own risk, since it's always a good idea to build from source instead of relying on someone else's builds)
 
 It runs on Windows and Linux with Python 3.11 or newer.
 
@@ -104,4 +104,4 @@ Open follow-ups are tracked in [TODO.md](./TODO.md).
 - Furnace 0.6.8.3 has no C352 core. A build with the ported core can play those modules (`docs/c352.md`).
 - K053260 loops the whole sample. A source loop maps to the full body. Mid-note loop, KADPCM or direction changes use the key-on value. A voice keyed with pan 0 is written silent and raised when its pan moves (`docs/k053260.md`).
 - Chip volumes above unity only exist in INF2 files.
-- Patterns are 256 rows in size. The row grid is estimated per track and very fine pitch motion is approximated with per-row ramps (`docs/fur-writer.md`).
+- Patterns use a whole 8/4 or 16/4 phrase, up to Furnace's 256-row limit. The row grid is estimated per track, and very fine pitch motion is approximated with per-row ramps (`docs/fur-writer.md`).

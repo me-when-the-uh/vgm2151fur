@@ -399,6 +399,11 @@ class Song:
     )
     # How hz was chosen ("" = default 60 Hz). Shown in --report.
     grid_note: str = ""
+    # Held one/two-step pitch moves written as E8/E9, and one/two-step
+    # trajectories that stayed ramps (a slide, a release tail, or a short
+    # hold). Shown in --report.
+    legato_steps: int = 0
+    legato_ramps: int = 0
     # Rows per measured 16th (1 = one row per 16th). On SCC/AY this is the
     # 16th's tick count divided by the written row's tick count, and it can
     # be fractional. Highlight uses round(4 * this) and round(16 * this).
@@ -464,6 +469,15 @@ class Song:
     # Set by loop finding. The row `Bxx` jumps from. None keeps the jump on
     # the last content row, which is the VGM loop length.
     loop_end_sample: int | None = None
+    # The chosen rows. The writer uses these directly: re-deriving them from
+    # the sample points can round to a neighbouring row after the row length
+    # is calibrated to the loop.
+    loop_start_row: int | None = None
+    loop_end_row: int | None = None
+    # The unquantized source marker. Events after it belong to the loop body
+    # even when the coarser condensed row would put them in the row before
+    # the chosen start.
+    loop_marker_sample: int | None = None
     # The sample where the loop wraps, set with loop_end_sample. Notes at or
     # past it are the recording's copy of the head and stay unwritten, at
     # whichever row rate a rendition reads them.
@@ -1417,6 +1431,59 @@ def _finalize_sweep(
         ev.sweep = deltas
 
 
+# A held legato move is at least half a semitone in 1/64 units. Smaller
+# changes stay in the ramp model, where the row slide can express them.
+_LEGATO_MIN_UNITS = 32
+
+
+def _classify_legato(events: list[NoteEvent], row_samples: float) -> tuple[int, int]:
+    """Turn a held one- or two-step YM2151 move into a quick transposition.
+
+    A driver that retunes a sounding note once and holds it is not writing a
+    glide. E8xx/E9xx carries that step exactly, while a row ramp smears it
+    over a whole row. A staircase (more steps), a move that reverses, and a
+    release-tail retune stay ramps. Returns (steps, single-step ramps).
+    """
+    steps = ramps = 0
+    for ev in events:
+        if (
+            not ev.on or ev.pcm or ev.tone_chip or ev.dac or not ev.sweep
+        ):
+            continue
+        seq: list[tuple[int, int]] = []
+        last = 0
+        for sample, delta in ev.sweep:
+            if delta != last:
+                seq.append((sample, delta))
+                last = delta
+        if not 1 <= len(seq) <= 2:
+            continue
+        if abs(seq[-1][1]) < _LEGATO_MIN_UNITS:
+            ramps += 1
+            continue
+        # A step that does not hold for a row before the key-off is a slide,
+        # not a retune. So is a write in the release tail.
+        if ev.end and (
+            seq[-1][0] >= ev.end
+            or seq[-1][0] + row_samples > ev.end
+        ):
+            ramps += 1
+            continue
+        if len(seq) == 2:
+            # Two steps in one direction that keep moving. A return is a
+            # vibrato half-cycle and stays a ramp.
+            if (seq[0][1] > 0) != (seq[1][1] > 0):
+                ramps += 1
+                continue
+            if abs(seq[1][1]) <= abs(seq[0][1]):
+                ramps += 1
+                continue
+        ev.pitch_steps = tuple(seq)
+        ev.sweep = ()
+        steps += 1
+    return steps, ramps
+
+
 def _emit_ay_notes(
     events: list[NoteEvent],
     channel_fx: list[tuple[int, int, int, int]],
@@ -1561,8 +1628,9 @@ def _bind_fm_pitch(
     """Turn YM2203/YM2612 f-num trajectories into instrument pitch macros.
 
     `pitch2` is a 1/128-semitone offset. A macro carries the driver's
-    motion without row quantization. `allow_steps` (YM2612) encodes short
-    steps as row effects instead. Returns (copies made, row-ramp fallbacks).
+    motion without row quantization. `allow_steps` (the OPN and OPL
+    families) encodes short steps as row effects instead. Returns (copies
+    made, row-ramp fallbacks).
     """
     moving = [e for e in events if e.on and e.fm_pitch_pts]
     if not moving:
@@ -2358,6 +2426,62 @@ def _opl_rhythm_plan(vgm, kind: str) -> tuple[bool, dict]:
     return bool(stats["latches"]), stats
 
 
+def _family_keyons(vgm: VgmFile, chips: set[str]) -> int:
+    """Rising key-on edges of the named chip families.
+
+    Used to choose the family a mixed log converts. A repeated write while a
+    voice is already keyed is not a new note, and a rhythm latch counts each
+    newly set kit bit.
+    """
+    count = 0
+    fm_mask: dict[tuple[str, int, int], int] = {}
+    opl_on: dict[tuple[int, int, int], bool] = {}
+    rhythm: dict[int, int] = {}
+    for w in vgm.writes:
+        if w.chip not in chips:
+            continue
+        if w.chip == "ym2151":
+            if w.reg == 0x08 and (w.val & 0x78):
+                key = ("ym2151", w.chip_id, w.val & 7)
+                if not fm_mask.get(key):
+                    count += 1
+                fm_mask[key] = w.val & 0x78
+        elif w.chip == "ym2203":
+            if (w.reg & 0xFF) == 0x28:
+                ch = w.val & 3
+                mask = (w.val >> 4) & 0x0F
+                key = ("ym2203", w.chip_id, ch)
+                if mask and not fm_mask.get(key):
+                    count += 1
+                fm_mask[key] = mask
+        elif w.chip == "ym2612":
+            if not (w.reg & 0x100) and (w.reg & 0xFF) == 0x28:
+                raw = w.val & 7
+                if raw in (3, 7):
+                    continue
+                ch = raw if raw < 3 else raw - 1
+                mask = (w.val >> 4) & 0x0F
+                key = ("ym2612", w.chip_id, ch)
+                if mask and not fm_mask.get(key):
+                    count += 1
+                fm_mask[key] = mask
+        elif w.chip in ("opl", "opl2", "opl3"):
+            r = w.reg & 0xFF
+            port = (w.reg >> 8) & 1
+            if 0xB0 <= r <= 0xB8:
+                key = (w.chip_id, port, r)
+                on = bool(w.val & 0x20)
+                if on and not opl_on.get(key, False):
+                    count += 1
+                opl_on[key] = on
+            elif r == 0xBD and w.chip != "opl3":
+                trig = (w.val & 0x1F) if w.val & 0x20 else 0
+                prev = rhythm.get(w.chip_id, 0)
+                count += (trig & ~prev).bit_count()
+                rhythm[w.chip_id] = trig
+    return count
+
+
 def analyze(
     vgm: VgmFile, *, speed: int | None = None, pcm: bool = True,
     tick_samples: float | None = None,
@@ -2415,24 +2539,72 @@ def analyze(
             "only the YM2612 was converted"
         )
     
-    is_opnb = has_ym2610
-    is_opn2 = has_ym2612 and not is_opnb
-    is_opn = has_ym2203 and not has_ym2151 and not is_opn2 and not is_opnb
+    # A mixed OPL + arcade log converts one family. Pick the side with more
+    # key-ons, which is the one that carries the track, and name the loss.
+    opl_side = chips & {KIND_OPL, KIND_OPL2, KIND_OPL3}
+    arcade_side = chips & {"ym2151", "ym2203", "ym2612", "ym2610"}
+    prefer_opl = False
+    opl_keys = arcade_keys = 0
+    if has_opl and arcade_side:
+        opl_keys = _family_keyons(vgm, opl_side)
+        arcade_keys = _family_keyons(vgm, arcade_side)
+        prefer_opl = opl_keys > arcade_keys
+
+    is_opnb = has_ym2610 and not prefer_opl
+    is_opn2 = has_ym2612 and not is_opnb and not prefer_opl
+    is_opn = (
+        has_ym2203 and not has_ym2151 and not is_opn2 and not is_opnb
+        and not prefer_opl
+    )
     # The OPL family is one system per chip: the YM3526 and YM3812 own a flat
     # nine-channel space, the YMF262 two banks of nine. Rhythm mode is a second
     # system in Furnace (it reassigns the last FM channels to the kit), so the
-    # log decides which one a module gets. A log that mixes OPL writes with an
-    # arcade FM chip converts the arcade chip, as it always has.
-    opl_kind = next(
-        (k for k in (KIND_OPL2, KIND_OPL, KIND_OPL3) if k in chips), None,
-    ) if not (has_ym2151 or is_opn or is_opn2) else None
+    # log decides which one a module gets. When several OPL kinds write, the
+    # one with more key-ons carries the track.
+    opl_kinds = [k for k in (KIND_OPL, KIND_OPL2, KIND_OPL3) if k in chips]
+    opl_kind = None
+    if prefer_opl or not (has_ym2151 or is_opn or is_opn2):
+        if len(opl_kinds) > 1:
+            opl_kind = max(
+                opl_kinds, key=lambda k: _family_keyons(vgm, {k}),
+            )
+        elif opl_kinds:
+            opl_kind = opl_kinds[0]
     is_opl = opl_kind is not None
-    if has_opl and not is_opl:
-        other = sorted(chips & {"ym2151", "ym2203", "ym2612"})
+    if is_opl and len(opl_kinds) > 1:
+        dropped = "/".join(k.upper() for k in opl_kinds if k != opl_kind)
         warnings.append(
-            f"OPL-family and {'/'.join(o.upper() for o in other)} writes in one "
-            f"log are not supported together; only the {'/'.join(other)} was converted"
+            f"more than one OPL family writes in this log; only {opl_kind} "
+            f"was converted, the {dropped} side was dropped"
         )
+    if is_opl:
+        selected_fm_chips = {opl_kind}
+    elif is_opn:
+        selected_fm_chips = {"ym2203", "ym2203_ssg"}
+    elif is_opn2:
+        selected_fm_chips = {"ym2612"}
+    elif is_opnb:
+        selected_fm_chips = {"ym2610", "ym2610_ssg"}
+    elif has_ym2151:
+        selected_fm_chips = {"ym2151"}
+    else:
+        selected_fm_chips = None
+    if has_opl and arcade_side:
+        other = "/".join(sorted(c.upper() for c in arcade_side))
+        opl_writes = sum(1 for w in vgm.writes if w.chip in opl_side)
+        arcade_writes = sum(1 for w in vgm.writes if w.chip in arcade_side)
+        if prefer_opl:
+            warnings.append(
+                f"OPL has more key-ons ({opl_keys}) than {other} "
+                f"({arcade_keys}); writes OPL {opl_writes}, {other} "
+                f"{arcade_writes}; only the OPL side was converted"
+            )
+        else:
+            warnings.append(
+                f"{other} has more key-ons ({arcade_keys}) than OPL "
+                f"({opl_keys}); writes {other} {arcade_writes}, OPL "
+                f"{opl_writes}; only the {other} side was converted"
+            )
     opl_ids = (
         sorted({w.chip_id for w in vgm.writes if w.chip == opl_kind})
         if is_opl else []
@@ -4547,7 +4719,10 @@ def analyze(
             """The grid estimate for the track, memoised across factors"""
             key = (kind, tick, row_floor)
             if grid_cache is None or key not in grid_cache:
-                found = estimate_grid(vgm, tick_samples=tick, min_row=row_floor, **kw)
+                found = estimate_grid(
+                    vgm, tick_samples=tick, min_row=row_floor,
+                    chips=selected_fm_chips, **kw,
+                )
                 if grid_cache is not None:
                     grid_cache[key] = found
                 return found
@@ -4631,6 +4806,14 @@ def analyze(
         )
         grid_note = f"{grid_note}; condensed x{condense:g}" if grid_note else f"condensed x{condense:g}"
 
+    # A held retune is a transpose on the OPM. The OPN/OPL paths model their
+    # pitch motion with macros and ramps. This pass is YM2151 only.
+    legato_steps = legato_ramps = 0
+    if not (is_opn or is_opn2 or is_opnb or is_opl):
+        legato_steps, legato_ramps = _classify_legato(
+            events, (VGM_RATE / hz) * use_speed,
+        )
+
     # Group DAC runs after the row grid; insert their maps before tone instruments.
     dac_pan_events: list[tuple[int, int]] = []
     if dac_plays and dac_ch >= 0:
@@ -4702,7 +4885,7 @@ def analyze(
     fm_pitch_copies, fm_pitch_lost = _bind_fm_pitch(
         events, patches, patch_order, fm_pitch_clock, hz, vgm.total_samples or 0,
         cap=max(len(patch_order), 250 - foreign_ins - 24),
-        allow_steps=is_opn2 or is_opl or is_opnb,
+        allow_steps=is_opn or is_opn2 or is_opl or is_opnb,
     )
     _rebase_non_fm_ins(events, fm_before_pitch, len(patch_order))
     if fm_pitch_copies:
@@ -4833,6 +5016,8 @@ def analyze(
         warnings=warnings,
         chip_fx=chip_fx,
         grid_note=grid_note,
+        legato_steps=legato_steps,
+        legato_ramps=legato_ramps,
         row_subdiv=row_subdiv,
         hilight_a=hilight_a,
         hilight_b=hilight_b,
@@ -4902,6 +5087,11 @@ def format_report(song: Song) -> str:
         f"  ({song.bpm:.1f} BPM 16ths{'; ' + song.grid_note if song.grid_note else ''})",
         f"FM patches  {len(song.fm_patches)}",
     ]
+    if song.legato_steps or song.legato_ramps:
+        lines.append(
+            f"pitch       {song.legato_steps} legato steps, "
+            f"{song.legato_ramps} single-step ramps"
+        )
     if song.fm_chip == "ym2203":
         lines.insert(-1, (
             f"FM chip     YM2203 x{len(song.ym2203_ids)} @ "
@@ -4956,7 +5146,7 @@ def format_report(song: Song) -> str:
         lines.append("  (carrier TL rides the volume column; a kit column shares one voice)")
     if song.chip_fx:
         codes = (0x10, 0x17, 0x18, 0x1E, 0x1F)
-        lfo_n = sum(1 for _s, c, _v in song.chip_fx if c in codes)
+        lfo_n = sum(1 for entry in song.chip_fx if entry[1] in codes)
         if song.fm_chip in ("ym2612", "ym2610"):
             lines.append(f"LFO fx      {lfo_n} chip writes (10xx)")
         elif song.fm_chip in ("opl", "opl2", "opl3"):

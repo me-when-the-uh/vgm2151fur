@@ -340,11 +340,12 @@ class TestCompression(unittest.TestCase):
 
 
 class TestPatternWindow(unittest.TestCase):
-    """The pattern length follows the content, not the 256-row ceiling.
+    """The pattern length follows the musical phrase, not a fixed ceiling.
 
-    Furnace holds one pattern length for the whole module and the order list
-    is walked in that unit, so the window is the last content row plus a
-    ten-row tail; only a track that needs the ceiling gets it.
+    Furnace holds one pattern length for the whole module. A short track
+    gets its content plus a ten-row tail. A longer one gets a whole 8/4 or
+    16/4 phrase (32 pulses of the measured 16th), and the phrase grows only
+    when the 256-order budget needs it.
     """
 
     def test_short_track_gets_a_fitted_window(self):
@@ -358,13 +359,29 @@ class TestPatternWindow(unittest.TestCase):
         self.assertEqual(mod.n_ord, 1)
         self.assertEqual(mod.pat_len, 20 + 1 + 10)
 
-    def test_long_track_keeps_the_ceiling(self):
+    def test_long_track_uses_a_measure_window(self):
+        # One row per 16th: 8/4 is 32 rows. A 300-row track becomes ten
+        # phrase patterns instead of one 256-row chunk.
         events = [
             NoteEvent(sample=row * 735, ch=0, on=True, note=108, ins=-1,
                       vol=-1, e5=0x80, pan=0x80)
             for row in (0, 300)
         ]
         mod = parse_fur(write_fur(_fm_song(events, speed=1, hz=60.0)))
+        self.assertEqual(mod.pat_len, 32)
+        self.assertEqual(mod.n_ord, 10)
+
+    def test_a_dense_grid_still_reaches_the_ceiling(self):
+        # Eight rows per 16th makes 8/4 the full 256 rows. A longer track
+        # cannot grow past Furnace's ceiling.
+        events = [
+            NoteEvent(sample=row * 735, ch=0, on=True, note=108, ins=-1,
+                      vol=-1, e5=0x80, pan=0x80)
+            for row in (0, 300)
+        ]
+        song = _fm_song(events, speed=1, hz=60.0)
+        song.row_subdiv = 8
+        mod = parse_fur(write_fur(song))
         self.assertEqual(mod.pat_len, 256)
         self.assertEqual(mod.n_ord, 2)
 

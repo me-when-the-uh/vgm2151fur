@@ -43,7 +43,7 @@ python -m vgm2151fur convert "pack/02 Track.vgz" -o out --variants --optimize lo
 - `lossless`: pick the largest factor that adds no structural loss and no more
   than 0.1 st of pitch-model deviation over 1x; fall back to 1x when condensing
   is not safe (some dense rips are already lossy at 1x).
-- `all`: keep the largest factor and write the condensed files as
+- `all`: keep the largest factor. A condensed file the gate rejects is named
   `<name> xN (lossy).fur`.
 
 `--verify` makes `lossless` authoritative: every candidate is rendered through
@@ -94,12 +94,12 @@ row length and BPM), so the pitch macro still sees each write.
 
 The TUI asks `optimise? (Y/n)` and defaults to yes, the `all` pick: a plain
 `c convert` writes the 1x file to `default/` and every condensed factor to
-`x2 optimised/`, `x3 optimised/`, ..., with ` (lossy)` in the condensed
-names, and records every verdict in `condense.tsv`. Each manifest row names
-the grid it came from, which tells a measured lattice from a frame fallback
-at a glance. The CLI keeps the flat `<name> xN.fur` siblings unless you pass
-`--dirs`. The verdict is re-derived from the source on every run, so a
-reconversion (`tools/reconvert_all.py --optimize lossless [--verify]`)
+`x2 optimised/`, `x3 optimised/`, ..., with ` (lossy)` on the factors the
+gate rejects, and records every verdict in `condense.tsv`. Each manifest row
+names the grid it came from, which tells a measured lattice from a frame
+fallback at a glance. The CLI keeps the flat `<name> xN.fur` siblings unless
+you pass `--dirs`. The verdict is re-derived from the source on every run, so
+a reconversion (`tools/reconvert_all.py --optimize lossless [--verify]`)
 reaches the same set with or without the manifest - the manifest just lets
 you read it.
 
@@ -110,32 +110,25 @@ fits the module's master volume to a -2.5 dBFS peak (one render per track,
 a few seconds). `--no-normalize` skips the render and writes the module at
 unity.
 
-The same pass looks at the note grid and, when the loop is a whole number of
-bars, moves it onto the downbeat. It also searches a window on either side of
-the marker (four seconds, or the whole loop when that is shorter) for the
-phrase start whose copy sits one loop length later, and moves the loop there:
-a marker that fell inside the phrase lands on the phrase's own head, and the
-loop keeps the length the VGM header declares, unless the copy measures a
-shorter period, and then the wrap moves onto the copy's own row. The jump sits
-exactly one period after the new start, so the recording's overshoot, the next
-iteration's own head, stays outside the loop; a jump row carrying notes would
-play them and strike the head twice at the seam. Content at or past the wrap
-sample stays unwritten at every row rate, so a condensed grid cannot fold the
-copy's first row back onto the wrap row. The loop opens one row before the first
-commands, because a wider cut lands the seam on rows the log does not repeat
-exactly and the loop wobbles there. The cut is then seated: it moves a row or
-two only when a neighbouring seat lines the rows after the jump up exactly,
-because a shift does not change which rows pair across the seam, only which
-pairs sit right after it. A grid that does not repeat, or a loop with no
-phrase start in that window, keeps the VGM offset. `--no-loop-find` keeps it
-on every track. The convert line says `loop kept` or how far the marker moved
-(`loop -1/8`, `loop 30 rows late`, `loop 120 rows early`).
-
-The recording's own copy settles the phase. The rows past the declared loop
-end repeat the loop's first rows, and a start whose copy does not line up
-there moves onto the copy's first row. A start already faithful to the copy
-keeps its seat, and a loop whose copy the recording cuts off early keeps the
-VGM offset.
+The conversion keeps the VGM marker. A marker placed after a pickup leaves
+that pickup at the end of each iteration, where the source plays it.
+Opening the loop on the pickup would strike it twice per repeat. The loop
+end is the marker plus the header's loop length, rounded to rows, and the
+row length is re-derived from that length. One repeat is then sample exact.
+The tempo correction is under 1%. Events just before the wrap that the
+writer would round past the last row stay on that row with a delay. A
+post-marker event that the row grid puts before the start moves to the
+first loop row. The jump rides a channel whose row has no delay. A delayed
+note on the last row still lands before it. Content at or past the wrap
+sample stays unwritten at every row rate. A condensed grid cannot fold the
+next iteration's first row back onto the wrap row. A copy that measures a
+different period within a couple of rows moves the wrap to that row. The
+module uses loop modality 2. Furnace keeps held voices and samples across
+the jump. `--no-loop-find` keeps the raw marker and the source tail. The
+convert line says `loop kept`. A marker that moved is named in rows. Each
+condensed factor re-seats the loop on its own grid and recalibrates the
+row. A copied 1x loop point would land on the previous row and add one
+condensed row per repeat.
 
 Each track runs in its own worker process. The default count is pinned to
 the logical CPUs: one thread stays free below six, two at six or more, and

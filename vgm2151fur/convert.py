@@ -339,6 +339,8 @@ def convert_vgm(
         "dac_notes": song.dac_count,
         "dac_samples": len(song.dac_samples),
         "events": sum(1 for e in song.events if e.on),
+        "legato_steps": song.legato_steps,
+        "legato_ramps": song.legato_ramps,
         "warnings": warnings,
         "name": vgm.name,
         "peak": peak,
@@ -350,6 +352,28 @@ def convert_vgm(
 def _optimised_dir(factor: float) -> str:
     """The per-factor subfolder: `default/`, `x2 optimised/`, `x3 optimised/`."""
     return "default" if factor == 1 else f"x{factor:g} optimised"
+
+
+def _lossy_name(path: Path) -> Path:
+    return path.with_name(f"{path.stem} (lossy){path.suffix}")
+
+
+def _plain_name(path: Path) -> Path:
+    return path.with_name(f"{path.stem.removesuffix(' (lossy)')}{path.suffix}")
+
+
+def _mark_lossy(results: list[dict]) -> None:
+    """Add ` (lossy)` to each rejected variant and drop stale marked names."""
+    for r in results:
+        if r["factor"] == 1:
+            continue
+        path = Path(r["dst"])
+        marked = _lossy_name(path)
+        if r["lossless"]:
+            marked.unlink(missing_ok=True)
+            continue
+        path.replace(marked)
+        r["dst"] = str(marked)
 
 
 def default_factors(condense: float) -> tuple[float, ...]:
@@ -378,6 +402,14 @@ def _place_dirs(results: list[dict], out_dir: Path, keep: set) -> None:
             if path != dest:
                 path.replace(dest)
             r["dst"] = str(dest)
+            if r["factor"] != 1:
+                # Drop the name this verdict no longer uses from an earlier run.
+                alternate = (
+                    _plain_name(dest)
+                    if dest.stem.endswith(" (lossy)")
+                    else _lossy_name(dest)
+                )
+                alternate.unlink(missing_ok=True)
         elif path.exists():
             try:
                 path.unlink()
@@ -428,10 +460,11 @@ def convert_variants(
 ) -> list[dict]:
     """Write one .fur per condense factor and pick one.
 
-    Factor 1 is the canonical `<stem>.fur`; factor N adds ` xN`, and `all`
-    adds ` (lossy)`. `mode` chooses the pick: none -> 1x, lossless -> largest
-    accepted factor, all -> largest factor. With `layout="dirs"` the kept
-    factors move to `default/` and `xN optimised/`.
+    Factor 1 is the canonical `<stem>.fur` and factor N adds ` xN`. In
+    `all` mode a factor the lossless gate rejects also adds ` (lossy)`.
+    `mode` chooses the pick: none -> 1x, lossless -> largest accepted factor,
+    all -> largest factor. With `layout="dirs"` the kept factors move to
+    `default/` and `xN optimised/`.
     """
     vgm = load_vgm(path)
     src = Path(path)
@@ -442,19 +475,19 @@ def convert_variants(
     base = analyze(vgm, speed=speed, pcm=pcm, min_row=min_row, condense=1.0,
                    grid_cache=grid_cache, c352_quad=c352_quad)
     loop_note = apply_loop(base) if loop_find else None
-    loop_pair = (base.loop_sample, base.loop_end_sample, base.loop_cut_sample)
     for f in factors:
         factor = float(f)
         if factor == 1:
             song = base
+            variant_loop = loop_note
         else:
             song = analyze(vgm, speed=speed, pcm=pcm, min_row=min_row,
                            condense=factor, grid_cache=grid_cache,
                            c352_quad=c352_quad)
-            if loop_find:
-                song.loop_sample, song.loop_end_sample, song.loop_cut_sample = loop_pair
-                if loop_note and loop_note != "loop kept":
-                    song.warnings.append(loop_note)
+            # A condensed grid has longer rows. Re-seat the loop on those
+            # rows and recalibrate them. Copying the 1x sample points would
+            # floor the start one row early and stretch the loop by a row.
+            variant_loop = apply_loop(song) if loop_find else None
         warnings = list(song.warnings)
         use_verify = verify and mode != "all"
         if verify and mode == "all":
@@ -468,8 +501,7 @@ def convert_variants(
                 f"condensed x{factor:g}: low-confidence source grid"
             )
         stats: dict = {}
-        lossy = " (lossy)" if mode == "all" else ""
-        name = f"{src.stem}.fur" if factor == 1 else f"{src.stem} x{factor:g}{lossy}.fur"
+        name = f"{src.stem}.fur" if factor == 1 else f"{src.stem} x{factor:g}.fur"
         out_path = out_dir / name
         data, peak, gain = _emit(
             song, out_path, pcm=pcm, include_fm=include_fm,
@@ -510,8 +542,10 @@ def convert_variants(
             "keyons": stats.get("keyons", 0),
             "missed": keyon_loss(stats),
             "dev_max": dev_max(stats),
+            "legato_steps": song.legato_steps,
+            "legato_ramps": song.legato_ramps,
             "warnings": warnings,
-            "loop": loop_note,
+            "loop": variant_loop,
             "peak": peak,
             "gain": gain,
             "div_ms": verdict.get("div_ms") if verdict else None,
@@ -564,6 +598,8 @@ def convert_variants(
 
     for r in results:
         r["lossless"] = _lossless(r)
+    if mode == "all":
+        _mark_lossy(results)
     ok = [r for r in results if r["lossless"]]
     if mode == "none" or not ok:
         pick = base

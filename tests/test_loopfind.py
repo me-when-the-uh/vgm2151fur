@@ -15,7 +15,7 @@ if str(ROOT) not in sys.path:
 
 from vgm2151fur.analyze import NoteEvent, Song  # noqa: E402
 from vgm2151fur.furio import parse_fur  # noqa: E402
-from vgm2151fur.furwrite import write_fur  # noqa: E402
+from vgm2151fur.furwrite import Row, _emit_steps, write_fur  # noqa: E402
 from vgm2151fur.loopfind import (  # noqa: E402
     _exact_rows,
     _seat_cost,
@@ -29,10 +29,10 @@ from vgm2151fur.vgm import VgmFile  # noqa: E402
 NOTE_OFF = 180
 
 
-def _vgm():
+def _vgm(loop_samples: int = 0, loop_sample: int | None = None):
     return VgmFile(
         path=Path("synthetic.vgm"), buf=b"", version=0x151, total_samples=1,
-        loop_samples=0, loop_file_pos=None, loop_sample=None,
+        loop_samples=loop_samples, loop_file_pos=None, loop_sample=loop_sample,
         ym2151_clock=3579545, k007232_clock=3579545, gd3={}, roms=[], writes=[],
     )
 
@@ -231,28 +231,130 @@ class TestApplyAndWrite(unittest.TestCase):
         for row in (0, 1, 17, 158):
             self.assertEqual(song.row_of(row_to_sample(song, row)), row)
 
-    def test_apply_loop_sets_both_ends(self):
+    def test_apply_loop_keeps_the_marker_and_sets_both_ends(self):
         notes, loop_row, end_row = _bar(loop_pulse=1, step=4)
+        length = end_row - loop_row + 1
         song = Song(
-            vgm=_vgm(), t0=0, loop_sample=loop_row * 735, speed=1, hz=60.0,
+            vgm=_vgm(loop_samples=length * 735, loop_sample=loop_row * 735),
+            t0=0, loop_sample=loop_row * 735, speed=1, hz=60.0,
             fm_patches=[], pcm_samples=[],
             events=[_event(row * 735, ch, pitch) for row, ch, pitch in notes],
         )
-        # The planted end is the last note only if we put one there. apply
-        # uses the last event row, so drop anything past end_row and make
-        # sure something sits on it.
-        song.events = [ev for ev in song.events if song.row_of(ev.sample) <= end_row]
-        if song.row_of(song.events[-1].sample) != end_row:
-            song.events.append(_event(end_row * 735, 0, 60))
         text = apply_loop(song)
         self.assertIsNotNone(text)
-        self.assertNotEqual(text, "loop kept")
-        self.assertEqual(song.row_of(song.loop_sample), loop_row - 4 - 1)
-        self.assertEqual(
-            song.row_of(song.loop_end_sample) - song.row_of(song.loop_sample),
-            end_row - loop_row,
-        )
+        self.assertEqual(song.loop_start_row, loop_row)
+        self.assertEqual(song.loop_end_row, end_row)
+        self.assertEqual(song.row_of(song.loop_sample), loop_row)
+        self.assertEqual(song.row_of(song.loop_end_sample), end_row)
         self.assertTrue(song.warnings)
+
+    def test_apply_loop_does_not_open_on_a_repeating_pickup(self):
+        # The marker sits after a chord that is released before it, and the
+        # tail repeats that chord one loop later. It is intro material. The
+        # loop opens on the marker. The chord plays once per iteration at the
+        # end, never twice at the start.
+        length = 32
+        notes = [
+            (8, 0, 60), (8, 1, 64), (14, 0, 62),
+            (16, 0, 67), (16, 1, 55), (24, 0, 69),
+            (40, 0, 60), (40, 1, 64), (46, 0, 62),
+            (48, 0, 67), (48, 1, 55),
+        ]
+        song = Song(
+            vgm=_vgm(loop_samples=length * 735, loop_sample=16 * 735),
+            t0=0, loop_sample=16 * 735, speed=1, hz=60.0,
+            fm_patches=[], pcm_samples=[],
+            events=[_event(row * 735, ch, pitch) for row, ch, pitch in notes],
+        )
+        apply_loop(song)
+        self.assertEqual(song.loop_start_row, 16)
+        self.assertEqual(song.loop_end_row, 16 + length - 1)
+
+    def test_apply_loop_calibrates_the_row_to_the_loop(self):
+        # 100000 samples do not divide into the measured 735-sample row. The
+        # written row is re-derived to make one iteration sample exact.
+        length = round(100000 / 735)
+        song = Song(
+            vgm=_vgm(loop_samples=100000, loop_sample=10 * 735),
+            t0=0, loop_sample=10 * 735, speed=1, hz=60.0,
+            fm_patches=[], pcm_samples=[],
+            events=[_event(10 * 735, 0, 60)],
+        )
+        apply_loop(song)
+        self.assertEqual(song.loop_end_row - song.loop_start_row + 1, length)
+        self.assertAlmostEqual(song.samples_per_row * length, 100000, delta=1.0)
+
+    def test_a_pre_wrap_note_rolling_past_the_end_stays_on_the_last_row(self):
+        # At speed 1 the writer rounds the note to the row after the loop
+        # end. The note is still before the wrap sample. It belongs to the
+        # last iteration row, not to the next iteration.
+        length = 41
+        end_row = length - 1
+        song = Song(
+            vgm=_vgm(loop_samples=length * 735, loop_sample=0),
+            t0=0, loop_sample=0, speed=1, hz=60.0,
+            fm_patches=[], pcm_samples=[],
+            events=[
+                _event(0, 0, 60),
+                _event(int((end_row + 0.6) * 735), 0, 64),
+            ],
+        )
+        apply_loop(song)
+        mod = parse_fur(write_fur(song, include_pcm=False, include_fm=True))
+        order = end_row // mod.pat_len
+        rows = mod.patterns[(0, mod.orders[0][order])]
+        self.assertEqual(rows[end_row % mod.pat_len].note, 64)
+
+    def test_the_jump_rides_a_channel_without_a_delay(self):
+        # Both channels carry a delayed note on the loop end row. One gives
+        # up its delay to carry Bxx. The other keeps ED and still sounds just
+        # before the wrap.
+        speed, hz = 6, 480.7
+        row = (44100.0 / hz) * speed
+        tick = row / speed
+        length, end_row = 9, 8
+        song = Song(
+            vgm=_vgm(loop_samples=int(length * row), loop_sample=0),
+            t0=0, loop_sample=0, speed=speed, hz=hz,
+            fm_patches=[], pcm_samples=[],
+            events=[
+                _event(int(end_row * row + 3 * tick), ch, 60 + ch)
+                for ch in range(8)
+            ],
+        )
+        apply_loop(song)
+        mod = parse_fur(write_fur(song, include_pcm=False, include_fm=True))
+        ch0 = mod.patterns[(0, mod.orders[0][0])][end_row]
+        ch1 = mod.patterns[(1, mod.orders[1][0])][end_row]
+        self.assertIn(0x0B, [c for c, _v in ch0.fx])
+        self.assertIn(0xED, [c for c, _v in ch1.fx])
+        self.assertNotIn(0x0B, [c for c, _v in ch1.fx])
+
+
+class TestClippedPitchStep(unittest.TestCase):
+    def test_a_step_on_the_clipped_note_row_moves_after_the_note(self):
+        # The loop-start clip can move a note forward one row. A late rate
+        # step that lands on the note's new row must move to the next row
+        # instead of being mistaken for a foreign note.
+        song = Song(
+            vgm=_vgm(), t0=0, loop_sample=None, speed=1, hz=60.0,
+            fm_patches=[], pcm_samples=[], events=[],
+        )
+        self.assertEqual(song.place(1000)[0], 1)
+        self.assertEqual(song.place(1470)[0], 2)
+        ev = NoteEvent(
+            sample=1000, ch=0, on=True, note=60, ins=0, vol=-1,
+            e5=0x80, pan=0, pcm=True, pitch_steps=((1470, 73),),
+            e5_lo=0x00, e5_hi=0xFF,
+        )
+        grid = [{2: Row(note=60)}]
+        e5: dict = {}
+        _emit_steps(grid, song, ev, 2, 10, e5, note_row=2)
+        row = grid[0].get(3)
+        self.assertIsNotNone(row)
+        self.assertTrue(
+            any(cmd in (0xE8, 0xE9) for cmd, _value in (row.fx or ())),
+        )
 
 
 if __name__ == "__main__":

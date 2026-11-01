@@ -1,10 +1,13 @@
-"""Move a VGM loop marker onto the downbeat of the bar.
+"""Place the source loop in a module's row grid.
 
-Rippers drop the marker where the phrase happened to be, and it can sit a
-pulse or a phrase late. The cut moves it onto the phrase head and opens a
-row early, keeping voices keyed just before the downbeat inside the loop.
-The loop keeps the length the VGM declares. A loop that is not a whole
-number of bars stays on the VGM marker.
+The VGM header names one iteration: a start sample and a length. The start
+is the authority. A marker after a pickup means the pickup plays in the
+intro and again just before each wrap. Opening the loop on the pickup
+instead strikes it twice per repeat. The end follows the header length,
+rounded to rows. The row length is calibrated, and a repeat is sample exact.
+Events just before the wrap that roll past the row end stay on the last loop
+row. The jump rides a channel with no delay. Delayed notes still land before
+it.
 """
 
 from __future__ import annotations
@@ -12,7 +15,7 @@ from __future__ import annotations
 import math
 from bisect import bisect_left
 from collections import Counter, defaultdict
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 
 NOTE_OFF = 180
 PERIODS = (4, 8, 12, 16)
@@ -865,60 +868,6 @@ def _copy_period(by, start: int, length: int, end_row: int,
     return period if pairs >= _COPY_MIN_EVENTS else None
 
 
-def _copy_head_start(by, samples_at, chan_at, start: int, length: int,
-                     drift: int, span: int = 8) -> tuple[int, int | None]:
-    """The row in front of `start` the recording's copy replays, plus the
-    first sample of that copy.
-
-    Rows ahead of the marker are intro material until the copy at the tail
-    sounds them again one loop later. Empty rows do not end the walk; a row
-    the copy does not answer does, and a row counts as answered when most
-    of its channels sound inside the copy's window (slides keep their
-    carriers sounding).
-    """
-    first: int | None = None
-    moved = False
-    chan_rows: dict[int, list[int]] = defaultdict(list)
-    for (ch, _pitch), rows in by.items():
-        chan_rows[ch].extend(rows)
-    for rows in chan_rows.values():
-        rows.sort()
-    for row in range(start - 1, max(-1, start - 1 - span), -1):
-        cells = [key for key, rows in by.items() if row in rows]
-        if not cells:
-            continue
-        target = row + length
-        hits = 0
-        chans: set[int] = set()
-        chan_hits = 0
-        for key in cells:
-            rows = by[key]
-            i = bisect_left(rows, target - drift)
-            ok = i < len(rows) and rows[i] <= target + drift
-            ch = key[0]
-            if ok:
-                sample = samples_at.get((rows[i], ch, key[1]))
-                if sample is None:
-                    sample = chan_at.get((rows[i], ch))
-                if sample is not None and (first is None or sample < first):
-                    first = sample
-            hits += int(ok)
-            if ch not in chans:
-                chans.add(ch)
-                rowsi = chan_rows[ch]
-                j = bisect_left(rowsi, target - drift)
-                if j < len(rowsi) and rowsi[j] <= target + drift:
-                    chan_hits += 1
-        if hits * 3 >= len(cells) * 2 or (
-            len(chans) >= 4 and chan_hits * 4 >= len(chans) * 3
-        ):
-            start = row
-            moved = True
-        else:
-            break
-    return start, (first if moved else None)
-
-
 def _copy_aligned(notes, picked: int, end_row: int, length: int | None,
                   window: int) -> int:
     """The start the recording's own copy puts the wrap on.
@@ -958,34 +907,92 @@ def _declared_length(song) -> int | None:
     return length if length >= 2 else None
 
 
-def _declared_end_row(song, start_row: int) -> int | None:
-    """The jump row the declared loop length puts the wrap on.
-
-    The header's length is the one iteration length the rip vouches for.
-    Rows the recording runs past it (the next iteration's head) stay
-    outside the loop, or the seam strikes the head twice.
-    """
-    length = _declared_length(song)
-    if length is None:
-        return None
-    return start_row + length - 1
+def _write_loop(
+    song, start_row: int, end_row: int, text: str,
+    marker: int | None = None,
+) -> str:
+    """Store one loop and make the played iteration match the header length."""
+    rows = end_row - start_row + 1
+    if song.vgm.loop_samples and rows > 0:
+        # The loop is a whole number of rows, and the measured row length can
+        # miss the header's length by a fraction of a sample. Over a long loop
+        # that fraction becomes milliseconds of drift per repeat. The row is
+        # re-derived from the loop. The correction stays under 1%.
+        target = song.vgm.loop_samples / rows
+        old = song.samples_per_row
+        if old > 0 and abs(target / old - 1.0) <= 0.01:
+            song.hz *= old / target
+    # A tenth of a row in. Every row rate reads the point as the row the
+    # loop opens on, not the row below.
+    nudge = int(song.samples_per_row / 10)
+    song.loop_start_row = start_row
+    song.loop_end_row = end_row
+    song.loop_marker_sample = (
+        marker if marker is not None else row_to_sample(song, start_row)
+    )
+    song.loop_sample = row_to_sample(song, start_row) + nudge
+    song.loop_end_sample = row_to_sample(song, end_row) + nudge
+    # The wrap sample: content at or past it is the copy of the head and
+    # stays unwritten at every row rate. A copy that drifts a hair early
+    # still lands past it.
+    cut = row_to_sample(song, end_row + 1)
+    if song.vgm.loop_samples:
+        cut = min(cut, song.loop_sample + song.vgm.loop_samples)
+    song.loop_cut_sample = cut
+    song.warnings.append(text)
+    return text
 
 
 def apply_loop(song) -> str | None:
-    """Move `song`'s loop onto the downbeat. None when the VGM has no loop.
+    """Set `song`'s loop start and end. None when the VGM has no loop.
 
-    `'loop kept'` when the marker already sits where it should, or the grid
-    does not say. A description when the order cut moves; that case is also
-    a warning on the song.
+    The header's loop length is the source's own statement of one iteration.
+    The end is always written from it. The start stays on the marker: a
+    marker placed after a pickup means the pickup plays once in the intro and
+    again at the end of each iteration. Moving the start back would strike it
+    twice per loop.
     """
     if song.loop_sample is None:
         return None
+    loop_row = max(0, song.row_of(song.loop_sample))
+    length = _declared_length(song)
     notes = [
         (song.row_of(ev.sample), ev.ch, ev.note)
         for ev in song.events
         if ev.on and 0 <= ev.note < NOTE_OFF
     ]
-    loop_row = song.row_of(song.loop_sample)
+    if length is not None:
+        rows = length
+        # The recording's copy can measure the exact row the head returns on.
+        # Use it only for a small correction. A long tail is the next
+        # iteration's own head, not a different period.
+        if notes:
+            last_row = _last_content_row(song)
+            by = _copy_index(notes)
+            if _copy_faithful(
+                by, loop_row, length, last_row, _COPY_DRIFT,
+            ):
+                period = _copy_period(
+                    by, loop_row, length, last_row, _COPY_DRIFT,
+                )
+                if period is not None and abs(period - length) <= _COPY_DRIFT:
+                    rows = period
+        # Anchor the marker to its nearest row in the final grid. The row
+        # length is about to be derived from the loop. Reading the marker row
+        # with the old length could put the start one row off.
+        if song.vgm.loop_samples > 0 and rows > 0:
+            start_row = int(round(
+                (song.loop_sample - song.t0) * rows / song.vgm.loop_samples
+            ))
+        else:
+            start_row = loop_row
+        start_row = max(0, start_row)
+        end_row = start_row + rows - 1
+        return _write_loop(
+            song, start_row, end_row, "loop kept", marker=song.loop_sample,
+        )
+
+    # A rip with no declared length keeps the finder's own estimate.
     end_row = _last_content_row(song)
     if not notes or end_row < loop_row:
         return "loop kept"
@@ -997,70 +1004,11 @@ def apply_loop(song) -> str | None:
     fix = find_loop(
         notes, loop_row=loop_row, end_row=end_row, forward_rows=forward,
     )
-    picked = fix.start_row if fix is not None else loop_row
-    start_row = _copy_aligned(
-        notes, picked, end_row, _declared_length(song), forward,
-    )
-    head_sample: int | None = None
-    if fix is None:
-        # The copy settles where the loop opens even when no other pick was
-        # found; a pick the copy already settled keeps its seat.
-        length = _declared_length(song)
-        if length is not None:
-            samples_at: dict[tuple[int, int, int], int] = {}
-            chan_at: dict[tuple[int, int], int] = {}
-            for ev in song.events:
-                if ev.on and 0 <= ev.note < NOTE_OFF:
-                    key = (song.row_of(ev.sample), ev.ch, ev.note)
-                    prev = samples_at.get(key)
-                    if prev is None or ev.sample < prev:
-                        samples_at[key] = ev.sample
-                    ckey = (key[0], ev.ch)
-                    prev = chan_at.get(ckey)
-                    if prev is None or ev.sample < prev:
-                        chan_at[ckey] = ev.sample
-            start_row, head_sample = _copy_head_start(
-                _copy_index(notes), samples_at, chan_at, start_row, length,
-                _COPY_DRIFT,
-            )
-        if start_row == loop_row:
-            return "loop kept"
+    picked = max(fix.start_row if fix is not None else loop_row, loop_row)
+    start_row = max(_copy_aligned(notes, picked, end_row, None, forward), loop_row)
+    if fix is None or start_row != fix.start_row:
         fix = LoopFix(
             start_row=start_row, end_row=start_row, period=0, shift_pulses=0,
             step_rows=1,
         )
-    elif start_row != fix.start_row:
-        fix = replace(fix, start_row=start_row)
-    declared = _declared_end_row(song, fix.start_row)
-    if declared is not None:
-        wrap_row = declared
-        # The copy's own period can put the wrap earlier than the header;
-        # the header would then run past the copy and sound its first row
-        # at the seam.
-        length = _declared_length(song)
-        by = _copy_index(notes)
-        if _copy_faithful(by, fix.start_row, length, end_row, _COPY_DRIFT):
-            period = _copy_period(by, fix.start_row, length, end_row, _COPY_DRIFT)
-            if period is not None and period < length:
-                wrap_row = fix.start_row + period - 1
-        elif head_sample is not None:
-            # The copy's own first sample says where the wrap belongs: the
-            # row before it.
-            wrap_row = max(fix.start_row, int(head_sample / song.samples_per_row) - 1)
-        if wrap_row != fix.end_row:
-            fix = replace(fix, end_row=wrap_row)
-    # A tenth of a row in, so every row rate reads the point as the row the
-    # loop opens on, not the row below.
-    nudge = int(song.samples_per_row / 10)
-    song.loop_sample = row_to_sample(song, fix.start_row) + nudge
-    song.loop_end_sample = row_to_sample(song, fix.end_row) + nudge
-    # The wrap sample: content at or past it is the copy of the head and
-    # stays unwritten at every row rate. A copy that drifts a hair early
-    # still lands past it.
-    cut = row_to_sample(song, fix.end_row + 1)
-    if song.vgm.loop_samples:
-        cut = min(cut, song.loop_sample + song.vgm.loop_samples)
-    song.loop_cut_sample = cut
-    text = describe_fix(fix, loop_row)
-    song.warnings.append(text)
-    return text
+    return _write_loop(song, start_row, fix.end_row, describe_fix(fix, loop_row))

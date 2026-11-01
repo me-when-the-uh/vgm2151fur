@@ -104,10 +104,14 @@ class _OplKeys:
         return hit
 
 
-def _keyons_by_channel(vgm: VgmFile) -> dict[int, list[int]]:
+def _keyons_by_channel(
+    vgm: VgmFile, chips: set[str] | None = None,
+) -> dict[int, list[int]]:
     out: dict[int, list[int]] = {}
     opl_trackers: dict[str, _OplKeys] = {}
     for w in vgm.writes:
+        if chips is not None and w.chip not in chips:
+            continue
         if w.chip == "ym2151" and w.reg == 0x08 and (w.val & 0x78):
             out.setdefault(w.val & 7, []).append(w.sample)
         elif w.chip == "ym2203" and w.reg == 0x28 and (w.val & 0xF0):
@@ -278,14 +282,16 @@ def estimate_grid(
     min_row: float = MIN_ROW_SAMPLES,
     onsets: dict[int, list[int]] | None = None,
     label: str = "key-on lattice",
+    chips: set[str] | None = None,
 ) -> Grid | None:
     """Return the measured grid, a subdivided 16th note, or None.
 
     Candidate units are scored by how many intervals they explain as integer
     multiples, and the coarsest near-best unit wins. `onsets` overrides the
-    note times, keyed by channel.
+    note times, keyed by channel. `chips` restricts the measured register
+    stream to the family a mixed log actually converts.
     """
-    by_ch = _keyons_by_channel(vgm) if onsets is None else onsets
+    by_ch = _keyons_by_channel(vgm, chips) if onsets is None else onsets
     deltas: list[int] = []
     for ch, ons in by_ch.items():
         for a, b in zip(ons, ons[1:]):

@@ -20,6 +20,7 @@ from vgm2151fur.analyze import (
     FMPatch,
     NoteEvent,
     OpRegs,
+    kc_kf_units,
     opm_pitch_offset,
     transpose_opm_events,
 )
@@ -27,6 +28,9 @@ from vgm2151fur.furio import parse_fur
 from vgm2151fur.furwrite import write_fur
 from vgm2151fur.timing import estimate_grid
 from vgm2151fur.vgm import ChipWrite, VgmFile
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _synth import note_song, staircase  # noqa: E402
 
 
 def _vgm_with_keyons(onsets):
@@ -278,8 +282,8 @@ class TestPercussionSweeps(unittest.TestCase):
         writes.append(ChipWrite(5100, "ym2151", 0, 0x08, 4))
         song = analyze(_vgm_with_writes(writes), pcm=False)
         note = next(e for e in song.events if e.on and e.ch == 4)
-        self.assertEqual(len(note.sweep), 1)
-        self.assertEqual(note.sweep[0][1], -768)  # one octave in 1/64 units
+        self.assertEqual(note.pitch_steps, ((2000, -768),))
+        self.assertEqual(note.sweep, ())
         data = write_fur(song, include_pcm=False, include_fm=True)
         m = parse_fur(data)
         rows = [
@@ -290,6 +294,74 @@ class TestPercussionSweeps(unittest.TestCase):
         self.assertEqual(down, [12], "the octave should land as one hard transpose")
         rates = [v for r in rows for c, v in r.fx if c in (0x01, 0x02) and v]
         self.assertEqual(rates, [])
+        fx = [
+            (c, v) for (ch, _i), rows in m.patterns.items() if ch == 4
+            for r in rows for c, v in r.fx
+        ]
+        self.assertTrue(any(c == 0xE9 for c, _v in fx), fx)
+        self.assertTrue(any(c == 0xE5 for c, _v in fx), fx)
+
+
+def _kc_for_units(units: int) -> int:
+    for kc in range(256):
+        if kc_kf_units(kc, 0) == units:
+            return kc
+    raise AssertionError(units)
+
+
+class TestLegatoSteps(unittest.TestCase):
+    """A held one- or two-step retune becomes E8/E9. Other motion stays a ramp."""
+
+    BASE_KC = 0x42
+
+    CH = 4
+
+    def _song(self, semis: int, *, key_on: int = 60000, key_off: int = 160000,
+              at: int = 70000):
+        target = _kc_for_units(kc_kf_units(self.BASE_KC, 0) + semis * 64)
+        return analyze(note_song(
+            key_on=key_on, key_off=key_off, kc=self.BASE_KC, kf=0,
+            pitch_writes=[(at, 0x28 | self.CH, target)], ch=self.CH,
+        ), pcm=False)
+
+    def test_held_semitone_steps_become_e8_e9(self):
+        for semis in (1, 2, 7, 12, -12):
+            with self.subTest(semis=semis):
+                song = self._song(semis)
+                note = next(
+                    e for e in song.events if e.on and e.ch == self.CH
+                )
+                self.assertEqual(note.pitch_steps, ((70000, semis * 64),))
+                self.assertEqual(note.sweep, ())
+                self.assertEqual(song.legato_steps, 1)
+                m = parse_fur(write_fur(
+                    song, include_pcm=False, include_fm=True,
+                ))
+                fx = [
+                    (c, v) for (ch, _i), rows in m.patterns.items()
+                    if ch == self.CH for r in rows for c, v in r.fx
+                ]
+                want = 0xE9 if semis < 0 else 0xE8
+                self.assertTrue(any(c == want for c, _v in fx), (semis, fx))
+
+    def test_a_staircase_stays_a_ramp(self):
+        writes = staircase(
+            70000, steps=20, step_samples=500, kc=self.BASE_KC, kf=0,
+            ch=self.CH,
+        )
+        song = analyze(note_song(
+            key_on=60000, key_off=160000, kc=self.BASE_KC, kf=0,
+            pitch_writes=writes, ch=self.CH,
+        ), pcm=False)
+        note = next(e for e in song.events if e.on and e.ch == self.CH)
+        self.assertEqual(note.pitch_steps, ())
+        self.assertTrue(note.sweep)
+
+    def test_a_release_tail_retune_stays_a_ramp(self):
+        song = self._song(7, key_on=60000, key_off=70000, at=72000)
+        note = next(e for e in song.events if e.on and e.ch == self.CH)
+        self.assertEqual(note.pitch_steps, ())
+        self.assertEqual(song.legato_steps, 0)
 
 
 def _traj_at(pts, t):

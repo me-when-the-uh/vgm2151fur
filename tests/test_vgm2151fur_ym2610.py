@@ -391,7 +391,10 @@ class TestYm2610Writer(unittest.TestCase):
         self.assertIn(7, offs)   # ADPCM-A channel 0
         self.assertIn(13, offs)  # ADPCM-B
 
-    def test_adpcm_loop_end_off(self):
+    def test_adpcm_loop_end_does_not_stop_a_sounding_sample(self):
+        # The B sample starts inside the loop and its source stop is past
+        # the wrap. The player would never reach that stop before looping.
+        # The module must not write an off at the seam either.
         song = analyze(_vgm(_adpcm_writes(), bytes(1024), total_samples=3000))
         song.loop_sample = 2000
         song.loop_end_sample = 2900
@@ -401,9 +404,11 @@ class TestYm2610Writer(unittest.TestCase):
             row for (ch, _idx), rows in m.patterns.items() if ch == 13
             for row in rows if row.note == NOTE_OFF
         ]
-        self.assertTrue(offs)
+        self.assertFalse(offs)
 
-    def test_adjusted_loop_keeps_source_tail(self):
+    def test_adjusted_loop_cuts_the_source_tail(self):
+        # A trigger past the wrap belongs to the next iteration. Keeping it
+        # would play it before the jump and then again after the jump.
         song = analyze(_vgm(_adpcm_writes(), bytes(1024), total_samples=3000))
         song.loop_sample = 1000
         song.loop_end_sample = 1500
@@ -413,7 +418,7 @@ class TestYm2610Writer(unittest.TestCase):
             row.note for (ch, _idx), rows in m.patterns.items() if ch == 13
             for row in rows if 0 <= row.note < 180
         ]
-        self.assertIn(60, notes)  # B trigger at 2000, after the bar trim
+        self.assertNotIn(60, notes)  # B trigger at 2000, past the loop end
 
     @unittest.skipUnless(HAVE_FURNACE, "Furnace is not installed")
     def test_furnace_round_trip_motion(self):
