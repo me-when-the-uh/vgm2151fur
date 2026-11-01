@@ -21,8 +21,10 @@ the hits per pack directory:
     ay8910   AY-3-8910/YM2149 at header 0x74 (VGM 1.51+), type byte 0x78
     ym2203   YM2203 at header 0x44; bit 30 marks a second chip (0xA5 writes)
     ym2612   YM2612 at header 0x2C; bit 30 marks a second chip (0xA2/A3 writes)
-    opl      YM3526 (OPL) at header 0x54; writes use command $5B. No rhythm
-             support in Furnace's chip, so a drum log of this family is rare
+    opl      YM3526 (OPL) at header 0x54; writes use command $5B. Rhythm mode
+             is the same $BD register as on a YM3812 and becomes Furnace's drums
+             system; the chip differs only in having no waveform select, so its
+             operators are sine and an instrument's wave byte does nothing
     opl2     YM3812 (OPL2) at header 0x50; bit 30 marks a second chip ($AA
              writes) and bit 31 that the pair is hard left/right. Commands $5A
              (bank A) and $AA (second chip). Rhythm mode is the $BD register: a

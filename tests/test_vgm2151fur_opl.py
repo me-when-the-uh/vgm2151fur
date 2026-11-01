@@ -14,6 +14,7 @@ from __future__ import annotations
 import math
 import tempfile
 import unittest
+from collections import Counter
 from pathlib import Path
 
 from vgm2151fur.analyze import analyze, format_report
@@ -853,6 +854,10 @@ METAL = Path(r"F:\NASbackup\JamesAlan\_devspace\grbsd\ripwip"
              r"\metalace-opl3\main_010a.vgm")
 KXEMI = Path(r"F:\NASbackup\JamesAlan\_devspace\grbsd\ripwip\_finished"
              r"\knightsofxentar-opl3\KXEMI1_opl2.vgm")
+# A YM3526 that really latches the kit. Rhythm mode is identical to a YM3812's -
+# same $BD register, same five percussion voices - the chip only lacks waveform
+# select, so this is what proves the family was not special-cased out of it.
+OPL1KIT = Path(r"D:\Apps\Audio\Furnace\opl1_rhythmtest.vgm")
 
 
 @unittest.skipUnless(HAVE_FURNACE and MC01.is_file(),
@@ -860,7 +865,7 @@ KXEMI = Path(r"F:\NASbackup\JamesAlan\_devspace\grbsd\ripwip\_finished"
 class TestOplRealRips(unittest.TestCase):
     """The rips the model was tuned on: every unbent note lands exactly."""
 
-    def _check(self, path: Path, kind: str):
+    def _check(self, path: Path, kind: str, min_attacks: int = 1000):
         """At every attack the chip is handed the same registers it was before.
 
         The comparison is sample-atomic (``diag.opl_attacks``): a driver that
@@ -905,6 +910,21 @@ class TestOplRealRips(unittest.TestCase):
         bytes_cmp = 0
         pitch_cmp = 0
         bad: list[str] = []
+        # Furnace re-latches the kit as it wraps the loop, so an exported attack
+        # past the source's last sample has nothing to compare with. Drop those,
+        # one row of slack for the tick it lands on; everything inside the song
+        # still has to match exactly.
+        edge = src.total_samples + 600
+        for key, brows in list(got.items()):
+            kept = [r for r in brows if r[2] <= edge]
+            if len(kept) != len(brows):
+                # only a rhythm channel may gain at the seam, and only its tail.
+                # The kick is one of them even though it plays a plain DIV_INS_OPL
+                # voice: it owns channel 7's two operators, like BD on the chip.
+                self.assertGreaterEqual(key[1], st.melodic,
+                                f"{path.name} ch{key}: melodic attack past the end")
+                self.assertEqual(kept, brows[:len(kept)])
+                got[key] = kept
         for ch, rows in sorted(want.items()):
             brows = got.get(ch, [])
             self.assertEqual(len(brows), len(rows),
@@ -943,9 +963,10 @@ class TestOplRealRips(unittest.TestCase):
                             bad.append("ch%s t=%.3f op %x/%02X want %02X got %02X"
                                        % (ch, t / VGM_RATE, a_port, a_off + page,
                                           w, g))
-        # Both comparisons must actually have run on these rips: thousands of
-        # attacks and tens of thousands of bytes.
-        self.assertGreater(total, 1000, path.name)
+        # Both comparisons must actually have run: every attack of the rip, and
+        # several operator registers at each one. A short fixture sets its own
+        # floor instead, so the test cannot pass by comparing nothing.
+        self.assertGreater(total, min_attacks, path.name)
         self.assertGreater(bytes_cmp, total * 4, path.name)
         self.assertEqual(bad[:6], [], f"{path.name}: {len(bad)} diffs")
 
@@ -963,6 +984,67 @@ class TestOplRealRips(unittest.TestCase):
         song = analyze(load_vgm(SOLAR))
         self.assertTrue(song.opl_drums)
         self._check(SOLAR, KIND_OPL2)
+
+    @unittest.skipUnless(OPL1KIT.is_file(), "YM3526 rhythm fixture missing")
+    def test_opl1_rhythm_rip(self):
+        # The YM3526 has rhythm mode exactly like a YM3812 - same $BD register,
+        # same kit - so the only thing a real OPL1 log can catch is the family
+        # being special-cased out of the drums layout, or its absent waveform
+        # register ($Ex) being invented on the way back.
+        src = load_vgm(OPL1KIT)
+        song = analyze(src)
+        self.assertEqual(song.fm_chip, KIND_OPL)
+        self.assertTrue(song.opl_drums, "the YM3526 was kept melodic")
+        m = parse_fur(write_fur(song, include_pcm=False))
+        self.assertEqual(m.chips, [CHIP_OPL_DRUMS])
+        self.assertEqual(m.n_ch, 11)
+
+        # $BD bits 4..0 latch BD, SD, TOM, CYM/TP and HH. BD is driven from
+        # channel 7's two operators of its own; only channels 8 and 9 put two
+        # voices on one frequency register.
+        NAMES = {4: "BD", 3: "SD", 2: "TM", 1: "TP", 0: "HH"}
+
+        def latches(vgm, times=False):
+            """Per-voice rising percussion edges in $BD, counted or timed."""
+            fired, prev = ({n: [] for n in NAMES.values()} if times else Counter()), 0
+            for w in vgm.writes:
+                if w.chip != KIND_OPL or (w.reg & 0xFF) != 0xBD:
+                    continue
+                cur = (w.val & 0x1F) if (w.val & 0x20) else 0
+                for k, name in NAMES.items():
+                    if (cur >> k) & 1 and not (prev >> k) & 1:
+                        if times:
+                            fired[name].append(w.sample)
+                        else:
+                            fired[name] += 1
+                prev = cur
+            return fired
+
+        back = load_vgm(self._export(OPL1KIT, song))
+        a, b = latches(src), latches(back)
+        self.assertGreater(sum(a.values()), 0, "the fixture latched no drum")
+        # Nothing may be lost: every voice the log latches must sound again.
+        for name, n in a.items():
+            self.assertGreaterEqual(b.get(name, 0), n,
+                                    "%s: %d hit(s) lost (%r vs %r)" % (name, n - b.get(name, 0), a, b))
+        # A surplus is only acceptable after the source's last sample, where the
+        # module plays its final row once more across the loop seam. Any earlier
+        # than that and a drum would double up inside the song.
+        for name, hits in latches(back, times=True).items():
+            want = set(latches(src, times=True)[name])
+            for t in hits:
+                if t not in want:
+                    self.assertGreater(
+                        t, src.total_samples - 2 * 551,
+                        "%s latched again at %.0fms, inside the song" % (name, t / 44.1))
+        # and every voice, kit included, lands with the registers it had
+        self._check(OPL1KIT, KIND_OPL, min_attacks=20)
+
+    def _export(self, path: Path, song) -> Path:
+        """Write the module and have Furnace re-export it."""
+        fur = TMP / f"opl1_{path.stem}.fur"
+        fur.write_bytes(write_fur(song, include_pcm=False))
+        return export_fur(fur, TMP / f"opl1_{path.stem}.vgm")
 
     @unittest.skipUnless(KXEMI.is_file(), "Knights of Xentar rip missing")
     def test_dual_opl2_rip(self):
@@ -1091,11 +1173,12 @@ class TestOplVerifyRoundTrip(unittest.TestCase):
 
 
 class TestOplChip1(unittest.TestCase):
-    """The YM3526: an OPL2 with no waveform register, and its own rhythm system.
+    """The YM3526: an OPL2 that has no waveform register.
 
-    None of the reference rips is an OPL1, so this family lives or dies on
-    synthetic logs measured through Furnace - which is also how the numbers below
-    were taken.
+    Rhythm mode is identical - same `0xBD`, same five voices, same drums system -
+    so the one thing to prove about this chip is that `0xE0`+ never appears, in
+    the log or in what Furnace writes back. `TestOplRealRips` does that on a real
+    OPL1 kit rip; the synthetic logs here cover what that rip does not reach.
     """
 
     def test_the_pitch_table_matches_the_opl2(self):

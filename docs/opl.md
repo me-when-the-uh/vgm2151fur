@@ -61,6 +61,21 @@ module shows eleven:
 10    Hi-hat       (HH)
 ```
 
+Which chip register each kit column comes from, and what it shares:
+
+| Column | Chip channel (`0xBn`) | Operators | Frequency register |
+| --- | --- | --- | --- |
+| 6 Kick/BD | 7 (`0xB6`) | `0x10` + `0x13` - both of them | `A6/B6`, to itself |
+| 7 Snare/SD | 8 (`0xB7`) | `0x14` (modulated) | `A7/B7`, shared with HH |
+| 10 Hi-hat/HH | 8 (`0xB7`) | `0x11` (fixed) | `A7/B7`, shared with SD |
+| 8 Tom/TM | 9 (`0xB8`) | `0x12` (fixed) | `A8/B8`, shared with TP |
+| 9 Top/TP | 9 (`0xB8`) | `0x15` (fixed) | `A8/B8`, shared with TM |
+
+So the bass drum is not a bit competing for someone else's pitch: it owns channel 7
+and both of its operators, which is why Furnace lets that column take an ordinary
+`DIV_INS_OPL` instrument. Only the pairs inside channels 8 and 9 share a
+frequency, which is why their pitch is not compared in the round trip below.
+
 Snare and hi-hat share frequency register `0xA7`/`0xB7`, tom and cymbal share
 `0xA8`/`0xB8` - exactly as the chip does. A kit column therefore cannot own a
 pitch: whichever of the pair was written last is what a register dump shows.
@@ -181,6 +196,7 @@ through the bundled console build, every attack's whole register set):
 | `mc_01.vgm` (Miwaku) | YMF262, 226 patches | 2974 | 1003 | 0 |
 | `main_010a.vgm` (Metal Ace) | YMF262 | 5434 | - | 0 |
 | `KXEMI1_opl2.vgm` (Knights of Xentar) | 2 x YM3812, hard panned | 22100 | - | 0 |
+| `opl1_rhythmtest.vgm` | YM3526 + rhythm | 50 | - | 0 |
 
 Kit columns are compared for their operator bytes; their frequency is not, since
 two percussion voices share one register - in the Solar Winds log a snare attack
