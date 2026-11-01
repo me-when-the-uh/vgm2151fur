@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from vgm2151fur.analyze import analyze
+from vgm2151fur.analyze import _adpcm_b_motion, analyze
 from vgm2151fur.audit import compare_ym2610_samples
 from vgm2151fur.diag import (
     ym2610_keyed_intervals,
@@ -29,13 +29,21 @@ from vgm2151fur.furwrite import (
     write_fur,
 )
 from vgm2151fur.furnace import export_vgm, find_furnace
-from vgm2151fur.vgm import ChipWrite, RomSlice, VgmFile, chips_in_head, load_vgm
+from vgm2151fur.vgm import (
+    ChipWrite,
+    RomSlice,
+    VgmFile,
+    assemble_rom,
+    chips_in_head,
+    load_vgm,
+)
 from vgm2151fur.ym2610 import (
     CHAN_OFF_4,
     CHAN_OFF_6,
     KON_4,
     KON_6,
     YM2610_DEFAULT_CLOCK,
+    AdpcmBHit,
     YM2610State,
     collect_ym2610_adpcm,
     ym2610_note_fnum,
@@ -118,7 +126,9 @@ def _fm_note(ch: int, *, b: bool = False, block: int = 4, fnum: int = 0x400,
     return out
 
 
-def _adpcm_writes(rom_len: int = 1024) -> list[ChipWrite]:
+def _adpcm_writes(
+    rom_len: int = 1024, stop: int = 3000, a_stop: int = 1100,
+) -> list[ChipWrite]:
     return [
         # ADPCM-A channel 1: region 0x000..0x1ff, gate level 0 then 8.
         ChipWrite(0, "ym2610", 0, 0x101, 0x3F),
@@ -129,7 +139,11 @@ def _adpcm_writes(rom_len: int = 1024) -> list[ChipWrite]:
         ChipWrite(100, "ym2610", 0, 0x108, 0xC0),
         ChipWrite(100, "ym2610", 0, 0x100, 0x01),
         ChipWrite(108, "ym2610", 0, 0x108, 0xC8),
-        ChipWrite(1100, "ym2610", 0, 0x100, 0x81),
+        # Mid-note level and pan changes, then a restore.
+        ChipWrite(900, "ym2610", 0, 0x108, 0x00),
+        ChipWrite(1600, "ym2610", 0, 0x108, 0x28),
+        ChipWrite(1700, "ym2610", 0, 0x108, 0xC8),
+        ChipWrite(a_stop, "ym2610", 0, 0x100, 0x81),
         # ADPCM-B: region 0x200..0x3ff, 50% rate, pan set after start.
         ChipWrite(2000, "ym2610", 0, 0x12, 0x02),
         ChipWrite(2000, "ym2610", 0, 0x13, 0x00),
@@ -142,7 +156,11 @@ def _adpcm_writes(rom_len: int = 1024) -> list[ChipWrite]:
         ChipWrite(2002, "ym2610", 0, 0x1B, 0x80),
         ChipWrite(2013, "ym2610", 0, 0x19, 0x00),
         ChipWrite(2015, "ym2610", 0, 0x1A, 0x80),
-        ChipWrite(3000, "ym2610", 0, 0x10, 0x00),
+        # Mid-note level and rate changes while the one-shot plays.
+        ChipWrite(3000, "ym2610", 0, 0x1B, 0x40),
+        ChipWrite(3300, "ym2610", 0, 0x19, 0x00),
+        ChipWrite(3301, "ym2610", 0, 0x1A, 0x40),
+        ChipWrite(stop, "ym2610", 0, 0x10, 0x00),
     ]
 
 
@@ -224,7 +242,7 @@ class TestYm2610Pitch(unittest.TestCase):
 class TestYm2610Adpcm(unittest.TestCase):
     def test_collect_a_and_b(self):
         rom = bytes(i & 0xFF for i in range(1024))
-        vgm = _vgm(_adpcm_writes(), rom)
+        vgm = _vgm(_adpcm_writes(stop=4000, a_stop=2500), rom)
         a, b, warnings = collect_ym2610_adpcm(vgm, rom)
         self.assertFalse(warnings)
         self.assertEqual(len(a), 1)
@@ -233,7 +251,9 @@ class TestYm2610Adpcm(unittest.TestCase):
         hit = a[0].hits[0]
         self.assertEqual(hit.vol, 8)  # 0xC8 written after the gate
         self.assertEqual(hit.pan, 0xFF)
-        self.assertEqual(hit.end_time, 1100)
+        self.assertEqual(hit.end_time, 2500)
+        self.assertEqual(hit.vol_pts, [(900, 0), (1600, 8)])
+        self.assertEqual(hit.pan_pts, [(900, 0x00), (1700, 0xFF)])
         self.assertEqual(len(b), 1)
         self.assertEqual((b[0].start, b[0].end, b[0].rate),
                          (0x200, 0x3FF, 0x8000))
@@ -241,7 +261,54 @@ class TestYm2610Adpcm(unittest.TestCase):
         bhit = b[0].hits[0]
         self.assertEqual(bhit.vol, 0x80)
         self.assertEqual(bhit.pan, 0xFF)
-        self.assertEqual(bhit.end_time, 3000)
+        self.assertEqual(bhit.end_time, 4000)
+        self.assertEqual(bhit.vol_pts, [(3000, 0x40)])
+        self.assertEqual(bhit.rate_pts, [(3301, 0x4000)])
+
+    def test_silent_pan_gate_skipped(self):
+        rom = bytes(1024)
+        writes = [
+            ChipWrite(0, "ym2610", 0, 0x101, 0x3F),
+            ChipWrite(100, "ym2610", 0, 0x110, 0x00),
+            ChipWrite(100, "ym2610", 0, 0x118, 0x00),
+            ChipWrite(100, "ym2610", 0, 0x120, 0x01),
+            ChipWrite(100, "ym2610", 0, 0x128, 0x00),
+            ChipWrite(100, "ym2610", 0, 0x108, 0x00),
+            ChipWrite(100, "ym2610", 0, 0x100, 0x01),
+            ChipWrite(3000, "ym2610", 0, 0x100, 0x81),
+        ]
+        song = analyze(_vgm(writes, rom, total_samples=3000))
+        self.assertFalse([e for e in song.events if e.on and e.pcm])
+
+    def test_final_pan_off_stops_hit(self):
+        rom = bytes(1024)
+        writes = [
+            ChipWrite(0, "ym2610", 0, 0x101, 0x3F),
+            ChipWrite(100, "ym2610", 0, 0x110, 0x00),
+            ChipWrite(100, "ym2610", 0, 0x118, 0x00),
+            ChipWrite(100, "ym2610", 0, 0x120, 0x01),
+            ChipWrite(100, "ym2610", 0, 0x128, 0x00),
+            ChipWrite(100, "ym2610", 0, 0x108, 0xC8),
+            ChipWrite(100, "ym2610", 0, 0x100, 0x01),
+            ChipWrite(900, "ym2610", 0, 0x108, 0x00),
+            ChipWrite(3000, "ym2610", 0, 0x100, 0x81),
+        ]
+        a, _b, _w = collect_ym2610_adpcm(_vgm(writes, rom), rom)
+        hit = a[0].hits[0]
+        self.assertEqual(hit.end_time, 900)
+        self.assertEqual(hit.pan_pts, [])
+        self.assertEqual(hit.vol_pts, [])
+
+    def test_b_late_motion(self):
+        hit = AdpcmBHit(
+            sample_time=100, chip_id=0, start=0, end=0x3FF,
+            rate=0x8000, vol=0x80, pan=0xFF, loop=False,
+            rate_pts=[(500, 0x4000)], vol_pts=[(300, 0x40)],
+            pan_pts=[(400, 0x00)],
+        )
+        steps, levels = _adpcm_b_motion(hit)
+        self.assertEqual(steps, ((500, -768),))
+        self.assertEqual(levels, ((300, 0x40, 0xFF), (400, 0, 0)))
 
     def test_bank_b_falls_back_to_83(self):
         rom_a = bytes(1024)
@@ -347,6 +414,32 @@ class TestYm2610Writer(unittest.TestCase):
             for row in rows if 0 <= row.note < 180
         ]
         self.assertIn(60, notes)  # B trigger at 2000, after the bar trim
+
+    @unittest.skipUnless(HAVE_FURNACE, "Furnace is not installed")
+    def test_furnace_round_trip_motion(self):
+        writes = _fm_note(1, b=True) + [
+            ChipWrite(200, "ym2610_ssg", 0, 0x00, 0x00),
+            ChipWrite(200, "ym2610_ssg", 0, 0x01, 0x02),
+            ChipWrite(200, "ym2610_ssg", 0, 0x08, 0x0F),
+            ChipWrite(200, "ym2610_ssg", 0, 0x07, 0x3E),
+        ] + _adpcm_writes(stop=4000, a_stop=2500)
+        rom = bytes(i & 0xFF for i in range(1024))
+        song = analyze(_vgm(writes, rom, b=True, total_samples=4000))
+        fur = TMP / "ym2610_motion.fur"
+        fur.write_bytes(write_fur(song, compress=True))
+        out = TMP / "ym2610_motion.vgm"
+        export_vgm(fur, out)
+        vgm = load_vgm(out)
+        exp_a, exp_b, _w = collect_ym2610_adpcm(
+            vgm, assemble_rom(vgm, "ym2610_adpcm"),
+            assemble_rom(vgm, "ym2610_deltat"),
+        )
+        ahit = [h for s in exp_a for h in s.hits][0]
+        self.assertTrue(any(v == 0 for _t, v in ahit.vol_pts))
+        self.assertTrue(any(v == 8 for _t, v in ahit.vol_pts))
+        bhit = [h for s in exp_b for h in s.hits][0]
+        self.assertTrue(any(r == 0x4000 for _t, r in bhit.rate_pts))
+        self.assertTrue(any(v == 0x40 for _t, v in bhit.vol_pts))
 
     @unittest.skipUnless(HAVE_FURNACE, "Furnace is not installed")
     def test_furnace_round_trip(self):

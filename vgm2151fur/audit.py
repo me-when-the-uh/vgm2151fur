@@ -256,13 +256,16 @@ def compare_ym2610_samples(src: VgmFile, exp: VgmFile) -> dict:
     if not any(w.chip in ("ym2610", "ym2610_ssg") for w in src.writes):
         return {}
 
+    def audible(h) -> bool:
+        return h.pan != 0 or any(p for _t, p in h.pan_pts)
+
     def hits(vgm):
         rom_a = assemble_rom(vgm, "ym2610_adpcm")
         rom_b = assemble_rom(vgm, "ym2610_deltat")
         a_s, b_s, _w = collect_ym2610_adpcm(vgm, rom_a, rom_b or rom_a)
         return (
-            [(h, s) for s in a_s for h in s.hits],
-            [(h, s) for s in b_s for h in s.hits],
+            [(h, s) for s in a_s for h in s.hits if audible(h)],
+            [(h, s) for s in b_s for h in s.hits if audible(h)],
         )
 
     def match(src_hits, exp_hits, key):

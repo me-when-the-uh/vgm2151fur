@@ -104,7 +104,9 @@ from vgm2151fur.ym2610 import (
     YM2610_DEFAULT_CLOCK,
     YM2610_SSG_DIVIDER,
     YM2610State,
+    AdpcmAHit,
     AdpcmASample,
+    AdpcmBHit,
     AdpcmBSample,
     collect_ym2610_adpcm,
     ym2610_note_for,
@@ -1829,6 +1831,56 @@ def _apply_opn_carrier_octave(
         )
         shifted += 1
     return shifted
+
+
+def _pcm_levels(
+    hit: AdpcmAHit | AdpcmBHit,
+) -> tuple[tuple[int, int, int], ...]:
+    """Late level and pan writes as (sample, volume, pan) points.
+
+    A pan of 0 silences the channel, but Furnace's panning command treats
+    `0x00` as center. Carry that silence in the volume column instead and
+    restore the level when the pan returns.
+    """
+    pts = sorted(
+        [(t, 0, v) for t, v in hit.vol_pts]
+        + [(t, 1, p) for t, p in hit.pan_pts]
+    )
+    vol, pan = hit.vol, hit.pan
+    last = (0 if pan == 0 else vol, pan)
+    levels: list[tuple[int, int, int]] = []
+    i = 0
+    while i < len(pts):
+        t = pts[i][0]
+        while i < len(pts) and pts[i][0] == t:
+            _t, kind, value = pts[i]
+            if kind:
+                pan = value
+            else:
+                vol = value
+            i += 1
+        level = (0 if pan == 0 else vol, pan)
+        if level == last:
+            continue
+        levels.append((t, *level))
+        last = level
+    return tuple(levels)
+
+
+def _adpcm_b_motion(hit: AdpcmBHit) -> tuple[
+    tuple[tuple[int, int], ...], tuple[tuple[int, int, int], ...]
+]:
+    """Late B writes as pitch steps (1/64 semitones) and volume/pan points."""
+    base = hit.rate & 0xFFFF
+    steps: list[tuple[int, int]] = []
+    if base:
+        for t, rate in hit.rate_pts:
+            delta = int(round(
+                64.0 * 12.0 * math.log2((rate & 0xFFFF) / base)
+            ))
+            if delta and (not steps or steps[-1][1] != delta):
+                steps.append((t, delta))
+    return tuple(steps), _pcm_levels(hit)
 
 
 def _collect_opl(
@@ -3671,21 +3723,26 @@ def analyze(
                 warnings.extend(ym_warn)
                 for i, smp in enumerate(ym2610_a_samples):
                     for h in smp.hits:
+                        ym2610_a_count += 1
+                        if h.pan == 0 and not any(p for _t, p in h.pan_pts):
+                            continue
                         ev = NoteEvent(
                             sample=h.sample_time,
                             ch=ym_base[h.chip_id] + ym2610_fm_count + 3 + h.channel,
                             on=True,
                             note=60 + (i % YM2610_MAP_SLOTS),
                             ins=-1,
-                            vol=max(0, min(31, h.vol)),
+                            vol=0 if h.pan == 0 else max(0, min(31, h.vol)),
                             e5=0x80,
                             pan=h.pan,
                             pcm=True,
                             end=h.end_time,
                         )
+                        levels = _pcm_levels(h)
+                        if levels:
+                            ev.vol_pts = levels
                         events.append(ev)
                         ym2610_events.append((ev, 0, i))
-                        ym2610_a_count += 1
                         if h.end_time and h.end_time > h.sample_time:
                             events.append(NoteEvent(
                                 sample=h.end_time,
@@ -3700,6 +3757,10 @@ def analyze(
                             ))
                 for i, smp in enumerate(ym2610_b_samples):
                     for h in smp.hits:
+                        ym2610_b_count += 1
+                        if h.pan == 0 and not any(p for _t, p in h.pan_pts):
+                            continue
+                        pitch_steps, vol_pts = _adpcm_b_motion(h)
                         ev = NoteEvent(
                             sample=h.sample_time,
                             ch=ym_base[h.chip_id] + ym2610_fm_count + 9,
@@ -3708,15 +3769,20 @@ def analyze(
                             ins=-1,
                             # ADPCM-B's channel volume is 8-bit (255 max),
                             # wider than the usual 0-127 pattern column.
-                            vol=max(0, min(255, h.vol)),
+                            vol=0 if h.pan == 0 else max(0, min(255, h.vol)),
                             e5=0x80,
                             pan=h.pan,
                             pcm=True,
                             end=h.end_time,
                         )
+                        if pitch_steps:
+                            ev.pitch_steps = pitch_steps
+                            ev.e5_lo = 0x00
+                            ev.e5_hi = 0xFF
+                        if vol_pts:
+                            ev.vol_pts = vol_pts
                         events.append(ev)
                         ym2610_events.append((ev, 1, i))
-                        ym2610_b_count += 1
                         if h.end_time and h.end_time > h.sample_time:
                             events.append(NoteEvent(
                                 sample=h.end_time,

@@ -297,6 +297,9 @@ class AdpcmAHit:
     vol: int
     pan: int
     end_time: int = 0
+    # Late 0x101/0x108-0x10D writes while the sample plays.
+    vol_pts: list[tuple[int, int]] = field(default_factory=list)
+    pan_pts: list[tuple[int, int]] = field(default_factory=list)
 
 
 @dataclass
@@ -319,6 +322,14 @@ class AdpcmBHit:
     pan: int
     loop: bool
     end_time: int = 0
+    # Late 0x11/0x19/0x1A/0x1B writes while the sample plays.
+    rate_pts: list[tuple[int, int]] = field(default_factory=list)
+    vol_pts: list[tuple[int, int]] = field(default_factory=list)
+    pan_pts: list[tuple[int, int]] = field(default_factory=list)
+    play_pos: float = 0.0
+    play_t: int = 0
+    play_rate: int = 0
+    ended: bool = False
 
 
 @dataclass
@@ -365,8 +376,63 @@ def collect_ym2610_adpcm(
     b_active: dict[int, AdpcmBHit] = {}
     a_hits: list[AdpcmAHit] = []
     b_hits: list[AdpcmBHit] = []
+    writes = vgm.writes
+    clock = vgm.ym2610_clock or 8_000_000
 
-    for w in vgm.writes:
+    def b_advance(hit: AdpcmBHit, t: int) -> bool:
+        """Move the B hit's ROM position to `t`. False once a one-shot ended."""
+        if hit.ended:
+            return False
+        dt = t - hit.play_t
+        if dt > 0 and not hit.loop:
+            rate_hz = clock / 144.0 * (hit.play_rate & 0xFFFF) / 65535.0
+            hit.play_pos += dt * rate_hz / 44100.0
+        hit.play_t = t
+        if not hit.loop and hit.play_pos >= (hit.end - hit.start + 1) * 2:
+            hit.ended = True
+            return False
+        return True
+
+    def rate_hi_follows(wi: int, chip_id: int, t: int) -> bool:
+        for nw in writes[wi + 1:wi + 9]:
+            if nw.sample - t > 8:
+                break
+            if (
+                nw.chip == "ym2610" and nw.chip_id == chip_id
+                and not (nw.reg & 0x100) and (nw.reg & 0xFF) == 0x1A
+            ):
+                return True
+        return False
+
+    def gate_follows(wi: int, chip_id: int, t: int) -> bool:
+        for nw in writes[wi + 1:wi + 17]:
+            if nw.sample - t > 64:
+                break
+            if (
+                nw.chip == "ym2610" and nw.chip_id == chip_id
+                and not (nw.reg & 0x100) and (nw.reg & 0xFF) == 0x10
+            ):
+                return True
+        return False
+
+    def a_playing(hit: AdpcmAHit, t: int) -> bool:
+        rate_hz = clock / 432.0
+        return ((t - hit.sample_time) * rate_hz / 44100.0
+                < (hit.end - hit.start + 1) * 2)
+
+    def a_gate_follows(wi: int, chip_id: int, ch: int, t: int) -> bool:
+        for nw in writes[wi + 1:wi + 17]:
+            if nw.sample - t > 64:
+                break
+            if (
+                nw.chip == "ym2610" and nw.chip_id == chip_id
+                and (nw.reg & 0x1FF) == 0x100
+                and (nw.val & (1 << ch))
+            ):
+                return True
+        return False
+
+    for wi, w in enumerate(writes):
         if w.chip != "ym2610":
             continue
         reg, val = w.reg, w.val
@@ -381,13 +447,36 @@ def collect_ym2610_adpcm(
             if 0x08 <= r <= 0x0D:
                 ch = r - 0x08
                 hit = a_active.get((w.chip_id, ch))
-                if hit is not None and 0 <= w.sample - hit.sample_time <= 64:
-                    hit.vol = a_st.adpcm_a_level(ch)
-                    hit.pan = pan_byte(a_st.a_pan[ch])
+                if hit is not None:
+                    dt = w.sample - hit.sample_time
+                    vol = a_st.adpcm_a_level(ch)
+                    pan = pan_byte(a_st.a_pan[ch])
+                    if 0 <= dt <= 64:
+                        hit.vol = vol
+                        hit.pan = pan
+                    elif (
+                        dt > 64
+                        and not a_gate_follows(wi, w.chip_id, ch, w.sample)
+                        and a_playing(hit, w.sample)
+                    ):
+                        last = hit.vol_pts[-1][1] if hit.vol_pts else hit.vol
+                        if vol != last:
+                            hit.vol_pts.append((w.sample, vol))
+                        last = hit.pan_pts[-1][1] if hit.pan_pts else hit.pan
+                        if pan != last:
+                            hit.pan_pts.append((w.sample, pan))
             elif r == 0x01:
                 for (cid, ch), hit in a_active.items():
-                    if cid == w.chip_id and 0 <= w.sample - hit.sample_time <= 64:
-                        hit.vol = a_st.adpcm_a_level(ch)
+                    if cid != w.chip_id:
+                        continue
+                    vol = a_st.adpcm_a_level(ch)
+                    dt = w.sample - hit.sample_time
+                    if 0 <= dt <= 64:
+                        hit.vol = vol
+                    elif dt > 64 and a_playing(hit, w.sample):
+                        last = hit.vol_pts[-1][1] if hit.vol_pts else hit.vol
+                        if vol != last:
+                            hit.vol_pts.append((w.sample, vol))
             if r != 0x00:
                 continue
             start_bits = val & 0x3F
@@ -424,17 +513,41 @@ def collect_ym2610_adpcm(
             continue
 
         b_st.write(reg, val)
-        # The driver commonly writes the pan (and sometimes the level) two
-        # samples after the start bit.  Fold those into the new hit.
         hit = b_active.get(w.chip_id)
-        if hit is not None and 0 <= w.sample - hit.sample_time <= 64:
-            if r == 0x11:
-                hit.pan = pan_byte(b_st.b_pan)
-            elif r in (0x19, 0x1A):
-                # Most drivers set the rate a few samples after the start bit.
-                hit.rate = b_st.b_freq
-            elif r == 0x1B:
-                hit.vol = b_st.b_vol
+        if hit is not None:
+            dt = w.sample - hit.sample_time
+            if 0 <= dt <= 64:
+                # The driver commonly writes the pan (and sometimes the
+                # level or rate) a few samples after the start bit.
+                if r == 0x11:
+                    hit.pan = pan_byte(b_st.b_pan)
+                elif r in (0x19, 0x1A):
+                    hit.rate = b_st.b_freq
+                    hit.play_rate = hit.rate
+                elif r == 0x1B:
+                    hit.vol = b_st.b_vol
+            elif (
+                dt > 64 and not gate_follows(wi, w.chip_id, w.sample)
+                and b_advance(hit, w.sample)
+            ):
+                if r == 0x11:
+                    pan = pan_byte(b_st.b_pan)
+                    last = hit.pan_pts[-1][1] if hit.pan_pts else hit.pan
+                    if pan != last:
+                        hit.pan_pts.append((w.sample, pan))
+                elif r == 0x1B:
+                    vol = b_st.b_vol
+                    last = hit.vol_pts[-1][1] if hit.vol_pts else hit.vol
+                    if vol != last:
+                        hit.vol_pts.append((w.sample, vol))
+                elif r == 0x1A or (r == 0x19 and not rate_hi_follows(
+                    wi, w.chip_id, w.sample
+                )):
+                    rate = b_st.b_freq
+                    last = hit.rate_pts[-1][1] if hit.rate_pts else hit.rate
+                    if rate != last:
+                        hit.rate_pts.append((w.sample, rate))
+                        hit.play_rate = rate
         if r != 0x10:
             continue
         start = bool(val & 0x80)
@@ -458,6 +571,8 @@ def collect_ym2610_adpcm(
             vol=b_st.b_vol,
             pan=pan_byte(b_st.b_pan),
             loop=bool(val & 0x40),
+            play_t=w.sample,
+            play_rate=b_st.b_freq,
         )
         b_hits.append(hit)
         b_active[w.chip_id] = hit
@@ -468,6 +583,20 @@ def collect_ym2610_adpcm(
         hit.end_time = end
     for hit in b_active.values():
         hit.end_time = end
+
+    # A pan of 0 mutes the channel, but Furnace's panning command turns 0
+    # into center. When the pan never returns, stop the note at the mute.
+    # The sample cannot then play on to the end of its ROM body.
+    for hit in a_hits + b_hits:
+        for idx, (t, pan) in enumerate(hit.pan_pts):
+            if pan or any(p for _t, p in hit.pan_pts[idx + 1:]):
+                continue
+            hit.end_time = t
+            hit.pan_pts = hit.pan_pts[:idx]
+            hit.vol_pts = [pt for pt in hit.vol_pts if pt[0] < t]
+            if isinstance(hit, AdpcmBHit):
+                hit.rate_pts = [pt for pt in hit.rate_pts if pt[0] < t]
+            break
 
     a_samples: dict[tuple[int, int, int], AdpcmASample] = {}
     if rom:
