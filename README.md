@@ -90,6 +90,8 @@ docs/           operating guide, format notes, chip notes
 
 Project state and workflow are in `docs/portable-context.md` and `docs/implementation-notes.md`. Chip details are in `docs/opm-notes.md`, `docs/ym2203.md`, `docs/ym2612.md`, `docs/ym2610.md`, `docs/k053260.md` and `docs/opl.md`.
 
+Open follow-ups are tracked in [TODO.md](./TODO.md).
+
 ## Known limits
 
 - The YM2151, YM2203, YM2612 and YM2610 models cover the OPM/OPN/OPN2/OPNB register sets the arcade and Genesis drivers use; the YM3526, YM3812 and YMF262 models cover the OPL family (`docs/opl.md`). Other chips (YM2608, YM2413/OPLL, YMF278b) are not supported.
