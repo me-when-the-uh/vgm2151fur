@@ -563,6 +563,39 @@ class TestOplAnalyze(unittest.TestCase):
         ev = next(e for e in song.events if e.on and e.ch == 0)
         self.assertEqual(ev.pan, 0)
 
+    def test_a_rhythm_poke_without_a_latch_keeps_nine_channels(self):
+        # The bug this guards: a driver that pokes $BD with bit 5 set during chip
+        # init and clears it in the same sample never sounds a drum, yet taking
+        # that write as "this is a kit track" moved the module to the drums system
+        # and left every melody note on channels 7 to 9 with no column at all.
+        ws = voice(100, KIND_OPL2, 6, block=3, fnum=900) + heart()
+        ws += voice(20000, KIND_OPL2, 7, block=3, fnum=500)
+        ws += voice(40000, KIND_OPL2, 8, block=4, fnum=300)
+        # Mode on and off inside one sample, no trigger bit ever set.
+        ws += [ChipWrite(150, KIND_OPL2, 0, 0xBD, 0x20),
+               ChipWrite(150, KIND_OPL2, 0, 0xBD, 0xC0)]
+        song = analyze(_vgm(ws))
+        self.assertFalse(song.opl_drums, "a poke became a kit")
+        data = write_fur(song, include_pcm=False)
+        m = parse_fur(data)
+        self.assertEqual(m.chips, [CHIP_OPL2])
+        self.assertEqual(m.n_ch, 9)
+        chans = {e.ch for e in song.events if e.on}
+        # The heartbeat keys its own column too; what matters is that the three
+        # channels rhythm mode would have taken still carry their melody.
+        self.assertTrue({6, 7, 8} <= chans, sorted(chans))
+        self.assertFalse(any("kit" in w for w in song.warnings), song.warnings)
+
+    def test_a_latch_beside_the_poke_still_selects_the_kit(self):
+        # The other half: once a percussion bit is really latched while the mode
+        # is held, that is a kit track and its columns exist to be played on.
+        ws = voice(100, KIND_OPL2, 6, drums=True, block=3, fnum=900) + heart()
+        ws += [rhythm(2000), rhythm(10000, bits=0x18), rhythm(14000, bits=0)]
+        song = analyze(_vgm(ws))
+        self.assertTrue(song.opl_drums)
+        self.assertEqual(parse_fur(write_fur(song, include_pcm=False)).chips,
+                         [CHIP_OPL2_DRUMS])
+
     def test_grid_comes_from_the_key_on_lattice(self):
         src = _vgm(voice(100, KIND_OPL2, 3) + heart())
         self.assertIsNotNone(estimate_grid(src))

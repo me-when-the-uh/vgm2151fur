@@ -2162,6 +2162,80 @@ def _collect_opl(
     return stats, warnings
 
 
+def _opl_rhythm_plan(vgm, kind: str) -> tuple[bool, dict]:
+    """Decide which OPL layout a log should become, and count what each costs.
+
+    Rhythm mode is one bit of one register, but it moves bank A's last three FM
+    channels into a kit, and Furnace keeps that choice in the *system* - so a
+    track is converted as either nine melodic columns or six (fifteen on an OPL3)
+    plus the percussion. Drivers differ, and picking wrongly loses notes:
+
+    - many arcade and sound-card drivers poke ``$BD`` with bit 5 set during chip
+      init and clear it in the same sample, never latching a drum. The melodic
+      layout keeps every one of that track's notes; the drums layout would take
+      its channels 7 to 9 away.
+    - a track that really latches the kit gets the drums layout, and a melodic
+      voice still played on the rhythm channels is routed onto the kit columns
+      that own their operators rather than dropped (see ``_collect_opl``).
+
+    Returns ``(drums, stats)``: kit latches actually triggered while the mode was
+    in force, how long rhythm mode stayed on, and the melodic key-ons that sit on
+    registers a kit takes over. Only OPL3's port-1 ``$1BD`` and the flat
+    ``$BD`` of an OPL or OPL2 are rhythm registers.
+    """
+    st = OPLState(kind, False)
+    kit_regs = {fch for fch, cm in enumerate(st.chan_map)
+                if ((cm >> 8) & 1) == 0 and (cm & 0xFF) >= 6}
+    chan_of: dict[tuple[int, int], list[int]] = {}
+    for fch, cm in enumerate(st.chan_map):
+        chan_of.setdefault((((cm >> 8) & 1) if st.opl3 else 0, cm & 0xFF),
+                           []).append(fch)
+
+    stats = {"latches": 0, "mode_samples": 0, "melodic_on_kit": 0}
+    per: dict[int, list] = {}
+    for w in vgm.writes:
+        if w.chip == kind:
+            per.setdefault(w.chip_id, []).append(w)
+    end = int(vgm.total_samples or 0)
+    for ws in per.values():
+        mode = False
+        since = 0
+        trig = 0
+        keyed: dict[tuple[int, int], bool] = {}
+        for w in ws + [None]:                       # sentinel closes the last mode
+            if w is None:
+                if mode and end > since:
+                    stats["mode_samples"] += end - since
+                break
+            port = ((w.reg >> 8) & 1) if st.opl3 else 0
+            r = w.reg & 0xFF
+            if r == 0xBD and (port == (1 if st.opl3 else 0)):
+                now = bool(w.val & 0x20)
+                if now != mode:
+                    stats["segments"] = stats.get("segments", 0) + 1
+                    if mode:
+                        stats["mode_samples"] += w.sample - since
+                    mode, since = now, w.sample
+                bits = (w.val & 0x1F) if now else 0
+                for k in range(5):
+                    bit = 1 << k
+                    if (bits & bit) and not (trig & bit):
+                        stats["latches"] += 1
+                trig = bits
+                continue
+            if 0xB0 <= r <= 0xB8:
+                on = bool(w.val & 0x20)
+                was = keyed.get((port, r), False)
+                keyed[(port, r)] = on
+                if on and not was and not mode:
+                    stats["melodic_on_kit"] += sum(
+                        1 for fch in chan_of.get((port, r - 0xB0), ())
+                        if fch in kit_regs)
+    # A latch that actually fires is the whole test: with none, rhythm mode was a
+    # poke between two writes of the same sample and no kit voice ever sounded.
+    return bool(stats["latches"]), stats
+
+
 def analyze(
     vgm: VgmFile, *, speed: int | None = None, pcm: bool = True,
     tick_samples: float | None = None,
@@ -2231,12 +2305,12 @@ def analyze(
         sorted({w.chip_id for w in vgm.writes if w.chip == opl_kind})
         if is_opl else []
     )
-    # Bit 5 of the rhythm register is the mode switch; once a log sets it, the
-    # module uses Furnace's drums system for the whole track.
-    opl_drums = bool(is_opl and not opl_kind == KIND_OPL3 and any(
-        (w.reg & 0xFF) == 0xBD and (w.val & 0x20)
-        for w in vgm.writes if w.chip == opl_kind
-    ))
+    # Bit 5 of the rhythm register is the mode switch, but a driver may poke it
+    # during chip init and clear it in the same sample without ever sounding a
+    # drum. Furnace holds that choice in the system, so only a log that actually
+    # latches a kit voice becomes the drums layout.
+    opl_drums, opl_rhythm = (
+        _opl_rhythm_plan(vgm, opl_kind) if is_opl else (False, {}))
     opl_clock = (
         opl_module_clock(
             (vgm.opl3_clock if opl_kind == KIND_OPL3 else
