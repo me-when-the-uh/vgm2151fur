@@ -597,7 +597,44 @@ class TestOplAnalyze(unittest.TestCase):
         self.assertEqual(parse_fur(write_fur(song, include_pcm=False)).chips,
                          [CHIP_OPL2_DRUMS])
 
-    def test_grid_comes_from_the_key_on_lattice(self):
+    def test_hand_written_vibrato_keeps_its_return_legs(self):
+        # A slow-attack pad on channel 8 moves its pitch by alternating one
+        # f-num register between two values every ~150 ms (modaozi Dungeon Theme
+        # intro). Mid-note pitch used to be compared against the value the note
+        # *started* on, so every write returning to that pitch was discarded: half
+        # the oscillation survived and the pitch never came back down. Track the
+        # register's current value instead, and both legs appear.
+        ws = voice(100, KIND_OPL2, 7, block=4, fnum=580) + heart()
+        for k in range(6):
+            ws.append(ChipWrite(20000 + k * 6600, KIND_OPL2, 0, 0xA7,
+                                (580 + (96 if k % 2 else 0)) & 0xFF))
+        ws.append(ChipWrite(120000, KIND_OPL2, 0, 0xB7, 0x0F))
+        song = analyze(_vgm(ws))
+        ev = next(e for e in song.events if e.on and e.ch == 7)
+        pts = ev.fm_pitch_pts
+        # six writes, the first already at the note's own pitch: one anchor plus
+        # five real transitions.
+        self.assertEqual(len(pts), 6, "a leg of the oscillation was dropped")
+        # up, back to the start, up again - strictly alternating.
+        self.assertEqual(pts[0][2], pts[2][2], "the pitch did not return")
+        self.assertNotEqual(pts[1][2], pts[0][2])
+        self.assertEqual([p[2] for p in pts], [580, 676, 580, 676, 580, 676])
+        # The time steps must alternate too: five returns/up-moves, not one.
+        self.assertEqual(len({p[0] for p in pts}), len(pts))
+
+    def test_only_the_moving_channel_records_pitch(self):
+        # The alternation above must not smear onto the rest of the module: a
+        # channel whose frequency registers nobody touched keeps no pitch points.
+        ws = voice(100, KIND_OPL2, 7, block=4, fnum=580) + heart()
+        ws += voice(120, KIND_OPL2, 2, block=3, fnum=400)
+        for k in range(6):
+            ws.append(ChipWrite(20000 + k * 6600, KIND_OPL2, 0, 0xA7,
+                                (580 + (96 if k % 2 else 0)) & 0xFF))
+        song = analyze(_vgm(ws))
+        moving = {e.ch: len(e.fm_pitch_pts) for e in song.events if e.on}
+        self.assertEqual(moving.get(7), 6, moving)
+        self.assertFalse(moving.get(2), "a still channel picked up motion")
+
         src = _vgm(voice(100, KIND_OPL2, 3) + heart())
         self.assertIsNotNone(estimate_grid(src))
         keys = _keyons_by_channel(src)

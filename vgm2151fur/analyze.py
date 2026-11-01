@@ -1886,6 +1886,14 @@ def _collect_opl(
     held: dict[tuple[int, int], int] = {}
     pitch_pts: dict[tuple[int, int], list[tuple[int, int, int]]] = {}
     pitch_base: dict[tuple[int, int], tuple[int, int]] = {}
+    # Mid-note pitch is compared with what the register holds *now*, not with the
+    # value a note started on. A driver that writes vibrato by hand - alternating
+    # one channel's f-num between two values every 150 ms, as this rip's
+    # slow-attack pad does - returns to the starting pitch on every other write,
+    # and matching against the base drops each of those returns: one leg of the
+    # oscillation survives and the pitch never comes back. Levels already track
+    # their last value (`tl_last`) for exactly this reason.
+    pitch_last: dict[tuple[int, int], tuple[int, int]] = {}
     tl_pts: dict[tuple[int, int], list[tuple[int, int]]] = {}
     tl_last: dict[tuple[int, int], int] = {}
     # Level of a kit operator when its note started: the column steps from here.
@@ -2016,6 +2024,7 @@ def _collect_opl(
         ))
         held[key] = len(events) - 1
         pitch_base[key] = (block, fnum)
+        pitch_last[key] = (block, fnum)
         pitch_pts[key] = [(sample, block, fnum)]
         tl_pts[key] = []
         tl_last[key] = st.channel_tl(fch)
@@ -2143,8 +2152,11 @@ def _collect_opl(
                     close_note(cid, fch, w.sample, off=True)
                 if key in held:
                     block, fnum = st.frequency(fch)
-                    if (block, fnum) != pitch_base[key]:
+                    # This write carries the top two f-num bits as well, so a held
+                    # voice can move pitch here without any key transition.
+                    if (block, fnum) != pitch_last[key]:
                         pitch_pts[key].append((w.sample, block, fnum))
+                        pitch_last[key] = (block, fnum)
             continue
 
         st.write(port, r, val)
@@ -2156,8 +2168,9 @@ def _collect_opl(
                 if key not in held:
                     continue
                 block, fnum = st.frequency(fch)
-                if (block, fnum) != pitch_base[key]:
+                if (block, fnum) != pitch_last[key]:
                     pitch_pts[key].append((w.sample, block, fnum))
+                    pitch_last[key] = (block, fnum)
             continue
         slot = r & 0x1F
         if (r - slot) in (0x20, 0x40, 0x60, 0x80, 0xE0) and slot <= 0x15:

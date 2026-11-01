@@ -209,19 +209,30 @@ hi-hat write left it, and that belongs to the other voice.
 trimmed 35 ms at both ends so a row-tick note and the exact sample the driver
 used are not counted against each other (`diag.pitch_runs`):
 
-- A kit column reports nothing: its frequency register is another voice's.
+- A kit column reports nothing: its frequency register is another voice's - except
+  the kick, whose channel 7 pair it owns outright.
 - Divergence counts the row grid as well as pitch, so a few seconds over a
   multi-channel minute is normal - the same measure on a YM2612 rip from this
   collection reads 11948 ms. On these rips: Solar Winds 0 ms, Metal Ace 8988 ms,
-  Knights of Xentar 2979 ms, Miwaku mc_01 16539 ms.
+  Knights of Xentar 2979 ms, Miwaku mc_01 16539 ms, Dungeon Theme 11570 ms.
+
+Mid-note pitch follows the frequency register's **current** value, not the value
+the note started on. Drivers write vibrato by hand - `05 Dungeon Theme [Level 1]`
+alternates channel 8's and 9's `0xA7`/`0xA8` between two f-numbers every 150 ms
+under a slow attack - and comparing against the note's starting pitch drops every
+return leg, leaving one-sided motion that never comes back. The same reason the
+level path tracks `tl_last`. Fixing it took that pad from 2 and 3 captured points
+per note to 7 and 8, and lowered this rip's own divergence measure.
 - Key-on counts come from the same lattice the grid estimate uses, so a lost note
   shows up as `miss` instead of hiding in the pitch measure.
 
 The regression net is `tests/test_vgm2151fur_opl.py`: the VGM commands and header
 bits, Furnace's channel and slot tables including the OPL3 permutation, the pitch
-model (a full sweep of every reachable register), rhythm mode's shared registers,
-the `.fur` emission of both instrument types, and round trips through Furnace for
-synthetic voices and the four rips above.
+model (a full sweep of every reachable register), hand-written vibrato keeping
+both its legs, rhythm mode's shared registers on all three chips, the `.fur`
+emission of both instrument types, and round trips through Furnace for synthetic
+voices and the five rips above - including `opl1_rhythmtest.vgm`, which is what
+proves the YM3526 takes rhythm mode exactly like a YM3812.
 
 ## Limits
 
