@@ -5,6 +5,8 @@ Supported chips:
 - Yamaha YM2151 (OPM)
 - Yamaha YM2203 (OPN)
 - Yamaha YM2612 (OPN2), including channel-3 special/CSM frequency layouts
+- Yamaha YM3526 (OPL), YM3812 (OPL2) and YMF262 (OPL3), including rhythm mode
+  as its own system and OPL3 four-operator voices
 - Namco C140
 - Namco C352 (requires a development build of Furnace from a compatible fork. A build with C352 support (built from https://github.com/me-when-the-uh/furnace-ports) is located in `./furnace-c352` - use at your own risk, since it's always a good idea to build from source instead of relying on someone else's builds)
 - Konami K007232 (experimental)
@@ -84,11 +86,12 @@ tests/          pytest suite
 docs/           operating guide, format notes, chip notes
 ```
 
-Project state and workflow are in `docs/portable-context.md` and `docs/implementation-notes.md`. Chip details are in `docs/opm-notes.md`, `docs/ym2203.md` and `docs/ym2612.md`.
+Project state and workflow are in `docs/portable-context.md` and `docs/implementation-notes.md`. Chip details are in `docs/opm-notes.md`, `docs/ym2203.md`, `docs/ym2612.md` and `docs/opl.md`.
 
 ## Known limits
 
-- The YM2151, YM2203 and YM2612 models cover the OPM/OPN/OPN2 register sets the arcade and Genesis drivers use. Other chips (YM3812, YM2608, ...) are not supported.
+- The YM2151, YM2203 and YM2612 models cover the OPM/OPN/OPN2 register sets the arcade and Genesis drivers use; the YM3526, YM3812 and YMF262 models cover the OPL family (`docs/opl.md`). Other chips (YM2608, YM2413/OPLL, YMF278b) are not supported.
+- An OPL track whose log mixes chip families (OPL2 with OPL3, or two different crystals) is converted on the family that plays most of it and the report says so. Below about C-3 one f-num step is wider than a half tone, so a very deep register lands on the nearest cell; a waveform change written inside a held note is picked up at the next key-on instead. `docs/opl.md` lists both with the measured numbers.
 - YM2203 notes are labelled at the highest carrier's octave when a patch uses a power-of-two carrier MULT. A constant pitch macro on the instrument keeps the source f-num/block/audio unchanged, so the pattern note matches the audible carrier.
 - The YM2203's channel-3 3-slot chord is reduced to one operator, CSM timer key-ons are not synthesized, and LFO writes are skipped; the report throws a warning when it sees them. Very fast SSG ornaments shorter than a pattern row are simplified (`docs/ym2203.md`).
 - The Genesis SN76489 PSG is converted as four extra channels (three tone + noise). Extreme periods below the musical table range and two PSG notes on the same channel/row are approximated. The converter's default `.fur` SN76489 system volume is 0.500; an absolute VGM extra-header volume entry still overrides it.

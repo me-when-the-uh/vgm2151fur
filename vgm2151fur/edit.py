@@ -18,8 +18,9 @@ from pathlib import Path
 
 from vgm2151fur.furwrite import (
     CHIP_AY8910, CHIP_C140, CHIP_C352, CHIP_K007232, CHIP_K051649, CHIP_K052539,
-    CHIP_MSM6258, CHIP_MSM6295, CHIP_SEGAPCM, CHIP_YM2612, CHIP_YM2612_CSM,
-    CHIP_YM2612_EXT, FUR_MAGIC, compress_fur,
+    CHIP_MSM6258, CHIP_MSM6295, CHIP_OPL, CHIP_OPL2, CHIP_OPL2_DRUMS,
+    CHIP_OPL3, CHIP_OPL3_DRUMS, CHIP_OPL_DRUMS, CHIP_SEGAPCM, CHIP_YM2612,
+    CHIP_YM2612_CSM, CHIP_YM2612_EXT, FUR_MAGIC, compress_fur,
 )
 
 CHIP_NAMES = {
@@ -39,6 +40,14 @@ CHIP_NAMES = {
     CHIP_K051649: "SCC",
     CHIP_K052539: "SCC+",
     CHIP_AY8910: "AY8910",
+    # OPL family, named as Furnace names the system. A rhythm module is not the
+    # same instrument set: bank A's last channels are the kit.
+    CHIP_OPL: "OPL (YM3526)",
+    CHIP_OPL2: "OPL2 (YM3812)",
+    CHIP_OPL3: "OPL3 (YMF262)",
+    CHIP_OPL_DRUMS: "OPL (YM3526) + drums",
+    CHIP_OPL2_DRUMS: "OPL2 (YM3812) + drums",
+    CHIP_OPL3_DRUMS: "OPL3 (YMF262) + drums",
 }
 
 # Old readers take the byte field as a signed char. It stays <= 64.

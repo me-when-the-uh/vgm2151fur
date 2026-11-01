@@ -1,7 +1,8 @@
 """VGM / VGZ loader and command walker.
 
-Chips: YM2151, YM2203, YM2612, K007232, MSM6295, MSM6258, SegaPCM, C140,
-C352, AY-3-8910, K051649/K052539 (SCC).
+Chips: YM2151, YM2203, YM2612, YM3526 (OPL), YM3812 (OPL2), YMF262 (OPL3),
+K007232, MSM6295, MSM6258, SegaPCM, C140, C352, AY-3-8910, K051649/K052539
+(SCC).
 """
 
 from __future__ import annotations
@@ -14,6 +15,22 @@ from pathlib import Path
 
 VGM_RATE = 44100
 CMD_YM2151 = 0x54
+# The OPL family. 0x5B is the YM3526 and 0x5A the YM3812; both address one
+# flat register space. The YMF262 has two banks of nine channels, so the VGM
+# spec gives each bank its own command: 0x5E is port 0, 0x5F port 1. Every
+# per-channel and per-operator register exists in both banks and only the port
+# tells them apart, so the bank rides in bit 8 of ChipWrite.reg exactly like the
+# YM2612's second register bank does.
+CMD_YM3526 = 0x5B
+CMD_YM3812 = 0x5A
+# A dual-OPL2 log (the Sound Blaster Pro layout) keeps the second chip's
+# register stream in its own command. Confirmed on the Knights of Xentar rips:
+# header bit 30 says "Dual YM3812" and 0xAA carries chip 1's writes while
+# 0x5A stays on chip 0. There is no spec'd companion for the YM3526, so a
+# second OPL instance is reported instead of guessed at.
+CMD_YM3812_2 = 0xAA
+CMD_OPL3_P0 = 0x5E
+CMD_OPL3_P1 = 0x5F
 # 0x52/0x53 are the first YM2612's two register banks; 0xA2/0xA3 are the
 # second instance in a dual-chip log.  The chip's 9-bit register address is
 # stored flat as (bank << 8) | register, matching ymfm's index.
@@ -82,6 +99,19 @@ SN76489_DEFAULT_CLOCK = 3579545
 YM2203_CLOCK_OFF = 0x44
 YM2203_DUAL_BIT = 0x40000000
 YM2203_DEFAULT_CLOCK = 3579545
+# The OPL family joined the header in 1.51: YM3812 at 0x50, YM3526 at 0x54 and
+# YMF262 at 0x5C. Bit 30 of the YM3812 field is the dual-chip flag that lets
+# command 0xAA address the second one (the Sound Blaster Pro pair); rips also
+# set bit 31, which the players use for their own chip-count bookkeeping. The
+# spec defines no second-instance command for the YM3526, so a dual OPL flag is
+# reported rather than guessed at.
+OPL2_CLOCK_OFF = 0x50
+OPL_CLOCK_OFF = 0x54
+OPL3_CLOCK_OFF = 0x5C
+OPL_DUAL_BIT = 0x40000000
+OPL_DEFAULT_CLOCK = 3579545    # COLOR_NTSC, the AdLib and arcade standard
+OPL2_DEFAULT_CLOCK = 3579545   # YM3812; the same crystal as the YM3526
+OPL3_DEFAULT_CLOCK = 14318180  # COLOR_NTSC * 4, the OPL3 board standard
 AY8910_CLOCK_OFF = 0x74
 AY8910_TYPE_OFF = 0x78
 AY8910_FLAGS_OFF = 0x79
@@ -217,9 +247,9 @@ class Msm6258Play:
 @dataclass
 class ChipWrite:
     sample: int
-    chip: str  # "ym2151" | "ym2203" | "ym2612" | "k007232" | "msm6295" |
-    #            "msm6258" | "segapcm" | "c140" | "c352" | "ay8910" |
-    #            "k051649"
+    chip: str  # "ym2151" | "ym2203" | "ym2612" | "opl" | "opl2" | "opl3" |
+    #            "k007232" | "msm6295" | "msm6258" | "segapcm" | "c140" |
+    #            "c352" | "ay8910" | "k051649"
     chip_id: int
     reg: int
     val: int
@@ -270,6 +300,16 @@ class VgmFile:
     # second.  Registers 0x00-0x0F are the SSG.
     ym2203_clock: int = 0
     ym2203_dual: bool = False
+    # The OPL family (header 1.51+): YM3812 at 0x50, YM3526 at 0x54, YMF262 at
+    # 0x5C.  Bit 30 of a clock field flags a second chip and bit 31 pans the
+    # pair hard left/right, which is how a Sound Blaster Pro wires its two
+    # YM3812s.  Only the YM3812 pair has a stream this tool reads (command 0xAA
+    # carries chip 1); a flagged second OPL or OPL3 is reported, not guessed at.
+    opl_clock: int = 0
+    opl2_clock: int = 0
+    opl2_dual: bool = False
+    opl2_pan: bool = False
+    opl3_clock: int = 0
     # MSM6295 header 0x98 (VGM 1.61+). Bit 31 of the raw field is pin 7,
     # bit 30 marks a second chip (the player halves each instance's volume).
     msm6295_clock: int = 0
@@ -529,6 +569,19 @@ def chips_in_head(buf: bytes) -> set[str]:
         kinds.add("segapcm")
     if version >= 0x151 and 100_000 <= _header_clock(buf, AY8910_CLOCK_OFF) <= 40_000_000:
         kinds.add("ay8910")
+    # The OPL family joined the header in 1.51. A YM3812 field with bit 30 set
+    # carries a second chip on command 0xAA; bit 31 is the Sound Blaster Pro
+    # hard-pan of that pair, so it is reported apart from the chip itself.
+    if version >= 0x151 and _field_in_header(buf, OPL2_CLOCK_OFF, 4):
+        opl2_raw = _header_raw(buf, OPL2_CLOCK_OFF)
+        if 100_000 <= (opl2_raw & 0x3FFFFFFF) <= 40_000_000:
+            kinds.add("opl2")
+            if opl2_raw & OPL_DUAL_BIT:
+                kinds.add("opl2_dual")
+    if version >= 0x151 and 100_000 <= _header_clock(buf, OPL_CLOCK_OFF) <= 40_000_000:
+        kinds.add("opl")
+    if version >= 0x151 and 100_000 <= _header_clock(buf, OPL3_CLOCK_OFF) <= 40_000_000:
+        kinds.add("opl3")
     k051 = _header_raw(buf, K051649_CLOCK_OFF)
     if version >= 0x161 and _field_in_header(buf, K051649_CLOCK_OFF, 4):
         if 100_000 <= (k051 & 0x3FFFFFFF) <= 40_000_000:
@@ -613,6 +666,15 @@ def load_vgm(path: Path | str) -> VgmFile:
     ym2203_clock = _sane_clock(ym2203_raw)
     if not ym2203_clock:
         ym2203_clock = _sane_clock(clocks.get(EXTRA_YM2203, 0))
+    # OPL family. The three chips share the header's 1.51 block and each of
+    # their clock fields carries a second-instance bit; only the YM3812 has a
+    # command for the pair (0xAA), and bit 31 there pans them hard.
+    opl2_raw = _header_raw(buf, OPL2_CLOCK_OFF) if ver >= 0x151 else 0
+    opl2_clock = _sane_clock(opl2_raw)
+    opl2_dual = bool(opl2_raw & OPL_DUAL_BIT)
+    opl2_pan = bool(opl2_raw & 0x80000000)
+    opl_clock = _clock_or_zero(buf, OPL_CLOCK_OFF) if ver >= 0x151 else 0
+    opl3_clock = _clock_or_zero(buf, OPL3_CLOCK_OFF) if ver >= 0x151 else 0
     sn76489_clock = _clock_or_zero(buf, SN76489_CLOCK_OFF)
     k_clock = _k007232_clock(buf, clocks, ym_clock, ver)
     oki_raw = _header_raw(buf, 0x98) if ver >= 0x161 else 0
@@ -693,6 +755,11 @@ def load_vgm(path: Path | str) -> VgmFile:
         sn76489_clock=sn76489_clock,
         ym2203_clock=ym2203_clock,
         ym2203_dual=ym2203_dual,
+        opl_clock=opl_clock,
+        opl2_clock=opl2_clock,
+        opl2_dual=opl2_dual,
+        opl2_pan=opl2_pan,
+        opl3_clock=opl3_clock,
         msm6295_clock=oki_raw & 0x3FFFFFFF,
         msm6295_pin7=bool(oki_raw & 0x80000000),
         msm6295_dual=bool(oki_raw & 0x40000000),
@@ -722,6 +789,7 @@ def load_vgm(path: Path | str) -> VgmFile:
     skipped_sample_cmds: set[int] = set()
     stray_ym2203_second = False
     stray_ym2612_second = False
+    stray_opl2_second = False
     saw_end = False
     saw_adpcm_compressed = False
     # stream id -> setup recorded by 0x90/0x91/0x92
@@ -923,6 +991,31 @@ def load_vgm(path: Path | str) -> VgmFile:
             pos += 3
             continue
         if (
+            cmd in (CMD_YM3526, CMD_YM3812, CMD_YM3812_2, CMD_OPL3_P0, CMD_OPL3_P1)
+            and pos + 3 <= n
+        ):
+            # The OPL chips take (register, value) in one flat space. The YMF262
+            # has two banks of nine channels and the command *is* the bank, so
+            # the port is folded into bit 8 of reg exactly like the YM2612's
+            # second register bank; every per-channel register then names one
+            # hardware channel unambiguously.
+            if cmd == CMD_YM3526:
+                vgm.writes.append(ChipWrite(sample, "opl", 0, buf[pos + 1], buf[pos + 2]))
+            elif cmd == CMD_YM3812:
+                vgm.writes.append(ChipWrite(sample, "opl2", 0, buf[pos + 1], buf[pos + 2]))
+            elif cmd == CMD_YM3812_2:
+                if opl2_dual:
+                    vgm.writes.append(ChipWrite(sample, "opl2", 1, buf[pos + 1], buf[pos + 2]))
+                else:
+                    stray_opl2_second = True
+            else:
+                port = 1 if cmd == CMD_OPL3_P1 else 0
+                vgm.writes.append(ChipWrite(
+                    sample, "opl3", 0, (port << 8) | buf[pos + 1], buf[pos + 2],
+                ))
+            pos += 3
+            continue
+        if (
             cmd in (CMD_YM2612_P0, CMD_YM2612_P1, CMD_YM2612_B_P0, CMD_YM2612_B_P1)
             and pos + 3 <= n
         ):
@@ -1059,6 +1152,28 @@ def load_vgm(path: Path | str) -> VgmFile:
         vgm.warnings.append(
             f"YM2612 clock is missing or out of range; using {YM2612_DEFAULT_CLOCK}"
         )
+    # OPL family. The three clock fields all carry the second-instance bit, but
+    # only the YM3812 pair has a distinct command ($AA), so a flagged second OPL
+    # or OPL3 is reported instead of folded into the first chip's registers.
+    if any(w.chip == "opl" for w in vgm.writes) and not vgm.opl_clock:
+        vgm.warnings.append(
+            f"YM3526 clock is missing or out of range; using {OPL_DEFAULT_CLOCK}"
+        )
+    if any(w.chip == "opl2" for w in vgm.writes) and not vgm.opl2_clock:
+        vgm.warnings.append(
+            f"YM3812 clock is missing or out of range; using {OPL2_DEFAULT_CLOCK}"
+        )
+    if any(w.chip == "opl3" for w in vgm.writes) and not vgm.opl3_clock:
+        vgm.warnings.append(
+            f"YMF262 clock is missing or out of range; using {OPL3_DEFAULT_CLOCK}"
+        )
+    for off, name in ((OPL_CLOCK_OFF, "YM3526"), (OPL3_CLOCK_OFF, "YMF262")):
+        raw = _header_raw(buf, off) if ver >= 0x151 else 0
+        if raw & OPL_DUAL_BIT:
+            vgm.warnings.append(
+                f"header declares a second {name}; only the first chip's "
+                "register stream is converted"
+            )
     if any(w.chip == "sn76489" for w in vgm.writes) and not vgm.sn76489_clock:
         vgm.warnings.append(
             f"SN76489 clock is missing or out of range; using {SN76489_DEFAULT_CLOCK}"
@@ -1093,6 +1208,11 @@ def load_vgm(path: Path | str) -> VgmFile:
     if stray_ym2203_second:
         vgm.warnings.append(
             "0xA5 YM2203 writes without the dual-instance header bit; "
+            "they were treated as the first chip"
+        )
+    if stray_opl2_second:
+        vgm.warnings.append(
+            "0xAA YM3812 writes without the dual-instance header bit; "
             "they were treated as the first chip"
         )
     return vgm

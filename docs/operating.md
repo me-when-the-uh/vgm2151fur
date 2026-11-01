@@ -69,6 +69,18 @@ export the pitch check already produced. `condense.tsv` has the
 corresponding `audit_miss`, `fields`, `tl`, `psg_miss` and `dac_miss`
 columns.
 
+On an OPL-family module the `aud` half reads `0/0`: that field audit walks YM2151
+kc/kf snapshots. `keys`/`miss` do work there - the key-on lattice comes from each
+chip's own `0xBn` bit 5, or from the latch bits of `0xBD` in rhythm mode - and
+`div` measures pitch inside every voice's own key, trimmed 35 ms at both ends so a
+row-tick note and the sample the driver used are not charged against each other. A
+kit column is left out of that measure: two percussion voices share one frequency
+register, so the byte at a hit belongs to whichever was written last. The
+full-register form of the check - every operator page at every attack, compared
+sample-atomically after a Furnace round trip - is asserted by
+`tests.test_vgm2151fur_opl.TestOplRealRips`; `diag.opl_attacks()` is the helper to
+call by hand on a pack (`docs/opl.md`).
+
 The grid is measured from a lattice of note starts. The YM2151, YM2203 or
 YM2612 key-on register supplies it when the rip has a usable FM stream. When
 it does not - the C352 and SegaPCM-only board rips have no FM chip at all -

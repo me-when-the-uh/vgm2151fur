@@ -12,6 +12,7 @@ import math
 from collections import Counter
 from dataclasses import dataclass
 
+from vgm2151fur.opl import KIND_OPL3, DRUM_BITS, chan_map_for, melodic_count
 from vgm2151fur.vgm import VGM_RATE, VgmFile
 
 # Target length of one tick: fine enough for frame-quantized note starts,
@@ -55,8 +56,57 @@ class Grid:
         return names.get(self.subdiv, f"1/{self.subdiv} of a 16th")
 
 
+class _OplKeys:
+    """Rising key edges of an OPL-family register stream.
+
+    A channel is keyed by bit 5 of its own ``0xBn`` register, or - in rhythm
+    mode - by one latch bit of ``0xBD``, so both have to be tracked against the
+    previous byte. The channel a register belongs to comes from Furnace's own
+    table, because the YMF262 writes two banks through one register space and
+    pairs its channels for four-operator voices.
+    """
+
+    def __init__(self, kind: str, writes) -> None:
+        self.kind = kind
+        self.opl3 = kind == KIND_OPL3
+        drums = any(
+            w.chip == kind and (w.reg & 0xFF) == 0xBD and (w.val & 0x20)
+            for w in writes
+        )
+        self.drums = drums
+        self.melodic = melodic_count(kind, drums)
+        self.chan_map = chan_map_for(kind, drums)
+        self.by_reg: dict[tuple[int, int], list[int]] = {}
+        for fch, cm in enumerate(self.chan_map):
+            self.by_reg.setdefault(((cm >> 8) & 1 if self.opl3 else 0, cm & 0xFF), []).append(fch)
+        self.keyed: dict[tuple[int, int], bool] = {}
+        self.trig = 0
+
+    def feed(self, w) -> list[int]:
+        port = (w.reg >> 8) & 1 if self.opl3 else 0
+        r = w.reg & 0xFF
+        hit: list[int] = []
+        if 0xB0 <= r <= 0xB8:
+            on = bool(w.val & 0x20)
+            # The table is keyed by channel offset; the register names it.
+            for fch in self.by_reg.get((port, r - 0xB0), ()):
+                was = self.keyed.get((port, fch), False)
+                self.keyed[(port, fch)] = on
+                if on and not was and not (self.drums and fch >= self.melodic):
+                    hit.append(fch)
+        elif r == 0xBD and not self.opl3:
+            rhythm = bool(w.val & 0x20)
+            trig = (w.val & 0x1F) if rhythm else 0
+            for i, (bit, _name) in enumerate(DRUM_BITS):
+                if (trig & bit) and not (self.trig & bit):
+                    hit.append(self.melodic + i)
+            self.trig = trig
+        return hit
+
+
 def _keyons_by_channel(vgm: VgmFile) -> dict[int, list[int]]:
     out: dict[int, list[int]] = {}
+    opl_trackers: dict[str, _OplKeys] = {}
     for w in vgm.writes:
         if w.chip == "ym2151" and w.reg == 0x08 and (w.val & 0x78):
             out.setdefault(w.val & 7, []).append(w.sample)
@@ -75,6 +125,14 @@ def _keyons_by_channel(vgm: VgmFile) -> dict[int, list[int]]:
                 continue
             ch = raw if raw < 3 else raw - 1
             out.setdefault(2000 + w.chip_id * 6 + ch, []).append(w.sample)
+        elif w.chip in ("opl", "opl2", "opl3"):
+            tracker = opl_trackers.get(w.chip)
+            if tracker is None:
+                tracker = opl_trackers[w.chip] = _OplKeys(w.chip, vgm.writes)
+            # An OPL3 owns both banks in one system; a YM3812 pair keeps its
+            # instances apart so one chip's lattice cannot alias the other's.
+            for fch in tracker.feed(w):
+                out.setdefault(4000 + w.chip_id * 32 + fch, []).append(w.sample)
     for v in out.values():
         v.sort()
     return out

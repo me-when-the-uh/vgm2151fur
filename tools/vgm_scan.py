@@ -19,6 +19,16 @@ the hits per pack directory:
     ay8910   AY-3-8910/YM2149 at header 0x74 (VGM 1.51+), type byte 0x78
     ym2203   YM2203 at header 0x44; bit 30 marks a second chip (0xA5 writes)
     ym2612   YM2612 at header 0x2C; bit 30 marks a second chip (0xA2/A3 writes)
+    opl      YM3526 (OPL) at header 0x54; writes use command $5B. No rhythm
+             support in Furnace's chip, so a drum log of this family is rare
+    opl2     YM3812 (OPL2) at header 0x50; bit 30 marks a second chip ($AA
+             writes) and bit 31 that the pair is hard left/right. Commands $5A
+             (bank A) and $AA (second chip). Rhythm mode is the $BD register: a
+             log that latches it becomes the drums system in Furnace.
+    opl3     YMF262 (OPL3) at header 0x5C; both registers banks go through one
+             chip, commands $5E (port 0) and $5F (port 1), the bank living in
+             bit 8 of the register byte. $104 in port 1 pairs channels for
+             four-operator voices, so a channel count says nothing about it.
 
 Detection is heuristic (header clocks plus the extra-header clock list).
 Run it before batch convert requests so the pack list is complete, and
@@ -41,7 +51,10 @@ SKIP = {"output", "third_party", ".git", "__pycache__", ".commandcode",
         "node_modules", "soundcheck"}
 
 CENSUS_KINDS = {"segapcm", "c140", "c219", "c352", "k051649", "scc_plus",
-                "ay8910", "ym2203", "ym2612"}
+                "ay8910", "ym2203", "ym2612",
+                # The OPL family is FM rather than a sample chip, but a census
+                # without it hides most of the AdLib and sound-card logs.
+                "opl", "opl2", "opl3"}
 
 
 def detect(p: Path, want: int) -> set[str] | None:

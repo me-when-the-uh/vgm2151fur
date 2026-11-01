@@ -14,8 +14,9 @@ from pathlib import Path
 
 from vgm2151fur.furwrite import (
     CHIP_AY8910, CHIP_C140, CHIP_C352, CHIP_K007232, CHIP_K051649, CHIP_K052539,
-    CHIP_MSM6258, CHIP_MSM6295, CHIP_SEGAPCM, CHIP_YM2612, CHIP_YM2612_CSM,
-    CHIP_YM2612_EXT, FUR_MAGIC, decompress_fur,
+    CHIP_MSM6258, CHIP_MSM6295, CHIP_OPL, CHIP_OPL2, CHIP_OPL2_DRUMS,
+    CHIP_OPL3, CHIP_OPL3_DRUMS, CHIP_OPL_DRUMS, CHIP_SEGAPCM, CHIP_YM2612,
+    CHIP_YM2612_CSM, CHIP_YM2612_EXT, FUR_MAGIC, decompress_fur,
 )
 
 
@@ -28,6 +29,14 @@ CHIP_CHANNELS = {
     CHIP_YM2612: 6,  # YM2612: 6 FM voices (channel 6 may play samples)
     CHIP_YM2612_EXT: 9,  # YM2612 Ext: 2 FM + 4 channel-3 operators + FM4-6
     CHIP_YM2612_CSM: 10,  # YM2612 CSM: Ext + the CSM timer channel
+    # OPL family. Rhythm mode is its own system: bank A's last FM channels
+    # become the kit, so it shows five columns more on OPL/OPL2 and two on OPL3.
+    CHIP_OPL: 9,
+    CHIP_OPL2: 9,
+    CHIP_OPL3: 18,
+    CHIP_OPL_DRUMS: 11,
+    CHIP_OPL2_DRUMS: 11,
+    CHIP_OPL3_DRUMS: 20,
     CHIP_MSM6295: 4,  # MSM6295
     CHIP_MSM6258: 1,  # MSM6258
     CHIP_K007232: 2,  # K007232
