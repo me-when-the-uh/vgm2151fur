@@ -132,7 +132,7 @@ class TestOperatorMacroCapture(unittest.TestCase):
         self.assertEqual([v for v in seen if v in RAMP], RAMP,
                          "the logged steps must arrive in order, unturned")
 
-    def test_file_stores_the_inverted_level_and_no_delay(self):
+    def test_file_stores_levels_in_furnaces_domain_and_no_delay(self):
         data = write_fur(self.song, include_pcm=False, include_fm=True)
         feats = _macro_features(data)
         self.assertIn("O1", feats, sorted(feats))
@@ -142,10 +142,27 @@ class TestOperatorMacroCapture(unittest.TestCase):
         self.assertEqual(delay, 0, "an operator macro has no delay concept")
         self.assertGreaterEqual(speed, 1)
         self.assertEqual(ln, len(values))
-        self.assertEqual(values[0], 63 - 25, "stored as a level: up is louder")
-        # Every logged step must be in the file, inverted and in order.
-        self.assertEqual([v for v in values if 63 - v in RAMP],
-                         [63 - v for v in RAMP])
+        # byte = 127 - $4n, so the editor reads back exactly the logged level.
+        self.assertEqual(values[0], 127 - 25, "entry zero is the attack level")
+        self.assertEqual([v for v in values if 127 - v in RAMP],
+                         [127 - t for t in RAMP])
+
+    def test_editor_visible_level_stays_in_the_opl_six_bit_range(self):
+        """What the UI shows for an OPL operator TL macro must be a $4n.
+
+        The file byte is Furnace's level domain (`$4n = 63 - (byte & 63)`, editor
+        shows `127 - byte`), so the test checks the number a person reads in the
+        instrument editor, not the raw byte.
+        """
+        data = write_fur(self.song, include_pcm=False, include_fm=True)
+        bad = []
+        for tag, (_code, _ln, _delay, _speed, values) in _macro_features(
+                data).items():
+            for v in values:
+                shown = 127 - v
+                if not (0 <= shown <= 63):
+                    bad.append((tag, v, shown))
+        self.assertEqual(bad, [], f"editor levels outside $4n range: {bad[:6]}")
 
     def test_carrier_script_stays_on_the_volume_column(self):
         song = analyze(_song(script_mod=False), pcm=False)

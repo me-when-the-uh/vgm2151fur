@@ -453,27 +453,31 @@ def _write_op_ma(b: Buf, op_index: int, values: tuple[int, ...],
     """An ``O1``..``O4`` feature: the macro list of one operator.
 
     Furnace reads these in ``DivInstrument::readFeatureOx`` and applies code 6
-    (``DIV_MACRO_OP_TL``) as ``op.tl = val & 63``. There is no delay concept for
-    an operator macro: it starts running at the key-on, entry by entry every
-    ``speed`` ticks and holding its last value after that, so the first entry is
-    the level the note attacks with. For an operator without ``kvs`` the register
-    write is ``$4n = op.tl``, straight through; that is what makes a scripted
-    modulator reachable at all, since the volume column scales only a KVS operator.
+    (``DIV_MACRO_OP_TL``). There is no delay concept for an operator macro: it
+    starts running at the key-on, entry by entry every ``speed`` ticks and holding
+    its last value after that, so the first entry is the level the note attacks
+    with. For an operator without ``kvs`` the register write is `$4n = op.tl`,
+    straight through - that is what makes a scripted modulator reachable at all,
+    since the volume column scales only a KVS operator.
 
-    The value is a *level*, not an attenuation - measured through the console
-    build, entries came back as ``$4n = 63 - value`` - so it is inverted here;
-    the model above speaks ``$4n``. Only macros that are present are read, and the
-    list ends at 255.
+    The stored number is a **level in Furnace's seven-bit domain, not the
+    attenuation**: measured through the console build, a stored byte S reaches the
+    chip as `$4n = 63 - (S & 63)`, and an editor shows `127 - S`. The model above
+    speaks `$4n` (0..63 on an OPL), so `127 - $4n` is written: the register gets
+    the logged attenuation *and* the editor reads 0..63. Writing `63 - $4n` plays
+    the same only because bit 6 is discarded, and then the editor shows 90-103 for
+    a level of 26-37. Only macros that are present are read; the list ends at 255.
     """
     if not values:
         return
+    stored = [127 - (v & 0x3F) for v in values]
     b.raw(f"O{op_index + 1}".encode("ascii"))
     size_off = len(b.b)
     b.u16(0)
     start = len(b.b)
     # if you update the macro header, update this length as well (Furnace: 8)
     b.u16(8)
-    _write_macro(b, 6, [63 - (v & 63) for v in values], speed=speed)
+    _write_macro(b, 6, stored, speed=speed)
     b.u8(255)  # stop
     b.b[size_off:size_off + 2] = int(len(b.b) - start).to_bytes(2, "little")
 
