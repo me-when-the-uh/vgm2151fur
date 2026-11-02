@@ -13,6 +13,7 @@ if str(ROOT) not in sys.path:
 
 from vgm2151fur.analyze import (
     Song,
+    CARRIERS,
     _musical_row,
     _rebase_non_fm_ins,
     _shift_note_e5,
@@ -597,6 +598,80 @@ class TestKeyOnOperatorMask(unittest.TestCase):
         self.assertEqual([patch.ops[i].tl for i in range(4)], [0x19, 0x7F, 0x06, 0x7F])
         self.assertLess(patch.carrier_tl(), 0x7F,
                         "a carrier left at TL 7F is a silent instrument")
+
+
+class TestOpmLevelReach(unittest.TestCase):
+    """A crescendo that gets louder than its instrument must stay reachable.
+
+    "Purple Twilight" (Armed Police Batrider, stage 2) opens its lead on FM
+    channels 1-3 at CON=4 with op1/op2 held at $1E while op3/op4 walk
+    $39,$37,...,$1E under the held note. Volume can only attenuate what the
+    instrument stores (``TL = 127 - vol + op.tl``), so with the carriers frozen
+    at $39 every note row maxed at vol 127 and the entrance never got louder -
+    precisely "too quiet and inaudible, the changes cannot exceed max".
+    """
+
+    CH = 0
+    QUIET = 0x39
+    LOUD = 0x1E
+
+    def _writes(self):
+        w = [
+            ChipWrite(sample=1, chip="ym2151", chip_id=0, reg=0x60 + self.CH, val=0x1E),
+            ChipWrite(sample=2, chip="ym2151", chip_id=0, reg=0x68 + self.CH, val=0x1E),
+            ChipWrite(sample=3, chip="ym2151", chip_id=0, reg=0x70 + self.CH, val=self.QUIET),
+            ChipWrite(sample=4, chip="ym2151", chip_id=0, reg=0x78 + self.CH, val=self.QUIET),
+            ChipWrite(sample=5, chip="ym2151", chip_id=0, reg=0x20 + self.CH, val=0xC4),
+            # key on all four operators
+            ChipWrite(sample=10, chip="ym2151", chip_id=0, reg=0x08, val=(0xF << 3) | self.CH),
+        ]
+        # the climb: op3/op4 walk down (louder) while the note sounds, ending
+        # exactly on the level op1/op2 hold (0x39 to 0x1E is an odd span, so the
+        # last step is appended rather than letting a -2 ladder miss it).
+        t = 8000
+        for v in list(range(self.QUIET - 2, self.LOUD, -2)) + [self.LOUD]:
+            w.append(ChipWrite(sample=t, chip="ym2151", chip_id=0,
+                               reg=0x70 + self.CH, val=v))
+            w.append(ChipWrite(sample=t + 2, chip="ym2151", chip_id=0,
+                               reg=0x78 + self.CH, val=v))
+            t += 4000
+        w.append(ChipWrite(sample=90000, chip="ym2151", chip_id=0, reg=0x08,
+                           val=self.CH))
+        return w
+
+    def setUp(self):
+        self.song = analyze(_vgm_with_writes(self._writes()), pcm=False)
+        ons = [e for e in self.song.events if e.on and not e.pcm]
+        self.assertEqual(len(ons), 1, "the synthetic voice is one held note")
+        self.ev = ons[0]
+        self.patch = self.song.fm_patches[self.ev.ins]
+
+    def test_algorithm_4_carriers_are_op3_and_op4(self):
+        """Measured across 49 YM2151 rips: automation is always op3+op4."""
+        self.assertEqual(CARRIERS.get(4), (2, 3))
+
+    def test_instrument_is_opened_to_the_loudest_requested_level(self):
+        self.assertEqual(self.patch.carrier_tl(), self.LOUD,
+                         "the carriers must reach the top of the crescendo")
+
+    def test_note_row_starts_attenuated_not_maxed(self):
+        # vol such that 127 - vol + LOUD == QUIET: the entrance is quiet because
+        # the column says so, not because the instrument cannot go louder.
+        self.assertEqual(self.ev.vol, 127 - (self.QUIET - self.LOUD))
+        self.assertLess(self.ev.vol, 127)
+
+    def test_mid_note_steps_scale_from_the_same_floor(self):
+        self.assertEqual(self.ev.vol_tl_base, self.LOUD)
+        self.assertTrue(self.ev.tl_pts, "the climb must still be recorded")
+        # No step may ask for a level the instrument cannot reach at vol 127.
+        unreachable = [tl for _t, tl in self.ev.tl_pts if tl < self.patch.carrier_tl()]
+        self.assertEqual(unreachable, [],
+                         f"levels below the instrument floor: {unreachable}")
+
+    def test_writers_volume_column_reaches_max_only_at_the_top(self):
+        data = write_fur(self.song, include_pcm=False, include_fm=True)
+        self.assertIn(bytes([self.patch.ops[2].tl & 0x7F]), data)
+        self.assertEqual(self.ev.vol, 127 - (self.QUIET - self.LOUD))
 
 
 class TestChipClockFlags(unittest.TestCase):

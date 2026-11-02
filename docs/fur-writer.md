@@ -127,7 +127,7 @@ the OPN sustain rate (0x70) and SSG-EG (0x90) instead of DT2. A per-note pitch
 macro (code 4) on an instrument copy reproduces later f-num writes; the note's
 E5 carries the key-on remainder.
 
-YM2612 instruments use the same type 1 and OPN operator layout. They also carry the channel's PMS/AMS in the FM feature, and the carrier TLs are stored relative to the loudest carrier while the note's volume column carries the absolute level (Furnace's `newVolumeScaling` makes that exact). The DAC uses `DIV_INS_AMIGA` sample maps of 120 slots with `first_sample=0`; pattern note `60+slot` selects a release-capped PCM chunk. `collect_dac(..., slices=True)` is the explicit per-run slice mode. The SN76489 uses a plain `DIV_INS_STD` instrument (pitch macro only), a 0-15 volume column, and effect `20xy` for noise mode; its system volume defaults to 0.500, and an absolute extra-header volume entry overrides it. The FM feature's four operator columns of the Ext system share one timbre instrument.
+YM2612 instruments use the same type 1 and OPN operator layout. They also carry the channel's PMS/AMS in the FM feature, and the carrier TLs are stored relative to the loudest carrier while the note's volume column carries the absolute level (Furnace's `newVolumeScaling` makes that exact). The DAC uses `DIV_INS_AMIGA` sample maps of 120 slots with `first_sample=0`; pattern note `60+slot` selects a release-capped PCM chunk. `collect_dac(..., slices=True)` is the explicit per-run slice mode. The SN76489 uses a plain `DIV_INS_STD` instrument (pitch macro only), a 0-15 volume column, and effect `20xy` for noise mode; its system volume defaults to 0.500, and an absolute extra-header volume entry overrides it. The FM feature's four operator columns of the Ext system share one timbre instrument. Column `ch` (channels 2-5) plays `ops[orderedOps[ch]]`, and `orderedOps` is `{0,2,1,3}` (`fmsharedbase.h`), so channel 3 plays `ops[2]` - the twist is a different axis from the `$08` key-on bits and `OPN_ORDERED_OPS` carries it. The instrument cache deliberately ignores TL so one voice stays one instrument, therefore each column's level must ride its own volume: `DIV_CMD_VOLUME` in `ym2203ext.cpp` answers unconditionally with `TL = 127 - vol + op.tl`, so `_bind_ext_levels` parks that operator's lowest requested TL in the instrument and gives every note `vol = 127 - (its TL - floor)`. A column that never moves sits at `vol 127`; one the driver walks (`01 Exit Logo` runs `$4A` through `06-2D`) reproduces every step.
 
 OPL-family instruments are `DIV_INS_OPL` (type 14) for a voice and
 `DIV_INS_OPL_DRUMS` (type 32) for a single-operator percussion column, both with
@@ -165,6 +165,15 @@ voices per chip, MSM6295 four voices per chip, MSM6258 one, SegaPCM sixteen,
 C140 twenty-four, C352 thirty-two. Sample bodies are stored 8-bit signed
 (C140 and C352 mulaw are 16-bit linear). K053260 KADPCM uses sample depth 7
 and stores the raw nibble bytes; the SMP2 count is the nibble count.
+
+Every 4-bit depth takes a **nibble** count in SMP2, MSM6295 included:
+`DivSample::initInternal` answers `DIV_SAMPLE_DEPTH_VOX` with
+`lengthVOX = (count + 1) / 2` bytes (`sample.cpp`) for every chip, so declaring
+a byte count silently discards the back half of the sample and Furnace shows
+half the length - a 15,149-byte banked voice arrives as 7,575 and stops
+mid-word. `furwrite._write_vox` therefore always doubles. MSM6258 additionally
+swaps nibbles in its core (`okim6258::data_w` reads low-first), so that payload
+is pre-swapped; MSM6295 copies `dataVOX` to ROM as it stands.
 
 A YM2610 system carries its FM and SSG voices plus six ADPCM-A and one
 ADPCM-B channel. ADPCM-A instruments are type 37 with sample depth 5,
