@@ -71,6 +71,16 @@ from vgm2151fur.opl import (
     opl_carrier_octave,
     opl_module_clock,
     opl_note_for,
+    opll_module_clock,
+    opll_note_for,
+)
+from vgm2151fur.ym2413 import (
+    OPLL_CHANNELS,
+    OPLL_DRUMS,
+    OPLL_DRUMS_CHANNELS,
+    OPLL_SETTLE,
+    OPLLState,
+    opll_rhythm_plan,
 )
 from vgm2151fur.pcm import PcmSample, build_pcm_bank, pitch_to_note, rate_to_note
 from vgm2151fur.pitch import (
@@ -467,6 +477,11 @@ class Song:
     # melodic columns play the kit.
     opl_ids: list[int] = field(default_factory=list)
     opl_drums: bool = False
+    # YM2413 (OPLL) instances in channel order. Each owns nine melodic
+    # channels, or eleven when the drum kit is in use (the kit takes over the
+    # last three hardware channels as five percussion columns).
+    opll_ids: list[int] = field(default_factory=list)
+    opll_drums: bool = False
     # Top of the volume column for this system's FM channels. The OPL platform
     # answers 63 to getVolMax and masks the value to six bits, so writing the
     # 127 an OPN column tops out at would land on zero.
@@ -2689,6 +2704,364 @@ def _collect_opl(
     return stats, warnings
 
 
+def _collect_opll(
+    vgm: VgmFile,
+    events: list[NoteEvent],
+    patches: dict[tuple, FMPatch],
+    patch_order: list[tuple],
+    keyon_times: list[int],
+    channel_fx: list[tuple[int, int, int, int]],
+    chip_fx: list[tuple],
+    *,
+    ids: list[int],
+    base: dict[int, int],
+    clock: float,
+    drums: bool,
+) -> tuple[dict, list[str]]:
+    """Turn a YM2413 register stream into notes and OPLL instruments.
+
+    The chip keys a channel with bit 4 of ``$2x`` and carries the level in the
+    low nibble of ``$3x``; there is no separate carrier TL register. In
+    rhythm mode ``$0e`` keys five fixed drum voices and the ``$36-$38`` bytes
+    hold their levels, so those columns take their note from the shared
+    frequency registers and their volume from the nibble the chip reads.
+    """
+    states = {cid: OPLLState(drums) for cid in ids}
+    held: dict[tuple[int, int], int] = {}
+    pitch_pts: dict[tuple[int, int], list[tuple[int, int, int]]] = {}
+    pitch_base: dict[tuple[int, int], tuple[int, int]] = {}
+    pitch_last: dict[tuple[int, int], tuple[int, int]] = {}
+    vol_pts: dict[tuple[int, int], list[tuple[int, int]]] = {}
+    vol_last: dict[tuple[int, int], int] = {}
+    held_preset: dict[tuple[int, int], int] = {}
+    pending: dict[tuple[int, int], int] = {}
+    off_idx: list[int] = []
+    stats = {
+        "notes": 0, "drums": 0, "midnote_inst": 0, "inst_fx": 0,
+        "lost_melodic": 0,
+    }
+    warnings: list[str] = []
+
+    def hw_channels(hw: int) -> tuple[int, ...]:
+        """Furnace columns a chip channel's frequency registers drive.
+
+        In rhythm mode the kit shares one hardware voice between two columns:
+        channel 8 is snare and hi-hat, channel 9 is tom and top cymbal. A
+        pitch write there belongs to both, so the engine's own `drumSlot`
+        table (opll.cpp) is read backwards here. Without the kit, one chip
+        channel is exactly one column.
+        """
+        if not drums:
+            return (hw,) if hw < 9 else ()
+        if hw < 6:
+            return (hw,)
+        return {6: (6,), 7: (7, 10), 8: (8, 9)}.get(hw, ())
+
+    def column_level(cid: int, fch: int) -> int:
+        st = states[cid]
+        if drums and fch >= 6:
+            for entry in OPLL_DRUMS:
+                if entry[0] == fch:
+                    return 15 - st.drum_volume(entry[3], entry[4])
+            return 15
+        return 15 - st.volume(fch)
+
+    def intern(cid: int, fch: int) -> int:
+        st = states[cid]
+        if drums and fch >= 6:
+            snap = st.drum_patch()
+            key = ("opll-drum",) + snap.identity()
+        else:
+            snap = st.snapshot(fch)
+            key = snap.identity()
+        if key not in patches:
+            if drums and fch >= 6:
+                snap.name = "OPLL drums"
+            elif snap.preset:
+                snap.name = f"OPLL preset {snap.preset:02d}"
+            else:
+                snap.name = f"OPLL {len(patch_order):02d}"
+            patches[key] = snap
+            patch_order.append(key)
+        p = patches[key]
+        p.uses += 1
+        return patch_order.index(key)
+
+    def close_note(cid: int, fch: int, sample: int, *, off: bool) -> None:
+        key = (cid, fch)
+        idx = held.pop(key, None)
+        if idx is None:
+            return
+        ev = events[idx]
+        pts = pitch_pts.pop(key, [])
+        if pts:
+            merged: list[tuple[int, int, int]] = []
+            for p in pts:
+                if merged and p[0] - merged[-1][0] <= 16:
+                    merged[-1] = p
+                else:
+                    merged.append(p)
+            if (merged and merged[0][0] - ev.sample <= 120
+                    and merged[0][1:] != pitch_base[key]):
+                ev.note, ev.e5 = opll_note_for(
+                    merged[0][1], merged[0][2], clock,
+                )
+                merged = [(ev.sample, *merged[0][1:])] + merged[1:]
+                pitch_base[key] = merged[0][1:]
+            distinct: list[tuple[int, int, int]] = []
+            for p in merged:
+                if not distinct or p[1:] != distinct[-1][1:]:
+                    distinct.append(p)
+            if len(distinct) > 1:
+                ev.fm_pitch_pts = tuple(distinct)
+        vp = vol_pts.pop(key, [])
+        if vp:
+            ev.vol_pts = tuple((s, max(0, min(15, v)), None) for s, v in vp)
+        for d in (pitch_pts, pitch_base, pitch_last, vol_pts, vol_last,
+                  held_preset):
+            d.pop(key, None)
+        if off:
+            ev.end = sample
+            events.append(NoteEvent(
+                sample=sample, ch=ev.ch, on=False, note=180, ins=-1,
+                vol=-1, e5=0x80, pan=0,
+            ))
+            off_idx.append(len(events) - 1)
+
+    def open_note(cid: int, fch: int, sample: int) -> None:
+        st = states[cid]
+        close_note(cid, fch, sample, off=False)
+        hw = fch
+        if drums and fch >= 6:
+            for entry in OPLL_DRUMS:
+                if entry[0] == fch:
+                    hw = entry[2]
+                    break
+        block, fnum = st.block_fnum(hw)
+        note, e5 = opll_note_for(block, fnum, clock)
+        ins = intern(cid, fch)
+        vol = column_level(cid, fch)
+        key = (cid, fch)
+        events.append(NoteEvent(
+            sample=sample, ch=base[cid] + fch, on=True, note=note, ins=ins,
+            vol=vol, e5=e5, pan=0, sweep_div=2.0, e5_lo=0x00,
+            e5_hi=0xFF, drum=bool(drums and fch >= 6),
+        ))
+        held[key] = len(events) - 1
+        pitch_base[key] = (block, fnum)
+        pitch_last[key] = (block, fnum)
+        pitch_pts[key] = [(sample, block, fnum)]
+        vol_pts[key] = []
+        vol_last[key] = vol
+        held_preset[key] = st.preset(hw) if hw < 9 else 0
+        keyon_times.append(sample)
+        if drums and fch >= 6:
+            stats["drums"] += 1
+        else:
+            stats["notes"] += 1
+
+    def touch_freq(cid: int, hw: int, sample: int) -> None:
+        st = states[cid]
+        block, fnum = st.block_fnum(hw)
+        for fch in hw_channels(hw):
+            key = (cid, fch)
+            if key in held and (block, fnum) != pitch_last[key]:
+                pitch_pts[key].append((sample, block, fnum))
+                pitch_last[key] = (block, fnum)
+
+    def update_level(cid: int, fch: int, sample: int) -> None:
+        key = (cid, fch)
+        if key not in held:
+            return
+        level = column_level(cid, fch)
+        if level != vol_last[key]:
+            vol_pts[key].append((sample, level))
+            vol_last[key] = level
+
+    def keyed_here(w) -> bool:
+        r = w.reg & 0xFF
+        if 0x20 <= r <= 0x28:
+            return bool(w.val & 0x10)
+        if r == 0x0E:
+            return bool(w.val & 0x1F)
+        return False
+
+    def ordered(writes):
+        out = []
+        i, n = 0, len(writes)
+        while i < n:
+            j = i + 1
+            s = writes[i].sample
+            while j < n and writes[j].sample == s:
+                j += 1
+            group = writes[i:j]
+            out.extend(w for w in group if not keyed_here(w))
+            out.extend(w for w in group if keyed_here(w))
+            i = j
+        return out
+
+    def key_on_edge(cid: int, fch: int, sample: int) -> None:
+        """Arm a voice the moment its key bit rises.
+
+        The note is not opened there: ``$2x`` carries only the top bit of the
+        f-num, and drivers write ``$1x`` a sample or two after raising bit 4.
+        Reading the chip at the key therefore opens the voice mid-write - flat
+        by anything up to an octave on a YM2413 whose f-num is nine bits. The
+        open waits for ``OPLL_SETTLE`` so the voice takes the page the driver
+        lands on, which is also what one pattern row can hold.
+        """
+        flush_one(cid, fch)
+        pending[(cid, fch)] = sample
+
+    def flush_one(cid: int, fch: int) -> None:
+        t = pending.pop((cid, fch), None)
+        if t is not None:
+            open_note(cid, fch, t)
+
+    def flush_due(sample: int) -> None:
+        for key, t in list(pending.items()):
+            if t + OPLL_SETTLE < sample:
+                cid, fch = key
+                pending.pop(key, None)
+                open_note(cid, fch, t)
+
+    stream = ordered(vgm.writes)
+    for w in stream:
+        # Settle first, but only once the window is fully behind this write: a
+        # register landing exactly at the window's end belongs to the key.
+        flush_due(w.sample)
+        if w.chip != "opll":
+            continue
+        cid = w.chip_id
+        st = states.get(cid)
+        if st is None:
+            continue
+        r = w.reg & 0xFF
+        val = w.val & 0xFF
+        prev = st.regs[r]
+
+        if r == 0x0E:
+            st.write(r, val)
+            was_rhythm = bool(prev & 0x20)
+            is_rhythm = bool(val & 0x20)
+            old_trig = (prev & 0x1F) if was_rhythm else 0
+            trig = (val & 0x1F) if is_rhythm else 0
+            if is_rhythm and not was_rhythm and not drums:
+                # The kit takes channels 6-8 away from the melodic section.
+                for hw in (6, 7, 8):
+                    for fch in hw_channels(hw):
+                        flush_one(cid, fch)
+                        close_note(cid, fch, w.sample, off=True)
+            if drums:
+                for entry in OPLL_DRUMS:
+                    fch, _name, _hw, _reg, _shift, bit = entry
+                    if (trig & bit) and not (old_trig & bit) and is_rhythm:
+                        key_on_edge(cid, fch, w.sample)
+                    elif (old_trig & bit) and not (trig & bit):
+                        flush_one(cid, fch)
+                        close_note(cid, fch, w.sample, off=True)
+            continue
+
+        if 0x10 <= r <= 0x18:
+            st.write(r, val)
+            touch_freq(cid, r - 0x10, w.sample)
+            continue
+
+        if 0x20 <= r <= 0x28:
+            st.write(r, val)
+            hw = r - 0x20
+            was_on = bool(prev & 0x10)
+            is_on = bool(val & 0x10)
+            if drums:
+                if hw >= 6:
+                    if is_on and not was_on:
+                        stats["lost_melodic"] += 1
+                elif is_on and not was_on:
+                    key_on_edge(cid, hw, w.sample)
+                elif was_on and not is_on:
+                    flush_one(cid, hw)
+                    close_note(cid, hw, w.sample, off=True)
+            else:
+                if is_on and not was_on:
+                    key_on_edge(cid, hw, w.sample)
+                elif was_on and not is_on:
+                    flush_one(cid, hw)
+                    close_note(cid, hw, w.sample, off=True)
+            touch_freq(cid, hw, w.sample)
+            continue
+
+        if 0x30 <= r <= 0x38:
+            st.write(r, val)
+            hw = r - 0x30
+            if drums and hw >= 6:
+                for entry in OPLL_DRUMS:
+                    if entry[3] == r:
+                        update_level(cid, entry[0], w.sample)
+            else:
+                key = (cid, hw)
+                if key in held and st.preset(hw) != held_preset[key]:
+                    # Furnace reloads a held OPLL voice through the wave
+                    # column: effect 10xx is DIV_CMD_WAVE, which writes the
+                    # $3x instrument nibble without touching the note.
+                    preset = st.preset(hw)
+                    ev = events[held[key]]
+                    bank = (
+                        patches[patch_order[ev.ins]].preset == 0
+                        if 0 <= ev.ins < len(patch_order) else False
+                    )
+                    if preset or bank:
+                        # A switch to the user patch is only faithful while
+                        # the note already plays one: $00-$07 hold that
+                        # instrument and nothing else rewrites them here.
+                        channel_fx.append(
+                            (w.sample, base[cid] + hw, 0x10, preset)
+                        )
+                        stats["inst_fx"] += 1
+                    else:
+                        stats["midnote_inst"] += 1
+                    held_preset[key] = preset
+                update_level(cid, hw, w.sample)
+            continue
+
+        # $00-$07 hold the single user instrument. A change while a custom
+        # voice is sounding reaches the chip immediately, but one pattern cell
+        # cannot reload a held note, so the next key-on takes it.
+        st.write(r, val)
+        if r <= 0x07:
+            for key in held:
+                if key[0] == cid and not held_preset.get(key, 0):
+                    stats["midnote_inst"] += 1
+                    break
+
+    for cid, fch in list(pending):
+        flush_one(cid, fch)
+    for cid, fch in list(held):
+        close_note(cid, fch, vgm.total_samples or 0, off=False)
+
+    if stats["midnote_inst"]:
+        warnings.append(
+            f"{stats['midnote_inst']} user-patch change(s) landed inside a "
+            "held OPLL note; the next key-on picks them up"
+        )
+    if drums and stats["lost_melodic"]:
+        warnings.append(
+            f"rhythm mode is on, so OPLL channels 7-9 are the kit; "
+            f"{stats['lost_melodic']} melodic key-on(s) there had no column"
+        )
+    ons_by_ch: dict[int, list[int]] = {}
+    for e in events:
+        if e.on:
+            ons_by_ch.setdefault(e.ch, []).append(e.sample)
+    drop = {
+        idx for idx in off_idx
+        if any(abs(t - events[idx].sample) <= 2
+               for t in ons_by_ch.get(events[idx].ch, ()))
+    }
+    if drop:
+        events[:] = [e for i, e in enumerate(events) if i not in drop]
+    return stats, warnings
+
+
 def _opl_rhythm_plan(vgm, kind: str) -> tuple[bool, dict]:
     """Decide which OPL layout a log should become, and count what each costs.
 
@@ -2850,6 +3223,7 @@ def analyze(
     has_ym2610 = "ym2610" in chips or "ym2610_ssg" in chips
     has_sn76489 = "sn76489" in chips
     has_opl = bool(chips & {"opl", "opl2", "opl3"})
+    has_opll = "opll" in chips
 
     if has_ym2610 and (has_ym2151 or has_ym2203 or has_ym2612):
         warnings.append(
@@ -2908,6 +3282,17 @@ def analyze(
         elif opl_kinds:
             opl_kind = opl_kinds[0]
     is_opl = opl_kind is not None
+    # The YM2413 is its own system. It coexists with the SMS PSG and an AY-8910
+    # (Furnace ships those pairings), but not with another FM family.
+    is_opll = (
+        has_opll and not is_opl
+        and not (has_ym2151 or has_ym2203 or has_ym2612 or has_ym2610)
+    )
+    if has_opll and not is_opll:
+        warnings.append(
+            "OPLL and another FM chip write in one log; only the "
+            f"{'OPL' if is_opl else 'arcade FM'} side was converted"
+        )
     if is_opl and len(opl_kinds) > 1:
         dropped = "/".join(k.upper() for k in opl_kinds if k != opl_kind)
         warnings.append(
@@ -2916,6 +3301,8 @@ def analyze(
         )
     if is_opl:
         selected_fm_chips = {opl_kind}
+    elif is_opll:
+        selected_fm_chips = {"opll"}
     elif is_opn:
         selected_fm_chips = {"ym2203", "ym2203_ssg"}
     elif is_opn2:
@@ -2958,6 +3345,18 @@ def analyze(
              vgm.opl2_clock if opl_kind == KIND_OPL2 else vgm.opl_clock),
             opl_kind == KIND_OPL3,
         ) if is_opl else 0.0
+    )
+    opll_ids = (
+        sorted({w.chip_id for w in vgm.writes if w.chip == "opll"})
+        if is_opll else []
+    )
+    # Like the OPL kit, the drums layout is a separate Furnace system. It is
+    # chosen only when a $0e trigger actually rises while rhythm mode is on.
+    opll_drums, opll_rhythm = (
+        opll_rhythm_plan(vgm, opll_ids) if is_opll else (False, {})
+    )
+    opll_clock = (
+        opll_module_clock(vgm.ym2413_clock or 3579545) if is_opll else 0.0
     )
     ym_ids = (
         sorted({w.chip_id for w in vgm.writes if w.chip in ("ym2203", "ym2203_ssg")})
@@ -3019,6 +3418,11 @@ def analyze(
     # eighteen for an OPL3, plus the five kit columns when rhythm is on.
     opl_chunk = channel_count(opl_kind, opl_drums) if is_opl else 0
     opl_base = {cid: opl_chunk * i for i, cid in enumerate(opl_ids)}
+    # The YM2413 owns nine melodic columns, or eleven when its kit is in use.
+    opll_chunk = (
+        OPLL_DRUMS_CHANNELS if opll_drums else OPLL_CHANNELS
+    ) if is_opll else 0
+    opll_base = {cid: opll_chunk * i for i, cid in enumerate(opll_ids)}
 
     if is_opnb:
         fm_end = ym_chunk * len(ym2610_ids)
@@ -3026,6 +3430,8 @@ def analyze(
         fm_end = ym_chunk * len(ym_ids if is_opn else ym2612_ids)
     elif is_opl:
         fm_end = opl_chunk * len(opl_ids)
+    elif is_opll:
+        fm_end = opll_chunk * len(opll_ids)
     else:
         fm_end = 8
 
@@ -4128,6 +4534,22 @@ def analyze(
             warnings.append(
                 f"{opl_stats['four_op']} note-on(s) read as an OPL3 "
                 "four-operator voice (0x104 pair bit)"
+            )
+
+    opll_stats: dict = {}
+    if is_opll:
+        opll_stats, opll_warn = _collect_opll(
+            vgm, events, patches, patch_order, keyon_times, channel_fx, chip_fx,
+            ids=opll_ids, base=opll_base, clock=opll_clock,
+            drums=opll_drums,
+        )
+        warnings.extend(opll_warn)
+        if opll_drums and opll_rhythm.get("melodic_on_kit"):
+            # The kit layout was chosen, yet the log also played those chip
+            # channels melodically while rhythm mode was off.
+            warnings.append(
+                f"{opll_rhythm['melodic_on_kit']} melodic key-on(s) on OPLL "
+                "channels 7-9 landed while rhythm mode was off"
             )
 
     ym2610_ssg_count = 0
@@ -5349,7 +5771,7 @@ def analyze(
     fm_pitch_copies, fm_pitch_lost = _bind_fm_pitch(
         events, patches, patch_order, fm_pitch_clock, hz, vgm.total_samples or 0,
         cap=max(len(patch_order), 250 - foreign_ins - 24),
-        allow_steps=is_opn or is_opn2 or is_opl or is_opnb,
+        allow_steps=is_opn or is_opn2 or is_opl or is_opnb or is_opll,
     )
     # An operator level the driver scripted while its note sounded. The volume
     # column reaches only a KVS operator. The rest travel as instrument macros.
@@ -5509,6 +5931,7 @@ def analyze(
         c352_quad=c352_quad_events,
         fm_chip=(
             opl_kind if is_opl else
+            "opll" if is_opll else
             "ym2610" if is_opnb else
             ("ym2203" if is_opn else ("ym2612" if is_opn2 else "ym2151"))
         ),
@@ -5520,9 +5943,17 @@ def analyze(
         ym2612_csm=ym2612_csm,
         opl_ids=opl_ids,
         opl_drums=opl_drums,
-        fm_vol_max=63 if is_opl else 127,
-        fm_notes=opl_stats.get("notes", 0) if is_opl else 0,
-        drum_notes=opl_stats.get("drums", 0) if is_opl else 0,
+        opll_ids=opll_ids,
+        opll_drums=opll_drums,
+        fm_vol_max=15 if is_opll else (63 if is_opl else 127),
+        fm_notes=(
+            opll_stats.get("notes", 0) if is_opll else
+            opl_stats.get("notes", 0) if is_opl else 0
+        ),
+        drum_notes=(
+            opll_stats.get("drums", 0) if is_opll else
+            opl_stats.get("drums", 0) if is_opl else 0
+        ),
         ym2610_ids=ym2610_ids,
         ym2610_b=ym2610_b,
         ym2610_ssg_count=ym2610_ssg_count,

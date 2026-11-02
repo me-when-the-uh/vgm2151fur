@@ -19,7 +19,8 @@ from vgm2151fur.c352 import C352_DEFAULT_CLOCK
 from vgm2151fur.fm import CARRIERS, OPN_CARRIERS
 from vgm2151fur.oki import msm6258_flag_text, oki_flag_text, oki_needs_banked
 from vgm2151fur.opl import (
-    FURNACE_CLOCK, FURNACE_CLOCK_OPL3, opl_module_clock,
+    FURNACE_CLOCK, FURNACE_CLOCK_OPL3, opl_module_clock, opll_clock_flag,
+    opll_module_clock,
 )
 from vgm2151fur.pcm import pcm7_to_s8, scale_pcm7
 from vgm2151fur.pitch import FURNACE_CLOCK_DEFAULT, module_clock
@@ -100,6 +101,17 @@ CHIP_OPL3_DRUMS = 0xA4
 OPL_CHIP = {("opl", False): CHIP_OPL, ("opl2", False): CHIP_OPL2,
             ("opl3", False): CHIP_OPL3, ("opl", True): CHIP_OPL_DRUMS,
             ("opl2", True): CHIP_OPL2_DRUMS, ("opl3", True): CHIP_OPL3_DRUMS}
+# The YM2413 (OPLL) is its own core and instrument type. Rhythm mode is a
+# separate system whose last three hardware channels become five kit columns.
+CHIP_OPLL = 0x89
+CHIP_OPLL_DRUMS = 0xA7
+OPLL_CHANNELS = 9
+OPLL_DRUMS_CHANNELS = 11
+OPLL_DRUMS_MELODIC = 6
+OPLL_DRUM_LABELS = (
+    ("Kick", "BD"), ("Snare", "SD"), ("Tom", "TM"), ("Top", "TP"),
+    ("HiHat", "HH"),
+)
 OPL_CHANNELS = {("opl", False): 9, ("opl2", False): 9, ("opl3", False): 18,
                 ("opl", True): 11, ("opl2", True): 11, ("opl3", True): 20}
 OPL_MELODIC = {("opl", False): 9, ("opl2", False): 9, ("opl3", False): 18,
@@ -142,6 +154,22 @@ def opl_channel_names(kind: str, drums: bool) -> tuple[list[str], list[str]]:
         short_names.append(short_name)
     return long_names, short_names
 
+
+def opll_channel_names(drums: bool) -> tuple[list[str], list[str]]:
+    """The long and short channel names of the OPLL and its drums sibling."""
+    total = OPLL_DRUMS_CHANNELS if drums else OPLL_CHANNELS
+    long_names: list[str] = []
+    short_names: list[str] = []
+    for ch in range(total):
+        if drums and ch >= OPLL_DRUMS_MELODIC:
+            where = ch - OPLL_DRUMS_MELODIC
+            long_names.append(OPLL_DRUM_LABELS[where][0])
+            short_names.append(OPLL_DRUM_LABELS[where][1])
+        else:
+            long_names.append(f"FM {ch + 1}")
+            short_names.append(f"F{ch + 1}")
+    return long_names, short_names
+
 INS_OPM = 33
 # DIV_INS_FM: the generic OPN instrument used by the YM2203.  Furnace reads
 # its 0x70/0x90 fields from the same INS2 "FM" feature.
@@ -151,6 +179,8 @@ INS_FM = 1
 # operators in its operator slots.
 INS_OPL = 14
 INS_OPL_DRUMS = 32
+# DIV_INS_OPLL: the YM2413's own instrument type, two operators and a preset.
+INS_OPLL = 13
 INS_MSM6258 = 35
 INS_MSM6295 = 36
 INS_ADPCMA = 37
@@ -320,6 +350,10 @@ def _write_fm_feature(b: Buf, patch) -> None:
     size_off = len(b.b)
     b.u16(0)
     start = len(b.b)
+    if getattr(patch, "opll", False):
+        _write_opll_fm_feature_body(b, patch)
+        b.b[size_off:size_off + 2] = int(len(b.b) - start).to_bytes(2, "little")
+        return
     if getattr(patch, "opl", False):
         _write_opl_fm_feature_body(b, patch)
         b.b[size_off:size_off + 2] = int(len(b.b) - start).to_bytes(2, "little")
@@ -380,6 +414,34 @@ def _write_opl_fm_feature_body(b: Buf, patch) -> None:
         b.u8(((op.sl & 15) << 4) | (op.rr & 15))
         b.u8(0)  # deep vibrato and SSG-EG are not OPL fields
         b.u8(op.ws & 7)
+
+
+def _write_opll_fm_feature_body(b: Buf, patch) -> None:
+    """The 'FM' feature payload of a DIV_INS_OPLL voice.
+
+    The OPLL has two operators and no channel-level connection; ``alg`` in
+    this feature is the per-operator sustain (hold) bit. Byte 3 carries the
+    ROM preset nibble: zero selects the single user patch in ``$00-$07``,
+    1-15 a factory voice. The carrier's TL stays 0 because the chip takes the
+    level from the ``$3x`` volume nibble; the pattern volume column mirrors
+    that nibble, so a note keeps the source level.
+    """
+    b.u8(2 | 0x10 | 0x20)
+    b.u8(((patch.alg & 1) << 4) | (patch.fb & 7))
+    # The chip's $03 bits 4 and 3 are the vibrato and tremolo depth.
+    b.u8(((patch.ams & 3) << 3) | (patch.pms & 7))
+    b.u8(patch.preset & 31)
+    for idx in range(2):
+        op = patch.ops[idx]
+        b.u8(((op.ksr & 1) << 7) | (op.mult & 15))
+        b.u8(((op.sus & 1) << 7) | (op.tl & 63))
+        b.u8(((op.vib & 1) << 5) | (op.ar & 15))
+        b.u8(((op.am & 1) << 7) | ((op.ksl & 3) << 5) | (op.dr & 15))
+        b.u8(0)
+        b.u8(((op.sl & 15) << 4) | (op.rr & 15))
+        # Bit 3 of ssgEnv maps back to $00/$01 bit 5 (ET).
+        b.u8(op.ssg_eg & 0x0F)
+        b.u8(0)
 
 
 def _write_macro(
@@ -487,6 +549,7 @@ def _write_ins_opm(b: Buf, name: str, patch) -> None:
     """
     opl = bool(getattr(patch, "opl", False))
     ins_type = (
+        INS_OPLL if getattr(patch, "opll", False) else
         INS_OPL_DRUMS if getattr(patch, "drum", False) else INS_OPL
     ) if opl else (INS_FM if getattr(patch, "opn", False) else INS_OPM)
     size_off, start = b.begin_block(b"INS2")
@@ -2738,6 +2801,10 @@ def write_fur(
     opl = opl_kind is not None
     opl_drums = bool(getattr(song, "opl_drums", False))
     opl_ids = list(getattr(song, "opl_ids", ()) or ()) if opl else []
+    # The YM2413 is its own system (0x89) with a separate drums layout (0xa7).
+    opll = fm_family == "opll"
+    opll_drums = bool(getattr(song, "opll_drums", False)) if opll else False
+    opll_ids = list(getattr(song, "opll_ids", ()) or ()) if opll else []
     ym2610 = fm_family == "ym2610"
     ym_chip = ym2203 or ym2612 or ym2610
     ym_ext = bool(
@@ -2759,6 +2826,8 @@ def write_fur(
         fm_present = (include_fm or include_pcm) and bool(ym_ids)
     elif opl:
         fm_present = include_fm and bool(opl_ids)
+    elif opll:
+        fm_present = include_fm and bool(opll_ids)
     else:
         fm_present = include_fm and (bool(ym_ids) if ym_chip else True)
     fm_ins = song.fm_patches if (fm_present and include_fm) else []
@@ -2834,6 +2903,8 @@ def write_fur(
             n_fm = (6 if ym_ext else 3) * len(ym_ids)
         elif opl:
             n_fm = OPL_CHANNELS[(opl_kind, opl_drums)] * len(opl_ids)
+        elif opll:
+            n_fm = (OPLL_DRUMS_CHANNELS if opll_drums else OPLL_CHANNELS) * len(opll_ids)
         else:
             n_fm = 8
     else:
@@ -2878,6 +2949,10 @@ def write_fur(
         fm_analysis_block = (6 if song.ym2610_b else 4) + 3 + 6 + 1
     elif opl:
         fm_analysis_block = OPL_CHANNELS[(opl_kind, opl_drums)] * len(opl_ids)
+    elif opll:
+        fm_analysis_block = (
+            OPLL_DRUMS_CHANNELS if opll_drums else OPLL_CHANNELS
+        ) * len(opll_ids)
     else:
         fm_analysis_block = ((9 if ym_ext else 6) * len(ym_ids)) if ym_chip else 8
 
@@ -2968,6 +3043,20 @@ def write_fur(
                     if short_name.startswith("F") and short_name[1:].isdigit()
                     else f"{short_name}{cid + 1}"
                 )
+    elif opll and fm_present:
+        multi = len(opll_ids) > 1
+        for cid in range(len(opll_ids)):
+            for long_name, short_name in zip(*opll_channel_names(opll_drums)):
+                if not multi:
+                    names_long.append(long_name)
+                    names_short.append(short_name)
+                    continue
+                names_long.append(f"{long_name} ({cid + 1})")
+                names_short.append(
+                    f"F{cid + 1}-{short_name[1:]}"
+                    if short_name.startswith("F") and short_name[1:].isdigit()
+                    else f"{short_name}{cid + 1}"
+                )
     elif n_fm:
         names_long += [f"FM {i + 1}" for i in range(n_fm)]
         names_short += [f"F{i + 1}" for i in range(n_fm)]
@@ -3026,6 +3115,11 @@ def write_fur(
                 base += " drums"
             label_parts.append(
                 f"{base} x{len(opl_ids)}" if len(opl_ids) > 1 else base
+            )
+        elif opll:
+            base = "OPLL" + (" drums" if opll_drums else "")
+            label_parts.append(
+                f"{base} x{len(opll_ids)}" if len(opll_ids) > 1 else base
             )
         elif ym2610:
             base = "YM2610B" if song.ym2610_b else "YM2610"
@@ -3120,6 +3214,14 @@ def write_fur(
             "effects (20xx/21xx/22xy/23xx/24xx) work on the last three "
             "channels of each six-channel block.\n"
         )
+    if opll:
+        comment += (
+            "\nYM2413: instrument 0 is the user patch in $00-$07; every other "
+            "voice picks a ROM preset (the wave column, 1-15). The volume "
+            "column is the $3x level nibble (0 loudest)."
+            + (" Rhythm mode takes channels 7-9 as BD/SD/TM/TP/HH.\n"
+               if opll_drums else "\n")
+        )
 
     b = Buf()
     b.raw(FUR_MAGIC)
@@ -3132,9 +3234,11 @@ def write_fur(
     flag_texts: list[str] = []
     ym2610_sys: dict[int, int] = {}
     if fm_present:
-        for _cid in (opl_ids or ym_ids or [0]):
+        for _cid in (opl_ids or opll_ids or ym_ids or [0]):
             if opl:
                 chips.append(OPL_CHIP[(opl_kind, opl_drums)])
+            elif opll:
+                chips.append(CHIP_OPLL_DRUMS if opll_drums else CHIP_OPLL)
             elif ym2612:
                 chips.append(CHIP_YM2612_EXT if ym_ext else CHIP_YM2612)
             elif ym2203:
@@ -3156,6 +3260,11 @@ def write_fur(
                 flag_texts.append(
                     "" if module == default else f"customClock={fm_clock}"
                 )
+                continue
+            if opll:
+                # DivPlatformOPLL's named clock selections cover the usual MSX
+                # and arcade clocks exactly; use those before a custom clock.
+                flag_texts.append(opll_clock_flag(song.vgm.ym2413_clock))
                 continue
             if ym2612:
                 fm_clock = song.vgm.ym2612_clock
@@ -3361,7 +3470,9 @@ def write_fur(
     ins_ptrs: list[int] = []
     for i, patch in enumerate(fm_ins):
         ins_ptrs.append(len(b))
-        if getattr(patch, "opl", False):
+        if getattr(patch, "opll", False):
+            fam = "OPLL"
+        elif getattr(patch, "opl", False):
             fam = "OPL3" if getattr(patch, "four", False) else "OPL"
         else:
             fam = "OPN" if getattr(patch, "opn", False) else "OPM"

@@ -14,6 +14,7 @@ from dataclasses import dataclass
 
 from vgm2151fur.opl import KIND_OPL3, DRUM_BITS, chan_map_for, melodic_count
 from vgm2151fur.vgm import VGM_RATE, VgmFile
+from vgm2151fur.ym2413 import KIT_TRIGGERS
 
 # Target length of one tick: fine enough for frame-quantized note starts,
 # coarse enough that ED values stay small.
@@ -104,20 +105,67 @@ class _OplKeys:
         return hit
 
 
+class _OpllKeys:
+    """Rising key edges of one YM2413.
+
+    Bit 4 of ``$2x`` keys a melodic voice. In rhythm mode the last three
+    registers belong to the chip's own kit and ``$0e``'s five low bits latch
+    it, so the kit's onsets come from there instead. The column numbering is
+    Furnace's: six melodic voices then BD, SD, TM, TP and HH.
+    """
+
+    def __init__(self) -> None:
+        self.keyed: dict[int, bool] = {}
+        self.rhythm = False
+        self.trig = 0
+
+    def feed(self, w) -> list[int]:
+        r = w.reg & 0xFF
+        hits: list[int] = []
+        if 0x20 <= r <= 0x28:
+            hw = r - 0x20
+            on = bool(w.val & 0x10)
+            was = self.keyed.get(hw, False)
+            self.keyed[hw] = on
+            if on and not was and not (self.rhythm and hw >= 6):
+                hits.append(hw)
+        elif r == 0x0E:
+            self.rhythm = bool(w.val & 0x20)
+            trig = (w.val & 0x1F) if self.rhythm else 0
+            for i, (bit, _name) in enumerate(KIT_TRIGGERS):
+                if (trig & bit) and not (self.trig & bit):
+                    hits.append(6 + i)
+            self.trig = trig
+        return hits
+
+
 def _keyons_by_channel(
     vgm: VgmFile, chips: set[str] | None = None,
 ) -> dict[int, list[int]]:
     out: dict[int, list[int]] = {}
     opl_trackers: dict[str, _OplKeys] = {}
+    opll_trackers: dict[int, _OpllKeys] = {}
     for w in vgm.writes:
         if chips is not None and w.chip not in chips:
             continue
         if w.chip == "ym2151" and w.reg == 0x08 and (w.val & 0x78):
             out.setdefault(w.val & 7, []).append(w.sample)
-        elif w.chip == "ym2203" and w.reg == 0x28 and (w.val & 0xF0):
+        elif (
+            w.chip in ("ym2203", "ym2608") and (w.reg & 0xFF) == 0x28
+            and (w.val & 0xF0)
+        ):
             # Per-operator key masks; any 0->1 start is an onset. Keep chip
-            # instances apart without colliding with the YM2151's 0-7.
-            out.setdefault(1000 + w.chip_id * 3 + (w.val & 3), []).append(w.sample)
+            # instances apart without colliding with the YM2151's 0-7. The
+            # YM2608 owns a second FM block, reached through bus B (bit 8 of
+            # the flattened register), whose three channels continue its run.
+            if w.chip == "ym2608":
+                raw = w.val & 3
+                if (w.reg & 0x100) and raw == 3:
+                    continue
+                voice = (1 if (w.reg & 0x100) else 0) * 3 + raw
+            else:
+                voice = w.val & 3
+            out.setdefault(1000 + w.chip_id * 6 + voice, []).append(w.sample)
         elif (
             w.chip == "ym2612" and not (w.reg & 0x100)
             and (w.reg & 0xFF) == 0x28 and (w.val & 0xF0)
@@ -151,6 +199,12 @@ def _keyons_by_channel(
             # instances apart, and one chip's lattice cannot alias the other's.
             for fch in tracker.feed(w):
                 out.setdefault(4000 + w.chip_id * 32 + fch, []).append(w.sample)
+        elif w.chip == "opll":
+            tracker = opll_trackers.get(w.chip_id)
+            if tracker is None:
+                tracker = opll_trackers[w.chip_id] = _OpllKeys()
+            for fch in tracker.feed(w):
+                out.setdefault(5000 + w.chip_id * 16 + fch, []).append(w.sample)
     for v in out.values():
         v.sort()
     return out
