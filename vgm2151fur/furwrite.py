@@ -24,7 +24,11 @@ from vgm2151fur.opl import (
 )
 from vgm2151fur.pcm import pcm7_to_s8, scale_pcm7
 from vgm2151fur.pitch import FURNACE_CLOCK_DEFAULT, module_clock
-from vgm2151fur.ym2608 import RHYTHM_VOICES, YM2608_DEFAULT_CLOCK
+from vgm2151fur.ym2608 import (
+    RHYTHM_VOICES,
+    YM2608_DEFAULT_CLOCK,
+    deltat_store_body,
+)
 
 # Furnace arcade.cpp: rWrite(DT, dtTable[op.dt]<<4). Inverse of
 # dtTable = (7, 6, 5, 0, 1, 2, 3, 4) so YM2151 register DT survives the
@@ -3767,9 +3771,13 @@ def write_fur(
         loop = any(h.loop for h in smp.hits)
         smp_ptrs.append(len(b))
         # The OPNA has one sample bank and reads renderOn[0] (ym2608.cpp:2032),
-        # unlike the YM2610, whose delta-T memory is bank 1.
+        # unlike the YM2610, whose delta-T memory is bank 1. The body carries an
+        # idle tail out to Furnace's 256-byte sample quantum: the platform plays
+        # `lengthB` bytes whether or not the source range was that long, and a
+        # short body would read the next sample off its heels.
         _write_sample_adpcm(
-            b, f"deltaT_{smp.start:06x}_{smp.rate:04x}", smp.data, rate,
+            b, f"deltaT_{smp.start:06x}_{smp.rate:04x}",
+            deltat_store_body(smp.data), rate,
             SMP_DEPTH_ADPCM_B, (1 << sys, 0, 0, 0), loop=loop,
         )
 

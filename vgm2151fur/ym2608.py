@@ -42,15 +42,19 @@ from vgm2151fur.ym2610 import (
     YM2610State,
     pan_byte,
 )
+from vgm2151fur.ym2612 import YM2612_FREQ_BASE
 
 # Furnace's own default is 8 MHz; a real FM Towns rip says 7987200 and the
 # difference moves every f-num, so the clock travels with the module.
 YM2608_DEFAULT_CLOCK = 7_987_200
-# DivPlatformYM2608's ctor passes 9437184.0 at the /6 prescale - the YM2612's
-# base, which is why the OPNA shares its note inverse. SSG divides by 32 like
-# the YM2610's (the YM2203 uses 16).
-YM2608_FREQ_BASE = 9437184.0
+# DivPlatformYM2608's ctor: fmFreqBase 9437184, fmDivBase 72 and ayDiv 32 at
+# the /6 prescale (ym2608.cpp:2091-2097). The frequency base is the YM2612's to
+# the unit, so the OPNA needs no note path of its own - every banked-OPN chip
+# converts f-num to note through ym2612_note_for, and only the clock is per
+# chip. Only the SSG divider differs from the YM2203's 16.
+YM2608_FREQ_BASE = YM2612_FREQ_BASE
 YM2608_SSG_DIVIDER = 32
+
 # $102-$105 hold the byte address shifted right by five.
 ADPCM_B_ADDR_SHIFT = 5
 
@@ -262,12 +266,29 @@ def collect_ym2608_rhythm(vgm) -> tuple[list[RhythmHit], list[str]]:
     return hits, warnings
 
 
-def _deltat_slice(rom: bytes, start: int, end: int) -> bytes:
-    """One ADPCM-B range, taken to the end of its last 32-byte block.
+def deltat_store_body(data: bytes) -> bytes:
+    """Pad a delta-T body out to the 256-byte length Furnace will play.
 
-    Furnace recomputes the address registers as ``offset >> 5`` and
-    ``(offset + length - 1) >> 5``, so a length that is a multiple of the
-    block size sends both back exactly as the source had them.
+    ``DivSample`` sizes a depth-6 sample as ``(((count+1)/2)+255)&~0xff``
+    (sample.cpp:593) and the platform plays ``offset`` to ``offset + lengthB -
+    1``, so a body whose declared length is not a multiple of 256 makes the chip
+    read whatever sample was packed after it. Tailing on the idle nibble costs
+    at most 255 bytes of silence and keeps that read inside our own sample.
+    """
+    if len(data) & 0xFF:
+        data = bytes(data) + b"\x80" * (0x100 - (len(data) & 0xFF))
+    return bytes(data)
+
+
+def _deltat_slice(rom: bytes, start: int, end: int) -> bytes:
+    """One delta-T range at the chip's own 32-byte address granularity.
+
+    `$102-$105` name blocks of 32, so this is the byte span the source actually
+    played - no wider. Rounding down to a 256-byte block instead, which is what
+    an ADPCM-A ROM bank wants, would put bytes from *before* the sample in front
+    of it and delay its attack by up to 255 bytes. The tail is `deltat_store_body`
+    business, on the other end. A range running past the end of the data block is
+    padded with the nibble that holds the accumulator still.
     """
     if not rom:
         return b""
@@ -278,9 +299,7 @@ def _deltat_slice(rom: bytes, start: int, end: int) -> bytes:
         end = start + size - 1
     data = bytes(rom[start:min(len(rom), end + 1)])
     if len(data) < end - start + 1:
-        data += b"\x00" * (end - start + 1 - len(data))
-    while len(data) % size:
-        data += b"\x00"
+        data += b"\x80" * (end - start + 1 - len(data))
     return data
 
 

@@ -35,6 +35,7 @@ from vgm2151fur.ym2610 import (
     KON_6,
     YM2610_DEFAULT_CLOCK,
 )
+from vgm2151fur.ym2608 import YM2608_DEFAULT_CLOCK, YM2608_SSG_DIVIDER
 from vgm2151fur.ym2612 import EXT_FREQ_OP, ym2612_pitch_units
 
 
@@ -89,23 +90,8 @@ def opn_ssg_units(period: int) -> float:
 
 
 def _opn_ssg_stream(vgm, cid: int, ssg: int) -> list[tuple[int, int]]:
-    out: list[tuple[int, int]] = []
-    lo = hi = None
-    min_period = ay_min_period(vgm.ym2203_clock or 3579545, 16)
-    for w in vgm.writes:
-        if w.chip != "ym2203_ssg" or w.chip_id != cid:
-            continue
-        if w.reg == ssg * 2:
-            lo = w.val
-        elif w.reg == ssg * 2 + 1:
-            hi = w.val
-        else:
-            continue
-        if lo is not None and hi is not None:
-            period = (lo & 0xFF) | ((hi & 0x0F) << 8)
-            if period >= min_period:
-                out.append((w.sample, round(opn_ssg_units(period))))
-    return out
+    return _ssg_stream(vgm, "ym2203_ssg", cid, ssg,
+                       vgm.ym2203_clock or 3579545, 16)
 
 
 def opn_pitch_stream(vgm, ch: int) -> list[tuple[int, int]]:
@@ -207,40 +193,12 @@ def opn_keyed_intervals(vgm, ch: int) -> list[tuple[int, int]]:
     start = 0
     ssg_at = 6 if ext else 3
     if voice >= ssg_at:
-        ssg = voice - ssg_at
-        mixer = 0
-        vol = [0, 0, 0]
-        lo = hi = 0
-        min_period = ay_min_period(vgm.ym2203_clock or 3579545, 16)
-        for w in vgm.writes:
-            if w.chip != "ym2203_ssg" or w.chip_id != cid:
-                continue
-            if w.reg == 7:
-                mixer = w.val
-            elif w.reg in (8, 9, 10):
-                vol[w.reg - 8] = w.val
-            elif w.reg == ssg * 2:
-                lo = w.val
-            elif w.reg == ssg * 2 + 1:
-                hi = w.val
-            else:
-                continue
-            level = vol[ssg]
-            period = (lo & 0xFF) | ((hi & 0x0F) << 8)
-            # Noise-only/noise-mixed percussion has no meaningful tone period;
-            # comparing the stale period register would report false pitch
-            # changes, so only tone-only gates count. Periods below the
-            # module's representable range are the driver's silence gate.
-            now = (not (mixer & (1 << ssg))
-                   and (mixer & (1 << (ssg + 3)))
-                   and ((level & 0x10) or (level & 0x0F))
-                   and period >= min_period)
-            if now and not on:
-                start = w.sample
-                on = True
-            elif not now and on:
-                out.append((start, w.sample))
-                on = False
+        # Noise-only percussion has no meaningful tone period, and a period
+        # below the module's representable range is the driver's silence gate:
+        # both are handled by the shared SSG walker, which gates on a tone-only
+        # mixer and an in-range period.
+        return _ssg_keyed_intervals(vgm, "ym2203_ssg", cid, voice - ssg_at,
+                                    vgm.ym2203_clock or 3579545, 16)
     else:
         ext_col = ext and voice >= 2
         target_ch = 2 if ext_col else voice
@@ -265,30 +223,37 @@ def opn_keyed_intervals(vgm, ch: int) -> list[tuple[int, int]]:
     return out
 
 
-def _ym2612_chip_ids(vgm) -> list[int]:
-    return sorted({w.chip_id for w in vgm.writes if w.chip == "ym2612"})
+def _ym2612_chip_ids(vgm, chip: str = "ym2612") -> list[int]:
+    return sorted({w.chip_id for w in vgm.writes if w.chip == chip})
 
 
-def _ym2612_ext(vgm) -> bool:
-    """True when the source ever selects channel-3 special/CSM mode."""
+def _ym2612_ext(vgm, chip: str = "ym2612") -> bool:
+    """True when the source ever selects channel-3 special/CSM mode.
+
+    The mode register is on port 0 for every two-port OPN chip; the YM2608's
+    second FM block answers the same `$27` on its own port.
+    """
     return any(
-        w.chip == "ym2612" and (w.reg & 0xFF) == 0x27 and (w.val & 0xC0)
+        w.chip == chip and not (w.reg & 0x100) and (w.reg & 0xFF) == 0x27
+        and (w.val & 0xC0)
         for w in vgm.writes
     )
 
 
-def _ym2612_channel_map(vgm, ch: int) -> tuple[int, str, int] | None:
+def _ym2612_channel_map(
+    vgm, ch: int, chip: str = "ym2612",
+) -> tuple[int, str, int] | None:
     """(chip id, kind, voice/column) for one module channel.
 
     `kind` is "fm" for a normal channel, "ext" for a channel-3 operator
     column.  Returns None when the module layout has no such channel.
     """
-    ids = _ym2612_chip_ids(vgm)
-    chunk = 9 if _ym2612_ext(vgm) else 6
-    chip, voice = divmod(ch, chunk)
-    if chip >= len(ids):
+    ids = _ym2612_chip_ids(vgm, chip)
+    chunk = 9 if _ym2612_ext(vgm, chip) else 6
+    chip_i, voice = divmod(ch, chunk)
+    if chip_i >= len(ids):
         return None
-    cid = ids[chip]
+    cid = ids[chip_i]
     if voice < 2:
         return cid, "fm", voice
     if chunk == 9:
@@ -298,13 +263,17 @@ def _ym2612_channel_map(vgm, ch: int) -> tuple[int, str, int] | None:
     return cid, "fm", voice
 
 
-def ym2612_pitch_stream(vgm, ch: int) -> list[tuple[int, int]]:
-    """(sample, pitch units) for one YM2612 module channel.
+def ym2612_pitch_stream(
+    vgm, ch: int, chip: str = "ym2612",
+) -> list[tuple[int, int]]:
+    """(sample, pitch units) for one two-port OPN module channel.
 
     The normal layout follows the channel's latched f-num/block.  The Ext
-    layout follows the four channel-3 operator pairs for its columns.
+    layout follows the four channel-3 operator pairs for its columns.  Every
+    two-port OPN chip - YM2612 and YM2608 alike - uses this one mapping,
+    because the frequency registers and their formula are shared.
     """
-    mapped = _ym2612_channel_map(vgm, ch)
+    mapped = _ym2612_channel_map(vgm, ch, chip)
     if mapped is None:
         return []
     cid, kind, voice = mapped
@@ -325,7 +294,7 @@ def ym2612_pitch_stream(vgm, ch: int) -> list[tuple[int, int]]:
             out.append((sample, ym2612_pitch_units(*voice_value)))
 
     for w in vgm.writes:
-        if w.chip != "ym2612" or w.chip_id != cid:
+        if w.chip != chip or w.chip_id != cid:
             continue
         r = w.reg & 0xFF
         bank = bool(w.reg & 0x100)
@@ -372,14 +341,17 @@ def ym2612_pitch_stream(vgm, ch: int) -> list[tuple[int, int]]:
     return out
 
 
-def ym2612_keyed_intervals(vgm, ch: int) -> list[tuple[int, int]]:
-    """Samples where one YM2612 module channel is keyed.
+def ym2612_keyed_intervals(
+    vgm, ch: int, chip: str = "ym2612", *, dac: bool = True,
+) -> list[tuple[int, int]]:
+    """Samples where one two-port OPN module channel is keyed.
 
     In the Ext layout channel-3 columns follow the 0x28 mask bits; the other
     channels use their own key state.  DAC playback on channel 6 is not FM,
-    so a keyed FM6 under DAC enable is treated as silent.
+    so a keyed FM6 under DAC enable is treated as silent - that test is the
+    chip's own, since `$2B` is an IRQ register on the YM2608.
     """
-    mapped = _ym2612_channel_map(vgm, ch)
+    mapped = _ym2612_channel_map(vgm, ch, chip)
     if mapped is None:
         return []
     cid, kind, voice = mapped
@@ -392,13 +364,13 @@ def ym2612_keyed_intervals(vgm, ch: int) -> list[tuple[int, int]]:
     out: list[tuple[int, int]] = []
     on = False
     start = 0
-    dac = False
+    dac_on = False
     for w in vgm.writes:
-        if w.chip != "ym2612" or w.chip_id != cid:
+        if w.chip != chip or w.chip_id != cid:
             continue
         r = w.reg & 0xFF
-        if not (w.reg & 0x100) and r == 0x2B:
-            dac = bool(w.val & 0x80)
+        if dac and not (w.reg & 0x100) and r == 0x2B:
+            dac_on = bool(w.val & 0x80)
             continue
         if r != 0x28 or (w.reg & 0x100):
             continue
@@ -410,7 +382,7 @@ def ym2612_keyed_intervals(vgm, ch: int) -> list[tuple[int, int]]:
             continue
         mask = (w.val >> 4) & 0x0F
         now = bool(mask & bit) if bit is not None else bool(mask)
-        if target_ch == 5 and dac:
+        if dac and target_ch == 5 and dac_on:
             now = False
         if now and not on:
             start = w.sample
@@ -556,17 +528,18 @@ def _ym2610_channel_map(vgm, ch: int) -> tuple[int, str, int] | None:
     return None
 
 
-def _ym2610_ssg_stream(vgm, cid: int, ssg: int) -> list[tuple[int, int]]:
+def _ssg_stream(vgm, ssg_chip: str, cid: int, voice: int, clock: int,
+                divider: int) -> list[tuple[int, int]]:
+    """(sample, pitch units) from one SSG voice's tone period."""
     out: list[tuple[int, int]] = []
     lo = hi = None
-    clock = vgm.ym2610_clock or YM2610_DEFAULT_CLOCK
-    min_period = ay_min_period(clock, 32)
+    min_period = ay_min_period(clock, divider)
     for w in vgm.writes:
-        if w.chip != "ym2610_ssg" or w.chip_id != cid:
+        if w.chip != ssg_chip or w.chip_id != cid:
             continue
-        if w.reg == ssg * 2:
+        if w.reg == voice * 2:
             lo = w.val
-        elif w.reg == ssg * 2 + 1:
+        elif w.reg == voice * 2 + 1:
             hi = w.val
         else:
             continue
@@ -575,6 +548,52 @@ def _ym2610_ssg_stream(vgm, cid: int, ssg: int) -> list[tuple[int, int]]:
             if period >= min_period:
                 out.append((w.sample, round(opn_ssg_units(period))))
     return out
+
+
+def _ssg_keyed_intervals(vgm, ssg_chip: str, cid: int, voice: int,
+                         clock: int, divider: int) -> list[tuple[int, int]]:
+    """Spans where one SSG voice has its tone bit on and a level to say so."""
+    out: list[tuple[int, int]] = []
+    mixer = 0
+    vol = [0, 0, 0]
+    lo = hi = 0
+    on = False
+    start = 0
+    min_period = ay_min_period(clock, divider)
+    for w in vgm.writes:
+        if w.chip != ssg_chip or w.chip_id != cid:
+            continue
+        if w.reg == 7:
+            mixer = w.val
+        elif w.reg in (8, 9, 10):
+            vol[w.reg - 8] = w.val
+        elif w.reg == voice * 2:
+            lo = w.val
+        elif w.reg == voice * 2 + 1:
+            hi = w.val
+        else:
+            continue
+        level = vol[voice]
+        period = (lo & 0xFF) | ((hi & 0x0F) << 8)
+        now = (not (mixer & (1 << voice))
+               and (mixer & (1 << (voice + 3)))
+               and ((level & 0x10) or (level & 0x0F))
+               and period >= min_period)
+        if now and not on:
+            start = w.sample
+            on = True
+        elif not now and on:
+            out.append((start, w.sample))
+            on = False
+    if on:
+        out.append((start, vgm.total_samples or (
+            max((w.sample for w in vgm.writes), default=start) + 1)))
+    return out
+
+
+def _ym2610_ssg_stream(vgm, cid: int, ssg: int) -> list[tuple[int, int]]:
+    return _ssg_stream(vgm, "ym2610_ssg", cid, ssg,
+                       vgm.ym2610_clock or YM2610_DEFAULT_CLOCK, 32)
 
 
 def ym2610_pitch_stream(vgm, ch: int) -> list[tuple[int, int]]:
@@ -628,36 +647,8 @@ def ym2610_keyed_intervals(vgm, ch: int) -> list[tuple[int, int]]:
     on = False
     start = 0
     if kind == "ssg":
-        mixer = 0
-        vol = [0, 0, 0]
-        lo = hi = 0
-        clock = vgm.ym2610_clock or YM2610_DEFAULT_CLOCK
-        min_period = ay_min_period(clock, 32)
-        for w in vgm.writes:
-            if w.chip != "ym2610_ssg" or w.chip_id != cid:
-                continue
-            if w.reg == 7:
-                mixer = w.val
-            elif w.reg in (8, 9, 10):
-                vol[w.reg - 8] = w.val
-            elif w.reg == voice * 2:
-                lo = w.val
-            elif w.reg == voice * 2 + 1:
-                hi = w.val
-            else:
-                continue
-            level = vol[voice]
-            period = (lo & 0xFF) | ((hi & 0x0F) << 8)
-            now = (not (mixer & (1 << voice))
-                   and (mixer & (1 << (voice + 3)))
-                   and ((level & 0x10) or (level & 0x0F))
-                   and period >= min_period)
-            if now and not on:
-                start = w.sample
-                on = True
-            elif not now and on:
-                out.append((start, w.sample))
-                on = False
+        return _ssg_keyed_intervals(vgm, "ym2610_ssg", cid, voice,
+                                    vgm.ym2610_clock or YM2610_DEFAULT_CLOCK, 32)
     elif kind == "fm":
         kon = KON_6 if _ym2610_fm_count(vgm) == 6 else KON_4
         for w in vgm.writes:
@@ -682,6 +673,66 @@ def ym2610_keyed_intervals(vgm, ch: int) -> list[tuple[int, int]]:
         )
         out.append((start, end))
     return out
+
+
+def _ym2608_channel_map(vgm, ch: int) -> tuple[int, str, int] | None:
+    """(chip id, kind, walk channel) for one YM2608 module channel.
+
+    `kind` is "fm" for any FM voice or channel-3 operator column - the walk
+    channel then indexes a run of six per chip, or nine when channel 3 is split,
+    which is what :func:`ym2612_pitch_stream` expects - "ssg" for one of the
+    three tone voices, and "rhythm" or "delta_t" for the sample columns.
+    """
+    ids = _ym2612_chip_ids(vgm, "ym2608")
+    fm_count = 9 if _ym2612_ext(vgm, "ym2608") else 6
+    chunk = fm_count + 3 + 6 + 1
+    idx, voice = divmod(ch, chunk)
+    if idx >= len(ids):
+        return None
+    cid = ids[idx]
+    if voice < fm_count:
+        return cid, "fm", idx * fm_count + voice
+    if voice < fm_count + 3:
+        return cid, "ssg", voice - fm_count
+    if voice < fm_count + 9:
+        return cid, "rhythm", voice - (fm_count + 3)
+    return cid, "delta_t", 0
+
+
+def ym2608_pitch_stream(vgm, ch: int) -> list[tuple[int, int]]:
+    """(sample, pitch units) for one YM2608 module channel.
+
+    The OPNA's FM voices - split channel 3 included - are the same two-port
+    OPN registers, so the stream comes from that walk with the chip swapped.
+    Its SSG voices follow tone periods; rhythm and delta-T have no pitch to
+    compare, exactly as on the YM2610.
+    """
+    mapped = _ym2608_channel_map(vgm, ch)
+    if mapped is None:
+        return []
+    cid, kind, voice = mapped
+    if kind == "fm":
+        return ym2612_pitch_stream(vgm, voice, chip="ym2608")
+    if kind == "ssg":
+        return _ssg_stream(vgm, "ym2608_ssg", cid, voice,
+                           vgm.ym2608_clock or YM2608_DEFAULT_CLOCK,
+                           YM2608_SSG_DIVIDER)
+    return []
+
+
+def ym2608_keyed_intervals(vgm, ch: int) -> list[tuple[int, int]]:
+    """Samples where one YM2608 module voice is sounding."""
+    mapped = _ym2608_channel_map(vgm, ch)
+    if mapped is None:
+        return []
+    cid, kind, voice = mapped
+    if kind == "fm":
+        return ym2612_keyed_intervals(vgm, voice, chip="ym2608", dac=False)
+    if kind == "ssg":
+        return _ssg_keyed_intervals(vgm, "ym2608_ssg", cid, voice,
+                                    vgm.ym2608_clock or YM2608_DEFAULT_CLOCK,
+                                    YM2608_SSG_DIVIDER)
+    return []
 
 
 def opl_attacks(vgm, kind: str | None = None, drums: bool | None = None):
@@ -785,11 +836,16 @@ def pitch_runs(
     opnb = any(
         w.chip in ("ym2610", "ym2610_ssg") for w in src_vgm.writes
     )
+    opna = any(
+        w.chip in ("ym2608", "ym2608_ssg") for w in src_vgm.writes
+    )
     opn = any(w.chip == "ym2203" for w in src_vgm.writes)
     opn2 = any(w.chip == "ym2612" for w in src_vgm.writes)
     opl = _opl_kind(src_vgm) is not None
     if opnb:
         stream = ym2610_pitch_stream
+    elif opna:
+        stream = ym2608_pitch_stream
     elif opn2:
         stream = ym2612_pitch_stream
     elif opn:
@@ -812,8 +868,9 @@ def pitch_runs(
     if limit is not None:
         times = {t for t in times if t <= limit}
     keyed_at = None
-    if opnb:
-        intervals = ym2610_keyed_intervals(src_vgm, ch)
+    if opnb or opna:
+        intervals = (ym2610_keyed_intervals if opnb else ym2608_keyed_intervals)(
+            src_vgm, ch)
         times |= {s for s, _e in intervals}
         times |= {e for _s, e in intervals}
 

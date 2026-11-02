@@ -180,6 +180,10 @@ def _verify_runs(
         w.chip_id for w in src_vgm.writes
         if w.chip in ("ym2610", "ym2610_ssg")
     }
+    ym2608_ids = {
+        w.chip_id for w in src_vgm.writes
+        if w.chip in ("ym2608", "ym2608_ssg")
+    }
     has_opm = any(w.chip == "ym2151" for w in src_vgm.writes)
     
     opl_kind = next(
@@ -196,6 +200,16 @@ def _verify_runs(
         )
         ids = {w.chip_id for w in src_vgm.writes if w.chip == opl_kind}
         channels = opl_channels(opl_kind, drums) * max(1, len(ids))
+    elif ym2608_ids and not has_opm:
+        # 16 channels per OPNA (six FM, three SSG, six rhythm, one delta-T), or
+        # 19 with channel 3 split. Rhythm and delta-T have no pitch stream to
+        # compare; the audit's own sample tally covers them.
+        ext = any(
+            w.chip == "ym2608" and not (w.reg & 0x100)
+            and (w.reg & 0xFF) == 0x27 and (w.val & 0xC0)
+            for w in src_vgm.writes
+        )
+        channels = (19 if ext else 16) * len(ym2608_ids)
     elif ym2610_ids and not has_opm:
         # 14 channels, 16 on the B variant.  ADPCM channels have no pitch
         # stream, and pitch_runs returns nothing for them.
@@ -330,6 +344,12 @@ def convert_vgm(
         "ym2610_a_notes": song.ym2610_a_count,
         "ym2610_b_notes": song.ym2610_b_count,
         "ym2610_ssg_notes": song.ym2610_ssg_count,
+        "ym2608_chips": len(song.ym2608_ids),
+        "ym2608_ext": bool(getattr(song, "ym2608_ext", False)),
+        "ym2608_delta_t_samples": len(song.ym2608_b_samples) if pcm else 0,
+        "ym2608_rhythm_notes": song.ym2608_rhythm_count,
+        "ym2608_delta_t_notes": song.ym2608_b_count,
+        "ym2608_ssg_notes": song.ym2608_ssg_count,
         "scc_notes": song.scc_count,
         "ay_notes": song.ay_count,
         "ym2203_chips": len(song.ym2203_ids),
@@ -680,6 +700,19 @@ def format_variant_lines(variants: list[dict], dest: Path) -> list[str]:
                 ms = d.get("missed", 0)
                 if mt + ms:
                     check += f" {kind} {mt}/{mt + ms}"
+                    nf = sum(
+                        d.get(k, 0) for k in
+                        ("data", "length", "vol", "pan", "rate")
+                    )
+                    if nf:
+                        check += f" fld {nf}"
+            opna = audit.get("ym2608") or {}
+            for tag, kind in (("rhy", "rhythm"), ("dt", "delta_t")):
+                d = opna.get(kind) or {}
+                mt = d.get("matched", 0)
+                ms = d.get("missed", 0)
+                if mt + ms:
+                    check += f" {tag} {mt}/{mt + ms}"
                     nf = sum(
                         d.get(k, 0) for k in
                         ("data", "length", "vol", "pan", "rate")

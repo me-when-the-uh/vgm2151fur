@@ -370,13 +370,15 @@ def _compare(args) -> int:
     except FurnaceError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
-    from vgm2151fur.audit import compare_ym2610_samples
+    from vgm2151fur.audit import compare_ym2608_samples, compare_ym2610_samples
     from vgm2151fur.vgm import load_vgm
 
     src_vgm = load_vgm(source)
+    exp_vgm = load_vgm(exported)
     field_bad = 0
-    if any(w.chip in ("ym2610", "ym2610_ssg") for w in src_vgm.writes):
-        samples = compare_ym2610_samples(src_vgm, load_vgm(exported))
+    chips = {w.chip for w in src_vgm.writes}
+    if chips & {"ym2610", "ym2610_ssg"}:
+        samples = compare_ym2610_samples(src_vgm, exp_vgm)
         for kind in ("a", "b"):
             d = samples.get(kind) or {}
             if not d:
@@ -384,6 +386,24 @@ def _compare(args) -> int:
             total = d["matched"] + d["missed"]
             print(
                 f"ADPCM-{kind.upper()}: {d['matched']}/{total} matched, "
+                f"data {d['data']}, length {d['length']}, vol {d['vol']}, "
+                f"pan {d['pan']}, rate {d['rate']}"
+            )
+            field_bad += sum(
+                d[k] for k in ("data", "length", "vol", "pan", "rate")
+            )
+    if chips & {"ym2608", "ym2608_ssg"}:
+        # A rhythm level is the source's `$18` value with its `$11` master
+        # folded in, so both sides are compared through the same fold; the
+        # delta-T body has to come back byte for byte at a matching step value.
+        samples = compare_ym2608_samples(src_vgm, exp_vgm)
+        for label, kind in (("rhythm", "rhythm"), ("delta-T", "delta_t")):
+            d = samples.get(kind) or {}
+            if not d:
+                continue
+            total = d["matched"] + d["missed"]
+            print(
+                f"{label}: {d['matched']}/{total} matched, extra {d['extra']}, "
                 f"data {d['data']}, length {d['length']}, vol {d['vol']}, "
                 f"pan {d['pan']}, rate {d['rate']}"
             )
