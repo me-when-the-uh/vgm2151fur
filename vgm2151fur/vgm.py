@@ -45,6 +45,19 @@ CMD_YM2610_P0 = 0x58
 CMD_YM2610_P1 = 0x59
 CMD_YM2610_B_P0 = 0xA8
 CMD_YM2610_B_P1 = 0xA9
+# 0x56/0x57 are the YM2608's two register buses; 0xA6/0xA7 the second chip
+# instance.  Bus A holds SSG (<0x10), rhythm (0x10-0x1F) and FM block 1;
+# bus B holds ADPCM-B (<=0x0F) and FM block 2.  Bus B rides in bit 8 of reg
+# like the YM2612's bank, so every OPN decode can treat one flat address space.
+CMD_YM2608_P0 = 0x56
+CMD_YM2608_P1 = 0x57
+CMD_YM2608_B_P0 = 0xA6
+CMD_YM2608_B_P1 = 0xA7
+# 0x51 is the YM2413; its dual instance uses 0xA1 (YM family: +0x50). The chip
+# addresses one flat space; the banked user-instrument registers are < 0x10 and
+# rhythm control is $0E.
+CMD_YM2413 = 0x51
+CMD_YM2413_2 = 0xA1
 CMD_SN76489 = 0x50
 CMD_DAC_WRITE = 0x2A
 CMD_DAC_ENABLE = 0x2B
@@ -74,6 +87,7 @@ C140_ROM_TYPE = 0x8D  # Namco C140 ROM
 C352_ROM_TYPE = 0x92  # Namco C352 ROM
 YM2610_ADPCM_ROM_TYPE = 0x82  # YM2610 ADPCM-A/B ROM
 YM2610_DELTAT_ROM_TYPE = 0x83  # YM2610 delta-T ROM
+YM2608_DELTAT_ROM_TYPE = 0x81  # YM2608 ADPCM-B (delta-T) ROM
 K053260_ROM_TYPE = 0x8E  # Konami K053260 ROM
 K007232_TRIGGER_REG = 0x1F
 # Extra-header chip ids (libvgm device index). 0x02 is YM2612, 0x2A K007232.
@@ -117,6 +131,14 @@ YM2203_DEFAULT_CLOCK = 3579545
 YM2610_CLOCK_OFF = 0x4C
 YM2610_B_BIT = 0x80000000
 YM2610_DUAL_BIT = 0x40000000
+# YM2608 joined the header in 1.51 at 0x48; bit 30 is its second instance
+# ($A6/$A7). The rhythm/DTA stream additions are 1.61, but the clock field
+# itself is 1.51 and rips sometimes carry older versions with it set anyway,
+# so version-gate the field, not the feature. YM2413 shares the grid at 0x10;
+# for VGM <= 1.4 that dword held the YM2612 clock (spec note on 0x2C).
+YM2608_CLOCK_OFF = 0x48
+YM2608_DUAL_BIT = 0x40000000
+YM2413_CLOCK_OFF = 0x10
 YM2610_DEFAULT_CLOCK = 8000000
 # The OPL family joined the header in 1.51: YM3812 at 0x50, YM3526 at 0x54 and
 # YMF262 at 0x5C. Bit 30 of the YM3812 field is the dual-chip flag that lets
@@ -308,6 +330,15 @@ class VgmFile:
     ym2610_clock: int = 0
     ym2610_dual: bool = False
     ym2610_b: bool = False
+    # YM2608 header 0x48 (VGM 1.51+). Bit 30 marks a second chip; its writes
+    # arrive on $A6/$A7. Both the dual bit and the rhythm/ADPCM-B blocks are
+    # new in 1.61, so version-gate them the way the header is gated elsewhere.
+    ym2608_clock: int = 0
+    ym2608_dual: bool = False
+    # YM2413 header 0x10 (the first chip-clock field the format ever had).
+    # The dual instance writes via 0xA1 with bit 30 set here.
+    ym2413_clock: int = 0
+    ym2413_dual: bool = False
     # Genesis SN76489 header 0x0C.  The data bytes arrive as 0x50 writes;
     # they are a serial register stream, not address/data pairs.
     sn76489_clock: int = 0
@@ -604,6 +635,20 @@ def chips_in_head(buf: bytes) -> set[str]:
                 kinds.add("ym2610_b")
             if ym2610_raw & YM2610_DUAL_BIT:
                 kinds.add("ym2610_dual")
+    # YM2608 (header 0x48, VGM 1.51+). Detected apart from its SSG part; the
+    # AY of an OPNA is intrinsic, not a second entry in the chip set.
+    if version >= 0x151 and _field_in_header(buf, YM2608_CLOCK_OFF, 4):
+        ym2608_raw = _header_raw(buf, YM2608_CLOCK_OFF)
+        if 100_000 <= (ym2608_raw & 0x3FFFFFFF) <= 40_000_000:
+            kinds.add("ym2608")
+            if ym2608_raw & YM2608_DUAL_BIT:
+                kinds.add("ym2608_dual")
+    # YM2413 (header 0x10). Under VGM 1.50 this dword meant YM2612; only
+    # report it as OPLL when a 0x51/$A1 stream actually exists, which
+    # chips_in_head callers cross-check against the parsed writes.
+    if version >= 0x150 and _field_in_header(buf, YM2413_CLOCK_OFF, 4):
+        if 100_000 <= _header_clock(buf, YM2413_CLOCK_OFF) <= 40_000_000:
+            kinds.add("opll")
     if version >= 0x151 and 100_000 <= _header_clock(buf, SEGAPCM_CLOCK_OFF) <= 40_000_000:
         kinds.add("segapcm")
     if version >= 0x151 and 100_000 <= _header_clock(buf, AY8910_CLOCK_OFF) <= 40_000_000:
@@ -718,6 +763,15 @@ def load_vgm(path: Path | str) -> VgmFile:
     ym2610_clock = _sane_clock(ym2610_raw)
     if not ym2610_clock:
         ym2610_clock = _sane_clock(clocks.get(EXTRA_YM2610, 0))
+    # YM2608: bit 30 of clock 0x48 marks the second chip ($A6/$A7). The
+    # rhythm DAC and delta-T share the single clock with both FM buses.
+    ym2608_raw = _header_raw(buf, YM2608_CLOCK_OFF) if ver >= 0x151 else 0
+    ym2608_dual = bool(ym2608_raw & YM2608_DUAL_BIT)
+    ym2608_clock = _sane_clock(ym2608_raw)
+    # YM2413: the header's first chip clock, 0x10.
+    ym2413_raw = _header_raw(buf, YM2413_CLOCK_OFF) if ver >= 0x150 else 0
+    ym2413_dual = bool(ym2413_raw & YM2608_DUAL_BIT)
+    ym2413_clock = _sane_clock(ym2413_raw)
     # OPL family. The three chips share the header's 1.51 block and each of
     # their clock fields carries a second-instance bit; only the YM3812 has a
     # command for the pair (0xAA), and bit 31 there pans them hard.
@@ -815,6 +869,10 @@ def load_vgm(path: Path | str) -> VgmFile:
         ym2610_clock=ym2610_clock,
         ym2610_dual=ym2610_dual,
         ym2610_b=ym2610_b,
+        ym2608_clock=ym2608_clock,
+        ym2608_dual=ym2608_dual,
+        ym2413_clock=ym2413_clock,
+        ym2413_dual=ym2413_dual,
         opl_clock=opl_clock,
         opl2_clock=opl2_clock,
         opl2_dual=opl2_dual,
@@ -851,6 +909,8 @@ def load_vgm(path: Path | str) -> VgmFile:
     stray_ym2203_second = False
     stray_ym2612_second = False
     stray_ym2610_second = False
+    stray_ym2608_second = False
+    stray_opll_second = False
     stray_opl2_second = False
     saw_end = False
     saw_adpcm_compressed = False
@@ -899,6 +959,7 @@ def load_vgm(path: Path | str) -> VgmFile:
                     K053260_ROM_TYPE: "k053260",
                     YM2610_ADPCM_ROM_TYPE: "ym2610_adpcm",
                     YM2610_DELTAT_ROM_TYPE: "ym2610_deltat",
+                    YM2608_DELTAT_ROM_TYPE: "ym2608_deltat",
                 }.get(typ) if len(payload) >= 8 else None
                 if kind:
                     rom_size = int.from_bytes(payload[0:4], "little")
@@ -1137,6 +1198,43 @@ def load_vgm(path: Path | str) -> VgmFile:
             ))
             pos += 3
             continue
+        if (
+            cmd in (CMD_YM2608_P0, CMD_YM2608_P1,
+                    CMD_YM2608_B_P0, CMD_YM2608_B_P1)
+            and pos + 3 <= n
+        ):
+            # 0x56/0x57 are the first chip's buses A/B; 0xA6/0xA7 the second.
+            # Bus B rides in bit 8 exactly like a YM2612 bank, so one flat
+            # address serves both FM blocks; bus A below 0x10 is the SSG and
+            # 0x10-0x1F its rhythm section. docs/opna-opll.md has the table.
+            cid = 0
+            if cmd in (CMD_YM2608_B_P0, CMD_YM2608_B_P1):
+                if ym2608_dual:
+                    cid = 1
+                else:
+                    stray_ym2608_second = True
+            port1 = cmd in (CMD_YM2608_P1, CMD_YM2608_B_P1)
+            reg = buf[pos + 1]
+            name = "ym2608_ssg" if (not port1 and reg < 0x10) else "ym2608"
+            vgm.writes.append(ChipWrite(
+                sample, name, cid, (0x100 if port1 else 0) | reg, buf[pos + 2],
+            ))
+            pos += 3
+            continue
+        if cmd in (CMD_YM2413, CMD_YM2413_2) and pos + 3 <= n:
+            # One flat register space, like the other OPLs but with banked
+            # user-instrument bytes below 0x10 and rhythm control at $0E.
+            # 0xA1 is the second chip's stream, gated on clock-0x10 bit 30.
+            cid = 0
+            if cmd == CMD_YM2413_2:
+                if ym2413_dual:
+                    cid = 1
+                else:
+                    stray_opll_second = True
+            vgm.writes.append(ChipWrite(sample, "opll", cid, buf[pos + 1],
+                                        buf[pos + 2]))
+            pos += 3
+            continue
         if cmd == CMD_K007232 and pos + 3 <= n:
             aa = buf[pos + 1]
             vgm.writes.append(ChipWrite(sample, "k007232", (aa >> 7) & 1, aa & 0x7F, buf[pos + 2]))
@@ -1270,6 +1368,25 @@ def load_vgm(path: Path | str) -> VgmFile:
         vgm.warnings.append(
             "0xA8/0xA9 YM2610 writes without the dual-instance header bit; "
             "they were treated as the first chip"
+        )
+    if stray_ym2608_second:
+        vgm.warnings.append(
+            "0xA6/0xA7 YM2608 writes without the dual-instance header bit; "
+            "they were treated as the first chip"
+        )
+    if stray_opll_second:
+        vgm.warnings.append(
+            "0xA1 YM2413 writes without the dual-instance header bit; "
+            "they were treated as the first chip"
+        )
+    if (any(w.chip in ("ym2608", "ym2608_ssg") for w in vgm.writes)
+            and not vgm.ym2608_clock):
+        vgm.warnings.append(
+            "YM2608 clock is missing or out of range; using the FM Towns clock"
+        )
+    if any(w.chip == "opll" for w in vgm.writes) and not vgm.ym2413_clock:
+        vgm.warnings.append(
+            "YM2413 clock is missing or out of range; using the standard clock"
         )
     if any(w.chip == "ym2612" for w in vgm.writes) and not vgm.ym2612_clock:
         vgm.warnings.append(
