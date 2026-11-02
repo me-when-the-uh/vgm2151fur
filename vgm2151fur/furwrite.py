@@ -2385,10 +2385,17 @@ def _build_patterns(song: Song, n_ch: int, pat_len_max: int, fx_cols: int,
             ev_ch = ev.ch + ch_offset
             if not ev.on or ev.pcm or not ev.tl_pts or not (0 <= ev_ch < n_ch):
                 continue
-            if 0 <= ev.ins < len(song.fm_patches):
-                t0 = song.fm_patches[ev.ins].carrier_tl()
-            else:
-                t0 = 0x7F
+            # An Ext channel-3 column scales one operator, not the algorithm's
+            # carrier set, so its baseline is that operator's floor - recorded on
+            # the note when the levels were bound (see _bind_ext_levels). Using
+            # carrier_tl() there would measure the fade from another operator's
+            # level and move the wrong register.
+            t0 = getattr(ev, "vol_tl_base", None)
+            if t0 is None:
+                if 0 <= ev.ins < len(song.fm_patches):
+                    t0 = song.fm_patches[ev.ins].carrier_tl()
+                else:
+                    t0 = 0x7F
             for sample, tl in ev.tl_pts:
                 if content_cut is not None and sample >= content_cut:
                     continue

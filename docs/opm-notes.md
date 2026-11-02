@@ -281,11 +281,33 @@ check.
   rewriting `0x60`-`0x7F` with no retrigger. The key-on snapshot cannot
   carry that, so the analyzer records the carrier TL steps of a held note
   and the writer writes them on the volume column as
-  `127 - (TL - instrument TL)`. The OPM volume column only attenuates a
-  KVS carrier, and the log curve makes the mapping exact, so a fade-out
-  survives; a step *louder* than the instrument cannot (the column's
-  ceiling is the instrument TL). A region that also changes the modulator
-  stays static.
+  `127 - (TL - instrument floor)`. A step *louder* than the instrument's
+  stored level used to be unreachable - the column only attenuates a KVS
+  carrier (`TL = 127 - vol + op.tl`), so its ceiling was the instrument.
+  `_bind_opm_levels` fixes that: when any note of an instrument asks for a
+  lower TL than the instrument holds, the carriers open up to that floor and
+  every note of the instrument states its own starting volume. Without it a
+  crescendo is silent at the top: "Purple Twilight" (Batrider stage 2) walks
+  op3/op4 `$39,$37,...,$1E` under one held note on FM 1-3, and the frozen `$39`
+  plus a maxed column meant none of those sixteen steps could be played. See
+  `tests/test_vgm2151fur_timing.py::TestOpmLevelReach`. A region that also
+  changes the modulator stays static.
+- **The `$08` key-on bits are S1,S3,S2,S4, not S1..S4.**
+  `DivPlatformArcade::commitState` composes the byte as
+  `(op[0]?1)|(op[2]?2)|(op[1]?4)|(op[3]?8)` then writes `(opMask<<3)|ch`, so bit
+  1 keys operator 3 and bit 2 keys operator 2. Read in order, a voice keyed on
+  op1+op3 blanks op3 and keeps op2 - which is how Batrider's "Flashback"
+  acquired an instrument whose carriers all sat at TL `7F`. `OPM_OP_TO_MASK`
+  holds the translation and `tests/test_vgm2151fur_timing.py::
+  TestKeyOnOperatorMask` pins it. Songs that only ever key `1111` (Blue Flight,
+  BQMUS03) are order-insensitive, which is why this hid.
+- **Algorithm 4 outputs on op3 and op4.** Measured across the 49 YM2151 rips of
+  the Batrider and Battle Garegga sets: every mid-note TL automation in that
+  corpus is on op3 and op4 together (138 writes each, never one without the
+  other). Automation marks what the platform scales, so that is the carrier set;
+  `CARRIERS[4]` used to say op2 and op4. Note OPN's table names `(2, 3)` for the
+  same algorithm number yet means slots S2,S4 there: its operator array is in
+  register order while OPM's is plain S1..S4 (`fm.py`).
 - **CBT TL writes at note boundaries become the next instrument snapshot.**
   The edge-case VGM rewrites carrier TL every 16 ms. A rewrite immediately
   before a key-on is not a held-note fade: the new note starts with that TL,

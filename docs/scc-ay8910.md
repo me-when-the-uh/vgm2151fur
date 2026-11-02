@@ -113,6 +113,16 @@ generator, which is how MSX drivers retrigger drums; that becomes a new note
 even when the voice never went quiet. A write that clears the envelope bit
 also emits a mode effect, or the register would keep using the generator.
 
+Before the first `$07` write the mixer defaults to **tone-only** (`$38`,
+`ay8910.REG_MIXER_DEFAULT`). A zeroed mixer enables noise on all three voices at
+noise period 0, and drivers commonly write pitch and volume some samples ahead of
+their first mixer byte - Madou Monogatari 1-2-3 keys ch0 and ch2 at t=29,912/29,914
+and only writes `$07=$BA` at 29,945 - so the default decided those openings and
+every song with the same habit played a pitched note as tone-plus-hiss. Tone-only
+matches what these drivers ask for next ($BA and MadouARS's $B8 both disable noise
+on every voice), and a part that wants noise says so in its own `$07`; MadouARS
+keeps its 134 ch2-noise notes from the real `$07=$98` writes.
+
 A "mute" is not a note: drivers silence a channel by writing a tone period
 below what the chip's music range can express (beyond B-9, so above roughly
 16 kHz - a few register units) while leaving the volume up. Those writes read

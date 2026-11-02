@@ -30,7 +30,8 @@ from vgm2151fur.c352 import (
     merge_step_writes as c352_merge_steps,
 )
 from vgm2151fur.fm import (
-    CARRIERS, FMPatch, OpRegs, OPN_CARRIERS, OPM_OP_TO_MASK, carriers_for,
+    CARRIERS, FMPatch, OpRegs, OPN_CARRIERS, OPM_OP_TO_MASK, OPN_ORDERED_OPS,
+    carriers_for, opn_tl_op,
 )
 from vgm2151fur.k053260 import (
     K053260_REFIT_SAMPLES,
@@ -297,6 +298,13 @@ class NoteEvent:
     # Mid-note carrier TL steps: (sample, absolute YM2151 carrier TL). The
     # writer maps them onto the volume column relative to the instrument.
     tl_pts: tuple[tuple[int, int], ...] = ()
+    # Volume-column baseline override for `tl_pts` and this note's own level.
+    # An Ext channel-3 column scales one operator, not the algorithm's carrier
+    # set (`ym2203ext.cpp` DIV_CMD_VOLUME), so the writer cannot take the
+    # baseline from carrier_tl(); it is that operator's floor instead. The chip
+    # answers `TL = 127 - vol + op.tl`, so the instrument holds the quietest
+    # reachable number (the *loudest* level) and every step is `127 - (TL-floor)`.
+    vol_tl_base: int | None = None
     # PCM pan 0x00 is a real "both off"; OKI/MSM6258 are mono and must not
     # write 08xx.
     no_pan: bool = False
@@ -2057,6 +2065,143 @@ def _adpcm_b_motion(hit: AdpcmBHit) -> tuple[
     return tuple(steps), _pcm_levels(hit)
 
 
+def _bind_opm_levels(
+    events: list["NoteEvent"], patches: dict[tuple, FMPatch],
+    patch_order: list[tuple],
+) -> tuple[int, int]:
+    """Make a held note's *rising* level reachable, not just its falling one.
+
+    A YM2151 voice that builds up walks its carriers down through the TL range -
+    "Purple Twilight" takes op3/op4 from 0x39 to 0x1E while op1/op2 hold 0x1E.
+    The converter keeps a carrier's logged TL in the instrument and puts mid-note
+    moves on the volume column, but the platform answers
+    ``TL = 127 - vol + op.tl``: volume can only attenuate. So a step *louder* than
+    the instrument's stored level was unreachable - the note row went out at vol
+    127 (the column's maximum) and the chip stayed at 0x39, leaving the entrance
+    of a crescendo inaudible.
+
+    Fix: for an instrument whose notes ever ask for a lower TL than it stores,
+    open the instrument up to that floor and hang every note off the column
+    instead. The carriers keep their relative differences (the driver moves them in
+    lockstep), the loudest request now lands at vol 127, and a note that starts
+    quietly rides ``127 - (level - floor)``.
+
+    Returns (instruments opened, notes given a baseline).
+    """
+    # Pass 1: what is the loudest level each instrument is ever asked for?
+    floor: dict[int, int] = {}
+    tl_keys: set[int] = set()
+    for ev in events:
+        if not ev.on or ev.pcm or not (0 <= ev.ins < len(patch_order)):
+            continue
+        if not ev.tl_pts:
+            continue                # nothing moved: the instrument is already right
+        patch = patches.get(patch_order[ev.ins])
+        if patch is None:
+            continue
+        key = ev.ins
+        want = min([tl for _t, tl in ev.tl_pts] + [patch.carrier_tl()])
+        prev = floor.get(key)
+        floor[key] = want if prev is None else min(prev, want)
+        tl_keys.add(key)
+
+    # Pass 2: open each affected instrument to its floor, remembering what it
+    # stored before so the notes can be hung beneath it. Every note of an
+    # instrument starts at that same level - `identity()` keeps carrier TL in the
+    # cluster key, so notes at a different level are separate instruments.
+    opened: dict[int, int] = {}        # instrument -> TL it stored before shifting
+    for key in sorted(tl_keys):
+        patch = patches.get(patch_order[key])
+        if patch is None:
+            continue
+        base = patch.carrier_tl()
+        low = floor[key]
+        if low >= base:
+            continue
+        delta = base - low
+        carriers = set(patch.carriers())
+        ops = list(patch.ops)
+        for i, op in enumerate(ops):
+            if i in carriers and (op.tl & 0x7F) < 0x7F:
+                ops[i] = replace(op, tl=(op.tl & 0x7F) - delta)
+        patch.ops = tuple(ops)      # type: ignore[assignment]
+        opened[key] = base
+
+    # Pass 3: hang the notes off the column. Every note of an opened instrument
+    # states its own starting level now - including short notes that never move,
+    # which would otherwise play at the instrument's new, louder floor. The note
+    # row carries that level and `vol_tl_base` gives the writer the same baseline
+    # for the mid-note steps, where it computes `vol = fm_vol_max - (tl - base)`.
+    rebased = 0
+    if opened:
+        for ev in events:
+            if not ev.on or ev.pcm or not (0 <= ev.ins < len(patch_order)):
+                continue
+            base = opened.get(ev.ins)
+            if base is None:
+                continue
+            low = floor[ev.ins]
+            ev.vol_tl_base = low
+            ev.vol = max(0, min(127, 127 - (base - low)))
+            rebased += 1
+    return len(opened), rebased
+
+
+def _bind_ext_levels(
+    events: list["NoteEvent"], patches: dict[tuple, FMPatch],
+    patch_order: list[tuple], notes: list[tuple[int, int, int, int]],
+    floors: dict[int, list[int]],
+) -> tuple[int, int]:
+    """Give each Ext channel-3 column back the level range it was scripted with.
+
+    An Ext column is its own Furnace channel, and `DIV_CMD_VOLUME` in
+    ym2203ext.cpp answers it with `TL = 127 - vol + op.tl` for the one operator
+    that column plays (`ops[orderedOps[ch]]`). Volume only attenuates, so the
+    instrument carries the *lowest* TL - the loudest level - that any note of
+    that operator started on or moved to, and each note rides its own difference.
+
+    `notes` holds (event index, instrument index, operator index, TL at key-on);
+    `floors` the running per-operator minimum collected beside them. Without this
+    a column that walked `$4A` through 6,7,8...19 played every note at whichever
+    level the first interned instrument happened to hold, because the Ext cache
+    key ignores TL to keep one shared timbre per voice.
+
+    Returns (notes levelled, notes skipped as unaddressable).
+    """
+    # The floor of an instrument's operator is shared by every note of that
+    # column, so set it once, before any note is rebased onto it.
+    for ins_idx, per_op in floors.items():
+        if not (0 <= ins_idx < len(patch_order)):
+            continue
+        patch = patches.get(patch_order[ins_idx])
+        if patch is None:
+            continue
+        ops = list(patch.ops)
+        for oi, floor in enumerate(per_op):
+            if floor <= 0x7F and ops[oi].tl & 0x7F != floor:
+                ops[oi] = replace(ops[oi], tl=floor)
+        patch.ops = tuple(ops)  # type: ignore[assignment]
+
+    levelled = skipped = 0
+    for ev_i, ins_idx, oi, tl in notes:
+        if not (0 <= ev_i < len(events)) or not (0 <= ins_idx < len(patch_order)):
+            skipped += 1
+            continue
+        patch = patches.get(patch_order[ins_idx])
+        if patch is None or oi >= len(patch.ops):
+            skipped += 1
+            continue
+        floor = floors.get(ins_idx, [0x7F] * 4)[oi]
+        ev = events[ev_i]
+        # vol such that 127 - vol + floor == tl. A level under the floor cannot
+        # occur here: the floor is the minimum of every level seen for this
+        # operator, mid-note moves included.
+        ev.vol_tl_base = floor
+        ev.vol = max(0, min(127, 127 - (tl - floor)))
+        levelled += 1
+    return levelled, skipped
+
+
 def _collect_opl(
     vgm: VgmFile,
     events: list[NoteEvent],
@@ -3127,6 +3272,14 @@ def analyze(
         close_sweep(ch)
         close_tl(ch)
 
+    # A crescendo walks the carriers *down* through the TL range while the note
+    # sounds. The volume column can only attenuate what the instrument stores, so
+    # open each affected instrument to its loudest requested level first and let
+    # the notes state their own starting volume. Must run after close_tl(), which
+    # is what hands every note its mid-note steps.
+    if has_ym2151 and patch_order:
+        _bind_opm_levels(events, patches, patch_order)
+
     # Key-offs were not recorded above. Re-walk for offs that sit after the
     # last key-on and before the next one.
     ym2 = YM2151State()
@@ -3289,6 +3442,23 @@ def analyze(
         ext_active_freqs: dict[int, tuple] = {}
         ext_patch_cache: dict[int, dict[tuple, int]] = {}
         ext_ready: set[int] = set()
+        # Per-column level bookkeeping for the Ext layout. The instrument a
+        # column plays is shared and TL-blind, so each note's level has to ride
+        # its own volume: `ext_tl_notes` remembers (event, instrument, operator,
+        # TL at key-on) and `ext_tl_floors` the lowest TL seen per operator,
+        # which `_bind_ext_levels` later writes into the instrument. A level is
+        # reachable only upwards in attenuation from that floor, because the
+        # platform answers `TL = 127 - vol + op.tl`.
+        ext_tl_notes: list[tuple[int, int, int, int]] = []
+        ext_tl_floors: dict[int, list[int]] = {}
+        # Which (instrument, operator) a held column belongs to, so a mid-note
+        # $4X write can widen that operator's floor.
+        ext_key_op: dict[tuple[int, int, int], tuple[int, int]] = {}
+
+        def ext_floor(ins: int, oi: int, tl: int) -> None:
+            per_op = ext_tl_floors.setdefault(ins, [0x7F] * 4)
+            if tl < per_op[oi]:
+                per_op[oi] = tl
 
         for w in vgm.writes:
             if w.chip != "ym2203":
@@ -3357,7 +3527,17 @@ def analyze(
                             pitch_base[key] = (block, fnum)
                             pitch_pts[key] = [(w.sample, block, fnum)]
                             opn_tl_pts[key] = []
-                            opn_tl_last[key] = 0x7F
+                            # This column plays ops[orderedOps[c]]. Keep its key-on
+                            # level: `_bind_ext_levels` rebases the note's volume
+                            # onto the instrument's floor for that operator, and a
+                            # mid-note $4X write widens the same floor.
+                            tl_op = OPN_ORDERED_OPS[c]
+                            tl0 = st.ops[ch][tl_op].tl & 0x7F
+                            ext_floor(ins, tl_op, tl0)
+                            ext_tl_notes.append(
+                                (len(events) - 1, ins, tl_op, tl0))
+                            ext_key_op[key] = (ins, tl_op)
+                            opn_tl_last[key] = tl0
                             emitted = True
                         ext_active_freqs[cid] = freqs
                         if emitted:
@@ -3416,9 +3596,23 @@ def analyze(
                 continue
             if ym2203_ext and ch == 2:
                 if 0x40 <= reg <= 0x4E:
-                    # TL writes on an operator column would need the column's
-                    # own baseline for the volume column; the next key-on
-                    # picks the new TL up from the instrument copy instead.
+                    # A level write on an operator column IS that column's
+                    # volume: the driver scripts it continuously under a held
+                    # note (Exit Logo walks $4A and $4E through 6,7,8...19).
+                    # Record it against the operator this column plays and widen
+                    # that instrument's floor so a louder step stays reachable.
+                    tl_op = opn_tl_op(reg)
+                    c = OPN_ORDERED_OPS.index(tl_op)
+                    key = (cid, ch, c)
+                    if key not in held_idx:
+                        continue
+                    tl_now = st.ops[ch][tl_op].tl & 0x7F
+                    ins, _oi = ext_key_op.get(key, (None, tl_op))
+                    if ins is not None:
+                        ext_floor(ins, tl_op, tl_now)
+                    if tl_now != opn_tl_last.get(key, 0x7F):
+                        opn_tl_pts[key].append((w.sample, tl_now))
+                        opn_tl_last[key] = tl_now
                     continue
                 if 0xA8 <= reg <= 0xAE:
                     op = reg & 0x03
@@ -3458,6 +3652,14 @@ def analyze(
         for key in list(held_idx):
             close_opn_note(key, vgm.total_samples or 0, off=False)
 
+        # Now that every note and its levels are in: park each Ext column's
+        # loudest level in the instrument and put the rest on that channel's
+        # volume. Doing it here is what lets a note that only moves later still
+        # reach the quietest value the driver ever asked for.
+        if ym2203_ext and ext_tl_notes:
+            _bind_ext_levels(
+                events, patches, patch_order, ext_tl_notes, ext_tl_floors)
+
         # A 0x00 that the driver writes immediately before the next key-on is
         # a retrigger, not a rest: keeping the note-off would cut the new
         # note (the writer orders the note-on first at the same row).
@@ -3493,6 +3695,18 @@ def analyze(
         ext_active_freqs: dict[int, tuple] = {}
         ext_patch_cache: dict[int, dict[tuple, int]] = {}
         ext_ready: set[int] = set()
+        # Ext column level bookkeeping, as on the YM2203: each column's volume
+        # must carry the levels the driver scripted, relative to the instrument
+        # floor `_bind_ext_levels` installs at the end of this collector.
+        ext_tl_notes: list[tuple[int, int, int, int]] = []
+        ext_tl_floors: dict[int, list[int]] = {}
+        ext_key_op: dict[tuple[int, int, int], tuple[int, int]] = {}
+
+        def ext_floor(ins: int, oi: int, tl: int) -> None:
+            per_op = ext_tl_floors.setdefault(ins, [0x7F] * 4)
+            if tl < per_op[oi]:
+                per_op[oi] = tl
+
         dac_writes = 0
         lfo_last: dict[int, int] = {}
 
@@ -3736,7 +3950,16 @@ def analyze(
                             pitch_base[key] = (block, fnum)
                             pitch_pts[key] = [(w.sample, block, fnum)]
                             opn_tl_pts[key] = []
-                            opn_tl_last[key] = 0x7F
+                            # This column plays ops[orderedOps[c]] (ym2610ext and
+                            # genesisext share the ym2203ext mapping); keep its
+                            # key-on level for the floor pass below.
+                            tl_op = OPN_ORDERED_OPS[c]
+                            tl0 = st.ops[ch][tl_op].tl & 0x7F
+                            ext_floor(ins, tl_op, tl0)
+                            ext_tl_notes.append(
+                                (len(events) - 1, ins, tl_op, tl0))
+                            ext_key_op[key] = (ins, tl_op)
+                            opn_tl_last[key] = tl0
                             emitted = True
                         ext_active_freqs[cid] = freqs
                         if emitted:
@@ -3816,8 +4039,23 @@ def analyze(
                     group = EXT_FREQ_OP[c]
                     if key in held_idx and after[group] != before[group]:
                         pitch_pts[key].append((w.sample, *after[group]))
-                # TL writes on an operator column: the next key-on picks the
-                # new level up from the instrument copy (as on the YM2203).
+                if (r & 0xF0) == 0x40:
+                    # A level write on an operator column IS that column's
+                    # volume: the driver scripts it continuously under a held
+                    # note, exactly as on the YM2203 Ext. Record it against the
+                    # operator this column plays, and widen that instrument's
+                    # floor so a louder step is still reachable by volume.
+                    tl_op = opn_tl_op(r)
+                    c = OPN_ORDERED_OPS.index(tl_op)
+                    key = (cid, ch, c)
+                    if key in held_idx:
+                        tl_now = st.ops[ch][tl_op].tl & 0x7F
+                        ins_x, _oi = ext_key_op.get(key, (None, tl_op))
+                        if ins_x is not None:
+                            ext_floor(ins_x, tl_op, tl_now)
+                        if tl_now != opn_tl_last.get(key, 0x7F):
+                            opn_tl_pts[key].append((w.sample, tl_now))
+                            opn_tl_last[key] = tl_now
             else:
                 key = (cid, ch, -1)
                 if key in held_idx and after[0] != before[0]:
@@ -3850,6 +4088,10 @@ def analyze(
 
         for key in list(held_idx):
             close_opn_note(key, vgm.total_samples or 0, off=False)
+
+        if ym2612_ext and ext_tl_notes:
+            _bind_ext_levels(
+                events, patches, patch_order, ext_tl_notes, ext_tl_floors)
 
         # A 0x00 written immediately before the next key-on is a retrigger.
         ons_by_ch: dict[int, list[int]] = {}

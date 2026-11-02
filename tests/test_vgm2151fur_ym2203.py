@@ -11,7 +11,7 @@ from vgm2151fur.analyze import (
     _SSG_VOLUME_TRIM, analyze, furnace_note_name,
 )
 from vgm2151fur.ay8910 import ay_rate, collect_ay8910
-from vgm2151fur.diag import opn_pitch_stream, pitch_runs
+from vgm2151fur.diag import export_fur, opn_pitch_stream, pitch_runs
 from vgm2151fur.furio import CHIP_CHANNELS, iter_blocks, parse_fur
 from vgm2151fur.furwrite import (
     CHIP_YM2203, CHIP_YM2203_EXT, INS_AY, INS_FM, write_fur,
@@ -200,6 +200,145 @@ class TestYm2203Pitch(unittest.TestCase):
         self.assertAlmostEqual(
             opn_pitch_units(3, 1000), opn_pitch_units(4, 500), places=9
         )
+
+
+class TestYm2203ExtColumns(unittest.TestCase):
+    """Ext channel-3: each operator column carries its own level.
+
+    Grounseed "Exit Logo" scripts `$4A`/`$4E` through 6,7,8...19 under held notes
+    and starts different notes of one timbre at different levels. The Ext layout
+    shares one instrument across the four columns and its cache key ignores TL, so
+    without per-column volume every note sits at whichever level happened to be
+    interned first - "those notes are all being played at the same volume".
+
+    These pin two things: that a column's level is read from the operator it
+    actually plays (`ops[orderedOps[ch]]`, so $4A lands on column 1 and not
+    column 2), and that a move *louder* than the instrument's level opens the
+    instrument instead of being clamped away.
+    """
+
+    T_ON = 200_000
+    T_MOVE = 230_000
+    T_OFF = 400_000 - 5_000
+    # one distinct level per operator, in register order S1,S3,S2,S4
+    TLS = {0x42: 0x10, 0x46: 0x20, 0x4A: 0x30, 0x4E: 0x40}
+
+    def _writes(self):
+        w = []
+        for op in range(4):                       # detune/mult, rates
+            w.append(ChipWrite(100, "ym2203", 0, 0x30 + op * 4, 0x01))
+            w.append(ChipWrite(101, "ym2203", 0, 0x50 + op * 4, 0x1F))
+            w.append(ChipWrite(102, "ym2203", 0, 0x60 + op * 4, 0x00))
+            w.append(ChipWrite(103, "ym2203", 0, 0x70 + op * 4, 0x1F))
+            w.append(ChipWrite(104, "ym2203", 0, 0x80 + op * 4, 0x1F))
+        for reg, tl in self.TLS.items():          # the four levels
+            w.append(ChipWrite(105, "ym2203", 0, reg, tl))
+        w.append(ChipWrite(106, "ym2203", 0, 0xB2, 0x07))     # ch3 alg 7
+        w.append(ChipWrite(107, "ym2203", 0, 0xAC, 0x15))     # per-slot f-num:
+        w.append(ChipWrite(108, "ym2203", 0, 0xA8, 0x00))     # this makes it Ext
+        w.append(ChipWrite(self.T_ON, "ym2203", 0, 0x28, 0xF0 | 2))
+        # the driver opens up slot S2 while the note sounds: $4A, a louder level
+        # than any operator stored, so it is unreachable by volume alone.
+        w.append(ChipWrite(self.T_MOVE, "ym2203", 0, 0x4A, 0x18))
+        w.append(ChipWrite(self.T_OFF, "ym2203", 0, 0x28, 0x02))
+        return w
+
+    def setUp(self):
+        self.song = analyze(_vgm(self._writes()), pcm=False)
+        ons = sorted((e for e in self.song.events if e.on and not e.pcm
+                      and e.sample == self.T_ON), key=lambda e: e.ch)
+        self.assertEqual(len(ons), 4, "the four operator columns each sound")
+        self.col = ons          # column c is the channel played by ops[orderedOps[c]]
+        self.patch = self.song.fm_patches[self.col[1].ins]
+
+    def test_ext_layout_is_detected(self):
+        self.assertTrue(self.song.ym2203_ext)
+
+    def test_each_column_keeps_its_own_operator_level(self):
+        got = [p.tl & 0x7F for p in self.patch.ops]
+        # $42,$46,$4A,$4E are ops[0..3] in register order; only $4A moved.
+        self.assertEqual(got[0], 0x10)
+        self.assertEqual(got[1], 0x20)
+        self.assertEqual(got[3], 0x40)
+
+    def test_a_louder_move_opens_the_instrument_on_the_right_operator(self):
+        """$4A is column 1's operator (ops[2]), and it wanted 0x18."""
+        self.assertEqual(self.patch.ops[2].tl & 0x7F, 0x18,
+                         "the floor must land on the operator that moved")
+
+    def test_column_volume_states_the_note_level(self):
+        # That column started at 0x30 with the instrument now at 0x18, so it must
+        # attenuate by the difference; the other columns started at their floor.
+        self.assertEqual(self.col[1].vol, 127 - (0x30 - 0x18))
+        self.assertEqual(self.col[1].vol_tl_base, 0x18)
+        for c in (0, 2, 3):
+            self.assertEqual(self.col[c].vol, 127,
+                             f"column {c} never moved off its floor")
+
+    def test_mid_note_move_survives_to_the_writer(self):
+        pts = [tl for _t, tl in self.col[1].tl_pts]
+        self.assertIn(0x18, pts, "the climb was dropped again")
+
+    def test_no_column_asks_for_an_unreachable_level(self):
+        for c, ev in enumerate(self.col):
+            floor = self.patch.ops[(0, 2, 1, 3)[c]].tl & 0x7F
+            loud = [tl for _t, tl in ev.tl_pts if tl < floor]
+            self.assertEqual(loud, [], f"column {c} cannot reach {loud}")
+
+
+@unittest.skipUnless(HAVE_FURNACE, "furnace console build missing")
+class TestExtRealRip(unittest.TestCase):
+    """The rip that reported it: Grounseed 'Exit Logo' (YM2203 Ext)."""
+
+    SRC = Path(r"F:\NASbackup\JamesAlan\_devspace\grbsd\ripwip\_finished"
+               r"\gs-opn\done\01 Exit Logo.vgz")
+
+    def test_channel3_slot_levels_reach_the_chip(self):
+        if not self.SRC.exists():
+            self.skipTest(f"{self.SRC} not present")
+        song = analyze(load_vgm(self.SRC))
+        self.assertTrue(song.ym2203_ext)
+        stem = TMP / "exit_logo"
+        fur = stem.with_suffix(".fur")
+        fur.write_bytes(write_fur(song, include_pcm=False))
+        back = load_vgm(export_fur(fur, stem.with_suffix(".vgm")))
+
+        def walk(stream):
+            # YM2203 operators step by four within a channel, so ch3's TL
+            # registers are $42,$46,$4A,$4E (S1,S3,S2,S4).
+            out: dict[int, set[int]] = {}
+            for w in stream.writes:
+                r = w.reg & 0xFF
+                if 0x40 <= r <= 0x4E and (r & 3) == 2:
+                    out.setdefault(r, set()).add(w.val & 0x7F)
+            return out
+
+        src, got = walk(load_vgm(self.SRC)), walk(back)
+        # Ask only of the slots this rip actually automates: two of them walk a
+        # long way down while the rest hold one or two levels.
+        automated = {}
+        for reg, vals in src.items():
+            moved = {v for v in vals if 0 < v < 0x7F}
+            if len(moved) > 4:
+                automated[reg] = moved
+        print("\n    automated ch3 slots (register: how far the source walks):")
+        for reg, moved in sorted(automated.items()):
+            print(f"      ${reg:02X}: {len(moved)} levels "
+                  f"({min(moved):#04x}-{max(moved):#04x})")
+        self.assertGreaterEqual(len(automated), 2,
+                                "expected this rip to automate two slot levels")
+        for reg, moved in sorted(automated.items()):
+            have = got.get(reg, set())
+            reached = len(have & moved)
+            print(f"    ${reg:02X}: source {len(moved)} levels, converted "
+                  f"hits {reached}")
+            self.assertGreater(
+                reached, 2,
+                f"${reg:02X}: converted produced {sorted(have)}, the source "
+                f"walked {sorted(moved)} - the column is frozen again")
+            self.assertGreaterEqual(
+                reached, len(moved) // 3,
+                f"${reg:02X}: only {reached} of {len(moved)} levels reached")
 
 
 class TestYm2203Analyze(unittest.TestCase):

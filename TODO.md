@@ -73,3 +73,27 @@ Remaining:
 - The key-on audit and the `keys`/`miss` counts say nothing about operator macros.
   The instrument listing shows `op1 $4n x168@2t`; a per-track total would make
   the difference visible without reading every patch.
+
+## From the 2026-11 batch (PSG default, Ext columns, OPM key-on bits, OKI length)
+
+- **`02 Zero Cop [Opening]` (Batrider) differs in pitch on FM 4-6.** Four runs,
+  all short: `-1.1` to `-2.2 st` over 206-371 ms around t=4.6-5.2 s, and the
+  module's loop/tail timing drifts afterwards (`other: 1978888 samples` against a
+  `1506339` source). It reproduces at HEAD identically, so it is not from the
+  `$08` bit-order or level work - most likely a legato/retune boundary. Start by
+  dumping `$28-$37` for those channels in that window against the render.
+- **Level parks are not reproduced.** Batrider drivers silence a voice by writing
+  `7F` to every operator (`08 Purple Twilight` does it six times per channel);
+  the converter ends the note instead, so those register values never appear in
+  the export. Musically equivalent, but it keeps `vgmdiff` from being fully clean
+  on songs that park rather than key off. Count them in the report so a real
+  dropped level is distinguishable from a park.
+- **Modulator automation is still static.** `_bind_opm_levels` opens the carriers;
+  an operator that modulates and moves mid-note keeps its key-on value, and the
+  OPM has no per-operator gate to do otherwise. The YM2151 corpus says automation
+  is overwhelmingly on the op3/op4 carrier pair, so the loss is rare - measure it
+  before designing anything.
+- **`Ext` mid-note `$4X` on a row the note owns is dropped** (`vol_step_dropped`)
+  in favour of the note's own volume. `01 Exit Logo` lands 21/21 and 23/23 of its
+  scripted levels, so the remainder is a row-boundary rounding; check whether an
+  `EDxx` delay would recover it before adding a second volume mechanism.
