@@ -171,12 +171,54 @@ Per-operator am, vibrato and sustain stay in the instrument. The chip-wide depth
 where the log wrote them: `0x10` for amplitude-modulation depth and `0x17` for
 vibrato depth.
 
-An operator envelope or waveform written *inside* a held note is applied at the
-next key-on, not mid-note: Furnace rebuilds an OPL voice from its instrument when
-the note starts. Those writes are counted and reported ("N operator envelope or
-waveform write(s) landed inside a held note") rather than dropped silently. An
-`OPL3` waveform change mid-note (`2Axy`) is not expressed either, since a tracker
-row cannot retarget one operator of a voice that is sounding.
+## Operator macros: a level the log moves under a sounding note
+
+Tyrian's engine scripts the **modulator** output level (`$4n`) hundreds of times
+per channel while a note holds. On `14 Gyges, Will You Please Help Me` the four
+channels sharing one voice each take ~1,750 mid-note `$4n` writes with the carrier
+almost still; on `21 Come Back to Me, Savara` channels 3-5 take 3,021 / 3,191 /
+4,566 against two carrier writes. That register *is* the modulation index, so a
+frozen one sounds like brightness that never evolves - and it hides from any
+attack-time check, because every byte written at key-on was correct.
+
+The volume column cannot carry it: `opl.cpp` scales only an operator that is both
+marked KVS and an output (its `KVSL` macro), so a modulator has no path at all.
+Furnace's per-operator macros do. Each operator keeps its own macro list in an
+`O1`..`O4` feature, and code 6 (`DIV_MACRO_OP_TL`) is applied as
+`op.tl = val & 63`; for a non-KVS operator the register write is
+`op.tl | op.ksl << 6`. So far so direct - but pushing a ramp
+`3, 7, 11 ... 62` through the player came back as `$4n = 60, 56, 52 ... 1`.
+**The macro stores a level, not an attenuation**: up is louder. The writer
+inverts (`furwrite._write_op_ma`); everything above it, including `analyze`, keeps
+speaking `$4n`.
+
+The other operator codes live in `DivMacroTypeOp` - 0 AM, 1 AR, 2 DR, 3 MULT,
+4 RR, 5 SL, 6 TL, and 15 KSL, 16 SUS, 17 VIB, 18 WS, 19 KSR. Today only TL is
+driven. An operator **envelope or waveform** written inside a held note still
+applies at the next key-on, since Furnace rebuilds the voice from its instrument
+when the note starts; those writes are counted and reported ("N operator envelope
+or waveform write(s) landed inside a held note"), as is an `OPL3` mid-note
+waveform change (`2Axy`). Each of those codes needs its own measured polarity and
+mask before it can be trusted - the TL inversion is exactly that warning.
+
+`analyze._collect_opl` records `$4n` per operator while a voice sounds
+(`NoteEvent.opl_op_tl`, primed from the instrument at key-on so a stretch with no
+movement adds nothing), and `analyze._bind_op_macros` cuts the curve onto a copy of
+the instrument named `+lvl`: one entry every `speed` ticks, running from the
+key-on. An operator macro has **no delay** - it starts with the note, and Furnace
+ignores the field on these (measured: an entry list written with `delay=5` still
+stepped from tick zero) - so a level that first moves several ticks in repeats its
+starting entry across that hold, and the sweep's resolution pays for it. Speed is
+the smallest that fits a macro's 255 entries - 1 to 5 ticks (2-10 ms) on these
+songs.
+
+Re-exported through the bundled console build, mid-note `$4n` writes go from zero
+to **6,358 of 7,046** on Gyges (69-82% of sampled moments exact, 87-97% within two
+levels) and **13,253 of 15,222** on Savara (67-85% exact, 93-100% within two). The
+gap is inherent: several writes fall inside one tick, and a long note trades
+resolution for the entry limit. `report` lists each curve as
+`op1 $4n x158@2t`, and `tests/test_opl_operator_macro.py` pins the capture,
+the inverted file encoding, and a round trip through the real player.
 
 ## Attack order: comparing two streams
 
@@ -238,7 +280,9 @@ proves the YM3526 takes rhythm mode exactly like a YM3812.
 
 ## Limits
 
-- Waveform and envelope writes inside a held note move at the next key-on.
+- Waveform and envelope writes inside a held note move at the next key-on. A
+  modulator *level* no longer waits: it travels as that operator's `TL` macro, so
+  the remaining cases are `$6n`, `$8n`, `$2n` and `$En` moves.
 - Below `note 24` one table step is wider than a half tone, so an unplayably
   deep register lands on the nearest cell; `opl_note_for` clamps into the note
   range instead of raising.

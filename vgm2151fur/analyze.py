@@ -29,7 +29,9 @@ from vgm2151fur.c352 import (
     hit_played_freq as c352_played_freq,
     merge_step_writes as c352_merge_steps,
 )
-from vgm2151fur.fm import CARRIERS, FMPatch, OpRegs, OPN_CARRIERS
+from vgm2151fur.fm import (
+    CARRIERS, FMPatch, OpRegs, OPN_CARRIERS, carriers_for,
+)
 from vgm2151fur.k053260 import (
     K053260_REFIT_SAMPLES,
     K053260Sample,
@@ -60,6 +62,7 @@ from vgm2151fur.opl import (
     OPL2_DEFAULT_CLOCK,
     OPL3_DEFAULT_CLOCK,
     OPL_DEFAULT_CLOCK,
+    ORDERED_OPS_L,
     SLOT_ADDR,
     OPLState,
     channel_count,
@@ -338,6 +341,11 @@ class NoteEvent:
     # semitones). No instrument copy is needed. Thousands of octave switches
     # stay under the 250-instrument limit.
     pitch_steps: tuple[tuple[int, int], ...] = ()
+    # OPL only: output level writes per operator while the note is held,
+    # (operator index, ((sample, $4n low six bits), ...)). `_bind_op_macros`
+    # turns these into an operator macro; the carrier's own levels already ride
+    # the volume column through `tl_pts`.
+    opl_op_tl: tuple[tuple[int, tuple[tuple[int, int], ...]], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1727,6 +1735,97 @@ def _bind_fm_pitch(
     return made, fallbacks
 
 
+def _bind_op_macros(
+    events: list[NoteEvent],
+    patches: dict[tuple, FMPatch],
+    patch_order: list[tuple],
+    tick_samples: float,
+    cap: int = 250,
+) -> tuple[int, int]:
+    """Turn a scripted operator level into that operator's macro.
+
+    A driver that moves an operator's ``$4n`` while its note sounds is drawing
+    the voice's colour over time: on FM that register is the modulator's output,
+    so it sets how much of the carrier each harmonic gets. Furnace cannot follow
+    it with the volume column, which reaches only an operator marked KVS, so the
+    curve travels as that operator's own macro (``O1``..``O4``, code 6) where the
+    platform assigns it as an absolute level. Returns ``(copies, skipped)``.
+    """
+    made = fallbacks = 0
+    idx_map: dict[tuple, int] = {}
+    if tick_samples <= 0:
+        return 0, 0
+    for e in events:
+        if not e.on or not e.opl_op_tl or getattr(e, "drum", False) or e.pcm:
+            continue
+        if not (0 <= e.ins < len(patch_order)):
+            continue
+        base_key = patch_order[e.ins]
+        base = patches[base_key]
+        carriers = set(base.carriers())
+        entries: list[tuple[int, tuple[int, ...], int]] = []
+        for oi, pts in e.opl_op_tl:
+            if oi in carriers or not pts:
+                continue          # the volume column already carries that one
+            last_s = pts[-1][0]
+            span_end = e.end if (e.end and e.end > last_s) else last_s
+            span_ticks = max(1.0, (span_end - e.sample) / tick_samples)
+            # One value per `speed` ticks, coarse enough that the part of the note
+            # where this operator moves fits the entries a macro can hold. Any
+            # coarser and the sweep would step in plain sight.
+            speed = max(1, min(254, int(span_ticks // 240) + 1))
+            # Which macro entry each logged level lands on, last write winning:
+            # only one level can sound per tick.
+            marks: list[tuple[int, int]] = []
+            for s, val in pts:
+                slot = max(0, int((s - e.sample) // tick_samples)) // speed
+                if slot > 254:
+                    break
+                if marks and marks[-1][0] == slot:
+                    marks[-1] = (slot, val)
+                else:
+                    marks.append((slot, val))
+            if not marks:
+                continue
+            start = base.ops[oi].tl & 0x3F
+            if (len(marks) == 1 and marks[0][1] == start):
+                continue          # nothing this operator ever moved
+            # An operator macro has no delay: it starts running at the key-on, so
+            # entry 0 is the level the note attacks with. Every tick before the
+            # first logged move therefore has to be written out as its own entry,
+            # and the resolution of the sweep is paid for with those entries.
+            values: list[int] = []
+            mi = 0
+            cur = start
+            for slot in range(0, marks[-1][0] + 1):
+                while mi < len(marks) and marks[mi][0] <= slot:
+                    cur = marks[mi][1]
+                    mi += 1
+                values.append(cur)
+            if len(set(values)) < 2 and values[0] == start:
+                continue
+            entries.append((oi, tuple(values), speed))
+        if not entries:
+            continue
+        key = ("op-tl", base_key, tuple(entries))
+        idx = idx_map.get(key)
+        if idx is None:
+            if len(patch_order) >= cap:
+                fallbacks += 1
+                continue
+            copy = replace(base, op_tl_macro=tuple(entries), uses=1,
+                           name=f"{base.name}+lvl")
+            patches[key] = copy
+            patch_order.append(key)
+            idx = len(patch_order) - 1
+            idx_map[key] = idx
+        else:
+            patches[patch_order[idx]].uses += 1
+        e.ins = idx
+        made += 1
+    return made, fallbacks
+
+
 def _bind_pms_macros(
     events: list[NoteEvent],
     patches: dict[tuple, FMPatch],
@@ -1994,21 +2093,40 @@ def _collect_opl(
     # register to that voice's third or fourth slot.
     freq_owners: dict[int, dict[int, list[int]]] = {}
     op_owners: dict[int, dict[int, list[int]]] = {}
+    # Which operator *of the instrument* a slot register tunes. A four-operator
+    # voice takes its rows from both channels of the pair and Furnace walks them
+    # through orderedOpsL, so the row number is not the operator number there.
+    op_index: dict[int, dict[tuple[int, int], int]] = {}
+    # The operators one voice owns: (operator index, slot register base). Read at
+    # key-on to prime the level curve without building a patch each time.
+    chan_ops: dict[int, dict[int, list[tuple[int, int]]]] = {}
     for cid in ids:
         st = states[cid]
         fmap: dict[int, list[int]] = {}
         omap: dict[int, list[int]] = {}
+        imap: dict[tuple[int, int], int] = {}
+        ops_of: dict[int, list[tuple[int, int]]] = {}
         for fch, cm in enumerate(st.chan_map):
             fmap.setdefault(cm, []).append(fch)
         for row in range(len(st.slots)):
             for fch, slot in enumerate(st.slots[row]):
                 if slot == OPL_N:
                     continue
-                owners = omap.setdefault(SLOT_ADDR[slot], [])
+                addr = SLOT_ADDR[slot]
+                owners = omap.setdefault(addr, [])
                 if fch not in owners:
                     owners.append(fch)
+                four = st.is_four_op(fch if not (row > 1 and fch & 1)
+                                     else fch - 1)
+                imap.setdefault((addr, fch),
+                                ORDERED_OPS_L[row] if four else row)
+                # Same pair, grouped the other way: what to prime at key-on.
+                ops_of.setdefault(fch, []).append(
+                    (ORDERED_OPS_L[row] if four else row, addr))
         freq_owners[cid] = fmap
         op_owners[cid] = omap
+        op_index[cid] = imap
+        chan_ops[cid] = ops_of
 
     held: dict[tuple[int, int], int] = {}
     pitch_pts: dict[tuple[int, int], list[tuple[int, int, int]]] = {}
@@ -2025,6 +2143,11 @@ def _collect_opl(
     tl_last: dict[tuple[int, int], int] = {}
     # Level of a kit operator when its note started: the column steps from here.
     tl_open: dict[tuple[int, int], int] = {}
+    # Output level per operator of a sounding voice. The volume column only
+    # reaches an operator marked KVS, so a scripted modulator has to travel as an
+    # instrument macro instead; both are recorded, each on its own path.
+    op_tl_pts: dict[tuple[int, int], dict[int, list[tuple[int, int]]]] = {}
+    op_tl_last: dict[tuple[int, int, int], int] = {}
     off_idx: list[int] = []
     stats = {
         "notes": 0, "drums": 0, "four_op": 0,
@@ -2032,6 +2155,19 @@ def _collect_opl(
         "midnote_ops": 0,
     }
     warnings: list[str] = []
+
+    def op_is_carrier(cid: int, fch: int, oi: int) -> bool:
+        """Whether an operator reaches the output, i.e. rides the volume column.
+
+        Furnace scales a level by the channel volume only where `kvs==2` and the
+        operator is an output (opl.cpp KVSL), so this mirrors that test. A kit
+        column is one operator of its own and always counts as one.
+        """
+        st = states[cid]
+        if st.drums and fch > st.melodic:
+            return True
+        return oi in carriers_for(st.algorithm(fch), False, True,
+                                  st.is_four_op(fch))
 
     def normalized_opl(patch: FMPatch) -> tuple[FMPatch, int]:
         """Carrier level out of the instrument and into the volume column.
@@ -2116,6 +2252,16 @@ def _collect_opl(
                 )
             else:
                 ev.tl_pts = tuple(tl)
+        # Hand the level moves on to the macro pass. Keep a single move too: one
+        # brightness step inside a long note is exactly what a driver uses to
+        # change colour, and `_bind_op_macros` already discards the curve when the
+        # value it holds never differs from the instrument's.
+        curves = op_tl_pts.pop(key, {})
+        ev.opl_op_tl = tuple(
+            (oi, tuple(pts)) for oi, pts in sorted(curves.items()) if pts
+        )
+        for oi in range(4):
+            op_tl_last.pop((cid, fch, oi), None)
         tl_open.pop(key, None)
         if off:
             ev.end = sample
@@ -2156,6 +2302,19 @@ def _collect_opl(
         tl_pts[key] = []
         tl_last[key] = st.channel_tl(fch)
         tl_open[key] = tl_last[key]
+        # Prime each operator with the level its note starts on: a macro runs from
+        # the key-on, so entry zero has to be this value. Reading the register page
+        # rather than a snapshot keeps a held note from allocating a patch, and an
+        # operator the voice does not own is dropped with pop() so it cannot carry
+        # a stale level into the next note's entry zero.
+        op_tl_pts[key] = {}
+        owned: set[int] = set()
+        for oi, addr in chan_ops[cid].get(fch, ()):
+            op_tl_last[(cid, fch, oi)] = st.regs[0x40 | addr] & 0x3F
+            owned.add(oi)
+        for stale in [k for k in op_tl_last if k[0] == cid and k[1] == fch
+                      and k[2] not in owned]:
+            op_tl_last.pop(stale, None)
         keyon_times.append(sample)
         if kit:
             stats["drums"] += 1
@@ -2286,6 +2445,7 @@ def _collect_opl(
                         pitch_last[key] = (block, fnum)
             continue
 
+        prev_val = st.regs[addr]
         st.write(port, r, val)
 
         if 0xA0 <= r <= 0xA8:
@@ -2310,14 +2470,37 @@ def _collect_opl(
             if not owners:
                 continue
             if (r - slot) != 0x40:
+                if prev_val == val:
+                    continue        # the driver re-wrote the same byte; no change
                 for fch in owners:
                     if (cid, fch) in held:
+                        # An envelope or waveform move belongs to the instrument,
+                        # and Furnace rebuilds a voice from it only at key-on, so
+                        # the next note takes these. A level (`$4n`) move is not
+                        # counted: it travels as the operator macro recorded
+                        # below.
                         stats["midnote_ops"] += 1
                 continue
             for fch in owners:
                 key = (cid, fch)
                 if key not in held:
                     continue
+                # Record this operator's own level. Only the carrier's composite
+                # level can ride the volume column, so a write that moves just a
+                # modulator stops here rather than testing (and overwriting) the
+                # channel value: keeping it would latch the modulator's number as
+                # the carrier reference and drop every later carrier step.
+                oi = op_index[cid].get(((port << 8) | slot, fch))
+                if oi is not None:
+                    here = val & 0x3F
+                    if op_tl_last.get((cid, fch, oi)) != here:
+                        ops = op_tl_pts.setdefault(key, {})
+                        ops.setdefault(oi, []).append((w.sample, here))
+                        op_tl_last[(cid, fch, oi)] = here
+                    if not op_is_carrier(cid, fch, oi):
+                        # A modulator. The volume column cannot reach it, so this
+                        # level only survives as the operator macro built later.
+                        continue
                 cur = st.channel_tl(fch)
                 if cur != tl_last[key]:
                     tl_pts[key].append((w.sample, cur))
@@ -4918,6 +5101,14 @@ def analyze(
         cap=max(len(patch_order), 250 - foreign_ins - 24),
         allow_steps=is_opn or is_opn2 or is_opl or is_opnb,
     )
+    # An operator level the driver scripted while its note sounded. The volume
+    # column reaches only a KVS operator, so the rest travel as instrument macros.
+    op_tl_copies = op_tl_lost = 0
+    if is_opl:
+        op_tl_copies, op_tl_lost = _bind_op_macros(
+            events, patches, patch_order, VGM_RATE / hz,
+            cap=max(len(patch_order), 250 - foreign_ins - 24),
+        )
     _rebase_non_fm_ins(events, fm_before_pitch, len(patch_order))
     if fm_pitch_copies:
         # Keep the DAC maps when recomputing after pitch copies.
@@ -4938,6 +5129,11 @@ def analyze(
         warnings.append(
             f"{fm_pitch_lost} {pitch_chip} pitch sweeps "
             "encoded as row ramps: instrument limit"
+        )
+    if op_tl_lost:
+        warnings.append(
+            f"{op_tl_lost} OPL note(s) scripted a modulator level that stayed "
+            "flat on the base instrument: operator macro limit"
         )
 
     # Tone-chip instruments, after the row rate is final. A macro advances
@@ -5167,14 +5363,23 @@ def format_report(song: Song) -> str:
         lfo = ""
         if p.fms_macro:
             lfo = f"  FMS {list(p.fms_macro)} @{p.macro_speed}t"
+        # An operator level the driver scripted while notes of this voice sounded.
+        ops = ""
+        entries = getattr(p, "op_tl_macro", ()) or ()
+        if entries:
+            ops = "  " + ", ".join(
+                f"op{oi + 1} $4n x{len(vals)}@{spd}t"
+                for oi, vals, spd in entries)
         lines.append(
             f"  {i:02d}  alg {p.alg} fb {p.fb}  uses {p.uses:4d}  "
-            f"carrierTL {p.carrier_tl():02X}  {p.name}{lfo}"
+            f"carrierTL {p.carrier_tl():02X}  {p.name}{lfo}{ops}"
         )
     if song.fm_chip == "ym2612" and song.fm_patches:
         lines.append("  (carrier TL is relative; the key-on level rides the volume column)")
     elif song.fm_chip in ("opl", "opl2", "opl3") and song.fm_patches:
-        lines.append("  (carrier TL rides the volume column; a kit column shares one voice)")
+        lines.append("  (carrier TL rides the volume column; a modulator level "
+                     "the log moved mid-note travels as an operator macro; "
+                     "a kit column shares one voice)")
     if song.chip_fx:
         codes = (0x10, 0x17, 0x18, 0x1E, 0x1F)
         lfo_n = sum(1 for entry in song.chip_fx if entry[1] in codes)

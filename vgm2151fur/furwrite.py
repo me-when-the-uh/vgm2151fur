@@ -448,6 +448,36 @@ def _write_ma(b: Buf, patch=None) -> None:
     b.b[size_off:size_off + 2] = int(len(b.b) - start).to_bytes(2, "little")
 
 
+def _write_op_ma(b: Buf, op_index: int, values: tuple[int, ...],
+                 speed: int) -> None:
+    """An ``O1``..``O4`` feature: the macro list of one operator.
+
+    Furnace reads these in ``DivInstrument::readFeatureOx`` and applies code 6
+    (``DIV_MACRO_OP_TL``) as ``op.tl = val & 63``. There is no delay concept for
+    an operator macro: it starts running at the key-on, entry by entry every
+    ``speed`` ticks and holding its last value after that, so the first entry is
+    the level the note attacks with. For an operator without ``kvs`` the register
+    write is ``$4n = op.tl``, straight through; that is what makes a scripted
+    modulator reachable at all, since the volume column scales only a KVS operator.
+
+    The value is a *level*, not an attenuation - measured through the console
+    build, entries came back as ``$4n = 63 - value`` - so it is inverted here;
+    the model above speaks ``$4n``. Only macros that are present are read, and the
+    list ends at 255.
+    """
+    if not values:
+        return
+    b.raw(f"O{op_index + 1}".encode("ascii"))
+    size_off = len(b.b)
+    b.u16(0)
+    start = len(b.b)
+    # if you update the macro header, update this length as well (Furnace: 8)
+    b.u16(8)
+    _write_macro(b, 6, [63 - (v & 63) for v in values], speed=speed)
+    b.u8(255)  # stop
+    b.b[size_off:size_off + 2] = int(len(b.b) - start).to_bytes(2, "little")
+
+
 def _write_ins_opm(b: Buf, name: str, patch) -> None:
     """INS2 for an FM instrument of any family.
 
@@ -469,6 +499,8 @@ def _write_ins_opm(b: Buf, name: str, patch) -> None:
     b.b[na_size:na_size + 2] = int(len(b.b) - na_start).to_bytes(2, "little")
     _write_fm_feature(b, patch)
     _write_ma(b, patch)
+    for oi, values, speed in getattr(patch, "op_tl_macro", ()) or ():
+        _write_op_ma(b, oi, values, speed)
     b.raw(b"EN")
     b.end_block(size_off, start)
 

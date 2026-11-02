@@ -156,6 +156,18 @@ class FMPatch:
     pitch_macro: tuple[int, ...] = ()
     pitch_speed: int = 1
     pitch_loop: int = 255
+    # OPL only: per-operator output level automation, as the log wrote it.
+    # Entries are ``(operator index, values, speed)``: running from the key-on,
+    # the operator takes one entry of `values` every `speed` ticks and then holds
+    # its last, each entry an absolute `$4n`. An operator macro has no delay of
+    # its own - it starts with the note - so a level that first moves several
+    # ticks in repeats its starting entry across that hold. The volume column
+    # reaches only an operator marked KVS, so a driver that scripts a modulator's
+    # level has no other way to say it: the voice would play one bright or dull
+    # colour where the chip moved. Furnace reads these from an ``O1``..``O4``
+    # feature, macro code 6 (DIV_MACRO_OP_TL), and a non-KVS operator writes the
+    # value straight to ``$4n``.
+    op_tl_macro: tuple[tuple[int, tuple[int, ...], int], ...] = ()
 
     def identity(self) -> tuple:
         """Cluster key: full timbre including carrier TLs.
