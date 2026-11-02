@@ -65,10 +65,10 @@ Remaining:
   OPL2/OPL3 waveform - using `DivMacroTypeOp` codes 1, 2, 4, 5 and 18. Those
   writes still wait for the next key-on and are counted in the report (36 on
   `21 Come Back to Me, Savara`). Measure each code's polarity, mask and hold
-  behaviour against the player before encoding it: TL turned out to store a level,
+  behaviour against the player before encoding it. TL turned out to store a level,
   not an attenuation (`$4n = 63 - value`), and only a round trip showed that.
-- An envelope rate written to a keyed operator does not restart its generator, so
-  confirm what the player actually does with mid-note AR/DR entries - whether the
+- An envelope rate written to a keyed operator does not restart its generator.
+  Confirm what the player actually does with mid-note AR/DR entries - whether the
   running envelope takes the new rate or it waits for the next release.
 - The key-on audit and the `keys`/`miss` counts say nothing about operator macros.
   The instrument listing shows `op1 $4n x168@2t`; a per-track total would make

@@ -3,8 +3,8 @@
 The chip is an OPN core with 4 FM channels (6 on the YM2610B), the AY SSG,
 and two sample engines: ADPCM-A (six fixed-rate channels) and ADPCM-B (one
 variable-rate channel).  Furnace's YM2610 platforms run in linear pitch mode
-with a 9440540 frequency base, so the FM note inverse is the YM2612 formula
-with that base.  The sample engines use Furnace's ADPCM-A/B sample formats
+with a 9440540 frequency base. The FM note inverse is the YM2612 formula with
+that base.  The sample engines use Furnace's ADPCM-A/B sample formats
 and sample-map instruments.
 """
 
@@ -490,7 +490,7 @@ def collect_ym2610_adpcm(
                 continue
             # A non-stop 0x100 write retriggers every selected channel, even
             # one that is already sounding.  Furnace's export writes combined
-            # masks (0x3, 0x6) on one row, so a 0->1 test would lose them.
+            # masks (0x3, 0x6) on one row. A 0->1 test would lose them.
             for ch in range(6):
                 if not (start_bits & (1 << ch)):
                     continue

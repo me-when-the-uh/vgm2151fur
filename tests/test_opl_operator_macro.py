@@ -2,18 +2,18 @@
 """OPL operator macros: a scripted modulator level must reach the chip.
 
 Furnace rebuilds an OPL voice from its instrument at key-on and scales only an
-operator marked KVS with the channel volume, so a driver that scripts a
-modulator's `$4n` cannot be followed by the volume column at all: the voice used
-to play one colour where the log moved it, and the conversion looked perfect at
-every key-on because only the sustained part differed.
+operator marked KVS with the channel volume. A driver that scripts a
+modulator's `$4n` therefore cannot be followed by the volume column at all:
+the voice used to play one colour where the log moved it, and the conversion
+looked perfect at every key-on because only the sustained part differed.
 
 The route is a per-operator macro: feature `O1`..`O4`, code 6
 (DIV_MACRO_OP_TL). Measured end to end through the bundled Furnace build, the
-chip receives `$4n = 63 - value`, i.e. Furnace stores a *level* (up is louder)
-while the log holds attenuation, so the writer inverts. A macro runs from the
-key-on and has no delay of its own, so entry zero is the attack level and a move
-that starts several ticks in costs that many repeated entries - which is why the
-curve is quantized to a `speed` rather than being sampled per tick.
+chip receives `$4n = 63 - value`. Furnace stores a *level* (up is louder)
+while the log holds attenuation, and the writer inverts. A macro runs from
+the key-on and has no delay of its own. Entry zero is the attack level, and a
+move that starts several ticks in costs that many repeated entries, which is
+why the curve is quantized to a `speed` rather than being sampled per tick.
 """
 
 from __future__ import annotations

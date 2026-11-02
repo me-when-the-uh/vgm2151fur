@@ -198,7 +198,7 @@ def _verify_runs(
         channels = opl_channels(opl_kind, drums) * max(1, len(ids))
     elif ym2610_ids and not has_opm:
         # 14 channels, 16 on the B variant.  ADPCM channels have no pitch
-        # stream, so pitch_runs returns nothing for them.
+        # stream, and pitch_runs returns nothing for them.
         channels = (16 if getattr(src_vgm, "ym2610_b", False) else 14) * len(
             ym2610_ids
         )

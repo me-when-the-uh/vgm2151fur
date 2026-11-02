@@ -452,21 +452,18 @@ def _write_op_ma(b: Buf, op_index: int, values: tuple[int, ...],
                  speed: int) -> None:
     """An ``O1``..``O4`` feature: the macro list of one operator.
 
-    Furnace reads these in ``DivInstrument::readFeatureOx`` and applies code 6
-    (``DIV_MACRO_OP_TL``). There is no delay concept for an operator macro: it
-    starts running at the key-on, entry by entry every ``speed`` ticks and holding
-    its last value after that, so the first entry is the level the note attacks
-    with. For an operator without ``kvs`` the register write is `$4n = op.tl`,
-    straight through - that is what makes a scripted modulator reachable at all,
-    since the volume column scales only a KVS operator.
+    Furnace reads these in ``DivInstrument::readFeatureOx`` and applies code
+    6 (``DIV_MACRO_OP_TL``). An operator macro has no delay: it runs from
+    the key-on, and entry 0 is the level the note attacks with.
 
-    The stored number is a **level in Furnace's seven-bit domain, not the
-    attenuation**: measured through the console build, a stored byte S reaches the
-    chip as `$4n = 63 - (S & 63)`, and an editor shows `127 - S`. The model above
-    speaks `$4n` (0..63 on an OPL), so `127 - $4n` is written: the register gets
-    the logged attenuation *and* the editor reads 0..63. Writing `63 - $4n` plays
-    the same only because bit 6 is discarded, and then the editor shows 90-103 for
-    a level of 26-37. Only macros that are present are read; the list ends at 255.
+    The stored byte is a level in Furnace's seven-bit domain, not the
+    attenuation: the chip receives ``$4n = 63 - (S & 63)`` and an editor
+    shows ``127 - S``. The model speaks ``$4n``. The writer therefore stores
+    ``127 - $4n``, which puts the register and the editor both in range.
+    Storing ``63 - $4n`` instead plays the same only because bit 6 is
+    discarded, and the editor then shows 90-103 for a level of 26-37.
+    Measured polarity, masks and hold behaviour are in "Operator macros" in
+    ``docs/opl.md``.
     """
     if not values:
         return
@@ -774,13 +771,11 @@ def _write_vox(
 
     `DivSample::initInternal` (sample.cpp) treats DIV_SAMPLE_DEPTH_VOX the same
     for every chip: `lengthVOX = (count + 1) / 2` bytes are allocated and read.
-    Declaring the byte count therefore throws away the back half of the sample -
-    a 15,149-byte banked MSM6295 voice came back as 7,575 and stopped mid-word.
-    Write the nibble count (twice the payload) so all of it survives.
-
-    The MSM6258 core additionally swaps nibbles before `okim6258::data_w` (low
-    nibble first), so its payload is pre-swapped; MSM6295 copies dataVOX to ROM
-    as it stands.
+    A byte count leaves the back half of the sample unread. A 15,149-byte
+    banked MSM6295 voice once came back as 7,575 and stopped mid-word.
+    `swap_nibbles` pre-swaps the payload for the MSM6258 core, whose reader
+    (`okim6258::data_w`) takes the low nibble first. MSM6295 copies dataVOX to
+    ROM as it stands.
     """
     stored = data
     if swap_nibbles:
@@ -1352,10 +1347,10 @@ def _emit_steps(
             semis = int(math.floor((desired - lo_units) / 64.0))
         else:
             semis = 0
-        # The range correction above is the *minimum* that fits, which parks E5
-        # on its edge. A residual of whole semitones belongs in the transpose:
-        # E5 at its limit has no room left to carry a later step or to correct a
-        # ramp's rounding on this channel, and the note then holds off pitch.
+        # The range correction above is the minimum that fits. It parks E5 on
+        # its edge, where the byte has no room left to carry a later step or
+        # to correct a ramp's rounding. A residual of whole semitones
+        # therefore belongs in the transpose.
         rest = desired - 64 * semis
         if rest and rest % 64 == 0:
             extra = int(rest / 64)
@@ -1413,18 +1408,19 @@ def _emit_jump_row(
     absolute pitch offset the row should reach, and `chunks` maps the rows
     this note's earlier jumps used to the semitones they carry.
 
-    E8xx resets the engine's accumulated slide displacement (measured: a jump
+    E8xx resets the engine's accumulated slide displacement. Measured: a jump
     after a glide lands on note + transpose + fine, not on what the glide had
-    reached), so the target is measured against the transpose alone; a running
-    01xx/02xx is stopped on the same row or it would resume under the jump.
+    reached. The target is therefore measured against the transpose alone,
+    and a running 01xx/02xx is stopped on the same row or it would resume
+    under the jump.
 
     A jump bigger than +-15 semitones needs several rows. `max_rows` is how
-    many the trajectory leaves it before the next step owns one; a transpose
-    that cannot land in time is not placed at all. When a later jump lands
-    inside the span an earlier one still occupies, its chunks are picked up
-    again from that row: what the transpose delivered before `row` stays, the
-    rest is re-planned, so a quick reversal cannot strand the voice on the
-    first jump's target.
+    many the trajectory leaves it before the next step owns one, and a
+    transpose that cannot land in time is not placed at all. When a later
+    jump lands inside the span an earlier one still occupies, its chunks are
+    picked up again from that row. What the transpose delivered before `row`
+    stays, and the rest is re-planned, which keeps a quick reversal from
+    stranding the voice on the first jump's target.
 
     The note's own key-on row is always allowed; a later note's row is not.
     Returns (the transposition this note carries once every chunk has landed,
@@ -1436,7 +1432,7 @@ def _emit_jump_row(
     # The semitones the transpose has already delivered before this row.
     held = sum(v for r, v in chunks.items() if r < row)
     # What E5 has to carry once E8xx/E9xx have done the whole semitones. The
-    # E5 byte is absolute (e5_note is the note's own fine tune), so its range
+    # E5 byte is absolute (e5_note is the note's own fine tune). Its range
     # does not depend on any earlier E5 write.
     off = target_abs - 64.0 * held
     w = int(round(off / 64.0))
@@ -1477,7 +1473,8 @@ def _emit_jump_row(
         if jrow != note_row and cell is not None and 0 <= cell.note < 180:
             return None
     # Drop the chunks this jump replaces, both from the grid and from the
-    # bookkeeping, so a reversal does not leave the old transpose in force.
+    # bookkeeping. A reversal would otherwise leave the old transpose in
+    # force.
     for jrow in [r for r in chunks if r >= row]:
         del chunks[jrow]
         cell = grid[ch].get(jrow)
@@ -1499,8 +1496,8 @@ def _emit_jump_row(
             chunks[jrow] = step
             _add_fx(cell, 0xE8 if step > 0 else 0xE9, abs(step),
                     fx_cols, stats)
-    # Record even when the byte equals the note's own: the replay walks a
-    # running value, so an unchanged request is deduplicated there.
+    # Record even when the byte equals the note's own. The replay walks a
+    # running value and deduplicates an unchanged request there.
     e5_writes[(ch, row)] = new_e5
     return 64.0 * sum(chunks.values()), new_e5
 
@@ -1580,7 +1577,7 @@ def _emit_sweep(
             _bump(stats, "sweep_clipped")
 
     # Row-level view of the trajectory. Two writes inside one row cannot be
-    # told apart by the engine (a row renders a single straight line), so each
+    # told apart by the engine (a row renders a single straight line). Each
     # row keeps its last value. Classifying on rows also collapses a one-row
     # glitch, a hard step reversed before the row ends, into no movement.
     per_row: list[list[int]] = []  # [row, first pts index, last pts index]
@@ -1646,7 +1643,8 @@ def _emit_sweep(
     last_rate = 0
     # The rows this note's jumps put a transpose on, with the semitones each
     # carries. A jump landing inside an earlier jump's span re-plans from its
-    # own row, so a quick reversal cannot strand the voice on the first target.
+    # own row. A quick reversal therefore cannot strand the voice on the
+    # first target.
     chunks: dict[int, int] = {}
 
     def pitch_now() -> float:
@@ -1672,8 +1670,8 @@ def _emit_sweep(
                 continue
             c = grid[ev.ch].get(jrow)
             if c is not None and 0 <= c.note < 180:
-                # Rounding put this step on a later note's row; that note
-                # re-keys with its own pitch, so the step is inaudible.
+                # Rounding put this step on a later note's row. That note
+                # re-keys with its own pitch, and the step is inaudible.
                 continue
             # Rows this jump may spend before the next segment owns one. A
             # transpose of more than +-15 semitones per row has no room here,
@@ -1736,15 +1734,15 @@ def _emit_sweep(
                       - bisect_left(step_times, rs) - 1))
             first_row = seg_i == 0 and k == 0
             cell_k = grid[ev.ch].get(row0 + k)
-            # A row runs its effects from the tick its ED delay names. When no
-            # slide is already carrying the voice into this row, that late start
-            # is also where its travel begins: the engine applies the rate once
-            # per tick from the delay to the end of the row, so the row is worth
-            # (speed - ed) ticks however far inside it the key-on sits. Rating it
-            # by the wall clock between the key-on and the row end under-delivers
-            # a fast bend, and the voice then holds flat for its whole note. A row
-            # a running rate enters keeps its full span: those first ticks move
-            # at the old rate, so the row still travels.
+            # A row runs its effects from the tick its ED delay names. With no
+            # slide already carrying the voice into this row, the engine
+            # applies the rate once per tick from the delay to the end of the
+            # row. The row is therefore worth (speed - ed) ticks however far
+            # inside it the key-on sits. Rating it by the wall clock between
+            # the key-on and the row end under-delivers a fast bend, and the
+            # voice then holds flat for its whole note. A row a running rate
+            # enters keeps its full span. Those first ticks move at the old
+            # rate, and the row still travels.
             ed = _cell_ed(cell_k) if last_rate == 0 else 0
             t_eff = start if first_row else rs
             want = 0.0 if first_row else traj_run(int(rs + tick))
@@ -2309,8 +2307,9 @@ def _build_patterns(song: Song, n_ch: int, pat_len_max: int, fx_cols: int,
             cell.ins = ev.ins
         if ev.vol >= 0:
             if ev.vol_slide:
-                # FA01 steps on the tick it is written, so the column is one
-                # higher than the level the chip should play. FA00 holds.
+                # FA01 steps on the tick it is written. The column is
+                # therefore one higher than the level the chip should play.
+                # FA00 holds.
                 if ev.vol_slide == 1:
                     cell.vol = _slide_level(ev.vol)
                     _add_fx(cell, 0xFA, 0x01, fx_cols, stats)
@@ -2378,8 +2377,9 @@ def _build_patterns(song: Song, n_ch: int, pat_len_max: int, fx_cols: int,
         total_rows, content_cut, stats,
     )
 
-    # A held note's carrier fade steps land on their own rows (only when no
-    # note owns the row, so a following note's volume wins).
+    # A held note's carrier fade steps land on their own rows. They are
+    # placed only where no note owns the row, and a following note's own
+    # volume wins.
     if fm_tl:
         for ev in song.events:
             ev_ch = ev.ch + ch_offset
@@ -2411,8 +2411,8 @@ def _build_patterns(song: Song, n_ch: int, pat_len_max: int, fx_cols: int,
                     continue
                 cell.vol = max(0, min(fm_vol_max, fm_vol_max - (tl - t0)))
 
-    # Pitch sweeps run after every event is placed, so the ramps can share
-    # the note-off rows and their ED delays. Note rows are known by now, so
+    # Pitch sweeps run after every event is placed. The ramps can then share
+    # the note-off rows and their ED delays. Note rows are known by now, and
     # each channel's list is built once for the crossing checks.
     note_rows: dict[int, list[int]] = {
         ch: sorted(r for r, cell in grid[ch].items() if 0 <= cell.note < 180)
@@ -2529,7 +2529,7 @@ def _build_patterns(song: Song, n_ch: int, pat_len_max: int, fx_cols: int,
                     _add_fx(cell, 0x08, pan & 0xFF, fx_cols, stats)
                     last_pan = pan
 
-    # A quad C352 voice carries its level on the four pan slots, so a mid-note
+    # A quad C352 voice carries its level on the four pan slots. A mid-note
     # step writes those effects. Note cells keep their own values.
     if song.events:
         for ev in song.events:
@@ -2680,8 +2680,8 @@ def _build_patterns(song: Song, n_ch: int, pat_len_max: int, fx_cols: int,
 def _fit_fx_cols(patterns: list[tuple[int, int, list[Row | None]]], n_ch: int) -> list[int]:
     """Effect columns per channel: one per effect the busiest row uses, 1..8.
 
-    Furnace sizes a pattern column from this count, so it is the
-    fit-to-content knob (docs/fur-writer.md).
+    Furnace sizes a pattern column from this count. It is the fit-to-content
+    knob (docs/fur-writer.md).
     """
     cols = [1] * n_ch
     for ch, _idx, rows in patterns:

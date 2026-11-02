@@ -7,7 +7,7 @@ MAME and Furnace.
 
 ## Commands
 
-- `0xD2 pp aa dd` — SCC, `pp` = register bank, `aa` = register:
+- `0xD2 pp aa dd`: SCC, `pp` = register bank, `aa` = register:
 
   | pp | bank | `aa` range |
   | --- | --- | --- |
@@ -23,7 +23,7 @@ MAME and Furnace.
   (SCC+) instead of `0xA1` (SCC). A K052539 rip writes voice 4's wave at
   bank 4, a K051649 rip inside bank 0 at 0x60–0x7F, which reaches both voices
   3 and 4.
-- `0xA0 rr dd` — AY-8910 register write. `rr` 0x00–0x0F, bit 7 selects the
+- `0xA0 rr dd`: AY-8910 register write. `rr` 0x00–0x0F, bit 7 selects the
   second instance. (The old `0xA0 → MultiPCM` note in `vgm.py` was wrong;
   MultiPCM is 0xB5.)
 

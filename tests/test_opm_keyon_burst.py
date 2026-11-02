@@ -4,14 +4,14 @@
 A driver that parks every carrier at TL 7F, keys on, and writes the voice's
 real levels a few samples later describes an instrument that cannot sound. The
 snapshot is taken at the key-on, and the level write that follows reaches the
-writer only as a mid-note fade -- the volume column can attenuate but never
-raise the voice back. The levels arrive inside the same burst as the key-on, so
-they belong to that note's instrument. This is what BQMUS03 does on every
+writer only as a mid-note fade. The volume column can attenuate but never
+raise the voice back. The levels arrive inside the same burst as the key-on,
+and they belong to that note's instrument. This is what BQMUS03 does on every
 channel at the start of the song and again when it changes voices mid-track.
 
 The companion bug -- a slide on a row that carries an ED delay, which travels
-fewer ticks than the row is long -- can only be measured against the player, so
-it is guarded by `TestSweepModel.test_bend_on_a_delayed_key_on_lands_on_pitch`
+fewer ticks than the row is long -- can only be measured against the player.
+It is guarded by `TestSweepModel.test_bend_on_a_delayed_key_on_lands_on_pitch`
 in `test_furnace_roundtrip.py`.
 """
 

@@ -440,7 +440,7 @@ def _opl_channel(vgm, ch: int) -> tuple[str, int, int] | None:
     Returns None when the channel is not an OPL voice it can measure: past the
     last chip, or one of a rhythm module's kit columns. Two percussion voices
     share one frequency register there - snare with hi-hat, tom and cymbal with
-    each other - so the byte at a hit belongs to whichever was written last and
+    each other. The byte at a hit belongs to whichever was written last and
     says nothing about the voice being compared.
     """
     kind = _opl_kind(vgm)
@@ -463,8 +463,8 @@ def _opl_channel(vgm, ch: int) -> tuple[str, int, int] | None:
 def opl_pitch_stream(vgm, ch: int) -> list[tuple[int, int]]:
     """(sample, pitch units) for one OPL-family voice channel.
 
-    The unit is ``fnum << block`` expressed in 1/64 semitone, so a comparison
-    between two streams of the same chip is a pitch difference. Only the channel
+    The unit is ``fnum << block`` expressed in 1/64 semitone. A comparison
+    between two streams of the same chip is therefore a pitch difference. Only the channel
     that owns the frequency register is followed: on an OPL3 four-operator pair
     that is the head, whose partner stays silent.
     """
@@ -689,7 +689,7 @@ def opl_attacks(vgm, kind: str | None = None, drums: bool | None = None):
 
     A driver that re-attacks quickly writes the new voice's operator levels and
     its key bit in one sample, interleaved with the previous note's release. The
-    chip applies those in stream order; a tracker row holds one value, so the
+    chip applies those in stream order, and a tracker row holds one value. The
     state that matters - and the state :mod:`vgm2151fur.analyze` snapshots when
     it opens a note - is the register set once that sample is finished. This walk
     gives exactly that: every write of a sample is applied, then its key edges
@@ -697,7 +697,7 @@ def opl_attacks(vgm, kind: str | None = None, drums: bool | None = None):
     hands the chip the same registers the rip did.
 
     Bank B of an OPL3 keeps its number in bit 8, and the keys it reports are
-    columns of Furnace's own table, so a four-operator voice and the kit's shared
+    columns of Furnace's own table. A four-operator voice and the kit's shared
     frequency registers are named as the engine names them.
     """
     if kind is None:
@@ -777,8 +777,8 @@ def pitch_runs(
     The comparison walks every write time of the two streams in order and
     samples both states. A short mismatch inside a glide is ignored while a
     held wrong pitch is reported with its full span.  For YM2203 chips the
-    driver keeps writing f-num during the gaps between notes, so the
-    comparison only counts samples where the source has a keyed operator. An
+    driver keeps writing f-num during the gaps between notes, and the
+    comparison therefore only counts samples where the source has a keyed operator. An
     OPL-family voice additionally trims its key, because a row-tick note and the
     sample the driver used do not coincide.
     """
@@ -835,10 +835,10 @@ def pitch_runs(
             return any(s <= t < e for s, e in intervals)
     elif opl:
         # The OPL keeps the last f-num in its register after a release, and a
-        # rhythm column shares one register with another drum, so only the spans
+        # rhythm column shares one register with another drum. Only the spans
         # where this voice itself held the key are compared. A module places a
-        # note on a row tick while the driver wrote it at an exact sample, so the
-        # two agree only a few milliseconds apart at each boundary: comparing
+        # note on a row tick while the driver wrote it at an exact sample, and
+        # the two agree only a few milliseconds apart at each boundary: comparing
         # there would measure that drift as wrong pitch. Trim the ends, and a
         # note shorter than the trim drops out - grace notes carry no evidence.
         trim = int(0.035 * VGM_RATE)
@@ -883,7 +883,7 @@ def pitch_runs(
         elif cur is not None:
             # The state only moves at write times, and every write time is in
             # `times`. The first non-divergent sample is the moment the pitch
-            # came back, so the run ends here.
+            # came back, and the run ends there.
             cur.t1 = t
             if cur.t1 - cur.t0 >= min_run:
                 runs.append(cur)

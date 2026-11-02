@@ -146,19 +146,19 @@ An operator's own automation rides an `O1`..`O4` feature: one macro list per
 operator, the same eight-byte header as `MA`, with codes from `DivMacroTypeOp` -
 0 AM, 1 AR, 2 DR, 3 MULT, 4 RR, 5 SL, **6 TL**, then 15 KSL, 16 SUS, 17 VIB,
 18 WS, 19 KSR. `opl.cpp` applies a TL entry as `op.tl = val & 63`, and for an
-operator without `kvs` writes `$4n` verbatim - but the number stored is a *level*,
+operator without `kvs` writes `$4n` verbatim. The number stored is a *level*,
 not an attenuation: measured through the bundled console build, entries
-`3, 7, 11 ... 62` come back as `$4n = 60, 56, 52 ... 1`, so
-`furwrite._write_op_ma` inverts on the way out and everything above it keeps
-speaking `$4n`. An operator macro has no delay: it runs from the key-on, and
-Furnace ignores the field on these (measured - `delay=5` still stepped from tick
-zero), so a level that first moves several ticks later repeats its starting entry
-across that hold. See "Operator macros" in `docs/opl.md`.
+`3, 7, 11 ... 62` come back as `$4n = 60, 56, 52 ... 1`. `furwrite._write_op_ma`
+inverts on the way out, and everything above it keeps speaking `$4n`. An
+operator macro has no delay: it runs from the key-on, and Furnace ignores the
+field on these (measured: `delay=5` still stepped from tick zero). A level that
+first moves several ticks later repeats its starting entry across that hold.
+See "Operator macros" in `docs/opl.md`.
 
 A waveform is three bits on the chip, yet Furnace masks `$En` with
-`(oplType == 3) ? 7 : 3`, so through this player an OPL2 reaches four waveforms;
-`opl.OPLState.operator` folds the same way to keep the exported register stream
-identical to what the engine will actually write.
+`(oplType == 3) ? 7 : 3`. Through this player an OPL2 therefore reaches four
+waveforms, and `opl.OPLState.operator` folds the same way to keep the exported
+register stream identical to what the engine will actually write.
 
 PCM instruments bind one sample each: K007232 two channels, K053260 four
 voices per chip, MSM6295 four voices per chip, MSM6258 one, SegaPCM sixteen,
