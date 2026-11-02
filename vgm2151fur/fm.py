@@ -17,14 +17,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-# YM2151 (OPM) carrier sets in its register order (0x40/0x48/0x50/0x58).
-# Algorithms 0-3 are chains ending on op4, 4 splits into two pairs, 5 and 6
-# add op1-fed carriers, 7 is additive. Algorithm 4 outputs on op1 and op3,
-# not the op2/op4 pair OPN's numbering gives it. Batrider's "Flashback" keys
-# a CON=4 voice with `$64=19, $74=06` on op1/op3 and `$6C=7F, $7C=7F` on the
-# rest. Under the op2/op4 reading its carriers all sit at 7F, and an audible
-# voice is reported silent. The register order here is plain S1..S4 (see
-# OPM_OP_TO_MASK). Indices are slot numbers minus one.
+# YM2151 (OPM) carrier sets in its register order (0x40/0x48/0x50/0x58 are
+# op1..op4, so the index is the slot number minus one). Algorithms 0-3 are
+# chains ending on op4, 5 and 6 add op1-fed carriers, 7 is additive.
+# Algorithm 4 outputs on op3 and op4: across the 49 YM2151 rips of the
+# Batrider/Garegga corpus every mid-note TL automation is op3+op4 paired
+# (138 writes each, e.g. "Purple Twilight"'s build-up). Automation marks what
+# the platform scales, so that pair is the carrier set. OPN's table names the
+# same slots S2,S4 only because its operator array is register order while
+# OPM's is plain S1..S4. See OPN_CARRIERS and OPM_OP_TO_MASK.
 CARRIERS = {
     0: (3,),
     1: (3,),
@@ -91,6 +92,19 @@ def carriers_for(alg: int, opn: bool, opl: bool = False, four: bool = False) -> 
 # while DivInstrumentFM/OpRegs store the operators in register order
 # S1,S3,S2,S4.  Index by *register* operator: which mask bit enables it.
 OPN_OP_TO_MASK = (0, 2, 1, 3)
+
+# Ext channel-3 layout: which ``ops[]`` entry each operator column plays.
+# DivPlatformYM2203Ext::dispatch maps its four columns through orderedOps =
+# {0,2,1,3} (fmsharedbase.h), so column 1 plays ops[2]. Same tuple as
+# OPN_OP_TO_MASK, different axis: operator per column vs mask bit per
+# operator. DIV_CMD_VOLUME scales the addressed op unconditionally (no KVS
+# gate), so each column's level must ride its own volume.
+OPN_ORDERED_OPS = (0, 2, 1, 3)
+
+# The register-order operator a channel-3 TL write names: pages step by four
+# within the channel, so $42/$46/$4A/$4E are S1/S3/S2/S4 = ops[0..3].
+def opn_tl_op(reg: int) -> int:
+    return (reg >> 2) & 0x03
 
 # The YM2151 key-on byte is twisted the same way: DivPlatformArcade::
 # commitState composes it as (op[0]?1)|(op[2]?2)|(op[1]?4)|(op[3]?8). Bit1 of
