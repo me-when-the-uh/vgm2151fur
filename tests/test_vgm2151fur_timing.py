@@ -299,7 +299,11 @@ class TestPercussionSweeps(unittest.TestCase):
             for r in rows for c, v in r.fx
         ]
         self.assertTrue(any(c == 0xE9 for c, _v in fx), fx)
-        self.assertTrue(any(c == 0xE5 for c, _v in fx), fx)
+        # The transpose carries the whole octave, so E5 keeps its full range. A
+        # split that parks it on 0x40/0xBF is exact here but leaves the channel
+        # no fine tune to correct a later step or a ramp's rounding with.
+        edge = [(c, v) for c, v in fx if c == 0xE5 and v in (0x40, 0xBF)]
+        self.assertEqual(edge, [], fx)
 
 
 def _kc_for_units(units: int) -> int:

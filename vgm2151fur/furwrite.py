@@ -1311,6 +1311,15 @@ def _emit_steps(
             semis = int(math.floor((desired - lo_units) / 64.0))
         else:
             semis = 0
+        # The range correction above is the *minimum* that fits, which parks E5
+        # on its edge. A residual of whole semitones belongs in the transpose:
+        # E5 at its limit has no room left to carry a later step or to correct a
+        # ramp's rounding on this channel, and the note then holds off pitch.
+        rest = desired - 64 * semis
+        if rest and rest % 64 == 0:
+            extra = int(rest / 64)
+            if abs(semis + extra) <= 15:
+                semis += extra
         if semis:
             if cur_row in e8_rows:
                 # This row already carries a chunk; a second E8 would
@@ -1685,10 +1694,20 @@ def _emit_sweep(
                   max(0, bisect_left(step_times, re_full)
                       - bisect_left(step_times, rs) - 1))
             first_row = seg_i == 0 and k == 0
+            cell_k = grid[ev.ch].get(row0 + k)
+            # A row runs its effects from the tick its ED delay names. When no
+            # slide is already carrying the voice into this row, that late start
+            # is also where its travel begins: the engine applies the rate once
+            # per tick from the delay to the end of the row, so the row is worth
+            # (speed - ed) ticks however far inside it the key-on sits. Rating it
+            # by the wall clock between the key-on and the row end under-delivers
+            # a fast bend, and the voice then holds flat for its whole note. A row
+            # a running rate enters keeps its full span: those first ticks move
+            # at the old rate, so the row still travels.
+            ed = _cell_ed(cell_k) if last_rate == 0 else 0
             t_eff = start if first_row else rs
             want = 0.0 if first_row else traj_run(int(rs + tick))
             cur = pitch_now()
-            cell_k = grid[ev.ch].get(row0 + k)
             if abs(want - cur) >= 6:
                 if cell_k is None or not (0 <= cell_k.note < 180):
                     # A later note's E5 sets its own attack and wins its row.
@@ -1701,6 +1720,10 @@ def _emit_sweep(
             # rated over its full span against the held value.
             is_last = k == k_last
             span = (re_full - t_eff) / tick if is_last else (re - t_eff) / tick
+            if ed:
+                # The ticks the row actually sounds, not the ones its wall-clock
+                # length suggests.
+                span = float(song.speed - ed)
             want_end = (
                 0.0 if (first_row and ev.pcm)
                 else traj_run(int(re_full if is_last else re))

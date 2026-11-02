@@ -195,6 +195,13 @@ OPM_DEFAULT_CLOCK = 3579545
 # writes.  A real drum interval is hundreds of samples, never tens.
 _ONSET_MERGE_SAMPLES = 100
 
+# A driver that keys on with its carriers parked at TL 7F loads the voice's
+# real levels inside the same burst. Measured on the samples that do this, the
+# last operator write lands 1-3 samples after the key-on; one OPM register
+# write takes about 2 samples, so a burst no longer than a few writes is still
+# the same command. Anything wider is a genuine mid-note change.
+_OPM_BURST_LOAD_SAMPLES = 16
+
 
 def opm_pitch_offset(clock: int | None) -> int:
     """Clock → note transposition in 1/64 semitone units.
@@ -2786,7 +2793,27 @@ def analyze(
 
     last_keyon_sample = [-10**9] * 8
     last_test_pulse = -10**9
-    for w in vgm.writes:
+
+    def settle_burst_tl(idx: int, ch: int, sample: int) -> None:
+        """Fold a key-on burst's post-key-on operator levels into the snapshot.
+
+        Some drivers park every carrier at TL 7F, key on, and write the voice's
+        real levels a few samples later in the same burst. A snapshot taken at
+        the key-on then describes an instrument that cannot sound, and the later
+        write is only a mid-note fade, which the volume column can attenuate
+        but never raise back. The burst belongs to this note, so apply it here.
+        """
+        for j in range(idx + 1, len(vgm.writes)):
+            w2 = vgm.writes[j]
+            if w2.sample - sample > _OPM_BURST_LOAD_SAMPLES:
+                break
+            if w2.chip != "ym2151" or not (0x60 <= w2.reg <= 0x7F):
+                continue
+            if (w2.reg & 7) != ch:
+                continue
+            ym.write(w2.reg, w2.val)
+
+    for wi, w in enumerate(vgm.writes):
         if w.chip != "ym2151":
             continue
         if w.reg != 0x08:
@@ -2856,6 +2883,10 @@ def analyze(
             close_pms(ch)
             close_sweep(ch)
             close_tl(ch)
+            if ym.carrier_tl(ch) >= 0x7F:
+                # Nothing in this voice can sound yet: the driver loads the
+                # real levels at the tail of this same burst.
+                settle_burst_tl(wi, ch, w.sample)
             ins = intern_patch(ch, mask)
             note = kc_to_furnace_note(ym.kc[ch])
             events.append(NoteEvent(
