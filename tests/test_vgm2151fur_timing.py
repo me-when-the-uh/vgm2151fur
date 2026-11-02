@@ -566,11 +566,37 @@ class TestKeyOnOperatorMask(unittest.TestCase):
             ChipWrite(sample=0, chip="ym2151", chip_id=0, reg=0x60 + op * 8 + self.CH, val=tl)
             for op, tl in enumerate((0x10, 0x20, 0x30, 0x40))
         ]
-        writes += self._writes([(10, 0xB)], [1000])  # 1011: operator 3 un-keyed
+        # The SS bits are the datasheet's S1,S3,S2,S4 register order, so a clear
+        # bit 2 releases operator 2 - not the third operator one would read from
+        # the bit position. See OPM_OP_TO_MASK and arcade.cpp's commitState,
+        # which composes the byte as (op[0]?1)|(op[2]?2)|(op[1]?4)|(op[3]?8).
+        writes += self._writes([(10, 0xB)], [1000])  # 1011: operator 2 un-keyed
         song = self._analyze(writes)
         ev = [e for e in song.events if e.on][0]
         patch = song.fm_patches[ev.ins]
-        self.assertEqual([patch.ops[i].tl for i in range(4)], [0x10, 0x20, 0x7F, 0x40])
+        self.assertEqual([patch.ops[i].tl for i in range(4)], [0x10, 0x7F, 0x30, 0x40])
+
+    def test_keyon_bits_key_the_sounding_operators(self):
+        """Armed Police Batrider's real voice: $08 bits 0+1 key op1 and op3.
+
+        Its four levels are written $64=19, $6C=7F, $74=06, $7C=7F with the
+        carriers on op1 and op3 for CON=4. Reading the mask in bit order keys
+        op2 instead, so the converter parks op3 - the carrier with TL 06 and a
+        full envelope - at 7F and reports an audible instrument as silent.
+        """
+        writes = [
+            ChipWrite(sample=0, chip="ym2151", chip_id=0, reg=0x60 + op * 8 + self.CH, val=tl)
+            for op, tl in enumerate((0x19, 0x7F, 0x06, 0x7F))
+        ]
+        writes.append(ChipWrite(sample=0, chip="ym2151", chip_id=0,
+                                reg=0x20 + self.CH, val=4))   # CON=4
+        writes += self._writes([(10, 0x3)], [1000])           # bits 0 and 1
+        song = self._analyze(writes)
+        ev = [e for e in song.events if e.on][0]
+        patch = song.fm_patches[ev.ins]
+        self.assertEqual([patch.ops[i].tl for i in range(4)], [0x19, 0x7F, 0x06, 0x7F])
+        self.assertLess(patch.carrier_tl(), 0x7F,
+                        "a carrier left at TL 7F is a silent instrument")
 
 
 class TestChipClockFlags(unittest.TestCase):

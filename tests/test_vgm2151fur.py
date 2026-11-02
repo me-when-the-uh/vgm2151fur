@@ -597,7 +597,12 @@ class TestOkiPhrase(unittest.TestCase):
         self.assertEqual(_ins_types(data), [36, 36])
         samples = list_fur_samples(data)
         self.assertEqual([s.depth for s in samples], [10, 10])
-        self.assertEqual([s.n_frames for s in samples], [8, 400])
+        # A VOX sample's stored length is a NIBBLE count: DivSample::initInternal
+        # allocates `lengthVOX = (count + 1) / 2` bytes and plays that many, on
+        # every chip. Declaring the byte count makes Furnace load and play half
+        # of each sample, which is how a 15,149-byte banked voice arrived as
+        # 7,575. Eight payload bytes are therefore sixteen frames.
+        self.assertEqual([s.n_frames for s in samples], [16, 800])
         self.assertEqual(samples[0].c4_rate, 15152)
         self.assertEqual(samples[0].data, b"\x11" * 8)
         self.assertNotEqual(samples[0].presence, b"\x00" * 16)

@@ -768,19 +768,24 @@ def _write_sample(b: Buf, name: str, pcm7: bytes, c4_rate: int, volume_scale: fl
 
 def _write_vox(
     b: Buf, name: str, data: bytes, c4_rate: int, *,
-    nibble_count: bool = False, swap_nibbles: bool = False,
+    swap_nibbles: bool = False,
 ) -> None:
-    """VOX ADPCM. MSM6295 stores a byte count; MSM6258 stores a nibble count.
+    """VOX ADPCM. The stored length is a *nibble* count, never a byte count.
 
-    Furnace sets lengthVOX to (samples+1)/2 and plays that many bytes, and
-    its MSM6258 core swaps nibbles again before okim6258::data_w (low nibble
-    first). A nibble count plus one swap makes the chip see the VGM byte.
-    MSM6295 copies dataVOX into ROM with no swap, so it keeps the byte count.
+    `DivSample::initInternal` (sample.cpp) treats DIV_SAMPLE_DEPTH_VOX the same
+    for every chip: `lengthVOX = (count + 1) / 2` bytes are allocated and read.
+    Declaring the byte count therefore throws away the back half of the sample -
+    a 15,149-byte banked MSM6295 voice came back as 7,575 and stopped mid-word.
+    Write the nibble count (twice the payload) so all of it survives.
+
+    The MSM6258 core additionally swaps nibbles before `okim6258::data_w` (low
+    nibble first), so its payload is pre-swapped; MSM6295 copies dataVOX to ROM
+    as it stands.
     """
     stored = data
     if swap_nibbles:
         stored = bytes((((x & 0x0F) << 4) | (x >> 4)) & 0xFF for x in data)
-    count = len(stored) * 2 if nibble_count else len(stored)
+    count = len(stored) * 2
     size_off, start = b.begin_block(b"SMP2")
     b.strz(name)
     b.u32(count)
@@ -3459,8 +3464,7 @@ def write_fur(
     for smp in adpcm_smps:
         smp_ptrs.append(len(b))
         _write_vox(
-            b, smp.name, smp.data, smp.rate,
-            nibble_count=True, swap_nibbles=True,
+            b, smp.name, smp.data, smp.rate, swap_nibbles=True,
         )
     for smp in spcm_smps:
         smp_ptrs.append(len(b))

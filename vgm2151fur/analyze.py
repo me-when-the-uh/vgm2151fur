@@ -30,7 +30,7 @@ from vgm2151fur.c352 import (
     merge_step_writes as c352_merge_steps,
 )
 from vgm2151fur.fm import (
-    CARRIERS, FMPatch, OpRegs, OPN_CARRIERS, carriers_for,
+    CARRIERS, FMPatch, OpRegs, OPN_CARRIERS, OPM_OP_TO_MASK, carriers_for,
 )
 from vgm2151fur.k053260 import (
     K053260_REFIT_SAMPLES,
@@ -2943,10 +2943,15 @@ def analyze(
         if mask != 0xF:
             # An un-keyed operator never starts its envelope. Maximum
             # attenuation (TL 127) is the closest a static OPM instrument gets.
+            # The mask bit that keys an operator is not the operator number:
+            # the $08 SS bits run S1,S3,S2,S4 (see OPM_OP_TO_MASK), so reading
+            # them in order blanks the wrong pair and can leave a voice whose
+            # every carrier is silent.
             snap.ops = tuple(
                 OpRegs(
                     dt_mul=op.dt_mul,
-                    tl=0x7F if not mask & (1 << i) else op.tl,
+                    tl=(0x7F if not mask & (1 << OPM_OP_TO_MASK[i])
+                        else op.tl),
                     ks_ar=op.ks_ar,
                     am_d1r=op.am_d1r,
                     dt2_d2r=op.dt2_d2r,
