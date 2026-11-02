@@ -18,13 +18,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 # YM2151 (OPM) carrier sets in its register order (0x40/0x48/0x50/0x58).
-# Algorithms 0-3 are chains ending on op4, 4 splits into two pairs, 5 and 6
-# add op1-fed carriers, 7 is additive. Algorithm 4 outputs on op1 and op3,
-# not the op2/op4 pair OPN's numbering gives it. Batrider's "Flashback" keys
-# a CON=4 voice with `$64=19, $74=06` on op1/op3 and `$6C=7F, $7C=7F` on the
-# rest. Under the op2/op4 reading its carriers all sit at 7F, and an audible
-# voice is reported silent. The register order here is plain S1..S4 (see
-# OPM_OP_TO_MASK). Indices are slot numbers minus one.
+# Algorithms 0-3 are chains ending on op4, 5 and 6 add op1-fed carriers, 7 is
+# additive. Algorithm 4 outputs on op3 and op4. Across 49 YM2151 rips every
+# mid-note TL automation is on that pair, always together, and a driver
+# automates what the platform scales. The register order is plain S1..S4 (see
+# OPM_OP_TO_MASK), so indices are slot numbers minus one.
 CARRIERS = {
     0: (3,),
     1: (3,),
@@ -91,6 +89,26 @@ def carriers_for(alg: int, opn: bool, opl: bool = False, four: bool = False) -> 
 # while DivInstrumentFM/OpRegs store the operators in register order
 # S1,S3,S2,S4.  Index by *register* operator: which mask bit enables it.
 OPN_OP_TO_MASK = (0, 2, 1, 3)
+
+# Ext channel-3 layout: which ops[] entry an operator column plays.
+# DivPlatformYM2203Ext::dispatch maps its four columns (channels 2..5) as
+# `int ch = c.chan - 2; int ordch = orderedOps[ch];` and writes the volume
+# column's scaling to `chan[2].state.op[ordch]`. Channel 3 (column 1) therefore
+# plays ops[2], not ops[1]. orderedOps is {0,2,1,3} in fmsharedbase.h.
+# DIV_CMD_VOLUME applies scaling unconditionally, so every column's level is
+# reachable through its own volume. DIV_CMD_FM_TL gates on KVS. The tuple
+# matches OPN_OP_TO_MASK but means operator indices per column, not mask bits
+# per operator.
+OPN_ORDERED_OPS = (0, 2, 1, 3)
+
+
+def opn_tl_op(reg: int) -> int:
+    """Return the ops[] index a channel-3 TL write names.
+
+    Pages advance by four within the channel, so $42/$46/$4A/$4E are
+    S1/S3/S2/S4 = ops[0..3].
+    """
+    return (reg >> 2) & 0x03
 
 # The YM2151 key-on byte is twisted the same way: DivPlatformArcade::
 # commitState composes it as (op[0]?1)|(op[2]?2)|(op[1]?4)|(op[3]?8). Bit1 of
