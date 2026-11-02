@@ -92,6 +92,32 @@ def staircase(start: int, steps: int = 20, *, step_samples: int = 500,
     return out
 
 
+def climb(start: int, semitones: int = 8, *, step_samples: int = 60,
+          kc: int = 0x40, kf: int = 0x14,
+          ch: int = 0) -> list[tuple[int, int, int]]:
+    """KC writes climbing whole semitones a few samples apart.
+
+    A bend this steep is what a driver writes to sweep a voice up from its
+    key-on, and it puts most of the travel inside the first row.
+    """
+    from vgm2151fur.analyze import kc_kf_units
+
+    def kc_for(units: int) -> int | None:
+        for code in range(256):
+            if kc_kf_units(code, kf) == units:
+                return code
+        return None
+
+    base = kc_kf_units(kc, kf)
+    out: list[tuple[int, int, int]] = []
+    for i in range(1, semitones + 1):
+        code = kc_for(base + 64 * i)
+        if code is None:
+            break
+        out.append((start + i * step_samples, 0x28 | ch, code))
+    return out
+
+
 @contextlib.contextmanager
 def inject_rows(song, plan: list[tuple[int, int, int]], key_on: int):
     """Add (row offset, effect, value) columns to the note's rows.

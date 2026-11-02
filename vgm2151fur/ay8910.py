@@ -115,9 +115,21 @@ class AyOff:
     voice: int
 
 
+# The mixer's power-up value on a real AY is undefined, and an image that zeroes
+# it enables *noise* on all three voices at noise period 0. Drivers playing a
+# pitched note usually write pitch and volume some samples before their first
+# $07, so that phantom default turns a song's opening notes into tone-plus-hiss.
+# Start tone-only with noise off: it matches the first mixer byte these drivers
+# go on to write ($BA / $B8 - noise disabled on every voice), and a driver that
+# really wants noise says so in that write. Every other register stays at reset.
+REG_MIXER_DEFAULT = 0x38
+
+
 def _blank_chip() -> dict:
+    reg = [0] * 16
+    reg[REG_MIXER] = REG_MIXER_DEFAULT
     return {
-        "reg": [0] * 16,
+        "reg": reg,
         "active": [None] * AY_VOICES,
     }
 

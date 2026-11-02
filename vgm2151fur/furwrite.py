@@ -448,6 +448,40 @@ def _write_ma(b: Buf, patch=None) -> None:
     b.b[size_off:size_off + 2] = int(len(b.b) - start).to_bytes(2, "little")
 
 
+def _write_op_ma(b: Buf, op_index: int, values: tuple[int, ...],
+                 speed: int) -> None:
+    """An ``O1``..``O4`` feature: the macro list of one operator.
+
+    Furnace reads these in ``DivInstrument::readFeatureOx`` and applies code 6
+    (``DIV_MACRO_OP_TL``). There is no delay concept for an operator macro: it
+    starts running at the key-on, entry by entry every ``speed`` ticks and holding
+    its last value after that, so the first entry is the level the note attacks
+    with. For an operator without ``kvs`` the register write is `$4n = op.tl`,
+    straight through - that is what makes a scripted modulator reachable at all,
+    since the volume column scales only a KVS operator.
+
+    The stored number is a **level in Furnace's seven-bit domain, not the
+    attenuation**: measured through the console build, a stored byte S reaches the
+    chip as `$4n = 63 - (S & 63)`, and an editor shows `127 - S`. The model above
+    speaks `$4n` (0..63 on an OPL), so `127 - $4n` is written: the register gets
+    the logged attenuation *and* the editor reads 0..63. Writing `63 - $4n` plays
+    the same only because bit 6 is discarded, and then the editor shows 90-103 for
+    a level of 26-37. Only macros that are present are read; the list ends at 255.
+    """
+    if not values:
+        return
+    stored = [127 - (v & 0x3F) for v in values]
+    b.raw(f"O{op_index + 1}".encode("ascii"))
+    size_off = len(b.b)
+    b.u16(0)
+    start = len(b.b)
+    # if you update the macro header, update this length as well (Furnace: 8)
+    b.u16(8)
+    _write_macro(b, 6, stored, speed=speed)
+    b.u8(255)  # stop
+    b.b[size_off:size_off + 2] = int(len(b.b) - start).to_bytes(2, "little")
+
+
 def _write_ins_opm(b: Buf, name: str, patch) -> None:
     """INS2 for an FM instrument of any family.
 
@@ -469,6 +503,8 @@ def _write_ins_opm(b: Buf, name: str, patch) -> None:
     b.b[na_size:na_size + 2] = int(len(b.b) - na_start).to_bytes(2, "little")
     _write_fm_feature(b, patch)
     _write_ma(b, patch)
+    for oi, values, speed in getattr(patch, "op_tl_macro", ()) or ():
+        _write_op_ma(b, oi, values, speed)
     b.raw(b"EN")
     b.end_block(size_off, start)
 
@@ -732,19 +768,24 @@ def _write_sample(b: Buf, name: str, pcm7: bytes, c4_rate: int, volume_scale: fl
 
 def _write_vox(
     b: Buf, name: str, data: bytes, c4_rate: int, *,
-    nibble_count: bool = False, swap_nibbles: bool = False,
+    swap_nibbles: bool = False,
 ) -> None:
-    """VOX ADPCM. MSM6295 stores a byte count; MSM6258 stores a nibble count.
+    """VOX ADPCM. The stored length is a *nibble* count, never a byte count.
 
-    Furnace sets lengthVOX to (samples+1)/2 and plays that many bytes, and
-    its MSM6258 core swaps nibbles again before okim6258::data_w (low nibble
-    first). A nibble count plus one swap makes the chip see the VGM byte.
-    MSM6295 copies dataVOX into ROM with no swap, so it keeps the byte count.
+    `DivSample::initInternal` (sample.cpp) treats DIV_SAMPLE_DEPTH_VOX the same
+    for every chip: `lengthVOX = (count + 1) / 2` bytes are allocated and read.
+    Declaring the byte count therefore throws away the back half of the sample -
+    a 15,149-byte banked MSM6295 voice came back as 7,575 and stopped mid-word.
+    Write the nibble count (twice the payload) so all of it survives.
+
+    The MSM6258 core additionally swaps nibbles before `okim6258::data_w` (low
+    nibble first), so its payload is pre-swapped; MSM6295 copies dataVOX to ROM
+    as it stands.
     """
     stored = data
     if swap_nibbles:
         stored = bytes((((x & 0x0F) << 4) | (x >> 4)) & 0xFF for x in data)
-    count = len(stored) * 2 if nibble_count else len(stored)
+    count = len(stored) * 2
     size_off, start = b.begin_block(b"SMP2")
     b.strz(name)
     b.u32(count)
@@ -1311,6 +1352,15 @@ def _emit_steps(
             semis = int(math.floor((desired - lo_units) / 64.0))
         else:
             semis = 0
+        # The range correction above is the *minimum* that fits, which parks E5
+        # on its edge. A residual of whole semitones belongs in the transpose:
+        # E5 at its limit has no room left to carry a later step or to correct a
+        # ramp's rounding on this channel, and the note then holds off pitch.
+        rest = desired - 64 * semis
+        if rest and rest % 64 == 0:
+            extra = int(rest / 64)
+            if abs(semis + extra) <= 15:
+                semis += extra
         if semis:
             if cur_row in e8_rows:
                 # This row already carries a chunk; a second E8 would
@@ -1685,10 +1735,20 @@ def _emit_sweep(
                   max(0, bisect_left(step_times, re_full)
                       - bisect_left(step_times, rs) - 1))
             first_row = seg_i == 0 and k == 0
+            cell_k = grid[ev.ch].get(row0 + k)
+            # A row runs its effects from the tick its ED delay names. When no
+            # slide is already carrying the voice into this row, that late start
+            # is also where its travel begins: the engine applies the rate once
+            # per tick from the delay to the end of the row, so the row is worth
+            # (speed - ed) ticks however far inside it the key-on sits. Rating it
+            # by the wall clock between the key-on and the row end under-delivers
+            # a fast bend, and the voice then holds flat for its whole note. A row
+            # a running rate enters keeps its full span: those first ticks move
+            # at the old rate, so the row still travels.
+            ed = _cell_ed(cell_k) if last_rate == 0 else 0
             t_eff = start if first_row else rs
             want = 0.0 if first_row else traj_run(int(rs + tick))
             cur = pitch_now()
-            cell_k = grid[ev.ch].get(row0 + k)
             if abs(want - cur) >= 6:
                 if cell_k is None or not (0 <= cell_k.note < 180):
                     # A later note's E5 sets its own attack and wins its row.
@@ -1701,6 +1761,10 @@ def _emit_sweep(
             # rated over its full span against the held value.
             is_last = k == k_last
             span = (re_full - t_eff) / tick if is_last else (re - t_eff) / tick
+            if ed:
+                # The ticks the row actually sounds, not the ones its wall-clock
+                # length suggests.
+                span = float(song.speed - ed)
             want_end = (
                 0.0 if (first_row and ev.pcm)
                 else traj_run(int(re_full if is_last else re))
@@ -3400,8 +3464,7 @@ def write_fur(
     for smp in adpcm_smps:
         smp_ptrs.append(len(b))
         _write_vox(
-            b, smp.name, smp.data, smp.rate,
-            nibble_count=True, swap_nibbles=True,
+            b, smp.name, smp.data, smp.rate, swap_nibbles=True,
         )
     for smp in spcm_smps:
         smp_ptrs.append(len(b))

@@ -20,12 +20,12 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from _synth import inject_rows, note_song, staircase  # noqa: E402
+from _synth import climb, inject_rows, lattice, note_song, staircase, vgm  # noqa: E402
 from vgm2151fur.analyze import analyze, kc_kf_units  # noqa: E402
 from vgm2151fur.diag import kc_kf_stream, register_writes, state_at  # noqa: E402
 from vgm2151fur.furnace import find_furnace, export_vgm  # noqa: E402
 from vgm2151fur.furwrite import write_fur  # noqa: E402
-from vgm2151fur.vgm import load_vgm  # noqa: E402
+from vgm2151fur.vgm import ChipWrite, load_vgm  # noqa: E402
 
 TMP = Path(tempfile.gettempdir()) / "vgm2151fur_roundtrip"
 TMP.mkdir(exist_ok=True)
@@ -92,6 +92,42 @@ class TestLfoEffects(unittest.TestCase):
         self.assertIn((0x19, 0x11), values)  # AMD plain
 
 
+BEND_CH = 4
+BASE_KC = 0x3E        # the key code the bend climbs from
+
+
+def _bend_song(key_on: int, *, semitones: int = 8, step_samples: int = 130):
+    """One note on channel 4 that bends up steeply from its own key-on.
+
+    The steps run past the end of the first row, which is what makes that row's
+    tick count matter: a bend that finishes inside one clipped row hides the
+    error. The voice is written here rather than taken from `_synth.PATCH`, whose
+    block carries its own KC/KF, and channel 0 belongs to the key-on heartbeat.
+    """
+    writes = list(lattice(80))
+    regs = [(0x20 | BEND_CH, 0xC7)]                    # RL both, fb 7, alg 7
+    for op in range(4):
+        regs.append(((0x40 + 8 * op) | BEND_CH, 0x11))  # DT1 / MULT
+        regs.append(((0x60 + 8 * op) | BEND_CH, 0x20))  # TL
+        regs.append(((0x80 + 8 * op) | BEND_CH, 0x1F))  # KS / AR
+        regs.append(((0xA0 + 8 * op) | BEND_CH, 0x05))  # AM / D1R
+        regs.append(((0xC0 + 8 * op) | BEND_CH, 0x00))  # DT2 / D2R
+        regs.append(((0xE0 + 8 * op) | BEND_CH, 0x5F))  # D1L / RR
+    for reg, val in regs:
+        writes.append(ChipWrite(key_on - 100, "ym2151", 0, reg, val))
+    writes.append(ChipWrite(key_on - 50, "ym2151", 0, 0x28 | BEND_CH, BASE_KC))
+    writes.append(ChipWrite(key_on - 50, "ym2151", 0, 0x30 | BEND_CH, 0x00))
+    writes.append(ChipWrite(key_on, "ym2151", 0, 0x08, 0x78 | BEND_CH))
+    bend = climb(key_on + 30, semitones=semitones, step_samples=step_samples,
+                 kc=BASE_KC, kf=0x00, ch=BEND_CH)
+    for sample, reg, val in bend:
+        writes.append(ChipWrite(sample, "ym2151", 0, reg, val))
+    writes.append(ChipWrite(bend[-1][0] + 40_000, "ym2151", 0, 0x08, BEND_CH))
+    writes.sort(key=lambda w: w.sample)
+    v = vgm(writes)
+    return analyze(v, pcm=False), v, bend
+
+
 @unittest.skipUnless(HAVE_FURNACE, "furnace console build missing")
 class TestSweepModel(unittest.TestCase):
     """The slide model has to track what the engine actually plays.
@@ -121,6 +157,49 @@ class TestSweepModel(unittest.TestCase):
         self.assertLessEqual(
             abs(delta), 8,
             f"pitch drifted {delta} units ({delta / 64:.2f} st) after the climb",
+        )
+
+    def test_bend_on_a_delayed_key_on_lands_on_pitch(self):
+        """A steep bend whose row starts late still reaches its pitch.
+
+        A row runs its effects from the tick its own ED delay names. When a
+        key-on lands between two ticks the delay rounds up, so the engine starts
+        the slide later than the key-on sample and has fewer ticks to travel;
+        rating the row from the key-on under-delivers the climb. Nothing notices
+        afterwards, because every later row is measured against what the model
+        believes it wrote, so the note holds flat until its next key-on. This is
+        the shape "04 Blue Flight" plays on FM3 and FM4: a sweep of two and a
+        half octaves from the key-on whose export sat about two semitones low.
+        """
+        # Learn the grid from the heartbeat, then land the key-on six-tenths of a
+        # tick past a boundary four ticks into a row. ED rounds up to 4, so the
+        # engine has three ticks to travel where the row looks like 3.4.
+        probe = analyze(note_song(key_on=60_000, key_off=160_000), pcm=False)
+        tick = probe.samples_per_row / probe.speed
+        row0 = probe.place(60_000)[0]
+        key_on = int(probe.t0 + ((row0 + 3) * probe.speed + 3.6) * tick)
+        song, src_vgm, bend = _bend_song(key_on)
+        row1, ed1 = song.place(key_on)
+        ev = next(e for e in song.events if e.on and e.ch == BEND_CH)
+        self.assertTrue(ev.sweep, "the bend should stay a ramp")
+        span_model = ((song.t0 + (row1 + 1) * song.samples_per_row) - key_on) / tick
+        self.assertGreater(span_model - (song.speed - ed1), 0.3,
+                           f"no tick to lose: model {span_model:.2f}, "
+                           f"engine {song.speed - ed1}")
+
+        export = _export(song, "delayed_bend", key_on=key_on)
+        src_stream = kc_kf_stream(src_vgm, BEND_CH)
+        exp_stream = kc_kf_stream(export, BEND_CH)
+        t_end = bend[-1][0] + 6000
+        src_pitch = state_at(src_stream, t_end)
+        exp_pitch = state_at(exp_stream, t_end)
+        self.assertIsNotNone(src_pitch)
+        self.assertIsNotNone(exp_pitch)
+        delta = exp_pitch - src_pitch
+        self.assertLessEqual(
+            abs(delta), 8,
+            f"a bend on a row delayed {ed1} ticks landed {delta} units "
+            f"({delta / 64:.2f} st) off its held pitch",
         )
 
 

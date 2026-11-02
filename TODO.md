@@ -49,3 +49,27 @@ Remaining:
 - `test_loopfind.py` still exposes the old within-bar `_phase_loop` and
   `_phrase_seam` helpers. Production `apply_loop` does not use them. Remove
   them or make the meter search use them.
+
+## Operator macros beyond the level
+
+A modulator `$4n` that the log moves under a held note now travels as that
+operator's TL macro: captured in `_collect_opl`, cut onto a `+lvl` instrument copy
+by `_bind_op_macros`, inverted by `furwrite._write_op_ma`, and described with its
+measured numbers in `docs/opl.md` ("Operator macros"). Verified through the
+bundled console build on two Tyrian rips: 6,358 of 7,046 and 13,253 of 15,222
+mid-note operator level writes reach the chip, where before none did.
+
+Remaining:
+
+- Drive the other fields the same way - `$6n` (AR, DR), `$8n` (SL, RR) and the
+  OPL2/OPL3 waveform - using `DivMacroTypeOp` codes 1, 2, 4, 5 and 18. Those
+  writes still wait for the next key-on and are counted in the report (36 on
+  `21 Come Back to Me, Savara`). Measure each code's polarity, mask and hold
+  behaviour against the player before encoding it: TL turned out to store a level,
+  not an attenuation (`$4n = 63 - value`), and only a round trip showed that.
+- An envelope rate written to a keyed operator does not restart its generator, so
+  confirm what the player actually does with mid-note AR/DR entries - whether the
+  running envelope takes the new rate or it waits for the next release.
+- The key-on audit and the `keys`/`miss` counts say nothing about operator macros.
+  The instrument listing shows `op1 $4n x168@2t`; a per-track total would make
+  the difference visible without reading every patch.

@@ -20,12 +20,21 @@ from dataclasses import dataclass
 # YM2151 (OPM) carrier sets in its register order (0x40/0x48/0x50/0x58).
 # Algorithms 0-3 are chains ending on op4, 4 splits into two pairs, 5 and 6
 # add op1-fed carriers, 7 is additive.
+#
+# Algorithm 4 outputs on op1 and op3, not the op2/op4 pair OPN's numbering
+# gives it. Armed Police Batrider's "Flashback" proves it from the wire: its
+# ch4/ch5 voice is CON=4 with `$64=19, $74=06` (real levels) and `$6C=7F,
+# $7C=7F`, keyed by the SS bits that compose to op1+op3. With carriers taken as
+# op2/op4, `carrier_tl()` is 7F and the converter calls a perfectly audible
+# voice silent - and derives its mid-note fades from two operators that never
+# move. The register order here is plain S1..S4 (see OPM_OP_TO_MASK), so the
+# indices are slot numbers minus one.
 CARRIERS = {
     0: (3,),
     1: (3,),
     2: (3,),
     3: (3,),
-    4: (1, 3),
+    4: (0, 2),
     5: (1, 2, 3),
     6: (1, 2, 3),
     7: (0, 1, 2, 3),
@@ -86,6 +95,15 @@ def carriers_for(alg: int, opn: bool, opl: bool = False, four: bool = False) -> 
 # while DivInstrumentFM/OpRegs store the operators in register order
 # S1,S3,S2,S4.  Index by *register* operator: which mask bit enables it.
 OPN_OP_TO_MASK = (0, 2, 1, 3)
+
+# The YM2151 key-on byte is twisted the same way: ``DivPlatformArcade::
+# commitState`` composes it as ``(op[0]?1)|(op[2]?2)|(op[1]?4)|(op[3]?8)`` and
+# writes ``($08 = opMask << 3 | channel)``, so bit1 of the logged mask enables
+# operator 3 and bit2 enables operator 2. Its *register* pages are plain S1..S4
+# (``$60/$68/$70/$78`` = TL of op1..op4), unlike OPN, but the mask->operator
+# table is identical. Read as identity, a voice keyed on op1+op3 blanks op3 and
+# keeps op2 - an instrument whose carriers all sit at TL 7F, i.e. silence.
+OPM_OP_TO_MASK = (0, 2, 1, 3)
 
 
 @dataclass
@@ -156,6 +174,18 @@ class FMPatch:
     pitch_macro: tuple[int, ...] = ()
     pitch_speed: int = 1
     pitch_loop: int = 255
+    # OPL only: per-operator output level automation, as the log wrote it.
+    # Entries are ``(operator index, values, speed)``: running from the key-on,
+    # the operator takes one entry of `values` every `speed` ticks and then holds
+    # its last, each entry an absolute `$4n`. An operator macro has no delay of
+    # its own - it starts with the note - so a level that first moves several
+    # ticks in repeats its starting entry across that hold. The volume column
+    # reaches only an operator marked KVS, so a driver that scripts a modulator's
+    # level has no other way to say it: the voice would play one bright or dull
+    # colour where the chip moved. Furnace reads these from an ``O1``..``O4``
+    # feature, macro code 6 (DIV_MACRO_OP_TL), and a non-KVS operator writes the
+    # value straight to ``$4n``.
+    op_tl_macro: tuple[tuple[int, tuple[int, ...], int], ...] = ()
 
     def identity(self) -> tuple:
         """Cluster key: full timbre including carrier TLs.
