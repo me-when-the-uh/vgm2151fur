@@ -153,7 +153,56 @@ routing doesn't swallow the YM2612 side when both are present.
 - Env var `VGM2151FUR_FURNACE=D:\Projects\Forks\vgm2151fur\furnace\furnace.exe`
   (Furnace-gated tests silently skip without it).
 
-## Build order
+## Empirical OPLL .fur layout (from `D:\Downloads\euress opll.fur`, verified
+2026-11: Furnace re-exports it **byte-exact** to the source VGM via
+`tools/fur2vgm.py`, 0 diff runs, equal loop and totals)
+
+- `INS2` record: **u16** fur version, then u8 type byte. The OPLL voices in
+  the reference are stored with the FM "FM" feature at **36 bytes = opCount
+  4 slots x 8 + four header bytes** (Furnace keeps four op rows; the engine
+  custom path reads only op[0]/op[1]). Preset lives in FM byte3 bits 0-4
+  (`(fms<<7)|(ams<<6)|(four<<5)|preset`; opllPreset==0 means custom bank).
+  The earlier "version=140 type=0" note here was a mis-offset read of the
+  u16 - corrected; re-dump if it matters. Verify every byte against the
+  Furnace-authored reference module before trusting any of this.
+- LD feature seen on these instruments: `00 20 05 50 05 c0 01` - drum fixed
+  frequencies (kickFreq/snareHatFreq/tomTopFreq) stored 16-bit; irrelevant
+  for melodic OPLL but must be reproduced when a module has drums.
+- The author's module is 1 chip `0x89`; `n_ch` in INFO was 1 channel while
+  the system offers 9 - our furio CHIP_CHANNELS needs `{0x89: 9, 0xa7: 11}`.
+
+## Furnace internal facts confirmed by the platform map (2026-11)
+
+- Rhythm ROM is compiled into Furnace (`platform/sound/rss.h`, 8 KiB
+  `YM2608_ADPCM_ROM`), with per-voice start/end hardcoded for the ymfm
+  core (`ymfm_opn.cpp:1005-1011`); LLE keeps a nibble-swapped copy.
+  => the converter ships no rhythm samples, exactly as djtub said.
+- Rhythm engine writes: `$56 reg $10` key mask (bit7=1 => those bits go
+  OFF), `$56 $11` global level, `$18+d` per-voice `(pan<<6)|vol`.
+  Channel map for our writer: dispatch 9..14 = BD SD TP HH TM RM,
+  `DIV_CH_NOISE`, instrument type DIV_INS_ADPCMA (sample ignored).
+- ADPCM-B is on bus **B** $100-$10F (opposite of YM2610); start/end in
+  32-byte units at $102-$105, freq $109/10A, vol $10B. Furnace exports
+  its RAM as data block type 0x81 - our parser already ingests that.
+- Ext channel: enable = write $56 reg $27 bit 0x40 (same trick as YM2203/
+  YM2612 - our ym2612.py already carries the ext detector).
+- YM3812 and YM2612 can coexist in one machine (no compound check beyond
+  count limits; max two instances of any family on export).
+
+## Milestones remaining (in order)
+
+1. analyze: `opll` stream -> Song with DIV_INS_OPLL instruments;
+   preset/custom interning honoring the single custom-slot aliasing.
+2. furwrite/furio: chip 0x89 (OPLL) emission + parse tables; round-trip
+   `euress opll.vgm` against its own .fur export as oracle (byte diff).
+3. analyze: YM2608 FM/SSG/ext via a banked-OPN state machine (reuse the
+   YM2612 decode with bus-bit mapping), rhythm events from $56 $10/$11/
+   $18-d, ADPCM-B from bus B ($100-..) reusing ym2610.py delta-T.
+4. furwrite: 0x8e + rhythm channel defs (ADPCMA dummy ins) + ADPCMB.
+   Oracle: N.G. vgm round trip incl. its 0x81 blocks and $57 traffic.
+5. OPLL_DRUMS when a stream uses $0E; then madou _38 (OPLL+AY) covers
+   two-chip machines in this repo's writer for the first time.
+6. z66: DAC stream + OPL2+YM2612 coexistence verification in one module.
 
 1. `vgm.py`: `$56/$57/A6/A7` -> writes `ym2608`/`ym2608_ssg`, clock 0x48 +
    dual, block 0x81; `$51` -> `ym2413` writes (clock 0x10 + dual bit via
