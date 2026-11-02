@@ -115,13 +115,12 @@ class AyOff:
     voice: int
 
 
-# The mixer's power-up value on a real AY is undefined, and an image that zeroes
-# it enables *noise* on all three voices at noise period 0. Drivers playing a
-# pitched note usually write pitch and volume some samples before their first
-# $07, so that phantom default turns a song's opening notes into tone-plus-hiss.
-# Start tone-only with noise off: it matches the first mixer byte these drivers
-# go on to write ($BA / $B8 - noise disabled on every voice), and a driver that
-# really wants noise says so in that write. Every other register stays at reset.
+# The mixer's power-up value is undefined on a real AY. A zeroed image
+# enables noise on all three voices, which turns a song's opening notes into
+# tone-plus-hiss wherever the driver writes pitch and volume before its
+# first $07. Tone-only (this value) matches the first mixer byte those
+# drivers write ($BA / $B8, noise disabled on every voice). A driver that
+# wants noise says so there. Every other register stays at reset.
 REG_MIXER_DEFAULT = 0x38
 
 

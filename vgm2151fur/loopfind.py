@@ -93,7 +93,7 @@ def _clock(notes: list[tuple[int, int, int]]) -> _Clock | None:
 
 def _better_clock(rec, best) -> bool:
     """Prefer the even voice. A regularity gap inside the tolerance loses to
-    the voice with more on-grid gaps, so the pulse is the dense one."""
+    the voice with more on-grid gaps. The pulse is the dense one."""
     reg, count = rec[0], rec[1]
     best_reg, best_count = best[0], best[1]
     if reg > best_reg + REG_TOLERANCE:
@@ -344,7 +344,7 @@ def _snap_empty_marker(notes, loop_row: int, end_row: int, step: int) -> LoopFix
     if hits < 2 or chord < 1:
         return None
     # A row before the commands, unless one row is a whole pulse. The end
-    # moves with the start, so the played span keeps its length.
+    # moves with the start, and the played span keeps its length.
     start = chord - CUT_ROWS if step > 1 else chord
     if start < 0:
         start = 0
@@ -388,7 +388,7 @@ def _phase_loop(
         grid, echoes, lead, loop_beat, end_beat, period,
     )
     # A non-zero vote must clear the runner-up and the phase the marker is
-    # on. Confirming the current phase does not, so a lead entry can still
+    # on. Confirming the current phase does not, and a lead entry can still
     # move the loop.
     vote_ok = vote != 0 and margin >= MIN_VOTE_MARGIN and gain >= MIN_PHASE_GAIN
     shift = _entry_shift(grid, lead, loop_beat, period)
@@ -404,7 +404,7 @@ def _phase_loop(
             shift = None
     if shift is not None and vote_ok and shift != vote:
         shift = None
-    # Shift 0 is a confirmed downbeat, so the order still opens a few rows
+    # Shift 0 is a confirmed downbeat, and the order still opens a few rows
     # early. A vote that did not clear the bar is not that confirmation: the
     # marker stays where the VGM put it.
     confirmed = vote_ok or (vote == 0 and margin >= MIN_VOTE_MARGIN)
@@ -516,7 +516,7 @@ def _best_return(bits, wide, start: int, end_row: int, lo: int, hi: int, width: 
     The comparison window has to fit completely inside the track: a copy
     clipped by the end of the log would be scored over fewer rows and can
     beat a real seam. A module already cut at its loop end has no complete
-    copy inside the track, so its loop is left alone.
+    copy inside the track, and its loop is left alone.
     """
     best_score = 0.0
     best_at = None
@@ -545,7 +545,7 @@ def _attack_agrees(by, command: int, ret: int, pedals: set[int]) -> int:
 
 
 # The cut may move this many rows either way when a different seat makes the
-# rows across the seam agree exactly. The end moves with the start, so the
+# rows across the seam agree exactly. The end moves with the start, and the
 # played length never changes.
 SEAT_SHIFT = 2
 # Rows after the seam the seat compares. The attack is what the ear follows,
@@ -565,7 +565,7 @@ def _exact_rows(notes: list[tuple[int, int, int]]) -> dict[int, set[tuple[int, i
 def _seat_cost(exact, start: int, end: int) -> int:
     """Voices that play on one side of the seam but not the other.
 
-    The jump sits on `end`, so the row after it must be the loop's first
+    The jump sits on `end`, and the row after it must be the loop's first
     row. The rows have to agree at the row here, not a couple of rows off:
     this measures what the module plays, while the fuzzy match only finds
     the seam.
@@ -711,9 +711,9 @@ def _phrase_seam(
         return None
     start = max(0, command - CUT_ROWS) if step > 1 else command
     # Played length equals the distance between the two copies of the chord,
-    # so the jump lands on the early row and the chord is not struck twice.
-    # The end follows the start: both ends move by the same amount, so the
-    # seam stays continuous (the row after the end copies the loop's first
+    # and the jump lands on the early row, where the chord is not struck twice.
+    # The end follows the start: both ends move by the same amount. The seam
+    # stays continuous (the row after the end copies the loop's first
     # row) and the played span keeps its length.
     end = start + (ret - command) - 1
     if end <= start or end > end_row or start > end_row:

@@ -117,7 +117,7 @@ unit = table[note % 12] + ((diff[note % 12] * (offset & 127)) >> 7)   after shif
 
 and `DivPlatformOPL::toFreq` splits it into block and f-num: the block is
 `(unit / 686).bit_length()` when that quotient is non-zero (Furnace's `bsr`
-counts bits, so it names one higher than the highest set bit), and f-num is what
+counts bits and names one higher than the highest set bit), and f-num is what
 is left after shifting. Two consequences that matter to a conversion:
 
 - Only the product `fnum << block` sets the frequency. A rip may hold a register
@@ -177,20 +177,20 @@ Tyrian's engine scripts the **modulator** output level (`$4n`) hundreds of times
 per channel while a note holds. On `14 Gyges, Will You Please Help Me` the four
 channels sharing one voice each take ~1,750 mid-note `$4n` writes with the carrier
 almost still; on `21 Come Back to Me, Savara` channels 3-5 take 3,021 / 3,191 /
-4,566 against two carrier writes. That register *is* the modulation index, so a
-frozen one sounds like brightness that never evolves - and it hides from any
+4,566 against two carrier writes. That register *is* the modulation index. A
+frozen one sounds like brightness that never evolves, and it hides from any
 attack-time check, because every byte written at key-on was correct.
 
 The volume column cannot carry it: `opl.cpp` scales only an operator that is both
-marked KVS and an output (its `KVSL` macro), so a modulator has no path at all.
+marked KVS and an output (its `KVSL` macro). A modulator has no path at all.
 Furnace's per-operator macros do. Each operator keeps its own macro list in an
 `O1`..`O4` feature, and code 6 (`DIV_MACRO_OP_TL`) is applied as
 `op.tl = val & 63`; for a non-KVS operator the register write is
-`op.tl | op.ksl << 6`. So far so direct - but pushing a ramp
+`op.tl | op.ksl << 6`. There is one measured surprise: pushing a ramp
 `3, 7, 11 ... 62` through the player came back as `$4n = 60, 56, 52 ... 1`.
 **The macro stores a level, not an attenuation**: up is louder. The writer
-inverts (`furwrite._write_op_ma`); everything above it, including `analyze`, keeps
-speaking `$4n`.
+inverts (`furwrite._write_op_ma`). Everything above it, including `analyze`,
+keeps speaking `$4n`.
 
 The other operator codes live in `DivMacroTypeOp` - 0 AM, 1 AR, 2 DR, 3 MULT,
 4 RR, 5 SL, 6 TL, and 15 KSL, 16 SUS, 17 VIB, 18 WS, 19 KSR. Today only TL is
@@ -199,16 +199,17 @@ applies at the next key-on, since Furnace rebuilds the voice from its instrument
 when the note starts; those writes are counted and reported ("N operator envelope
 or waveform write(s) landed inside a held note"), as is an `OPL3` mid-note
 waveform change (`2Axy`). Each of those codes needs its own measured polarity and
-mask before it can be trusted - the TL inversion is exactly that warning.
+mask before it can be trusted. The TL inversion is exactly that warning.
 
 `analyze._collect_opl` records `$4n` per operator while a voice sounds
 (`NoteEvent.opl_op_tl`, primed from the instrument at key-on so a stretch with no
 movement adds nothing), and `analyze._bind_op_macros` cuts the curve onto a copy of
 the instrument named `+lvl`: one entry every `speed` ticks, running from the
-key-on. An operator macro has **no delay** - it starts with the note, and Furnace
+key-on. An operator macro has **no delay**: it starts with the note, and Furnace
 ignores the field on these (measured: an entry list written with `delay=5` still
-stepped from tick zero) - so a level that first moves several ticks in repeats its
-starting entry across that hold, and the sweep's resolution pays for it. Speed is
+stepped from tick zero). A level that first moves several ticks in repeats its
+starting entry across that hold, and the sweep's resolution pays for those
+entries. Speed is
 the smallest that fits a macro's 255 entries - 1 to 5 ticks (2-10 ms) on these
 songs.
 

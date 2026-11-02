@@ -566,8 +566,8 @@ class TestKeyOnOperatorMask(unittest.TestCase):
             ChipWrite(sample=0, chip="ym2151", chip_id=0, reg=0x60 + op * 8 + self.CH, val=tl)
             for op, tl in enumerate((0x10, 0x20, 0x30, 0x40))
         ]
-        # The SS bits are the datasheet's S1,S3,S2,S4 register order, so a clear
-        # bit 2 releases operator 2 - not the third operator one would read from
+        # The SS bits are the datasheet's S1,S3,S2,S4 register order. A clear
+        # bit 2 releases operator 2, not the third operator one would read from
         # the bit position. See OPM_OP_TO_MASK and arcade.cpp's commitState,
         # which composes the byte as (op[0]?1)|(op[2]?2)|(op[1]?4)|(op[3]?8).
         writes += self._writes([(10, 0xB)], [1000])  # 1011: operator 2 un-keyed
@@ -581,8 +581,8 @@ class TestKeyOnOperatorMask(unittest.TestCase):
 
         Its four levels are written $64=19, $6C=7F, $74=06, $7C=7F with the
         carriers on op1 and op3 for CON=4. Reading the mask in bit order keys
-        op2 instead, so the converter parks op3 - the carrier with TL 06 and a
-        full envelope - at 7F and reports an audible instrument as silent.
+        op2 instead. The converter then parks op3, the carrier with TL 06 and
+        a full envelope, at 7F and reports an audible instrument as silent.
         """
         writes = [
             ChipWrite(sample=0, chip="ym2151", chip_id=0, reg=0x60 + op * 8 + self.CH, val=tl)

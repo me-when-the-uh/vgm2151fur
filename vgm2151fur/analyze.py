@@ -199,10 +199,10 @@ OPM_DEFAULT_CLOCK = 3579545
 _ONSET_MERGE_SAMPLES = 100
 
 # A driver that keys on with its carriers parked at TL 7F loads the voice's
-# real levels inside the same burst. Measured on the samples that do this, the
-# last operator write lands 1-3 samples after the key-on; one OPM register
-# write takes about 2 samples, so a burst no longer than a few writes is still
-# the same command. Anything wider is a genuine mid-note change.
+# real levels inside the same burst. Measured on the samples that do this,
+# the last operator write lands 1-3 samples after the key-on, and one OPM
+# register write takes about 2 samples. A burst no longer than a few writes
+# is still the same command. Anything wider is a genuine mid-note change.
 _OPM_BURST_LOAD_SAMPLES = 16
 
 
@@ -1744,12 +1744,11 @@ def _bind_op_macros(
 ) -> tuple[int, int]:
     """Turn a scripted operator level into that operator's macro.
 
-    A driver that moves an operator's ``$4n`` while its note sounds is drawing
-    the voice's colour over time: on FM that register is the modulator's output,
-    so it sets how much of the carrier each harmonic gets. Furnace cannot follow
-    it with the volume column, which reaches only an operator marked KVS, so the
-    curve travels as that operator's own macro (``O1``..``O4``, code 6) where the
-    platform assigns it as an absolute level. Returns ``(copies, skipped)``.
+    On FM the ``$4n`` register is the modulator's output and sets how much of
+    the carrier each harmonic gets. The volume column reaches only an
+    operator marked KVS. A scripted modulator level therefore travels as
+    that operator's own macro (``O1``..``O4``, code 6), which the platform
+    assigns as an absolute level. Returns ``(copies, skipped)``.
     """
     made = fallbacks = 0
     idx_map: dict[tuple, int] = {}
@@ -1790,10 +1789,11 @@ def _bind_op_macros(
             start = base.ops[oi].tl & 0x3F
             if (len(marks) == 1 and marks[0][1] == start):
                 continue          # nothing this operator ever moved
-            # An operator macro has no delay: it starts running at the key-on, so
-            # entry 0 is the level the note attacks with. Every tick before the
-            # first logged move therefore has to be written out as its own entry,
-            # and the resolution of the sweep is paid for with those entries.
+            # An operator macro has no delay: it starts running at the key-on,
+            # and entry 0 is the level the note attacks with. Every tick before
+            # the first logged move therefore has to be written out as its own
+            # entry, and the resolution of the sweep is paid for with those
+            # entries.
             values: list[int] = []
             mi = 0
             cur = start
@@ -2074,28 +2074,28 @@ def _collect_opl(
 ) -> tuple[dict, list[str]]:
     """Turn an OPL-family register stream into notes and instruments.
 
-    Channels are read through Furnace's own slot and channel tables, so a
-    converted voice lands on the column that drives the same operators: an OPL3
-    pairs its banks as (0,3), (1,4) and (2,5) per port, and rhythm mode takes
-    the last FM channels of bank A for the kit. Key state comes from where the
-    chip takes it - bit 5 of the channel's 0xBn register, or one latch bit of
-    0xBD - so a driver that keys a channel without touching its pitch still
-    starts a note, and a re-pitch with the key already down stays a bend inside
-    that note.
+    Channels are read through Furnace's own slot and channel tables. A
+    converted voice lands on the column that drives the same operators: an
+    OPL3 pairs its banks as (0,3), (1,4) and (2,5) per port, and rhythm mode
+    takes the last FM channels of bank A for the kit. Key state comes from
+    where the chip takes it: bit 5 of the channel's 0xBn register, or one
+    latch bit of 0xBD. A driver that keys a channel without touching its
+    pitch therefore still starts a note, and a re-pitch with the key already
+    down stays a bend inside that note.
 
     Returns counters for the report and the warnings the caller should show.
     """
     opl3 = kind == KIND_OPL3
     states = {cid: OPLState(kind, drums) for cid in ids}
     # Which Furnace channels a register drives. An OPL3 four-operator pair is
-    # keyed and tuned on its first channel but takes two operators from each,
-    # so one frequency register can belong to one voice and an operator
+    # keyed and tuned on its first channel but takes two operators from each.
+    # One frequency register can thus belong to one voice and an operator
     # register to that voice's third or fourth slot.
     freq_owners: dict[int, dict[int, list[int]]] = {}
     op_owners: dict[int, dict[int, list[int]]] = {}
     # Which operator *of the instrument* a slot register tunes. A four-operator
-    # voice takes its rows from both channels of the pair and Furnace walks them
-    # through orderedOpsL, so the row number is not the operator number there.
+    # voice takes its rows from both channels of the pair, and Furnace walks
+    # them through orderedOpsL: the row number is not the operator number there.
     op_index: dict[int, dict[tuple[int, int], int]] = {}
     # The operators one voice owns: (operator index, slot register base). Read at
     # key-on to prime the level curve without building a patch each time.
@@ -2144,8 +2144,8 @@ def _collect_opl(
     # Level of a kit operator when its note started: the column steps from here.
     tl_open: dict[tuple[int, int], int] = {}
     # Output level per operator of a sounding voice. The volume column only
-    # reaches an operator marked KVS, so a scripted modulator has to travel as an
-    # instrument macro instead; both are recorded, each on its own path.
+    # reaches an operator marked KVS. A scripted modulator has to travel as
+    # an instrument macro instead, and both are recorded, each on its own path.
     op_tl_pts: dict[tuple[int, int], dict[int, list[tuple[int, int]]]] = {}
     op_tl_last: dict[tuple[int, int, int], int] = {}
     off_idx: list[int] = []
@@ -2159,9 +2159,9 @@ def _collect_opl(
     def op_is_carrier(cid: int, fch: int, oi: int) -> bool:
         """Whether an operator reaches the output, i.e. rides the volume column.
 
-        Furnace scales a level by the channel volume only where `kvs==2` and the
-        operator is an output (opl.cpp KVSL), so this mirrors that test. A kit
-        column is one operator of its own and always counts as one.
+        Furnace scales a level by the channel volume only where `kvs==2` and
+        the operator is an output (opl.cpp KVSL). This mirrors that test. A
+        kit column is one operator of its own and always counts as one.
         """
         st = states[cid]
         if st.drums and fch > st.melodic:
@@ -2172,8 +2172,8 @@ def _collect_opl(
     def normalized_opl(patch: FMPatch) -> tuple[FMPatch, int]:
         """Carrier level out of the instrument and into the volume column.
 
-        Furnace scales an operator marked KVS by ``63 - clamp(vol - tl, 0, 63)``,
-        so putting the loudest carrier at 0 and its attenuation in the column
+        Furnace scales an operator marked KVS by ``63 - clamp(vol - tl, 0, 63)``.
+        Putting the loudest carrier at 0 and its attenuation in the column
         reproduces the logged register exactly while letting every note of one
         timbre share an instrument. Sixty-three is the top of an OPL column:
         `getVolMax` answers 63, and the platform masks the value to six bits.
@@ -2242,10 +2242,10 @@ def _collect_opl(
             if ev.drum:
                 # The kit shares one instrument across its four columns, and the
                 # platform writes an operator's logged level plus the column's
-                # move from the top, so a level step rides the column directly.
+                # move from the top. A level step rides the column directly.
                 shift = tl_open.pop(key, tl[0][1])
                 # A volume point is a triple: sample, column value and pan. The
-                # OPL has no per-point pan, so the last slot stays empty.
+                # OPL has no per-point pan, and the last slot stays empty.
                 ev.vol_pts = tuple(
                     (s, max(0, min(63, 63 + shift - value)), None)
                     for s, value in tl
@@ -2287,7 +2287,7 @@ def _collect_opl(
             ins=ins,
             vol=vol,
             e5=e5,
-            # The kit's own 0xCn bits mean nothing in rhythm mode, so a percussion
+            # The kit's own 0xCn bits mean nothing in rhythm mode. A percussion
             # column never gets a pan effect.
             pan=0 if kit else st.pan_byte(fch),
             sweep_div=2.0,
@@ -2302,11 +2302,12 @@ def _collect_opl(
         tl_pts[key] = []
         tl_last[key] = st.channel_tl(fch)
         tl_open[key] = tl_last[key]
-        # Prime each operator with the level its note starts on: a macro runs from
-        # the key-on, so entry zero has to be this value. Reading the register page
-        # rather than a snapshot keeps a held note from allocating a patch, and an
-        # operator the voice does not own is dropped with pop() so it cannot carry
-        # a stale level into the next note's entry zero.
+        # Prime each operator with the level its note starts on: a macro runs
+        # from the key-on, and entry zero is the level the note attacks with.
+        # Reading the register page rather than a snapshot keeps a held note
+        # from allocating a patch, and an operator the voice does not own is
+        # dropped with pop() to keep a stale level out of the next note's
+        # entry zero.
         op_tl_pts[key] = {}
         owned: set[int] = set()
         for oi, addr in chan_ops[cid].get(fch, ()):
@@ -2418,14 +2419,14 @@ def _collect_opl(
             st.write(port, r, val)
             was_on = bool(old & 0x20)
             is_on = bool(val & 0x20)
-            # The same byte carries the top two f-num bits, so a key-on row can
+            # The same byte carries the top two f-num bits. A key-on row can
             # also move the pitch of whatever voice this register tunes.
             chan_off = (port << 8) | (r - 0xB0)
             for fch in freq_owners[cid].get(chan_off, ()):
                 key = (cid, fch)
                 if drums and fch >= st.melodic:
-                    # Rhythm mode keys the kit through 0xBD, so this channel's
-                    # own key bit is only a pitch write here. A set bit while
+                    # Rhythm mode keys the kit through 0xBD. This channel's own
+                    # key bit is only a pitch write here. A set bit while
                     # rhythm is still off was a melodic voice with no column.
                     if is_on and not was_on and fch > st.melodic:
                         stats["lost_melodic"] += 1
@@ -2438,7 +2439,7 @@ def _collect_opl(
                     close_note(cid, fch, w.sample, off=True)
                 if key in held:
                     block, fnum = st.frequency(fch)
-                    # This write carries the top two f-num bits as well, so a held
+                    # This write carries the top two f-num bits as well. A held
                     # voice can move pitch here without any key transition.
                     if (block, fnum) != pitch_last[key]:
                         pitch_pts[key].append((w.sample, block, fnum))
@@ -2461,7 +2462,7 @@ def _collect_opl(
             continue
         slot = r & 0x1F
         if (r - slot) in (0x20, 0x40, 0x60, 0x80, 0xE0) and slot <= 0x15:
-            # Operator page. A slot's registers share their low five bits, so
+            # Operator page. A slot's registers share their low five bits:
             # 0x23, 0x43 and 0xE3 are one operator's AM/multiplier, level and
             # waveform byte. Only the level can be followed by the volume
             # column; an envelope or waveform write belongs to the instrument,
@@ -2475,8 +2476,8 @@ def _collect_opl(
                 for fch in owners:
                     if (cid, fch) in held:
                         # An envelope or waveform move belongs to the instrument,
-                        # and Furnace rebuilds a voice from it only at key-on, so
-                        # the next note takes these. A level (`$4n`) move is not
+                        # and Furnace rebuilds a voice from it only at key-on.
+                        # The next note takes these. A level (`$4n`) move is not
                         # counted: it travels as the operator macro recorded
                         # below.
                         stats["midnote_ops"] += 1
@@ -2486,7 +2487,7 @@ def _collect_opl(
                 if key not in held:
                     continue
                 # Record this operator's own level. Only the carrier's composite
-                # level can ride the volume column, so a write that moves just a
+                # level can ride the volume column. A write that moves just a
                 # modulator stops here rather than testing (and overwriting) the
                 # channel value: keeping it would latch the modulator's number as
                 # the carrier reference and drop every later carrier step.
@@ -2498,8 +2499,9 @@ def _collect_opl(
                         ops.setdefault(oi, []).append((w.sample, here))
                         op_tl_last[(cid, fch, oi)] = here
                     if not op_is_carrier(cid, fch, oi):
-                        # A modulator. The volume column cannot reach it, so this
-                        # level only survives as the operator macro built later.
+                        # A modulator. The volume column cannot reach it, and
+                        # this level only survives as the operator macro built
+                        # later.
                         continue
                 cur = st.channel_tl(fch)
                 if cur != tl_last[key]:
@@ -2546,13 +2548,13 @@ def _opl_rhythm_plan(vgm, kind: str) -> tuple[bool, dict]:
     """Decide which OPL layout a log should become, and count what each costs.
 
     Rhythm mode is one bit of one register, but it moves bank A's last three FM
-    channels into a kit, and Furnace keeps that choice in the *system* - so a
-    track is converted as either nine melodic columns or six (fifteen on an OPL3)
-    plus the percussion. Drivers differ, and picking wrongly loses notes:
+    channels into a kit, and the layout is stored in the Furnace system id. A
+    track is converted as either nine melodic columns or six (fifteen on an
+    OPL3) plus the percussion. Drivers differ, and picking wrongly loses notes:
 
     - many arcade and sound-card drivers poke ``$BD`` with bit 5 set during chip
       init and clear it in the same sample, never latching a drum. The melodic
-      layout keeps every one of that track's notes; the drums layout would take
+      layout keeps every one of that track's notes. The drums layout would take
       its channels 7 to 9 away.
     - a track that really latches the kit gets the drums layout, and a melodic
       voice still played on the rhythm channels is routed onto the kit columns
@@ -2748,7 +2750,7 @@ def analyze(
     )
     # The OPL family is one system per chip: the YM3526 and YM3812 own a flat
     # nine-channel space, the YMF262 two banks of nine. Rhythm mode is a second
-    # system in Furnace (it reassigns the last FM channels to the kit), so the
+    # system in Furnace (it reassigns the last FM channels to the kit), and the
     # log decides which one a module gets. When several OPL kinds write, the
     # one with more key-ons carries the track.
     opl_kinds = [k for k in (KIND_OPL, KIND_OPL2, KIND_OPL3) if k in chips]
@@ -2801,8 +2803,8 @@ def analyze(
     )
     # Bit 5 of the rhythm register is the mode switch, but a driver may poke it
     # during chip init and clear it in the same sample without ever sounding a
-    # drum. Furnace holds that choice in the system, so only a log that actually
-    # latches a kit voice becomes the drums layout.
+    # drum. The layout is stored in the Furnace system id. A track gets the
+    # drums layout only when the log shows a kit voice actually latching.
     opl_drums, opl_rhythm = (
         _opl_rhythm_plan(vgm, opl_kind) if is_opl else (False, {}))
     opl_clock = (
@@ -2944,9 +2946,9 @@ def analyze(
             # An un-keyed operator never starts its envelope. Maximum
             # attenuation (TL 127) is the closest a static OPM instrument gets.
             # The mask bit that keys an operator is not the operator number:
-            # the $08 SS bits run S1,S3,S2,S4 (see OPM_OP_TO_MASK), so reading
-            # them in order blanks the wrong pair and can leave a voice whose
-            # every carrier is silent.
+            # the $08 SS bits run S1,S3,S2,S4 (see OPM_OP_TO_MASK). Reading
+            # the bits in order mutes the wrong operators and can leave a
+            # voice whose every carrier is silent.
             snap.ops = tuple(
                 OpRegs(
                     dt_mul=op.dt_mul,
@@ -2987,9 +2989,10 @@ def analyze(
 
         Some drivers park every carrier at TL 7F, key on, and write the voice's
         real levels a few samples later in the same burst. A snapshot taken at
-        the key-on then describes an instrument that cannot sound, and the later
-        write is only a mid-note fade, which the volume column can attenuate
-        but never raise back. The burst belongs to this note, so apply it here.
+        the key-on then describes an instrument that cannot sound, and the
+        later write reaches the writer only as a mid-note fade, which the
+        volume column can attenuate but never raise back. The burst belongs
+        to this note.
         """
         for j in range(idx + 1, len(vgm.writes)):
             w2 = vgm.writes[j]
@@ -3867,8 +3870,8 @@ def analyze(
             )
 
     # Rhythm is per chip: one log may carry two YM3812s and set the mode on
-    # either of them. `getVolMax` answers 63 for the FM chips too, so every OPL
-    # column tops out there.
+    # either of them. `getVolMax` answers 63 for the FM chips too, and every
+    # OPL column tops out there.
     opl_stats: dict = {}
     if is_opl:
         opl_chunk = channel_count(opl_kind, opl_drums)
@@ -5107,7 +5110,7 @@ def analyze(
         allow_steps=is_opn or is_opn2 or is_opl or is_opnb,
     )
     # An operator level the driver scripted while its note sounded. The volume
-    # column reaches only a KVS operator, so the rest travel as instrument macros.
+    # column reaches only a KVS operator. The rest travel as instrument macros.
     op_tl_copies = op_tl_lost = 0
     if is_opl:
         op_tl_copies, op_tl_lost = _bind_op_macros(
@@ -5408,7 +5411,7 @@ def format_report(song: Song) -> str:
         )
     elif song.fm_chip in ("opl", "opl2", "opl3"):
         # The analyzer has already told the kit from the voices: rhythm columns
-        # share instruments and frequency registers, so they are counted apart.
+        # share instruments and frequency registers, and they are counted apart.
         fm_ons = song.fm_notes
     elif song.fm_chip == "ym2610":
         fm_end = (6 if song.ym2610_b else 4) * len(song.ym2610_ids)

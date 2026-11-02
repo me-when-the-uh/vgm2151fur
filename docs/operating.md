@@ -76,7 +76,7 @@ chip's own `0xBn` bit 5, or from the latch bits of `0xBD` in rhythm mode - and
 `div` measures pitch inside every voice's own key, trimmed 35 ms at both ends so a
 row-tick note and the sample the driver used are not charged against each other. A
 kit column is left out of that measure: two percussion voices share one frequency
-register, so the byte at a hit belongs to whichever was written last. The
+register, and the byte at a hit belongs to whichever was written last. The
 full-register form of the check - every operator page at every attack, compared
 sample-atomically after a Furnace round trip - is asserted by
 `tests.test_vgm2151fur_opl.TestOplRealRips`; `diag.opl_attacks()` is the helper to
@@ -135,8 +135,8 @@ the logical CPUs: one thread stays free below six, two at six or more, and
 16 is the ceiling (a 6 core/12 thread desktop runs 10 workers). The heavy
 part of a track is a single-threaded Furnace render, so the count follows
 threads rather than cores, and the spare threads keep the desktop
-responsive. `--workers N` may go up to one below the thread count — every
-thread when there are fewer than eight — with 31 as the safety ceiling:
+responsive. `--workers N` may go up to one below the thread count (every
+thread when there are fewer than eight), with 31 as the safety ceiling:
 past that the renders compete and the batch runs slower, not faster, and
 the clamp reports that when it applies (it never exceeds the track count
 either). `--workers 1` runs the tracks in order on that one worker. The

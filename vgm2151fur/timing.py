@@ -147,8 +147,8 @@ def _keyons_by_channel(
             tracker = opl_trackers.get(w.chip)
             if tracker is None:
                 tracker = opl_trackers[w.chip] = _OplKeys(w.chip, vgm.writes)
-            # An OPL3 owns both banks in one system; a YM3812 pair keeps its
-            # instances apart so one chip's lattice cannot alias the other's.
+            # An OPL3 owns both banks in one system. A YM3812 pair keeps its
+            # instances apart, and one chip's lattice cannot alias the other's.
             for fch in tracker.feed(w):
                 out.setdefault(4000 + w.chip_id * 32 + fch, []).append(w.sample)
     for v in out.values():

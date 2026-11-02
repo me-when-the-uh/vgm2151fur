@@ -160,15 +160,16 @@ Longer notes keep the release-tail trajectory until the next key-on.
 - **a delayed row gets `speed - ED` ticks of slide.** A row runs its effects
   from the tick its own `EDxx` names. Measured against Furnace 0.6.8.3: with
   `speed=10` and `ED=02`, a `01:9A` rate moves the pitch exactly eight times,
-  and with `speed=7`, `ED=04` a rate moves three times. So when the voice is at
-  rest, that row is worth `speed - ED` ticks however far inside it the key-on
-  sample sits; rating it by the wall clock between the key-on and the row end
-  writes a rate too small, and on a fast bend that loses tens of units. Nothing
-  notices afterwards, because every later row is measured against what the model
-  believes it wrote, so the note holds flat until its next key-on (this was FM3
-  and FM4 of "04 Blue Flight", about two semitones low after its opening sweep).
-  A row that a running rate enters is different: those first ticks keep moving at
-  the old rate, so the row still travels its full length.
+  and with `speed=7`, `ED=04` a rate moves three times. When the voice is at
+  rest, that row is therefore worth `speed - ED` ticks however far inside it
+  the key-on sample sits. Rating it by the wall clock between the key-on and
+  the row end writes a rate too small, and on a fast bend that loses tens of
+  units. Nothing notices afterwards, because every later row is measured
+  against what the model believes it wrote: the note holds flat until its
+  next key-on (this was FM3 and FM4 of "04 Blue Flight", about two semitones
+  low after its opening sweep). A row that a running rate enters is
+  different. Those first ticks keep moving at the old rate, and the row
+  still travels its full length.
 - the row that contains the trajectory's end is rated over the full row
   against the held final value: the ramp physically runs a whole row, so
   rating it over the clipped part would overshoot the bottom of a dive by
@@ -339,19 +340,19 @@ TL 7F, then KC/KF, then the key-on, and only then the four TL writes that make
 the carriers sound. On BQMUS03 (X68000, YM2151 + MSM6258) that tail lands 1-3
 samples after the key-on, on every channel at the head of the song and again
 wherever it changes voice: 46 key-ons in all. Snapshotting at the key-on gives
-an instrument whose carriers are all at 0x7F, and the level write that follows
-reaches the writer only as a mid-note fade -- the volume column can attenuate
-but never raise the voice back, so the note is silent however correct its pitch.
-`analyze.settle_burst_tl` finishes the burst before the snapshot when the key-on
-finds every carrier parked, within `_OPM_BURST_LOAD_SAMPLES` (16 samples: one
-register write is about 2). A key-on that already sounds keeps its snapshot as
-the strict rule, so a later voice change is never swallowed; the write stays
-visible where it belongs. The folded levels are not repeated as a volume step,
-because `tl_last` is taken after the settle. Guarded by
-`tests/test_opm_keyon_burst.py`. The same reason makes an E5 headroom rule:
-`_emit_steps` puts whole semitones of a hard step in `E8xx/E9xx` rather than the
-minimum that fits, because an E5 parked on 0x40/0xBF can no longer correct a
-later step or a ramp's rounding.
+an instrument whose carriers are all at 0x7F. The level write that follows
+reaches the writer only as a mid-note fade, and the volume column can
+attenuate but never raise the voice back. The note is silent however correct
+its pitch. `analyze.settle_burst_tl` finishes the burst before the snapshot
+when the key-on finds every carrier parked, within `_OPM_BURST_LOAD_SAMPLES`
+(16 samples: one register write is about 2). A key-on that already sounds
+keeps its snapshot as the strict rule. A later voice change is never
+swallowed, and the write stays visible where it belongs. The folded levels
+are not repeated as a volume step, because `tl_last` is taken after the
+settle. Guarded by `tests/test_opm_keyon_burst.py`. The same reason makes an
+E5 headroom rule: `_emit_steps` puts whole semitones of a hard step in
+`E8xx/E9xx` rather than the minimum that fits, because an E5 parked on
+0x40/0xBF can no longer correct a later step or a ramp's rounding.
 
 ## Checking by ear
 

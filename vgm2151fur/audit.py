@@ -248,7 +248,7 @@ def compare_ym2610_samples(src: VgmFile, exp: VgmFile) -> dict:
     The export writes the ADPCM-A memory as block 0x82 and the ADPCM-B
     memory as block 0x83.  The source uses 0x82 for A and 0x83 for B when
     that block is present.  Matching uses the time window and the extracted
-    payload, so a repacked sample memory does not affect the result.
+    payload, and a repacked sample memory does not affect the result.
     """
     from vgm2151fur.vgm import assemble_rom
     from vgm2151fur.ym2610 import collect_ym2610_adpcm

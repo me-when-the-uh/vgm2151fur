@@ -16,18 +16,18 @@ from pathlib import Path
 VGM_RATE = 44100
 CMD_YM2151 = 0x54
 # The OPL family. 0x5B is the YM3526 and 0x5A the YM3812; both address one
-# flat register space. The YMF262 has two banks of nine channels, so the VGM
+# flat register space. The YMF262 has two banks of nine channels, and the VGM
 # spec gives each bank its own command: 0x5E is port 0, 0x5F port 1. Every
 # per-channel and per-operator register exists in both banks and only the port
-# tells them apart, so the bank rides in bit 8 of ChipWrite.reg exactly like the
+# tells them apart. The bank rides in bit 8 of ChipWrite.reg exactly like the
 # YM2612's second register bank does.
 CMD_YM3526 = 0x5B
 CMD_YM3812 = 0x5A
 # A dual-OPL2 log (the Sound Blaster Pro layout) keeps the second chip's
 # register stream in its own command. Confirmed on the Knights of Xentar rips:
 # header bit 30 says "Dual YM3812" and 0xAA carries chip 1's writes while
-# 0x5A stays on chip 0. There is no spec'd companion for the YM3526, so a
-# second OPL instance is reported instead of guessed at.
+# 0x5A stays on chip 0. There is no spec'd companion for the YM3526. A second
+# OPL instance is reported instead of guessed at.
 CMD_YM3812_2 = 0xAA
 CMD_OPL3_P0 = 0x5E
 CMD_OPL3_P1 = 0x5F
@@ -122,7 +122,7 @@ YM2610_DEFAULT_CLOCK = 8000000
 # YMF262 at 0x5C. Bit 30 of the YM3812 field is the dual-chip flag that lets
 # command 0xAA address the second one (the Sound Blaster Pro pair); rips also
 # set bit 31, which the players use for their own chip-count bookkeeping. The
-# spec defines no second-instance command for the YM3526, so a dual OPL flag is
+# spec defines no second-instance command for the YM3526. A dual OPL flag is
 # reported rather than guessed at.
 OPL2_CLOCK_OFF = 0x50
 OPL_CLOCK_OFF = 0x54
@@ -609,8 +609,8 @@ def chips_in_head(buf: bytes) -> set[str]:
     if version >= 0x151 and 100_000 <= _header_clock(buf, AY8910_CLOCK_OFF) <= 40_000_000:
         kinds.add("ay8910")
     # The OPL family joined the header in 1.51. A YM3812 field with bit 30 set
-    # carries a second chip on command 0xAA; bit 31 is the Sound Blaster Pro
-    # hard-pan of that pair, so it is reported apart from the chip itself.
+    # carries a second chip on command 0xAA. Bit 31 is the Sound Blaster Pro
+    # hard-pan of that pair, and it is reported apart from the chip itself.
     if version >= 0x151 and _field_in_header(buf, OPL2_CLOCK_OFF, 4):
         opl2_raw = _header_raw(buf, OPL2_CLOCK_OFF)
         if 100_000 <= (opl2_raw & 0x3FFFFFFF) <= 40_000_000:
@@ -1060,8 +1060,8 @@ def load_vgm(path: Path | str) -> VgmFile:
             and pos + 3 <= n
         ):
             # The OPL chips take (register, value) in one flat space. The YMF262
-            # has two banks of nine channels and the command *is* the bank, so
-            # the port is folded into bit 8 of reg exactly like the YM2612's
+            # has two banks of nine channels and the command *is* the bank. The
+            # port is folded into bit 8 of reg exactly like the YM2612's
             # second register bank; every per-channel register then names one
             # hardware channel unambiguously.
             if cmd == CMD_YM3526:
@@ -1213,7 +1213,7 @@ def load_vgm(path: Path | str) -> VgmFile:
     # The 0x66 command's sample is the timeline the file really covers.  A
     # header total far past it truncates the converted module against a
     # source that still holds its last note, and a header total of 0 loses
-    # the grid/order budget entirely, so the stream length wins.
+    # the grid/order budget entirely. The stream length wins.
     if saw_end:
         if total != sample:
             if total and abs(total - sample) > VGM_RATE // 10:
@@ -1276,7 +1276,7 @@ def load_vgm(path: Path | str) -> VgmFile:
             f"YM2612 clock is missing or out of range; using {YM2612_DEFAULT_CLOCK}"
         )
     # OPL family. The three clock fields all carry the second-instance bit, but
-    # only the YM3812 pair has a distinct command ($AA), so a flagged second OPL
+    # only the YM3812 pair has a distinct command ($AA). A flagged second OPL
     # or OPL3 is reported instead of folded into the first chip's registers.
     if any(w.chip == "opl" for w in vgm.writes) and not vgm.opl_clock:
         vgm.warnings.append(

@@ -1,23 +1,23 @@
 """OPL-family (YM3526/YM3812/YMF262) support: pitch mapping and chip state.
 
 The OPL chips have two operators per channel (an OPL3 pair can be joined into
-one four-operator voice), a 6-bit TL and one connection bit, so their register
+one four-operator voice), a 6-bit TL and one connection bit. Their register
 image cannot share the OPM/OPN byte fields.  ``OPLState`` keeps the flat
 register image a VGM log writes and reads it back through the slot and channel
-tables of Furnace's own OPL platform (``src/engine/platform/opl.cpp``), so a
+tables of Furnace's own OPL platform (``src/engine/platform/opl.cpp``). A
 converted channel, operator or drum is the one Furnace will drive.
 
 Furnace numbers OPL3 channels by pair, not by the hardware channel order:
 ``CHAN_MAP`` carries that permutation and puts the port in bit 8, exactly as
 the platform's ``chanMapOPL3`` does.  A note is labelled with the channel's own
-f-number, so a four-operator voice reads the registers of its pair's first
-channel - which is what the chip keys.
+f-number. A four-operator voice reads the registers of its pair's first
+channel, which is what the chip keys.
 
 Pitch works through ``DivPitchTable`` in frequency mode: the engine turns a
 note plus ``E5xx`` (1/128 semitone in linear mode) into one number, and the
 platform splits that into block/f-num by taking the highest power of two not
-above it (``toFreq``).  ``opl_note_for`` inverts the pair of steps, so a log
-register comes back as the note/E5 combination that writes it again.
+above it (``toFreq``).  ``opl_note_for`` inverts the pair of steps. A log
+register therefore comes back as the note/E5 combination that writes it again.
 """
 
 from __future__ import annotations
@@ -35,7 +35,7 @@ KIND_OPL2 = "opl2"
 KIND_OPL3 = "opl3"
 
 # DivPlatformOPL::chipFreqBase, keyed by whether the chip has two banks. The
-# OPL3 runs eighteen channels off four times the prescaler, so at its usual
+# OPL3 runs eighteen channels off four times the prescaler. At its usual
 # 14.318 MHz clock a note lands on the same unit value an OPL2 finds at 3.58.
 FREQ_BASE = {False: 32768 * 72, True: 32768 * 288}
 # pitchTable.init's maximum, and the f-num ceiling of toFreq.
@@ -142,8 +142,8 @@ def drum_channel(bit: int, melodic: int) -> int:
 def is_drum_channel(kind: str, drums: bool, fch: int) -> bool:
     """True when Furnace drives the channel from a DIV_INS_OPL_DRUMS voice.
 
-    The kick keeps two operators and its own channel, so it takes a normal OPL
-    instrument; only the four single-operator columns use the kit voice.
+    The kick keeps two operators and its own channel. It takes a normal OPL
+    instrument, and only the four single-operator columns use the kit voice.
     """
     return drums and fch > LAYOUT[(kind, drums)][1]
 
@@ -153,7 +153,8 @@ def opl_carrier_octave(patch) -> int:
 
     The OPL multiplier table is OPN's without the halved values: 0 is a half,
     1 unison and then multiples up. Only an exact power of two can be cancelled
-    by a whole-octave note move, so 3/5/6/... leave the note where it is.
+    by a whole-octave note move. A multiplier of 3/5/6/... leaves the note
+    where it is.
     """
     if not getattr(patch, "opl", False) or getattr(patch, "drum", False):
         return 0
@@ -183,7 +184,7 @@ def opl_carrier_octave(patch) -> int:
 # --- pitch ------------------------------------------------------------------
 
 # In linear pitch mode ``calcFreq`` folds the E5 byte into the table offset
-# unchanged, so one unit is 1/128 semitone and the instrument pitch macro
+# unchanged. One unit is 1/128 semitone, and the instrument pitch macro
 # (``pitch2``) is added to the same offset. The ``mul`` argument the OPL platform
 # passes (2) only scales the legacy non-linear path, which this project never
 # writes - its modules keep Furnace's default linear pitch.
@@ -193,8 +194,9 @@ class FreqPitchTable:
     """DivPitchTable in frequency mode, for one (clock, base) pair.
 
     ``value`` returns the engine's frequency unit, which ``toFreq`` splits into
-    block and f-num; the table holds one octave and the note's octave shifts it,
-    rounding the carry in, so a closed form alone misses by a unit here and there.
+    block and f-num. The table holds one octave and the note's octave shifts
+    it, rounding the carry in. A closed form alone misses by a unit here and
+    there.
     """
 
     def __init__(self, clock: float, base: int, tuning: float = 440.0,
@@ -284,10 +286,11 @@ def to_freq(unit: int) -> tuple[int, int]:
     """DivPlatformOPL::toFreq for an instrument with no fixed block.
 
     ``bsr`` in Furnace counts the bits of ``unit / OPLL_C_NUM`` rather than
-    returning its highest set bit, so the block is one higher than an MSB index
-    suggests and the f-num keeps the next lower half-octave span. Verified
-    against a round trip through Furnace's own export: every note of three and
-    a half octaves lands on the same block and f-num this function predicts.
+    returning its highest set bit. The block is therefore one higher than an
+    MSB index suggests, and the f-num keeps the next lower half-octave span.
+    Verified against a round trip through Furnace's own export: every note of
+    three and a half octaves lands on the same block and f-num this function
+    predicts.
     """
     block = 0
     if unit > 0:
@@ -312,9 +315,10 @@ def opl_unit_for(
 ) -> int:
     """The engine frequency unit a note, its E5 byte and a macro value produce.
 
-    ``pitch2`` is an instrument pitch macro's offset in 1/128 semitone. ``get()``
-    folds it into the same offset as the fine tune, so a note whose instrument
-    carries an octave compensation still lands on the rip's register.
+    ``pitch2`` is an instrument pitch macro's offset in 1/128 semitone.
+    ``get()`` folds it into the same offset as the fine tune. A note whose
+    instrument carries an octave compensation therefore still lands on the
+    rip's register.
     """
     return pitch_table(clock, opl3).value(note, e5, pitch2)
 
@@ -337,10 +341,10 @@ def opl_note_for(
 
     The pair is searched in the domain the engine actually reaches: a note plus
     its E5 byte, scaled by ``E5_STEP`` inside the table. Only reachable values
-    are scored, so what comes back is what Furnace will write; when the target
+    are scored, and what comes back is what Furnace will write. When the target
     sits between two of them the closer one wins, then the smaller fine tune. A
-    register below note 0 or above B-9 has no pattern cell, so the window is
-    clamped into the range and the closest playable note wins.
+    register below note 0 or above B-9 has no pattern cell. The window is
+    clamped into the range, and the closest playable note wins.
     """
     block = max(0, min(7, int(block)))
     fnum = max(1, min(MAX_FNUM, int(fnum)))
@@ -357,7 +361,7 @@ def opl_note_for(
     hi_note = max(lo_note, min(179, center + 4))
     best: tuple[float, int, int, int] | None = None  # (pitch err, |e5|, note, e5)
     for note in range(lo_note, hi_note + 1):
-        # Pitch rises with the fine tune, so bisection finds the crossing. The
+        # Pitch rises with the fine tune, and bisection finds the crossing. The
         # search is in E5 units, one of which moves the table by two steps.
         lo, hi = -128, 127
         while lo < hi:
@@ -381,7 +385,7 @@ def opl_note_for(
 # --- register image ---------------------------------------------------------
 
 def _idle_op() -> OpRegs:
-    """An operator the chip never reaches: silent, so nothing is heard twice."""
+    """An operator the chip never reaches: it stays silent."""
     return OpRegs(tl=0x3F, mult=1)
 
 
@@ -390,7 +394,7 @@ class OPLState:
 
     ``kind`` picks the platform variant (waveform depth, banks and rhythm
     bits), and ``drums`` switches to the channel tables of Furnace's drums
-    system. The rhythm flag follows register 0xBD, so the log decides when the
+    system. The rhythm flag follows register 0xBD. The log decides when the
     percussion channels start to mean drums.
     """
 
@@ -477,10 +481,10 @@ class OPLState:
     def pan_byte(self, fch: int) -> int:
         """Furnace 08xy for the channel; 0 means "write nothing".
 
-        The OPL3 gate is one bit per side, so a full nibble carries the level
+        The OPL3 gate is one bit per side, and a full nibble carries the level
         Furnace scales by. Both sides on is the engine default and stays an
-        omitted effect; both sides off cannot be written without muting the
-        channel for good, so it is left at whatever the row before held.
+        omitted effect. Both sides off cannot be written without muting the
+        channel for good, and it is left at whatever the row before held.
         """
         if not self.opl3:
             return 0
@@ -565,8 +569,8 @@ class OPLState:
     def channel_tl(self, fch: int) -> int:
         """Level a volume-column step has to reproduce on this channel.
 
-        The platform scales only the operators that reach the output, so a
-        percussion column - one operator of its own - tracks that operator.
+        The platform scales only the operators that reach the output. A
+        percussion column is one operator of its own and tracks that operator.
         """
         if self.drums and fch > self.melodic:
             addr = self._op_addr(fch, 0)
