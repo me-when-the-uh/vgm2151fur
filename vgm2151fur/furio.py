@@ -17,6 +17,7 @@ from vgm2151fur.furwrite import (
     CHIP_K053260, CHIP_MSM6258, CHIP_MSM6295, CHIP_OPL, CHIP_OPL2,
     CHIP_OPLL, CHIP_OPL2_DRUMS, CHIP_OPLL_DRUMS, CHIP_OPL3, CHIP_OPL3_DRUMS,
     CHIP_OPL_DRUMS, CHIP_SEGAPCM,
+    CHIP_YM2608, CHIP_YM2608_EXT,
     CHIP_YM2610, CHIP_YM2610B, CHIP_YM2612, CHIP_YM2612_CSM, CHIP_YM2612_EXT,
     FUR_MAGIC, decompress_fur,
 )
@@ -33,6 +34,10 @@ CHIP_CHANNELS = {
     CHIP_YM2612_CSM: 10,  # YM2612 CSM: Ext + the CSM timer channel
     CHIP_YM2610: 14,  # YM2610: 4 FM + 3 SSG + 6 ADPCM-A + 1 ADPCM-B
     CHIP_YM2610B: 16,  # YM2610B: 6 FM + 3 SSG + 6 ADPCM-A + 1 ADPCM-B
+    # YM2608 (OPNA): the same span with the rhythm kit where the ADPCM-A
+    # voices were, and channel 3 split into four operator columns in Ext.
+    CHIP_YM2608: 16,  # YM2608: 6 FM + 3 SSG + 6 rhythm + 1 ADPCM-B
+    CHIP_YM2608_EXT: 19,  # YM2608 Ext: 2 FM + 4 operators + FM4-6 + the rest
     # OPL family. Rhythm mode is its own system: bank A's last FM channels
     # become the kit, so it shows five columns more on OPL/OPL2 and two on OPL3.
     CHIP_OPL: 9,

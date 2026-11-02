@@ -24,6 +24,7 @@ from vgm2151fur.opl import (
 )
 from vgm2151fur.pcm import pcm7_to_s8, scale_pcm7
 from vgm2151fur.pitch import FURNACE_CLOCK_DEFAULT, module_clock
+from vgm2151fur.ym2608 import RHYTHM_VOICES, YM2608_DEFAULT_CLOCK
 
 # Furnace arcade.cpp: rWrite(DT, dtTable[op.dt]<<4). Inverse of
 # dtTable = (7, 6, 5, 0, 1, 2, 3, 4) so YM2151 register DT survives the
@@ -68,6 +69,11 @@ CHIP_YM2612_CSM = 0xC1
 # YM2610B (6 FM, 16 channels).
 CHIP_YM2610 = 0xA5
 CHIP_YM2610B = 0x9E
+# Furnace's YM2608 (OPNA): the YM2610B's channel order with rhythm in place of
+# ADPCM-A - 6 FM + 3 SSG + 6 rhythm + 1 ADPCM-B = 16 channels, or 19 with
+# channel 3 split into four operator columns.
+CHIP_YM2608 = 0x8E
+CHIP_YM2608_EXT = 0xB7
 # TI SN76489 (the SMS platform): three square voices then noise.  A Genesis
 # module carries it as a second system after the YM2612.
 CHIP_SMS = 0x03
@@ -2806,23 +2812,30 @@ def write_fur(
     opll_drums = bool(getattr(song, "opll_drums", False)) if opll else False
     opll_ids = list(getattr(song, "opll_ids", ()) or ()) if opll else []
     ym2610 = fm_family == "ym2610"
-    ym_chip = ym2203 or ym2612 or ym2610
+    # The OPNA is the same shape again: six FM, three SSG, then its own two
+    # sample engines. It differs in that the percussion voices are the chip's
+    # ROM, so only the delta-T channel carries samples.
+    ym2608 = fm_family == "ym2608"
+    ym_chip = ym2203 or ym2612 or ym2610 or ym2608
     ym_ext = bool(
         (getattr(song, "ym2203_ext", False) if ym2203 else
-         getattr(song, "ym2612_ext", False))
-    ) if (ym2203 or ym2612) else False
+         getattr(song, "ym2612_ext", False) if ym2612 else
+         getattr(song, "ym2608_ext", False))
+    ) if (ym2203 or ym2612 or ym2608) else False
     if ym2203:
         ym_ids = list(getattr(song, "ym2203_ids", ()) or ())
     elif ym2612:
         ym_ids = list(getattr(song, "ym2612_ids", ()) or ())
     elif ym2610:
         ym_ids = list(getattr(song, "ym2610_ids", ()) or ())
+    elif ym2608:
+        ym_ids = list(getattr(song, "ym2608_ids", ()) or ())
     else:
         ym_ids = []
     # A YM2612 system stays when the log had the chip, even with no FM notes.
     # A YM2203 system likewise owns its three SSG voices.  A YM2610 system
     # owns FM, SSG and the two ADPCM engines, so either half keeps it.
-    if ym2610:
+    if ym2610 or ym2608:
         fm_present = (include_fm or include_pcm) and bool(ym_ids)
     elif opl:
         fm_present = include_fm and bool(opl_ids)
@@ -2859,6 +2872,17 @@ def write_fur(
     n_ym2610_b_ins = (len(ym2610_b_smps) + 119) // 120
     ym2610_a_smp_base = dac_smp_base + len(dac_smps)
     ym2610_b_smp_base = ym2610_a_smp_base + len(ym2610_a_smps)
+    # The OPNA's delta-T samples are laid out like the YM2610's B maps. Its
+    # rhythm kit needs no samples at all, just one instrument to hang the
+    # column's macros on.
+    ym2608_b_smps = (
+        list(getattr(song, "ym2608_b_samples", ()) or ()) if include_pcm else []
+    )
+    n_ym2608_b_ins = (len(ym2608_b_smps) + 119) // 120
+    n_ym2608_rhythm_ins = (
+        1 if (include_pcm and getattr(song, "ym2608_rhythm_notes", 0)) else 0
+    )
+    ym2608_b_smp_base = ym2610_b_smp_base + len(ym2610_b_smps)
     oki_ids, oki_groups = _grouped(oki_smps)
     adpcm_ids, adpcm_groups = _grouped(adpcm_smps)
     c140_ids: list[int] = []
@@ -2897,6 +2921,8 @@ def write_fur(
     if fm_present:
         if ym2610:
             n_fm = (6 if song.ym2610_b else 4) * len(ym_ids)
+        elif ym2608:
+            n_fm = (9 if ym_ext else 6) * len(ym_ids)
         elif ym2612:
             n_fm = (9 if ym_ext else 6) * len(ym_ids)
         elif ym2203:
@@ -2910,9 +2936,13 @@ def write_fur(
     else:
         n_fm = 0
     # The SSG is part of each YM2203/YM2610 system, not a separate AY chip.
-    n_ssg = 3 * len(ym_ids) if ((ym2203 or ym2610) and fm_present) else 0
-    n_adpcm_a = 6 * len(ym_ids) if (ym2610 and fm_present) else 0
-    n_adpcm_b = len(ym_ids) if (ym2610 and fm_present) else 0
+    n_ssg = (
+        3 * len(ym_ids) if ((ym2203 or ym2610 or ym2608) and fm_present) else 0
+    )
+    # On the OPNA the six columns after the SSG are the rhythm kit; Furnace
+    # gives them the same channel span as the YM2610's ADPCM-A voices.
+    n_adpcm_a = 6 * len(ym_ids) if ((ym2610 or ym2608) and fm_present) else 0
+    n_adpcm_b = len(ym_ids) if ((ym2610 or ym2608) and fm_present) else 0
     n_k007 = 2 if want_k007 else 0
     n_ch = (
         n_fm + n_ssg + n_adpcm_a + n_adpcm_b + n_psg + n_k007
@@ -2933,13 +2963,14 @@ def write_fur(
         len(fm_ins) + n_dac_ins + len(pcm_smps) + len(oki_smps) + n_adpcm_ins
         + len(spcm_smps) + len(c140_smps) + len(c352_smps) + len(k053260_smps)
         + n_ym2610_a_ins + n_ym2610_b_ins
+        + n_ym2608_rhythm_ins + n_ym2608_b_ins
         + len(scc_specs) + len(ay_specs) + len(psg_specs)
     )
     n_smp = (
         len(pcm_smps) + len(oki_smps) + len(adpcm_smps)
         + len(spcm_smps) + len(c140_smps) + len(c352_smps)
         + len(k053260_smps) + len(dac_smps)
-        + len(ym2610_a_smps) + len(ym2610_b_smps)
+        + len(ym2610_a_smps) + len(ym2610_b_smps) + len(ym2608_b_smps)
     )
     n_wav = len(scc_waves)
 
@@ -2947,6 +2978,8 @@ def write_fur(
     # they shift down to stay inside n_ch.
     if ym2610:
         fm_analysis_block = (6 if song.ym2610_b else 4) + 3 + 6 + 1
+    elif ym2608:
+        fm_analysis_block = (9 if ym_ext else 6) + 3 + 6 + 1
     elif opl:
         fm_analysis_block = OPL_CHANNELS[(opl_kind, opl_drums)] * len(opl_ids)
     elif opll:
@@ -2982,6 +3015,35 @@ def write_fur(
                 names_short.append(f"A{cid + 1}-{voice + 1}")
             names_long.append(f"ADPCM-B{suffix}")
             names_short.append(f"B{cid + 1}")
+    elif ym2608 and fm_present:
+        # Furnace names the OPNA's kit columns Kick, Snare, Top, HiHat, Tom and
+        # Rim (sysDef.cpp:1365-1370), and the delta-T voice simply ADPCM.
+        for cid in range(len(ym_ids)):
+            suffix = f" ({cid + 1})" if len(ym_ids) > 1 else ""
+            if ym_ext:
+                for voice, label in enumerate(("FM 1", "FM 2")):
+                    names_long.append(f"{label}{suffix}")
+                    names_short.append(f"F{cid + 1}-{voice + 1}")
+                for voice in range(4):
+                    # Column c carries operator (1,2,0,3)[c]'s frequency.
+                    op_label = (1, 2, 0, 3)[voice] + 1
+                    names_long.append(f"FM 3 OP{op_label}{suffix}")
+                    names_short.append(f"O{cid + 1}-{op_label}")
+                for voice in range(3):
+                    names_long.append(f"FM {voice + 4}{suffix}")
+                    names_short.append(f"F{cid + 1}-{voice + 4}")
+            else:
+                for voice in range(6):
+                    names_long.append(f"FM {voice + 1}{suffix}")
+                    names_short.append(f"F{cid + 1}-{voice + 1}")
+            for voice in range(3):
+                names_long.append(f"PSG {voice + 1}{suffix}")
+                names_short.append(f"P{cid + 1}-{voice + 1}")
+            for tag, long_name in RHYTHM_VOICES:
+                names_long.append(f"{long_name}{suffix}")
+                names_short.append(f"{tag}{cid + 1}")
+            names_long.append(f"ADPCM{suffix}")
+            names_short.append(f"D{cid + 1}")
     elif ym2612 and fm_present:
         for cid in range(len(ym_ids)):
             suffix = f" ({cid + 1})" if len(ym_ids) > 1 else ""
@@ -3124,6 +3186,9 @@ def write_fur(
         elif ym2610:
             base = "YM2610B" if song.ym2610_b else "YM2610"
             label_parts.append(f"{base} x{len(ym_ids)}" if len(ym_ids) > 1 else base)
+        elif ym2608:
+            base = "YM2608" + (" Ext" if ym_ext else "")
+            label_parts.append(f"{base} x{len(ym_ids)}" if len(ym_ids) > 1 else base)
         elif ym2612:
             base = "YM2612" + (" Ext" if ym_ext else "")
             label_parts.append(f"{base} x{len(ym_ids)}" if len(ym_ids) > 1 else base)
@@ -3207,6 +3272,17 @@ def write_fur(
             "channel. ADPCM-A plays at clock/432; ADPCM-B uses the source "
             "rate register.\n"
         )
+    elif ym2608:
+        comment += (
+            f"\nYM2608 at {song.vgm.ym2608_clock or YM2608_DEFAULT_CLOCK} Hz; "
+            "each system has the FM voices"
+            + (", channel 3 split into four operator columns," if ym_ext else ",")
+            + " three SSG voices, the chip's six rhythm voices and one ADPCM-B "
+            "channel. A rhythm column IS the drum - kick, snare, top cymbal, "
+            "hi-hat, tom and rim from the ROM Furnace compiles in - so its note "
+            "carries no sample, and the source's global $11 level is folded into "
+            "each hit's volume.\n"
+        )
     elif ym_chip:
         comment += (
             f"\nYM2203 at {song.vgm.ym2203_clock or 3579545} Hz; each system "
@@ -3233,6 +3309,7 @@ def write_fur(
     chips: list[int] = []
     flag_texts: list[str] = []
     ym2610_sys: dict[int, int] = {}
+    ym2608_sys: dict[int, int] = {}
     if fm_present:
         for _cid in (opl_ids or opll_ids or ym_ids or [0]):
             if opl:
@@ -3245,7 +3322,10 @@ def write_fur(
                 chips.append(CHIP_YM2203_EXT if ym_ext else CHIP_YM2203)
             elif ym2610:
                 chips.append(CHIP_YM2610B if song.ym2610_b else CHIP_YM2610)
-                ym2610_sys[cid] = len(chips) - 1
+                ym2610_sys[_cid] = len(chips) - 1
+            elif ym2608:
+                chips.append(CHIP_YM2608_EXT if ym_ext else CHIP_YM2608)
+                ym2608_sys[_cid] = len(chips) - 1
             else:
                 chips.append(CHIP_YM2151)
             if opl:
@@ -3277,6 +3357,16 @@ def write_fur(
                 fm_default = 3579545
             elif ym2610:
                 fm_clock = song.vgm.ym2610_clock
+                fm_default = 8000000
+            elif ym2608:
+                fm_clock = song.vgm.ym2608_clock or YM2608_DEFAULT_CLOCK
+                # Furnace's OPNA clock list has exactly one named entry beyond
+                # the 8 MHz default: 38400*13*16, the FM Towns oscillator a
+                # real rip reports. Ask for that instead of a custom clock so
+                # the module reads as a stock configuration.
+                if fm_clock == 38400 * 13 * 16:
+                    flag_texts.append("clockSel=1")
+                    continue
                 fm_default = 8000000
             else:
                 fm_clock = song.vgm.ym2151_clock
@@ -3550,6 +3640,23 @@ def write_fur(
         _write_ins_sample_map(
             b, f"ADPCM-B {group + 1}", 0, maps, INS_ADPCMB,
         )
+    if n_ym2608_rhythm_ins:
+        # One empty map serves all six kit columns. ymfm fixes each voice to a
+        # range of the rhythm ROM, so a note names nothing: the column is the
+        # drum. The instrument exists to give the channel a macro pool and the
+        # 0-31 volume scale the platform reports.
+        ins_ptrs.append(len(b))
+        _write_ins_sample_map(b, "Rhythm", 0, [], INS_ADPCMA)
+    for group in range(n_ym2608_b_ins):
+        ins_ptrs.append(len(b))
+        first = ym2608_b_smp_base + group * 120
+        maps = [
+            first + slot
+            for slot in range(min(120, len(ym2608_b_smps) - group * 120))
+        ]
+        _write_ins_sample_map(
+            b, f"ADPCM-B {group + 1}", 0, maps, INS_ADPCMB,
+        )
     for i, spec in enumerate(scc_specs):
         ins_ptrs.append(len(b))
         wave = scc_waves[spec.wave] if spec.wave < len(scc_waves) else b""
@@ -3644,6 +3751,26 @@ def write_fur(
         _write_sample_adpcm(
             b, f"adpcmB_{smp.start:06x}_{smp.rate:04x}", smp.data, rate,
             SMP_DEPTH_ADPCM_B, (0, 1 << sys, 0, 0), loop=loop,
+        )
+    ym2608_clock = song.vgm.ym2608_clock or YM2608_DEFAULT_CLOCK
+    for smp in ym2608_b_smps:
+        sys = ym2608_sys.get(smp.chip_id, 0)
+        # The delta-T engine steps its accumulator once per chipClock/144 and
+        # the platform turns a sample's rate back into that step value, so this
+        # is the register the source wrote.
+        rate = max(
+            1, int(round(
+                ym2608_clock / 144 * (smp.rate & 0xFFFF) / 65535
+                * ADPCM_B_RATE_COMPENSATION
+            )),
+        )
+        loop = any(h.loop for h in smp.hits)
+        smp_ptrs.append(len(b))
+        # The OPNA has one sample bank and reads renderOn[0] (ym2608.cpp:2032),
+        # unlike the YM2610, whose delta-T memory is bank 1.
+        _write_sample_adpcm(
+            b, f"deltaT_{smp.start:06x}_{smp.rate:04x}", smp.data, rate,
+            SMP_DEPTH_ADPCM_B, (1 << sys, 0, 0, 0), loop=loop,
         )
 
     pat_ptrs: list[int] = []

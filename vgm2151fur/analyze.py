@@ -125,6 +125,13 @@ from vgm2151fur.ym2610 import (
     collect_ym2610_adpcm,
     ym2610_note_for,
 )
+from vgm2151fur.ym2608 import (
+    YM2608_DEFAULT_CLOCK,
+    YM2608_SSG_DIVIDER,
+    YM2608State,
+    collect_ym2608_delta_t,
+    collect_ym2608_rhythm,
+)
 from vgm2151fur.ym2203 import (
     YM2203_DEFAULT_CLOCK,
     YM2203_SSG_DIVIDER,
@@ -500,6 +507,21 @@ class Song:
     ym2610_b_samples: list[AdpcmBSample] = field(default_factory=list)
     ym2610_a_count: int = 0
     ym2610_b_count: int = 0
+
+    # YM2608 (OPNA) instances. Each one owns 16 channels (6 FM + 3 SSG +
+    # 6 rhythm + 1 ADPCM-B), or 19 with channel 3 split into four operator
+    # columns. The rhythm voices are the chip's own ROM, so only the delta-T
+    # channel carries samples.
+    ym2608_ids: list[int] = field(default_factory=list)
+    ym2608_ext: bool = False
+    ym2608_ssg_count: int = 0
+    ym2608_rhythm_count: int = 0
+    # Rhythm keys that became a note in the module. The writer needs this to
+    # decide whether to emit the kit's instrument, because a muted voice is
+    # collected but never written.
+    ym2608_rhythm_notes: int = 0
+    ym2608_b_samples: list[AdpcmBSample] = field(default_factory=list)
+    ym2608_b_count: int = 0
 
     # K007232 output level relative to the YM2151, from the rip's own mix
     # (extra header) when present. Written to the .fur chip output.
@@ -3221,6 +3243,7 @@ def analyze(
     has_ym2151 = "ym2151" in chips
     has_ym2612 = "ym2612" in chips
     has_ym2610 = "ym2610" in chips or "ym2610_ssg" in chips
+    has_ym2608 = "ym2608" in chips or "ym2608_ssg" in chips
     has_sn76489 = "sn76489" in chips
     has_opl = bool(chips & {"opl", "opl2", "opl3"})
     has_opll = "opll" in chips
@@ -3229,6 +3252,17 @@ def analyze(
         warnings.append(
             "YM2610 and another FM chip write in one log; only the YM2610 "
             "was converted"
+        )
+    if has_ym2608 and (has_ym2151 or has_ym2203 or has_ym2612 or has_ym2610):
+        other = "/".join(sorted(
+            name.upper() for name, present in (
+                ("ym2151", has_ym2151), ("ym2203", has_ym2203),
+                ("ym2612", has_ym2612), ("ym2610", has_ym2610),
+            ) if present
+        ))
+        warnings.append(
+            f"YM2608 and {other} write in one log; only the YM2608 was "
+            "converted"
         )
 
     if has_ym2203 and has_ym2151:
@@ -3253,7 +3287,9 @@ def analyze(
     # A mixed OPL + arcade log converts one family. Pick the side with more
     # key-ons, which is the one that carries the track, and name the loss.
     opl_side = chips & {KIND_OPL, KIND_OPL2, KIND_OPL3}
-    arcade_side = chips & {"ym2151", "ym2203", "ym2612", "ym2610"}
+    arcade_side = chips & {
+        "ym2151", "ym2203", "ym2612", "ym2610", "ym2608",
+    }
     prefer_opl = False
     opl_keys = arcade_keys = 0
     if has_opl and arcade_side:
@@ -3261,11 +3297,14 @@ def analyze(
         arcade_keys = _family_keyons(vgm, arcade_side)
         prefer_opl = opl_keys > arcade_keys
 
-    is_opnb = has_ym2610 and not prefer_opl
-    is_opn2 = has_ym2612 and not is_opnb and not prefer_opl
+    # The OPNA owns its rhythm and delta-T engines, so it takes precedence over
+    # the other arcade families when a mixed log carries both.
+    is_opna = has_ym2608 and not prefer_opl
+    is_opnb = has_ym2610 and not is_opna and not prefer_opl
+    is_opn2 = has_ym2612 and not is_opnb and not is_opna and not prefer_opl
     is_opn = (
         has_ym2203 and not has_ym2151 and not is_opn2 and not is_opnb
-        and not prefer_opl
+        and not is_opna and not prefer_opl
     )
     # The OPL family is one system per chip: the YM3526 and YM3812 own a flat
     # nine-channel space, the YMF262 two banks of nine. Rhythm mode is a second
@@ -3309,6 +3348,8 @@ def analyze(
         selected_fm_chips = {"ym2612"}
     elif is_opnb:
         selected_fm_chips = {"ym2610", "ym2610_ssg"}
+    elif is_opna:
+        selected_fm_chips = {"ym2608", "ym2608_ssg"}
     elif has_ym2151:
         selected_fm_chips = {"ym2151"}
     else:
@@ -3402,11 +3443,34 @@ def analyze(
             "YM2610 channel-2 special/CSM mode is converted with the base "
             "14/16-channel layout; per-operator FM3 frequencies are not split"
         )
-    multi_ext = ym2203_ext or ym2612_ext
+    # The OPNA's channel order is the YM2610B's with rhythm in place of
+    # ADPCM-A: six FM (nine when channel 3 is split), three SSG, six rhythm
+    # and one ADPCM-B. Bus A $27 bits 6-7 are the same mode field, and only
+    # special mode (01) is in these logs - the OPNA has no CSM.
+    ym2608_ids = (
+        sorted({
+            w.chip_id for w in vgm.writes
+            if w.chip in ("ym2608", "ym2608_ssg")
+        })
+        if is_opna else []
+    )
+    ym2608_clock = vgm.ym2608_clock or YM2608_DEFAULT_CLOCK
+    ym2608_modes = {
+        (w.val >> 6) & 0x03
+        for w in vgm.writes
+        if is_opna and w.chip == "ym2608" and not (w.reg & 0x100)
+        and (w.reg & 0xFF) == 0x27
+    }
+    ym2608_ext = bool(ym2608_modes & {1, 2})
+    ym2608_fm_count = 9 if ym2608_ext else 6
+    multi_ext = ym2203_ext or ym2612_ext or ym2608_ext
     ym_chunk = 9 if multi_ext else 6
     if is_opnb:
         ym_chunk = ym2610_fm_count + 3 + 6 + 1
         ym_base = {cid: ym_chunk * i for i, cid in enumerate(ym2610_ids)}
+    elif is_opna:
+        ym_chunk = ym2608_fm_count + 3 + 6 + 1
+        ym_base = {cid: ym_chunk * i for i, cid in enumerate(ym2608_ids)}
     else:
         ym_base = {
             cid: ym_chunk * i
@@ -3426,6 +3490,8 @@ def analyze(
 
     if is_opnb:
         fm_end = ym_chunk * len(ym2610_ids)
+    elif is_opna:
+        fm_end = ym_chunk * len(ym2608_ids)
     elif is_opn or is_opn2:
         fm_end = ym_chunk * len(ym_ids if is_opn else ym2612_ids)
     elif is_opl:
@@ -4090,8 +4156,21 @@ def analyze(
                 "3-slot chords are approximated by one operator"
             )
 
-    if is_opn2:
-        states = {cid: YM2612State() for cid in ym2612_ids}
+    # The YM2612 and the YM2608 share one collector. Both are banked six-slot
+    # OPN cores at the same frequency base, and both key all six channels from
+    # one register on bus A: the values 0-2 are block 1 and 4-6 block 2, after
+    # a reserved slot. What differs is the name in the log and what lives below
+    # $30 - a DAC on the YM2612, an IRQ mask on the OPNA.
+    if is_opn2 or is_opna:
+        banked_chip = "ym2612" if is_opn2 else "ym2608"
+        banked_ids = ym2612_ids if is_opn2 else ym2608_ids
+        banked_clock = ym2612_clock if is_opn2 else ym2608_clock
+        banked_ext = ym2612_ext if is_opn2 else ym2608_ext
+        banked_csm = ym2612_csm if is_opn2 else False
+        states = {
+            cid: (YM2612State() if is_opn2 else YM2608State())
+            for cid in banked_ids
+        }
         held_idx: dict[tuple[int, int, int], int] = {}
         pitch_pts: dict[tuple[int, int, int], list[tuple[int, int, int]]] = {}
         pitch_base: dict[tuple[int, int, int], tuple[int, int]] = {}
@@ -4117,7 +4196,11 @@ def analyze(
         lfo_last: dict[int, int] = {}
 
         def opn_event_ch(cid: int, ch: int) -> int:
-            return ym_base[cid] + ch
+            # The Ext layout keeps the first block's three voices at 0-2 and
+            # splits channel 3 across four operator columns, so the second
+            # block continues at 6-8 (genesisext and ym2608ext both answer
+            # `c.chan > 5` by handing `chan - 3` to the base system).
+            return ym_base[cid] + (ch + 3 if (banked_ext and ch >= 3) else ch)
 
         def normalized_patch(snap):
             """Strip the carrier level into a pattern volume value.
@@ -4187,7 +4270,7 @@ def analyze(
                 if merged and merged[0][0] - ev.sample <= 120:
                     if merged[0][1:] != pitch_base[key]:
                         ev.note, ev.e5 = ym2612_note_for(
-                            merged[0][1], merged[0][2], ym2612_clock
+                            merged[0][1], merged[0][2], banked_clock
                         )
                         # The note now starts at this write.  Earlier points
                         # are the pre-key-on snapshot; keeping them would
@@ -4219,7 +4302,7 @@ def analyze(
 
         def chan_freqs(cid: int, ch: int) -> tuple[tuple[int, int], ...]:
             st = states[cid]
-            if ym2612_ext and ch == 2:
+            if banked_ext and ch == 2:
                 return tuple(st.frequency_op(2, g) for g in range(4))
             return (st.frequency(ch),)
 
@@ -4243,7 +4326,7 @@ def analyze(
 
                 def is_kon(w):
                     return (
-                        w.chip == "ym2612"
+                        w.chip == banked_chip
                         and not (w.reg & 0x100)
                         and (w.reg & 0xFF) == 0x28
                     )
@@ -4254,7 +4337,7 @@ def analyze(
             return ordered
 
         for w in kon_last(vgm.writes):
-            if w.chip != "ym2612":
+            if w.chip != banked_chip:
                 continue
             cid = w.chip_id
             st = states.get(cid)
@@ -4277,7 +4360,8 @@ def analyze(
                 continue
             if not bank and r == 0x2A:
                 st.write(reg, val)
-                dac_writes += 1
+                if is_opn2:
+                    dac_writes += 1
                 continue
             if not bank and r == 0x2B:
                 was = st.dac_enabled
@@ -4302,7 +4386,7 @@ def analyze(
                         close_opn_note((cid, ch, -1), w.sample, off=True)
                     st.op_mask[ch] = mask
                     continue
-                if ym2612_ext and ch == 2:
+                if banked_ext and ch == 2:
                     prev = st.op_mask[ch]
                     if mask:
                         if cid not in ext_ready:
@@ -4336,7 +4420,7 @@ def analyze(
                             group = EXT_FREQ_OP[c]
                             block, fnum = freqs[group]
                             note, e5 = ym2612_note_for(
-                                block, fnum, ym2612_clock
+                                block, fnum, banked_clock
                             )
                             events.append(NoteEvent(
                                 sample=w.sample,
@@ -4385,7 +4469,7 @@ def analyze(
                 if mask and newly_on:
                     close_opn_note(key, w.sample, off=False)
                     block, fnum = st.frequency(ch)
-                    note, e5 = ym2612_note_for(block, fnum, ym2612_clock)
+                    note, e5 = ym2612_note_for(block, fnum, banked_clock)
                     ins, vol = intern_opn_patch(cid, ch, mask)
                     events.append(NoteEvent(
                         sample=w.sample,
@@ -4439,7 +4523,7 @@ def analyze(
             st.write(reg, val)
             after = chan_freqs(cid, ch)
 
-            if ym2612_ext and ch == 2:
+            if banked_ext and ch == 2:
                 for c in range(4):
                     key = (cid, ch, c)
                     group = EXT_FREQ_OP[c]
@@ -4477,8 +4561,8 @@ def analyze(
                 new_b4 = st.pan_pms_ams[ch]
                 if new_b4 != b4:
                     target = (
-                        ym_base[cid] + 2 if (ym2612_ext and ch == 2)
-                        else ym_base[cid] + ch
+                        ym_base[cid] + 2 if (banked_ext and ch == 2)
+                        else opn_event_ch(cid, ch)
                     )
                     pan = st.pan_byte(ch)
                     if (b4 ^ new_b4) & 0xC0:
@@ -4495,7 +4579,7 @@ def analyze(
         for key in list(held_idx):
             close_opn_note(key, vgm.total_samples or 0, off=False)
 
-        if ym2612_ext and ext_tl_notes:
+        if banked_ext and ext_tl_notes:
             _bind_ext_levels(
                 events, patches, patch_order, ext_tl_notes, ext_tl_floors)
 
@@ -4511,7 +4595,7 @@ def analyze(
         }
         if drop:
             events = [e for i, e in enumerate(events) if i not in drop]
-        if ym2612_csm:
+        if banked_csm:
             warnings.append(
                 "YM2612 CSM mode: per-operator frequencies are converted, "
                 "but timer-generated key-ons are not synthesized"
@@ -4553,7 +4637,9 @@ def analyze(
             )
 
     ym2610_ssg_count = 0
+    ym2608_ssg_count = 0
     ym2610_a_samples: list[AdpcmASample] = []
+
     ym2610_b_samples: list[AdpcmBSample] = []
     ym2610_a_count = 0
     ym2610_b_count = 0
@@ -4857,6 +4943,97 @@ def analyze(
                 warnings.append(
                     "YM2610 ADPCM ROM block missing; sample channels skipped"
                 )
+
+    # The OPNA's rhythm kit and delta-T channel. A rhythm voice is picked by
+    # which bit of the key byte rose, so no sample data travels with it and all
+    # six columns share one empty instrument. ADPCM-B reads the 0x81 block
+    # through a sample map, exactly as the YM2610's does.
+    ym2608_b_samples: list[AdpcmBSample] = []
+    ym2608_rhythm_events: list[NoteEvent] = []
+    ym2608_b_events: list[tuple[NoteEvent, int]] = []
+    ym2608_rhythm_count = 0
+    ym2608_b_count = 0
+    if is_opna:
+        rhythm_hits, rh_warn = collect_ym2608_rhythm(vgm)
+        warnings.extend(rh_warn)
+        rom_b = assemble_rom(vgm, "ym2608_deltat") if pcm else b""
+        if pcm:
+            ym2608_b_samples, dt_warn = collect_ym2608_delta_t(vgm, rom_b)
+            warnings.extend(dt_warn)
+
+        for h in rhythm_hits:
+            ym2608_rhythm_count += 1
+            if h.pan == 0 and not any(p for _t, p in h.pan_pts):
+                continue
+            ev = NoteEvent(
+                sample=h.sample_time,
+                ch=ym_base[h.chip_id] + ym2608_fm_count + 3 + h.voice,
+                on=True,
+                # The voice is the channel; the engine reads no pitch here.
+                note=60,
+                ins=-1,  # bound with the other sample instruments
+                vol=max(0, min(31, h.vol)),
+                e5=0x80,
+                pan=h.pan,
+                pcm=True,
+                end=h.end_time,
+            )
+            levels = _pcm_levels(h)
+            if levels:
+                ev.vol_pts = levels
+            events.append(ev)
+            ym2608_rhythm_events.append(ev)
+            if h.end_time and h.end_time > h.sample_time:
+                events.append(NoteEvent(
+                    sample=h.end_time,
+                    ch=ev.ch,
+                    on=False,
+                    note=180,
+                    ins=-1,
+                    vol=-1,
+                    e5=0x80,
+                    pan=0,
+                    pcm=True,
+                ))
+
+        for i, smp in enumerate(ym2608_b_samples):
+            for h in smp.hits:
+                ym2608_b_count += 1
+                if h.pan == 0 and not any(p for _t, p in h.pan_pts):
+                    continue
+                pitch_steps, vol_pts = _adpcm_b_motion(h)
+                ev = NoteEvent(
+                    sample=h.sample_time,
+                    ch=ym_base[h.chip_id] + ym2608_fm_count + 9,
+                    on=True,
+                    note=60 + (i % YM2610_MAP_SLOTS),
+                    ins=-1,  # bound below with the ADPCM-B maps
+                    vol=0 if h.pan == 0 else max(0, min(255, h.vol)),
+                    e5=0x80,
+                    pan=h.pan,
+                    pcm=True,
+                    end=h.end_time,
+                )
+                if pitch_steps:
+                    ev.pitch_steps = pitch_steps
+                    ev.e5_lo = 0x00
+                    ev.e5_hi = 0xFF
+                if vol_pts:
+                    ev.vol_pts = vol_pts
+                events.append(ev)
+                ym2608_b_events.append((ev, i))
+                if h.end_time and h.end_time > h.sample_time:
+                    events.append(NoteEvent(
+                        sample=h.end_time,
+                        ch=ev.ch,
+                        on=False,
+                        note=180,
+                        ins=-1,
+                        vol=-1,
+                        e5=0x80,
+                        pan=0,
+                        pcm=True,
+                    ))
 
     # Collect DAC runs now; group them after the row grid is known.
     dac_samples: list[DacSample] = []
@@ -5420,18 +5597,30 @@ def analyze(
     # Count the final DAC maps once, below; the collector's list is transient.
     n_ym2610_a_ins = (len(ym2610_a_samples) + YM2610_MAP_SLOTS - 1) // YM2610_MAP_SLOTS
     n_ym2610_b_ins = (len(ym2610_b_samples) + YM2610_MAP_SLOTS - 1) // YM2610_MAP_SLOTS
+    # The OPNA's delta-T maps follow the YM2610's, and its rhythm kit rides on
+    # one empty map instrument: the engine picks the voice by channel, so no
+    # note selects a sample and only the macros are read.
+    n_ym2608_b_ins = (len(ym2608_b_samples) + YM2610_MAP_SLOTS - 1) // YM2610_MAP_SLOTS
+    n_ym2608_rhythm_ins = 1 if ym2608_rhythm_events else 0
     tone_ins_base = (
         len(patch_order)
         + (len(audible) if pcm else 0) + len(oki_samples)
         + n_adpcm_ins + len(spcm_audible) + len(c140_audible)
         + len(c352_audible) + len(k053260_audible)
         + n_ym2610_a_ins + n_ym2610_b_ins
+        + n_ym2608_rhythm_ins + n_ym2608_b_ins
     )
-    ym2610_b_ins_base = tone_ins_base - n_ym2610_b_ins
+    ym2610_b_ins_base = tone_ins_base - n_ym2610_b_ins - n_ym2608_rhythm_ins - n_ym2608_b_ins
     ym2610_a_ins_base = ym2610_b_ins_base - n_ym2610_a_ins
+    ym2608_rhythm_ins_base = tone_ins_base - n_ym2608_b_ins - n_ym2608_rhythm_ins
+    ym2608_b_ins_base = tone_ins_base - n_ym2608_b_ins
     for ev, kind, idx in ym2610_events:
         base = ym2610_a_ins_base if kind == 0 else ym2610_b_ins_base
         ev.ins = base + idx // YM2610_MAP_SLOTS
+    for ev in ym2608_rhythm_events:
+        ev.ins = ym2608_rhythm_ins_base
+    for ev, idx in ym2608_b_events:
+        ev.ins = ym2608_b_ins_base + idx // YM2610_MAP_SLOTS
     scc_ids: list[int] = []
     scc_waves: list[bytes] = []
     scc_ins: list[ToneIns] = []
@@ -5576,6 +5765,23 @@ def analyze(
             tone_ins_base + len(scc_ins), vgm.total_samples or 0,
         )
         ay_count += ym2610_ssg_count
+
+    # The OPNA's SSG sits after its FM block and divides the same way.
+    ym2608_ssg_hits, ym2608_ssg_offs, ym2608_ssg_warn = collect_ay8910(
+        vgm, chip="ym2608_ssg", clock=ym2608_clock,
+        divider=YM2608_SSG_DIVIDER,
+    )
+    warnings.extend(ym2608_ssg_warn)
+    if ym2608_ssg_hits and ym2608_ids:
+        ssg_at = {
+            cid: ym_base[cid] + ym2608_fm_count for cid in ym2608_ids
+        }
+        ym2608_ssg_count = _emit_ay_notes(
+            events, channel_fx, ym2608_ssg_hits, ym2608_ssg_offs, ssg_at,
+            ym2608_clock, YM2608_SSG_DIVIDER,
+            tone_ins_base + len(scc_ins), vgm.total_samples or 0,
+        )
+        ay_count += ym2608_ssg_count
 
     events.sort(key=lambda e: (e.sample, e.ch, 0 if e.on else 1))
 
@@ -5747,6 +5953,7 @@ def analyze(
         + (len(audible) if pcm else 0) + len(oki_samples) + n_adpcm_ins
         + len(spcm_audible) + len(c140_audible) + len(c352_audible)
         + len(k053260_audible) + n_ym2610_a_ins + n_ym2610_b_ins
+        + n_ym2608_rhythm_ins + n_ym2608_b_ins
     )
     for ins, ramps in held_lfo.items():
         if not (0 <= ins < len(patch_order)):
@@ -5790,6 +5997,7 @@ def analyze(
             + n_adpcm_ins + len(spcm_audible) + len(c140_audible)
             + len(c352_audible) + len(k053260_audible)
             + n_ym2610_a_ins + n_ym2610_b_ins
+            + n_ym2608_rhythm_ins + n_ym2608_b_ins
         )
     if pms_lost:
         warnings.append(
@@ -5879,6 +6087,7 @@ def analyze(
         + len(spcm_audible) + len(c140_audible) + len(c352_audible)
         + len(k053260_audible) + n_ym2610_a_ins + n_ym2610_b_ins
         + len(scc_ins) + len(ay_ins) + len(psg_ins)
+        + n_ym2608_rhythm_ins + n_ym2608_b_ins
     )
     if n_total_ins > 250:
         warnings.append(
@@ -5933,7 +6142,8 @@ def analyze(
             opl_kind if is_opl else
             "opll" if is_opll else
             "ym2610" if is_opnb else
-            ("ym2203" if is_opn else ("ym2612" if is_opn2 else "ym2151"))
+            ("ym2608" if is_opna else
+             ("ym2203" if is_opn else ("ym2612" if is_opn2 else "ym2151")))
         ),
         ym2203_ids=ym_ids,
         ym2203_ext=ym2203_ext,
@@ -5961,6 +6171,13 @@ def analyze(
         ym2610_b_samples=ym2610_b_samples,
         ym2610_a_count=ym2610_a_count,
         ym2610_b_count=ym2610_b_count,
+        ym2608_ids=ym2608_ids,
+        ym2608_ext=ym2608_ext,
+        ym2608_ssg_count=ym2608_ssg_count,
+        ym2608_rhythm_count=ym2608_rhythm_count,
+        ym2608_rhythm_notes=len(ym2608_rhythm_events),
+        ym2608_b_samples=ym2608_b_samples,
+        ym2608_b_count=ym2608_b_count,
         scc_ids=scc_ids,
         scc_waves=scc_waves,
         scc_ins=scc_ins,
@@ -6039,6 +6256,14 @@ def format_report(song: Song) -> str:
             f"{(v.ym2610_clock or YM2610_DEFAULT_CLOCK) / 1e6:.6g} MHz, "
             f"{song.ym2610_ssg_count} SSG notes, "
             f"{song.ym2610_a_count} ADPCM-A, {song.ym2610_b_count} ADPCM-B"
+        ))
+    elif song.fm_chip == "ym2608":
+        layout = " Ext" if song.ym2608_ext else ""
+        lines.insert(-1, (
+            f"FM chip     YM2608{layout} x{len(song.ym2608_ids)} @ "
+            f"{(v.ym2608_clock or YM2608_DEFAULT_CLOCK) / 1e6:.6g} MHz, "
+            f"{song.ym2608_ssg_count} SSG notes, "
+            f"{song.ym2608_rhythm_count} rhythm, {song.ym2608_b_count} ADPCM-B"
         ))
     for i, p in enumerate(song.fm_patches):
         lfo = ""

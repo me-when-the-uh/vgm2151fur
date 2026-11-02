@@ -151,27 +151,20 @@ def _keyons_by_channel(
         if w.chip == "ym2151" and w.reg == 0x08 and (w.val & 0x78):
             out.setdefault(w.val & 7, []).append(w.sample)
         elif (
-            w.chip in ("ym2203", "ym2608") and (w.reg & 0xFF) == 0x28
+            w.chip == "ym2203" and (w.reg & 0xFF) == 0x28
             and (w.val & 0xF0)
         ):
             # Per-operator key masks; any 0->1 start is an onset. Keep chip
-            # instances apart without colliding with the YM2151's 0-7. The
-            # YM2608 owns a second FM block, reached through bus B (bit 8 of
-            # the flattened register), whose three channels continue its run.
-            if w.chip == "ym2608":
-                raw = w.val & 3
-                if (w.reg & 0x100) and raw == 3:
-                    continue
-                voice = (1 if (w.reg & 0x100) else 0) * 3 + raw
-            else:
-                voice = w.val & 3
+            # instances apart without colliding with the YM2151's 0-7.
+            voice = w.val & 3
             out.setdefault(1000 + w.chip_id * 6 + voice, []).append(w.sample)
         elif (
-            w.chip == "ym2612" and not (w.reg & 0x100)
+            w.chip in ("ym2612", "ym2608") and not (w.reg & 0x100)
             and (w.reg & 0xFF) == 0x28 and (w.val & 0xF0)
         ):
-            # Same rule for the YM2612's six channels.  Key-on encodes the
-            # second group as 4-6 after the reserved 3.
+            # Same rule for the YM2612's and the YM2608's six channels.  Both
+            # key from one register on bus A, and the second group is encoded
+            # as 4-6 after the reserved 3.
             raw = w.val & 0x07
             if raw in (3, 7):
                 continue
