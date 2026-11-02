@@ -81,20 +81,27 @@ class YM2610State:
         self.special_block = [0] * 3
         self.special_set = [False] * 3
         self._special_hi: list[int | None] = [None] * 3
-        # ADPCM-A registers (port 1).  Start/end are address/256.
+        # ADPCM-A registers (port 1).  Start/end are address/256. The reset
+        # values are the chip's and Furnace's, not zeros: ymfm loads `0xDF` into
+        # each level byte - "max instrument volume; some neogeo homebrews rely on
+        # this" (ymfm_adpcm.cpp:48-51) - and DivPlatformYM2610/YM2608 write the
+        # global level to full at init. A zero default here would fold an
+        # unwritten voice to silence and drop its notes as muted.
         self.a_control = 0
-        self.a_master = 0
-        self.a_vol = [0] * 6
-        self.a_pan = [0] * 6
+        self.a_master = 0x3F
+        self.a_vol = [0x1F] * 6
+        self.a_pan = [3] * 6
         self.a_start = [0] * 6
         self.a_end = [0] * 6
-        # ADPCM-B registers (port 0).  Start/end are address/256.
+        # ADPCM-B registers (port 0).  Start/end are address/256. Same argument:
+        # the platform's reset writes $0B to 0xFF, and a channel pans both until
+        # told otherwise.
         self.b_control = 0
-        self.b_pan = 0
+        self.b_pan = 3
         self.b_start = 0
         self.b_end = 0
         self.b_freq = 0
-        self.b_vol = 0
+        self.b_vol = 0xFF
         self.b_flags = 0
 
     @property
