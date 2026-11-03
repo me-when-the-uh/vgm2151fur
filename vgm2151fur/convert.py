@@ -336,6 +336,8 @@ def convert_vgm(
         "oki_samples": len(song.oki_samples) if pcm else 0,
         "msm6258_samples": len(song.msm6258_samples) if pcm else 0,
         "segapcm_samples": len(song.segapcm_samples) if pcm else 0,
+        "rf5c68_samples": len(song.rf5c68_samples) if pcm else 0,
+        "rf5c164_samples": len(song.rf5c164_samples) if pcm else 0,
         "c140_samples": len(song.c140_samples) if pcm else 0,
         "c352_samples": len(song.c352_samples) if pcm else 0,
         "k053260_samples": len(song.k053260_samples) if pcm else 0,

@@ -235,6 +235,25 @@ they can be run from anywhere.
   exports it back through Furnace. Unset, it falls back to the grandparent of
   `VGM2151FUR_OPNA_RIPS`; if neither has a `*_merged.vgm`, the tests skip.
   See docs/merged-logs.md for what each log holds.
+- `VGM2151FUR_SAMPLE_RIPS`, `VGM2151FUR_SEGACD_RIPS`, `VGM2151FUR_FMTOWNS_RIPS`:
+  roots the RF5C real-rip tests search (in addition to the two above). The FM
+  Towns Xenon rip lives under the OPNA root (`xenon-fmtowns\done`), and a Sega
+  CD pack such as Popful Mail sits outside it, so each can be named directly.
+  See docs/segapcm-c140.md for the RF5C model.
+- `VGM2151FUR_Y8950_RIPS`: a folder holding the Y8950 rip the real-rip test
+  converts (`03v - Credit Inserted (with voice).vgm`). Without it that test
+  skips. See docs/opl.md for the Y8950 model.
+- `VGM2151FUR_YRW801`: path to the 2 MB YMF278B wave ROM (a `.rom`, or a
+  `.zip` containing one). The OPL4 converter embeds the ROM sample bodies
+  because Furnace does not load the ROM itself. Without the variable it also
+  looks for `furnace/yrw801.rom` under the project and the current directory,
+  then `yrw801.rom` in the current directory. A log whose wave slots address
+  ROM sample IDs loses those notes if the ROM cannot be found, and the
+  converter warns.
+- `VGM2151FUR_OPL4_RIPS`: a folder holding the MoonDriver OPL4 rips the
+  real-rip tests convert (`05 encounter the unknown environment.vgz` and
+  `06 TIME'S UP!.vgz`). Without it those tests skip. See docs/opl.md for the
+  YMF278B model, the wave descriptor format and the pan table.
 
 ## Exit codes
 

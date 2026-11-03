@@ -85,6 +85,9 @@ CHIP_MSM6295 = 0xAA
 CHIP_MSM6258 = 0xAB
 CHIP_K007232 = 0xC6
 CHIP_SEGAPCM = 0x9B
+# Furnace hosts the RF5C68 (FM Towns) and RF5C164 (Sega CD) as one system.
+# The chipType flag picks the variant: 0 = RF5C68, 1 = RF5C164.
+CHIP_RF5C68 = 0x95
 CHIP_C140 = 0xCE
 CHIP_K053260 = 0xCC
 # Furnace format.md reserves 0xD0 for Namco C352, 32 channels, and marks it
@@ -108,9 +111,17 @@ CHIP_OPL3_DRUMS = 0xA4
 # give the kick the first former FM channel and snare, tom, cymbal and hi-hat
 # the next four (sysDef.cpp); the kick keeps its two operators, so it plays a
 # normal OPL voice.
+# The Y8950 is an OPL2 with one ADPCM column after the FM block. The OPL4 is
+# an OPL3 with 24 wave columns after it.
+CHIP_Y8950 = 0xB2
+CHIP_Y8950_DRUMS = 0xB3
+CHIP_OPL4 = 0xAE
+CHIP_OPL4_DRUMS = 0xAF
 OPL_CHIP = {("opl", False): CHIP_OPL, ("opl2", False): CHIP_OPL2,
             ("opl3", False): CHIP_OPL3, ("opl", True): CHIP_OPL_DRUMS,
-            ("opl2", True): CHIP_OPL2_DRUMS, ("opl3", True): CHIP_OPL3_DRUMS}
+            ("opl2", True): CHIP_OPL2_DRUMS, ("opl3", True): CHIP_OPL3_DRUMS,
+            ("y8950", False): CHIP_Y8950, ("y8950", True): CHIP_Y8950_DRUMS,
+            ("opl4", False): CHIP_OPL4, ("opl4", True): CHIP_OPL4_DRUMS}
 # The YM2413 (OPLL) is its own core and instrument type. Rhythm mode is a
 # separate system whose last three hardware channels become five kit columns.
 CHIP_OPLL = 0x89
@@ -122,10 +133,16 @@ OPLL_DRUM_LABELS = (
     ("Kick", "BD"), ("Snare", "SD"), ("Tom", "TM"), ("Top", "TP"),
     ("HiHat", "HH"),
 )
+# The OPL4's FM half is OPL3-shaped; its 24 wave columns are counted by
+# `_system_span` on top of these.
 OPL_CHANNELS = {("opl", False): 9, ("opl2", False): 9, ("opl3", False): 18,
-                ("opl", True): 11, ("opl2", True): 11, ("opl3", True): 20}
+                ("opl", True): 11, ("opl2", True): 11, ("opl3", True): 20,
+                ("y8950", False): 9, ("y8950", True): 11,
+                ("opl4", False): 18, ("opl4", True): 20}
 OPL_MELODIC = {("opl", False): 9, ("opl2", False): 9, ("opl3", False): 18,
-               ("opl", True): 6, ("opl2", True): 6, ("opl3", True): 15}
+               ("opl", True): 6, ("opl2", True): 6, ("opl3", True): 15,
+               ("y8950", False): 9, ("y8950", True): 6,
+               ("opl4", False): 18, ("opl4", True): 15}
 # Furnace's channel labels. An OPL3 pair whose first channel is even can head a
 # four-operator voice, and the system names it that way whether or not a note
 # uses it.
@@ -196,6 +213,9 @@ INS_MSM6295 = 36
 INS_ADPCMA = 37
 INS_ADPCMB = 38
 INS_SEGAPCM = 39
+INS_RF5C68 = 42
+# DIV_INS_MULTIPCM: the OPL4 wave slot's sample-map instrument.
+INS_MULTIPCM = 28
 INS_K007232 = 45
 INS_K053260 = 50
 INS_C140 = 53
@@ -581,13 +601,16 @@ def _write_ins_opm(b: Buf, name: str, patch) -> None:
 
 def _write_ins_sample_map(
     b: Buf, name: str, first_sample: int, maps: list[int],
-    ins_type: int = INS_C352,
+    ins_type: int = INS_C352, flags: int = 0x01,
 ) -> None:
     """120 note slots, one sample per slot.
 
     Each slot stores freq 48, which the reader adds to note 60. Every slice
     plays at C-4 and uses the sample's own rate. `first_sample` stays 0:
     Furnace 0.6.8.3 reads a nonzero base as an embedded sample count.
+
+    `flags` selects the SM feature bits: 1 = useNoteMap, 2 = useSample,
+    3 = both.  The AY sample path needs useSample too, so SSG PCM passes 3.
     """
     size_off, start = b.begin_block(b"INS2")
     b.u16(FUR_VERSION)
@@ -603,7 +626,7 @@ def _write_ins_sample_map(
     b.u16(0)
     sm_start = len(b.b)
     b.u16(first_sample)
-    b.u8(1)   # use the note map
+    b.u8(flags & 0xFF)
     b.u8(31)  # wave length field (unused for samples)
     for slot in range(120):
         b.u16(48)  # note 60 + 48 = C-4 in the pre-246 encoding
@@ -983,6 +1006,27 @@ def segapcm_flag_text(clock: int, rom_size: int) -> str:
     # 0 = 2 MB (Y board), 1 = 512 KB (the rest). Furnace addresses the ROM in
     # 8-bit units and clips to this size.
     parts.append(f"memSize={0 if rom_size > 0x80000 else 1}")
+    return "\n".join(parts)
+
+
+def rf5c68_flag_text(clock: int, chip_type: int) -> str:
+    """RF5C68 system flags: chip type and clock.
+
+    `chipType` 0 is the RF5C68 (FM Towns) and 1 the RF5C164 (Sega CD), the
+    same split `DivPlatformRF5C68::setFlags` reads. Furnace's named clocks are
+    the FM Towns 8 MHz and the Sega CD 12.5 MHz, so the usual rips need no
+    custom clock.
+    """
+    parts = [f"chipType={1 if chip_type else 0}"]
+    clk = clock or 8000000
+    if clk == 8000000:
+        parts.append("clockSel=0")
+    elif clk == 10000000:
+        parts.append("clockSel=1")
+    elif clk == 12500000:
+        parts.append("clockSel=2")
+    else:
+        parts.append(f"customClock={clk}")
     return "\n".join(parts)
 
 
@@ -2632,6 +2676,28 @@ def _build_patterns(song: Song, n_ch: int, pat_len_max: int, fx_cols: int,
                 _add_quad_fx(cell, four, fx_cols, stats, prev)
                 prev = four
 
+    # An OPL modulator level that differs from the shared instrument baseline
+    # (12xx..15xx: operator 1-4 TL, 0 highest, 3F lowest). The note row can
+    # carry the attack level alongside its note; later rows carry the moves.
+    if song.events:
+        for ev in song.events:
+            ev_ch = ev.ch + ch_offset
+            if not (ev.on and ev.op_tl_fx) or ev_ch < 0 or ev_ch >= n_ch:
+                continue
+            for sample, op, value in ev.op_tl_fx:
+                if content_cut is not None and sample >= content_cut:
+                    continue
+                row, delay = song.place(sample, stats)
+                if row < 0 or row >= total_rows:
+                    continue
+                cell = grid[ev_ch].get(row)
+                if cell is None:
+                    cell = _blank_row()
+                    grid[ev_ch][row] = cell
+                _add_fx(cell, 0x12 + op, value & 0x3F, fx_cols, stats)
+                if delay:
+                    _add_fx(cell, 0xED, delay, fx_cols, stats)
+
     for ch in range(n_ch):
         cur_e5 = 0x80
         rows = sorted(
@@ -2826,7 +2892,7 @@ def _channel_vol_max(
     for system in systems:
         top = (
             15 if system.kind == "opll" else
-            63 if system.kind in ("opl", "opl2", "opl3") else 127
+            63 if system.kind in ("opl", "opl2", "opl3", "y8950", "opl4") else 127
         )
         for _ in range(system.fm_channels):
             if ch < n_ch:
@@ -2980,7 +3046,7 @@ def _append_system_names(
                 for voice in range(3):
                     longs.append(f"PSG {cid + 1}-{voice + 1}")
                     shorts.append(f"P{cid + 1}-{voice + 1}")
-        elif kind in ("opl", "opl2", "opl3"):
+        elif kind in ("opl", "opl2", "opl3", "y8950", "opl4"):
             melodic = OPL_MELODIC[(kind, bool(system.drums))]
             for i, (long_name, short_name) in enumerate(zip(*opl_channel_names(
                     kind, bool(system.drums)))):
@@ -2998,6 +3064,17 @@ def _append_system_names(
                     )
                 else:
                     shorts.append(short_name)
+            if kind == "y8950":
+                # The ADPCM voice is one column after the FM block.
+                longs.append(f"ADPCM{suffix}")
+                shorts.append(f"P{cid + 1}" if counts[kind] > 1 else "ADPCM")
+            if kind == "opl4":
+                # The 24 wave slots follow the FM block.
+                for i in range(24):
+                    longs.append(f"PCM {i + 1}{suffix}")
+                    shorts.append(
+                        f"P{cid + 1}-{i + 1}" if counts[kind] > 1 else f"P{i + 1}"
+                    )
         elif kind == "opll":
             for i, (long_name, short_name) in enumerate(
                     zip(*opll_channel_names(bool(system.drums)))):
@@ -3081,6 +3158,12 @@ def write_fur(
     adpcm_smps = list(song.msm6258_samples) if include_pcm else []
     n_adpcm_ins = (len(adpcm_smps) + 119) // 120
     spcm_smps = [s for s in song.segapcm_samples if s.length >= 8] if include_pcm else []
+    rf5c68_smps = (
+        [s for s in song.rf5c68_samples if s.length >= 8] if include_pcm else []
+    )
+    rf5c164_smps = (
+        [s for s in song.rf5c164_samples if s.length >= 8] if include_pcm else []
+    )
     c140_smps = [s for s in song.c140_samples if s.length >= 8] if include_pcm else []
     c352_smps = [s for s in song.c352_samples if s.length >= 8] if include_pcm else []
     k053260_smps = (
@@ -3090,8 +3173,8 @@ def write_fur(
     n_dac_ins = (len(dac_smps) + 119) // 120
     dac_smp_base = (
         len(pcm_smps) + len(oki_smps) + len(adpcm_smps)
-        + len(spcm_smps) + len(c140_smps) + len(c352_smps)
-        + len(k053260_smps)
+        + len(spcm_smps) + len(rf5c68_smps) + len(rf5c164_smps)
+        + len(c140_smps) + len(c352_smps) + len(k053260_smps)
     )
     ym2610_a_smps = (
         list(getattr(song, "ym2610_a_samples", ()) or ()) if include_pcm else []
@@ -3114,6 +3197,27 @@ def write_fur(
         1 if (include_pcm and getattr(song, "ym2608_rhythm_notes", 0)) else 0
     )
     ym2608_b_smp_base = ym2610_b_smp_base + len(ym2610_b_smps)
+    # The Y8950's one ADPCM voice uses the same ADPCM-B sample format.
+    y8950_b_smps = (
+        list(getattr(song, "y8950_b_samples", ()) or ()) if include_pcm else []
+    )
+    n_y8950_b_ins = (len(y8950_b_smps) + 119) // 120
+    y8950_b_smp_base = ym2608_b_smp_base + len(ym2608_b_smps)
+    # The OPL4 wave slots use DIV_INS_MULTIPCM sample maps.
+    opl4_wave_smps = (
+        list(getattr(song, "opl4_wave_samples", ()) or ()) if include_pcm else []
+    )
+    n_opl4_wave_ins = len(opl4_wave_smps)
+    opl4_wave_smp_base = y8950_b_smp_base + len(y8950_b_smps)
+    # SSG/PSG PCM: one DIV_INS_AY sample instrument per 8-bit body. The writer
+    # places these instruments just before the SCC/AY/PSG tone instruments and
+    # the sample blocks after the OPL4 wave bodies.
+    ssg_pcm_smps = (
+        list(getattr(song, "ssg_pcm_samples", ()) or ()) if include_pcm else []
+    )
+    # 120 bodies per AY sample-map instrument.
+    n_ssg_pcm_ins = (len(ssg_pcm_smps) + 119) // 120
+    ssg_pcm_smp_base = opl4_wave_smp_base + len(opl4_wave_smps)
     oki_ids, oki_groups = _grouped(oki_smps)
     adpcm_ids, adpcm_groups = _grouped(adpcm_smps)
     c140_ids: list[int] = []
@@ -3155,7 +3259,7 @@ def write_fur(
     if fm_present:
         for system in systems:
             kind = system.kind
-            if kind in ("opl", "opl2", "opl3", "opll"):
+            if kind in ("opl", "opl2", "opl3", "opll", "y8950", "opl4"):
                 n_fm += _system_span(system)
                 continue
             if kind == "ym2610" or kind == "ym2608":
@@ -3172,10 +3276,12 @@ def write_fur(
             else:
                 n_fm += system.fm_channels or 8
     n_k007 = 2 if want_k007 else 0
+    n_rf5c = (8 if rf5c68_smps else 0) + (8 if rf5c164_smps else 0)
     n_ch = (
         n_fm + n_ssg + n_adpcm_a + n_adpcm_b + n_psg + n_k007
         + 4 * len(oki_ids) + len(adpcm_ids)
-        + (16 if spcm_smps else 0) + 24 * len(c140_ids) + 32 * len(c352_ids)
+        + (16 if spcm_smps else 0) + n_rf5c
+        + 24 * len(c140_ids) + 32 * len(c352_ids)
         + 4 * len(k053260_ids) + n_scc + n_ay
     )
     if n_ch == 0:
@@ -3183,22 +3289,28 @@ def write_fur(
     fx_cols = 8  # room for LFO 17/18/1E/1F plus pan/E5/ED/Bxx
     k_clock = song.vgm.k007232_clock or 3579545
     spcm_clock = song.vgm.segapcm_clock or SEGAPCM_CLOCK_X
+    rf5c68_clock = song.vgm.rf5c68_clock or 8000000
+    rf5c164_clock = song.vgm.rf5c164_clock or 12500000
     c140_clock = song.vgm.c140_clock or 12288000
     c352_clock = song.vgm.c352_clock or C352_DEFAULT_CLOCK
     k053260_clock = song.vgm.k053260_clock or 3579545
 
     n_ins = (
         len(fm_ins) + n_dac_ins + len(pcm_smps) + len(oki_smps) + n_adpcm_ins
-        + len(spcm_smps) + len(c140_smps) + len(c352_smps) + len(k053260_smps)
+        + len(spcm_smps) + len(rf5c68_smps) + len(rf5c164_smps)
+        + len(c140_smps) + len(c352_smps) + len(k053260_smps)
         + n_ym2610_a_ins + n_ym2610_b_ins
         + n_ym2608_rhythm_ins + n_ym2608_b_ins
+        + n_y8950_b_ins + n_opl4_wave_ins + n_ssg_pcm_ins
         + len(scc_specs) + len(ay_specs) + len(psg_specs)
     )
     n_smp = (
         len(pcm_smps) + len(oki_smps) + len(adpcm_smps)
-        + len(spcm_smps) + len(c140_smps) + len(c352_smps)
+        + len(spcm_smps) + len(rf5c68_smps) + len(rf5c164_smps)
+        + len(c140_smps) + len(c352_smps)
         + len(k053260_smps) + len(dac_smps)
         + len(ym2610_a_smps) + len(ym2610_b_smps) + len(ym2608_b_smps)
+        + len(y8950_b_smps) + len(opl4_wave_smps) + len(ssg_pcm_smps)
     )
     n_wav = len(scc_waves)
 
@@ -3247,6 +3359,17 @@ def write_fur(
         for voice in range(16):
             names_long.append(f"SEGA {voice + 1}")
             names_short.append(f"S{voice + 1}")
+    # The RF5C pair are separate chips to Furnace (one system each), but share
+    # a label family: "PCM 1".."PCM 8" for the 68, "PCM 9".."PCM 16" for a 164
+    # in the same module, so a combined log never repeats a column name.
+    rf5c_n = 0
+    for smps in (rf5c68_smps, rf5c164_smps):
+        if not smps:
+            continue
+        for voice in range(8):
+            names_long.append(f"PCM {rf5c_n + voice + 1}")
+            names_short.append(f"P{rf5c_n + voice + 1}")
+        rf5c_n += 8
     for cid in c140_ids:
         for voice in range(24):
             names_long.append(f"C140 {cid + 1}-{voice + 1}")
@@ -3306,6 +3429,14 @@ def write_fur(
         label_parts.append("MSM6258")
     if spcm_smps:
         label_parts.append("SegaPCM")
+    if rf5c68_smps:
+        label_parts.append("RF5C68")
+    if rf5c164_smps:
+        label_parts.append("RF5C164")
+    if fm_present and any(s.kind == "y8950" for s in systems):
+        label_parts.append("Y8950")
+    if fm_present and any(s.kind == "opl4" for s in systems):
+        label_parts.append("OPL4")
     if c140_ids:
         label_parts.append("C140")
     if c352_ids:
@@ -3420,23 +3551,29 @@ def write_fur(
     flag_texts: list[str] = []
     ym2610_sys: dict[int, int] = {}
     ym2608_sys: dict[int, int] = {}
+    opl_sys: dict[int, int] = {}
     if fm_present:
         for system in systems:
             # One module system per chip, in the order the channels were laid
             # out. Each kind carries its own clock flag.
             kind = system.kind
             cid = system.chip_id
-            if kind in ("opl", "opl2", "opl3"):
+            if kind in ("opl", "opl2", "opl3", "y8950", "opl4"):
                 chips.append(OPL_CHIP[(kind, bool(system.drums))])
-                # An OPL core defaults to COLOR_NTSC and an OPL3 to four times
-                # it. Outside that tolerance the clock decides every f-num, so
-                # it has to travel with the module.
+                opl_sys[cid] = len(chips) - 1
+                # An OPL core defaults to COLOR_NTSC and an OPL3/OPL4 to four
+                # times it. Outside that tolerance the clock decides every
+                # f-num, so it has to travel with the module.
                 fm_clock = (
                     song.vgm.opl3_clock if kind == "opl3" else
-                    song.vgm.opl2_clock if kind == "opl2" else song.vgm.opl_clock
+                    song.vgm.opl2_clock if kind == "opl2" else
+                    song.vgm.y8950_clock if kind == "y8950" else
+                    song.vgm.ymf278b_clock if kind == "opl4" else
+                    song.vgm.opl_clock
                 )
-                default = FURNACE_CLOCK_OPL3 if kind == "opl3" else FURNACE_CLOCK
-                module = opl_module_clock(fm_clock, kind == "opl3")
+                is_opl3_clock = kind in ("opl3", "opl4")
+                default = FURNACE_CLOCK_OPL3 if is_opl3_clock else FURNACE_CLOCK
+                module = opl_module_clock(fm_clock, is_opl3_clock)
                 flag_texts.append(
                     "" if module == default else f"customClock={fm_clock}"
                 )
@@ -3521,6 +3658,12 @@ def write_fur(
             (s.rom_size for s in song.vgm.roms if s.kind == "segapcm"), default=0
         )
         flag_texts.append(segapcm_flag_text(song.vgm.segapcm_clock, rom_size))
+    if rf5c68_smps:
+        chips.append(CHIP_RF5C68)
+        flag_texts.append(rf5c68_flag_text(song.vgm.rf5c68_clock, 0))
+    if rf5c164_smps:
+        chips.append(CHIP_RF5C68)
+        flag_texts.append(rf5c68_flag_text(song.vgm.rf5c164_clock, 1))
     for cid in c140_ids:
         chips.append(CHIP_C140)
         flag_texts.append(c140_flag_text(song.vgm.c140_clock, song.vgm.c140_type))
@@ -3716,7 +3859,19 @@ def write_fur(
         _write_ins_pcm(
             b, f"SEGA {smp.start:05x}", spcm_ins_base + i, INS_SEGAPCM,
         )
-    c140_ins_base = spcm_ins_base + len(spcm_smps)
+    rf5c68_ins_base = spcm_ins_base + len(spcm_smps)
+    for i, smp in enumerate(rf5c68_smps):
+        ins_ptrs.append(len(b))
+        _write_ins_pcm(
+            b, f"RF5C68 {smp.start:04x}", rf5c68_ins_base + i, INS_RF5C68,
+        )
+    rf5c164_ins_base = rf5c68_ins_base + len(rf5c68_smps)
+    for i, smp in enumerate(rf5c164_smps):
+        ins_ptrs.append(len(b))
+        _write_ins_pcm(
+            b, f"RF5C164 {smp.start:04x}", rf5c164_ins_base + i, INS_RF5C68,
+        )
+    c140_ins_base = rf5c164_ins_base + len(rf5c164_smps)
     for i, smp in enumerate(c140_smps):
         ins_ptrs.append(len(b))
         _write_ins_pcm(
@@ -3772,6 +3927,36 @@ def write_fur(
         _write_ins_sample_map(
             b, f"ADPCM-B {group + 1}", 0, maps, INS_ADPCMB,
         )
+    for group in range(n_y8950_b_ins):
+        ins_ptrs.append(len(b))
+        first = y8950_b_smp_base + group * 120
+        maps = [
+            first + slot
+            for slot in range(min(120, len(y8950_b_smps) - group * 120))
+        ]
+        _write_ins_sample_map(
+            b, f"Y8950 ADPCM {group + 1}", 0, maps, INS_ADPCMB,
+        )
+    for i, smp in enumerate(opl4_wave_smps):
+        ins_ptrs.append(len(b))
+        _write_ins_pcm(
+            b, f"OPL4 WAVE {smp.wave:03d}", opl4_wave_smp_base + i,
+            INS_MULTIPCM,
+        )
+    # The AY sample path allows 120 bodies per instrument through a note map;
+    # notes 60-179 select a slot and every slot plays at C-4.  This keeps a
+    # drum-heavy track (hundreds of distinct bodies) inside the 255-instrument
+    # module limit.
+    for group in range(n_ssg_pcm_ins):
+        ins_ptrs.append(len(b))
+        first = group * 120
+        maps = [
+            ssg_pcm_smp_base + first + slot
+            for slot in range(min(120, len(ssg_pcm_smps) - first))
+        ]
+        _write_ins_sample_map(
+            b, f"PSG PCM {group + 1}", 0, maps, INS_AY, flags=0x03,
+        )
     for i, spec in enumerate(scc_specs):
         ins_ptrs.append(len(b))
         wave = scc_waves[spec.wave] if spec.wave < len(scc_waves) else b""
@@ -3810,6 +3995,20 @@ def write_fur(
         smp_ptrs.append(len(b))
         _write_sample_s8(
             b, f"spcm_{smp.start:05x}", smp.data, smp.c4_rate(spcm_clock),
+            loop=(smp.loop_start, smp.loop_end),
+        )
+    for smp in rf5c68_smps:
+        smp_ptrs.append(len(b))
+        _write_sample_s8(
+            b, f"rf5c68_{smp.start:04x}", smp.data,
+            smp.c4_rate(rf5c68_clock),
+            loop=(smp.loop_start, smp.loop_end),
+        )
+    for smp in rf5c164_smps:
+        smp_ptrs.append(len(b))
+        _write_sample_s8(
+            b, f"rf5c164_{smp.start:04x}", smp.data,
+            smp.c4_rate(rf5c164_clock),
             loop=(smp.loop_start, smp.loop_end),
         )
     for smp in c140_smps:
@@ -3891,6 +4090,38 @@ def write_fur(
             deltat_store_body(smp.data), rate,
             SMP_DEPTH_ADPCM_B, (1 << sys, 0, 0, 0), loop=loop,
         )
+    y8950_clock = song.vgm.y8950_clock or 3579545
+    for smp in y8950_b_smps:
+        sys = opl_sys.get(smp.chip_id, 0)
+        rate = max(
+            1, int(round(
+                y8950_clock / 144 * (smp.rate & 0xFFFF) / 65535
+                * ADPCM_B_RATE_COMPENSATION
+            )),
+        )
+        loop = any(h.loop for h in smp.hits)
+        smp_ptrs.append(len(b))
+        # The Y8950 has one ADPCM bank, read from renderOn[0].
+        _write_sample_adpcm(
+            b, f"y8950_{smp.start:06x}_{smp.rate:04x}",
+            deltat_store_body(smp.data), rate,
+            SMP_DEPTH_ADPCM_B, (1 << sys, 0, 0, 0), loop=loop,
+        )
+    opl4_clock = song.vgm.ymf278b_clock or 33868800
+    for smp in opl4_wave_smps:
+        smp_ptrs.append(len(b))
+        # The wave bodies are already signed 16-bit LE.
+        _write_sample_s8(
+            b, f"opl4_{smp.wave:03d}", smp.data,
+            smp.c4_rate(opl4_clock),
+            loop=(smp.loop_start, smp.loop_end),
+            depth=SMP_DEPTH_16BIT,
+        )
+    for smp in ssg_pcm_smps:
+        smp_ptrs.append(len(b))
+        # The bodies are already 8-bit levels encoded for the AY DAC table;
+        # `rate` is the source write rate and note 108 plays it 1:1.
+        _write_sample_s8(b, smp.name, smp.data, smp.rate)
 
     pat_ptrs: list[int] = []
     for ch, idx, rows in patterns:

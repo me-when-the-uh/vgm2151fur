@@ -33,11 +33,27 @@ OPL3_DEFAULT_CLOCK = 14318180  # YMF262; COLOR_NTSC * 4
 KIND_OPL = "opl"
 KIND_OPL2 = "opl2"
 KIND_OPL3 = "opl3"
+# The YMF278B/OPL4's FM half is OPL3-shaped (two banks, four-operator pairs,
+# waveform select) but runs off a different divider: Furnace's DivPlatformOPL
+# sets chipFreqBase to 32768*684 and its clock to 33.8688 MHz (opl.cpp:3390).
+KIND_OPL4 = "opl4"
+# The Y8950's FM half is an OPL2 (waveform select and rhythm included); its
+# ADPCM voice is handled outside this state.
+KIND_Y8950 = "y8950"
 
 # DivPlatformOPL::chipFreqBase, keyed by whether the chip has two banks. The
 # OPL3 runs eighteen channels off four times the prescaler. At its usual
 # 14.318 MHz clock a note lands on the same unit value an OPL2 finds at 3.58.
 FREQ_BASE = {False: 32768 * 72, True: 32768 * 288}
+# DivPlatformOPL::setOPLType for chipType 4 overrides the OPL3 base with the
+# OPL4's divider (32768*684). Using the OPL3 base here puts every FM note more
+# than an octave flat, so the pitch path carries it separately.
+FREQ_BASE_OPL4 = 32768 * 684
+
+
+def opl3_like(kind: str) -> bool:
+    """True for the two-bank OPL chips: YMF262 and the OPL4's FM half."""
+    return kind in (KIND_OPL3, KIND_OPL4)
 # pitchTable.init's maximum, and the f-num ceiling of toFreq.
 MAX_UNIT = 0x1FFFF
 MAX_FNUM = 0x3FF
@@ -101,17 +117,24 @@ LAYOUT = {
     (KIND_OPL, True): (11, 6),
     (KIND_OPL2, True): (11, 6),
     (KIND_OPL3, True): (20, 15),
+    # The OPL4's FM half, before the caller appends the 24 wave columns.
+    (KIND_OPL4, False): (18, 18),
+    (KIND_OPL4, True): (20, 15),
+    # The Y8950's FM half is OPL2-shaped. Its ADPCM column is appended by the
+    # caller, not part of this state.
+    (KIND_Y8950, False): (9, 9),
+    (KIND_Y8950, True): (11, 6),
 }
 
 
 def slots_for(kind: str, drums: bool) -> tuple[tuple[int, ...], ...]:
-    if kind == KIND_OPL3:
+    if opl3_like(kind):
         return SLOTS_OPL3_DRUMS if drums else SLOTS_OPL3
     return SLOTS_OPL2_DRUMS if drums else SLOTS_OPL2
 
 
 def chan_map_for(kind: str, drums: bool) -> tuple[int, ...]:
-    if kind == KIND_OPL3:
+    if opl3_like(kind):
         return CHAN_MAP_OPL3_DRUMS if drums else CHAN_MAP_OPL3
     return CHAN_MAP_OPL2_DRUMS if drums else CHAN_MAP_OPL2
 
@@ -288,16 +311,20 @@ def opl_module_clock(clock: int | float, opl3: bool = False) -> float:
     return float(clock)
 
 
-def pitch_table(clock: float, opl3: bool = False) -> FreqPitchTable:
+def pitch_table(
+    clock: float, opl3: bool = False, freq_base: int | None = None,
+) -> FreqPitchTable:
     """The module's table for one chip and clock.
 
-    ``opl3`` selects the two-bank frequency base; it is not derivable from the
-    clock, which a rip may set to anything.
+    ``opl3`` selects the two-bank layout, and ``freq_base`` overrides the
+    divider when the variant is not an OPL3 (the OPL4 uses ``32768*684``).
+    Neither is derivable from the clock, which a rip may set to anything.
     """
-    key = (round(opl_module_clock(clock, opl3), 4), bool(opl3))
+    base = FREQ_BASE[bool(opl3)] if freq_base is None else int(freq_base)
+    key = (round(opl_module_clock(clock, opl3), 4), base)
     tbl = _TABLES.get(key)
     if tbl is None:
-        tbl = FreqPitchTable(key[0], FREQ_BASE[bool(opl3)])
+        tbl = FreqPitchTable(key[0], base)
         _TABLES[key] = tbl
     return tbl
 
@@ -331,31 +358,32 @@ def opl_pitch_units(block: int, fnum: int) -> float:
 
 def opl_unit_for(
     note: int, clock: float, e5: int = 0x80, opl3: bool = False,
-    pitch2: int = 0,
+    pitch2: int = 0, freq_base: int | None = None,
 ) -> int:
     """The engine frequency unit a note, its E5 byte and a macro value produce.
 
     ``pitch2`` is an instrument pitch macro's offset in 1/128 semitone.
     ``get()`` folds it into the same offset as the fine tune. A note whose
     instrument carries an octave compensation therefore still lands on the
-    rip's register.
+    rip's register. ``freq_base`` is the variant's divider (OPL4).
     """
-    return pitch_table(clock, opl3).value(note, e5, pitch2)
+    return pitch_table(clock, opl3, freq_base).value(note, e5, pitch2)
 
 
 def opl_note_fnum(
     note: int, clock: float, e5: int = 0x80, opl3: bool = False,
-    pitch2: int = 0,
+    pitch2: int = 0, freq_base: int | None = None,
 ) -> tuple[int, int]:
     """(block, fnum) Furnace writes for a pattern note on this clock."""
-    return to_freq(opl_unit_for(note, clock, e5, opl3, pitch2))
+    return to_freq(opl_unit_for(note, clock, e5, opl3, pitch2, freq_base))
 
 
-_NOTES: dict[tuple[int, int, int, bool], tuple[int, int]] = {}
+_NOTES: dict[tuple[int, int, float, bool, int], tuple[int, int]] = {}
 
 
 def opl_note_for(
     block: int, fnum: int, clock: float, opl3: bool = False,
+    freq_base: int | None = None,
 ) -> tuple[int, int]:
     """Source (block, fnum) -> (pattern note, E5 byte).
 
@@ -368,11 +396,11 @@ def opl_note_for(
     """
     block = max(0, min(7, int(block)))
     fnum = max(1, min(MAX_FNUM, int(fnum)))
-    key = (block, fnum, round(float(clock), 4), bool(opl3))
+    tbl = pitch_table(clock, opl3, freq_base)
+    key = (block, fnum, round(float(clock), 4), bool(opl3), int(tbl.base))
     hit = _NOTES.get(key)
     if hit is not None:
         return hit
-    tbl = pitch_table(clock, opl3)
     want = opl_pitch_units(block, fnum)
     unit = max(1, fnum << block)
     est = 57.0 + 12.0 * math.log2(unit * tbl.clock / (tbl.tuning * tbl.base))
@@ -533,7 +561,7 @@ class OPLState:
 
     def __init__(self, kind: str = KIND_OPL2, drums: bool = False) -> None:
         self.kind = kind
-        self.opl3 = kind == KIND_OPL3
+        self.opl3 = opl3_like(kind)
         self.drums = drums
         self.regs = [0] * 512
         total, melodic = LAYOUT[(kind, drums)]

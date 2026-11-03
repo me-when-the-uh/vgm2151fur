@@ -1,9 +1,10 @@
-# SegaPCM and Namco C140 sample support
+# SegaPCM, Namco C140 and Ricoh RF5C sample support
 
-Both chips convert to their native Furnace systems, with no stand-in
-carrier. VGM writes `0xC0` (SegaPCM) and `0xD4` (C140) and ROM blocks `0x80`
-/ `0x8D` are parsed, samples are extracted per voice, and loops are
-preserved through the SMP2 loop points.
+The chips convert to their native Furnace systems, with no stand-in carrier.
+VGM writes `0xC0` (SegaPCM), `0xD4` (C140) and `0xB0`/`0xB1` (RF5C68/RF5C164)
+plus their ROM/ RAM blocks are parsed, samples are extracted per voice, and
+loops are preserved through the SMP2 loop points. The RF5C pair share one
+register model and one Furnace system; `chipType` picks the variant.
 
 ## Chips
 
@@ -169,6 +170,46 @@ movement the *engine* makes, not the ideal rate: a glide that wants 2.66
 units/tick is written as `01 03` (the parameter is a whole number), and
 crediting the ideal rate compounds a fraction-of-a-unit error into
 semitones over long climbs.
+
+## Ricoh RF5C68 / RF5C164
+
+Furnace hosts both chips as one system (`0x95`, eight voices) and picks the
+variant from the `chipType` flag: 0 is the RF5C68 (FM Towns, 8 MHz) and 1 the
+RF5C164 (Sega CD, 12.5 MHz). `DivPlatformRF5C68::setFlags` is the same split.
+VGM keeps them apart by command (`$B0`/`$C1` vs `$B1`/`$C2`), header clock
+(0x40 vs 0x6C) and RAM block type (0xC0 vs 0xC1); the register model is shared.
+
+| | RF5C68 | RF5C164 |
+|---|---|---|
+| `.fur` system | 0x95, `chipType=0` | 0x95, `chipType=1` |
+| instrument type | 42 (`DIV_INS_RF5C68`) | 42 |
+| VGM writes | `$B0` reg, `$C1` RAM | `$B1` reg, `$C2` RAM |
+| RAM block | 0xC0 (u16-LE start + data) | 0xC1 |
+| clock | header 0x40 | header 0x6C |
+| RAM | one 64 KB window | one 64 KB window |
+
+Registers (MAME `rf5c68.cpp`): 0x00 envelope, 0x01 pan (low nibble left, high
+right), 0x02/0x03 16-bit frequency step, 0x04/0x05 loop address, 0x06 start
+page (8-bit, units of 256 bytes), 0x07 control (bit 7 chip enable, bit 6
+select voice in bits 2-0 else set the 4 KB write bank in bits 3-0), 0x08
+voice-enable bitmap (a clear bit keys the voice and a set bit rewinds it).
+A 0xFF byte read from RAM is the end marker: the voice jumps to the loop
+address and stops when that byte is also 0xFF. Stored bytes are
+sign-magnitude (bit 7 sign, bits 0-6 magnitude); silence is 0x80.
+
+Playback rate is `clock * step / 786432` bytes/second (Furnace's
+`CHIP_FREQBASE` for the core, 384 * 2048). The sample's usual step is C-4 and
+each hit's step becomes the note/E5 ratio.
+
+**One-shot trick.** The chip has no loop-disable bit. Drivers that want a
+one-shot point the loop at the trailing silence just before the end marker,
+so a loop at `len-1` (the Xenon FM Towns rip does this for every hit) is
+stored as a one-shot and a genuinely mid-body loop keeps its points.
+
+**Retriggers.** A driver keys a voice by disabling it, rewriting the page and
+enabling it again in the same burst. A disable followed by an enable within
+64 samples is that burst, not a note-off; a disable that stays down is a real
+off. The loop is cut on the off so a looping sample does not ring forever.
 
 ## Limits
 

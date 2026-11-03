@@ -166,6 +166,15 @@ low and high bytes of one period are one update. A later cell from a pitch
 split writes the envelope shape only when register 13 was written in that
 cell; mode, noise and envelope period still follow their registers.
 
+## PCM sample playback
+
+The AY SSG can also act as a 4-bit DAC: a driver disables the voice's tone and
+noise bits and spams the volume register at audio rate. Those streams become
+`DIV_INS_AY` sample instruments (8-bit, 120 bodies per note map, every slot
+plays C-4) instead of tone notes; a channel that plays a tone first and drums
+later keeps both. See [`ssg-pcm.md`](ssg-pcm.md) for detection, segmentation,
+DAC-stream timing and the level map.
+
 ## Volumes
 
 Furnace system volumes come from the reference player's mix (both chips
