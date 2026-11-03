@@ -115,6 +115,21 @@ from vgm2151fur.rf5c import (
     collect_rf5c,
     rf5c_rate,
 )
+from vgm2151fur.nes import (
+    NES_CPU_DIVIDER,
+    NES_DEFAULT_CLOCK,
+    NES_FURNACE_CLOCK,
+    NesDpcmHit,
+    NesDpcmSample,
+    NesPcmHit,
+    NesPcmSample,
+    _noise_note as nes_noise_note,
+    _period_delta as nes_period_delta,
+    collect_nes_dpcm,
+    collect_nes_pcm,
+    collect_nes_tones,
+    nes_note,
+)
 from vgm2151fur.segapcm import (
     SegapcmSample, collect_segapcm, hit_played_freq as segapcm_played_freq,
     segapcm_rate,
@@ -467,6 +482,9 @@ class FmSystem:
     csm: bool = False
     drums: bool = False
     clock: int = 0
+    # The YM2413 core asked to run as a Konami VRC7 (six channels, its own
+    # preset ROM); the writer emits DIV_SYSTEM_VRC7 instead of the OPLL id.
+    vrc7: bool = False
 
     @property
     def channels(self) -> int:
@@ -487,6 +505,8 @@ class FmSystem:
             from vgm2151fur.opl import channel_count
             return channel_count(self.kind, self.drums) + 24
         if self.kind == "opll":
+            if self.vrc7:
+                return 6
             return OPLL_DRUMS_CHANNELS if self.drums else OPLL_CHANNELS
         if self.kind in ("ym2610", "ym2608"):
             # FM, three SSG voices, six kit or ADPCM-A voices and one delta-T.
@@ -589,6 +609,8 @@ class Song:
     # last three hardware channels as five percussion columns).
     opll_ids: list[int] = field(default_factory=list)
     opll_drums: bool = False
+    # The same core asked for as a Konami VRC7 (bit 31 of the YM2413 clock).
+    opll_vrc7: bool = False
     # Top of the volume column for this system's FM channels. The OPL platform
     # answers 63 to getVolMax and masks the value to six bits, so writing the
     # 127 an OPN column tops out at would land on zero.
@@ -669,6 +691,14 @@ class Song:
     # `ssg_pcm_count` notes.
     ssg_pcm_samples: list[SsgPcmSample] = field(default_factory=list)
     ssg_pcm_count: int = 0
+    # NES APU: five channels per instance. `nes_ins` holds the one plain tone
+    # instrument; DPCM bodies are 1-bit (depth 1) and direct `$4011` bodies are
+    # 8-bit PCM, each with one sample instrument.
+    nes_ids: list[int] = field(default_factory=list)
+    nes_ins: list[ToneIns] = field(default_factory=list)
+    nes_dpcm_samples: list[NesDpcmSample] = field(default_factory=list)
+    nes_pcm_samples: list[NesPcmSample] = field(default_factory=list)
+    nes_count: int = 0
     # Genesis SN76489: four channels (three tone + noise) after the FM block.
     psg_ids: list[int] = field(default_factory=list)
     psg_ins: list[ToneIns] = field(default_factory=list)
@@ -1096,10 +1126,12 @@ def _bind_tone_instruments(
     scc_ins: list[ToneIns],
     ay_ins: list[ToneIns],
     psg_ins: list[ToneIns],
+    nes_ins: list[ToneIns],
     tone_ins_base: int,
     scc_clock: int,
     ay_clock: int,
     psg_clock: int,
+    nes_clock: int,
     hz: float,
     total_samples: int,
 ) -> None:
@@ -1115,11 +1147,13 @@ def _bind_tone_instruments(
     scc_map: dict[ToneIns, int] = {}
     ay_map: dict[ToneIns, int] = {}
     psg_map: dict[ToneIns, int] = {}
+    nes_map: dict[ToneIns, int] = {}
     ins_cap = max(1, 250 - tone_ins_base)
     bound: list[tuple[NoteEvent, int]] = []
     tone_order = [e for e in events if e.on and e.tone_chip == 2]
     tone_order += [e for e in events if e.on and e.tone_chip == 1]
     tone_order += [e for e in events if e.on and e.tone_chip == 3]
+    tone_order += [e for e in events if e.on and e.tone_chip == 4]
     for e in tone_order:
         end = e.end or track_end
         # 255 macro values times the largest speed byte. Long SSG pads can
@@ -1136,6 +1170,14 @@ def _bind_tone_instruments(
                 clock = PSG_FURNACE_CLOCK
             divider = PSG_DIVIDER
             maximum = PSG_MAX_PERIOD
+        elif e.tone_chip == 4:
+            # The NES core runs the CPU at COLOR_NTSC/2 with a divider of 16
+            # and an 11-bit timer (never a module clock).
+            clock = e.tone_clock or nes_clock or NES_DEFAULT_CLOCK
+            if abs(clock - NES_FURNACE_CLOCK) <= 1:
+                clock = NES_FURNACE_CLOCK
+            divider = NES_CPU_DIVIDER
+            maximum = 0x7FF
         else:
             # AY and the YM2203's SSG share the instrument path but not the
             # clock or Furnace's divider (8 vs 16).
@@ -1144,7 +1186,7 @@ def _bind_tone_instruments(
             maximum = 0xFFF
         tbl = (
             pitch_table(float(clock), divider, maximum=maximum)
-            if e.tone_chip == 3
+            if e.tone_chip in (3, 4)
             else pitch_table(module_clock(clock), divider)
         )
         base_off = (e.note << 7) + (e.e5 - E5_CENTER)
@@ -1255,10 +1297,19 @@ def _bind_tone_instruments(
             idx, kept = _take_tone(
                 spec, psg_map, psg_ins, len(scc_ins) + len(ay_ins), ins_cap, 3,
             )
+        elif e.tone_chip == 4:
+            idx, kept = _take_tone(
+                spec, nes_map, nes_ins,
+                len(scc_ins) + len(ay_ins) + len(psg_ins), ins_cap, 4,
+            )
         else:
             # AY runs first, so the SCC list is still empty and `others` is 0.
             idx, kept = _take_tone(spec, ay_map, ay_ins, 0, ins_cap, 2)
         bound.append((e, idx))
+        if e.tone_chip == 4 and kept.pitch:
+            # The instrument now carries the pitch trajectory; the row ramp
+            # would double it.
+            e.sweep = ()
         if e.tone_chip == 3:
             # The SMS column is the raw 4-bit register; keep vol_pts as
             # pattern steps rather than folding them into a volume macro.
@@ -1286,11 +1337,14 @@ def _bind_tone_instruments(
             e.vol_pts = ()
     n_scc = len(scc_ins)
     n_ay = len(ay_ins)
+    n_psg = len(psg_ins)
     for event, idx in bound:
         if event.tone_chip == 1:
             event.ins = tone_ins_base + idx
         elif event.tone_chip == 3:
             event.ins = tone_ins_base + n_scc + n_ay + idx
+        elif event.tone_chip == 4:
+            event.ins = tone_ins_base + n_scc + n_ay + n_psg + idx
         else:
             event.ins = tone_ins_base + n_scc + idx
 
@@ -3608,6 +3662,7 @@ def analyze(
     has_y8950 = KIND_Y8950 in chips
     has_opl4 = "ymf278b" in chips
     has_opll = "opll" in chips
+    has_nes = "nes" in chips
 
     # The PCM a YM2612 streams is music even when the chip keys no FM voice,
     # so its activity counts the DAC as well as the key-ons.
@@ -3845,10 +3900,14 @@ def analyze(
         sorted({w.chip_id for w in vgm.writes if w.chip == "opll"})
         if is_opll else []
     )
+    # Bit 31 of the YM2413 clock field asks for the Konami VRC7: same OPLL
+    # core, six channels and the VRC7 preset ROM. It has no rhythm mode.
+    opll_vrc7 = bool(is_opll and getattr(vgm, "ym2413_vrc7", False))
     # Like the OPL kit, the drums layout is a separate Furnace system. It is
     # chosen only when a $0e trigger actually rises while rhythm mode is on.
     opll_drums, opll_rhythm = (
-        opll_rhythm_plan(vgm, opll_ids) if is_opll else (False, {})
+        opll_rhythm_plan(vgm, opll_ids) if is_opll and not opll_vrc7
+        else (False, {})
     )
     opll_clock = (
         opll_module_clock(vgm.ym2413_clock or 3579545) if is_opll else 0.0
@@ -3957,7 +4016,9 @@ def analyze(
     }
     opl_end = ym_end + opl_chunk * len(opl_ids)
     # The YM2413 owns nine melodic columns, or eleven when its kit is in use.
+    # The VRC7 is the same core with six.
     opll_chunk = (
+        6 if opll_vrc7 else
         OPLL_DRUMS_CHANNELS if opll_drums else OPLL_CHANNELS
     ) if is_opll else 0
     opll_start = opl_end if is_opl else ym_end
@@ -4018,8 +4079,9 @@ def analyze(
         for cid in opll_ids:
             fm_systems.append(FmSystem(
                 "opll", cid,
-                (OPLL_DRUMS_CHANNELS if opll_drums else OPLL_CHANNELS),
-                drums=opll_drums, clock=int(opll_clock),
+                (6 if opll_vrc7 else
+                 OPLL_DRUMS_CHANNELS if opll_drums else OPLL_CHANNELS),
+                drums=opll_drums, clock=int(opll_clock), vrc7=opll_vrc7,
             ))
 
     # A Genesis log carries the SN76489 beside the YM2612.  The module uses a
@@ -6367,6 +6429,31 @@ def analyze(
     else:
         audible = []
 
+    # NES APU: two pulses, triangle, noise and the DPCM/PCM channel.  Collect
+    # now so the instrument counts are known before the tone list is placed.
+    nes_ids = (
+        sorted({w.chip_id for w in vgm.writes if w.chip == "nes"})
+        if has_nes else []
+    )
+    nes_clock = vgm.nes_clock or NES_DEFAULT_CLOCK
+    if has_nes:
+        nes_tones, nes_offs, nes_warn = collect_nes_tones(vgm, nes_clock)
+        warnings.extend(nes_warn)
+        nes_dpcm_samples, nes_dpcm_hits, nes_warn = collect_nes_dpcm(
+            vgm, nes_clock,
+        )
+        warnings.extend(nes_warn)
+        nes_pcm_samples, nes_pcm_hits, nes_warn = collect_nes_pcm(
+            vgm, nes_clock,
+        )
+        warnings.extend(nes_warn)
+    else:
+        nes_tones, nes_offs = [], []
+        nes_dpcm_samples, nes_dpcm_hits = [], []
+        nes_pcm_samples, nes_pcm_hits = [], []
+    n_nes_dpcm_ins = len(nes_dpcm_samples)
+    n_nes_pcm_ins = len(nes_pcm_samples)
+
     # SCC and AY are pitched chips and convert even under --melody-only. Their
     # channels follow the FM block and every sample chip.
     tone_base = (
@@ -6433,6 +6520,7 @@ def analyze(
     ay_ids: list[int] = []
     ay_ins: list[ToneIns] = []
     psg_ins: list[ToneIns] = []
+    nes_ins: list[ToneIns] = []
     scc_count = 0
     ay_count = 0
     # SSG/PSG PCM bodies and the notes that play them. The instrument indices
@@ -6552,6 +6640,18 @@ def analyze(
     ay_hits, ay_offs, ay_warn = collect_ay8910(vgm)
     warnings.extend(ay_warn)
     ay_clock = vgm.ay8910_clock or AY_DEFAULT_CLOCK
+    # A Famicom's AY is a Sunsoft 5B with SEL tied low, so it runs at half
+    # the logged CPU clock.  The VGM's pin-26 flag (0x79 bit 4) says the same
+    # thing on other platforms.  The tracker's pitch table still runs from the
+    # logged clock, so label the notes at half speed; the written period is
+    # then doubled and the chip sounds at the real /2 rate.  A rip that
+    # already logged the halved clock is left alone.
+    nes_clk = vgm.nes_clock or NES_DEFAULT_CLOCK
+    if nes_ids:
+        ay_half = abs(ay_clock - nes_clk) <= 16
+    else:
+        ay_half = bool(getattr(vgm, "ay8910_flags", 0) & 0x10)
+    ay_note_clock = (ay_clock // 2) if ay_half else ay_clock
     ay_cids = sorted(
         {h.chip_id for h in ay_hits} | {h.chip_id for h in ay_pcm_hits}
     )
@@ -6562,10 +6662,116 @@ def analyze(
                  for i, cid in enumerate(ay_ids)}
         if ay_hits:
             ay_count = _emit_ay_notes(
-                events, channel_fx, ay_hits, ay_offs, ay_at, ay_clock, 8,
+                events, channel_fx, ay_hits, ay_offs, ay_at, ay_note_clock, 8,
                 tone_ins_base + len(scc_ins), vgm.total_samples or 0,
             )
         _emit_pcm(ay_pcm, ay_pcm_hits, ay_at)
+
+    # NES APU columns: two pulses, triangle, noise and DPCM/PCM. They follow
+    # the SCC/AY blocks in module order.
+    if nes_ids:
+        nes_base = (
+            tone_base + SCC_VOICES * len(scc_ids) + AY_VOICES * len(ay_ids)
+        )
+        nes_tone_events: list[NoteEvent] = []
+        for h in nes_tones:
+            ch = nes_base + h.voice
+            if h.voice == 3:
+                note = nes_noise_note(h.period)
+                e5 = 0x80
+                sweep: tuple[tuple[int, int], ...] = ()
+            else:
+                note, e5 = nes_note(nes_clock, h.period)
+                deltas = tuple(
+                    (t, nes_period_delta(h.period, per))
+                    for t, per in h.pitch_pts
+                )
+                vals = [d for _t, d in deltas]
+                sweep = deltas if deltas and max(vals + [0]) - min(vals + [0]) >= 4 else ()
+            # Duty/noise mode, envelope mode and the triangle linear counter
+            # are row effects.
+            if h.voice < 2:
+                channel_fx.append((h.sample_time, ch, 0x12, h.duty))
+                for t, duty in h.duty_pts:
+                    channel_fx.append((t, ch, 0x12, duty))
+            elif h.voice == 3:
+                channel_fx.append((h.sample_time, ch, 0x12, h.duty))
+                for t, duty in h.duty_pts:
+                    channel_fx.append((t, ch, 0x12, duty))
+                channel_fx.append((h.sample_time, ch, 0x15, h.env_mode))
+                for t, mode in h.env_pts:
+                    channel_fx.append((t, ch, 0x15, mode))
+            else:
+                channel_fx.append((h.sample_time, ch, 0x19, h.linear))
+                for t, linear in h.linear_pts:
+                    channel_fx.append((t, ch, 0x19, linear))
+            if h.voice < 2:
+                channel_fx.append((h.sample_time, ch, 0x15, h.env_mode))
+                for t, mode in h.env_pts:
+                    channel_fx.append((t, ch, 0x15, mode))
+            ev = NoteEvent(
+                sample=h.sample_time,
+                ch=ch,
+                on=True,
+                note=note,
+                ins=-1,
+                vol=15 if h.voice == 2 else h.vol,
+                e5=e5,
+                pan=0,
+                end=h.off_sample,
+                vol_pts=tuple((t, v, None) for t, v in h.vol_pts),
+                sweep=sweep,
+                sweep_div=2.0,
+                e5_lo=0x00,
+                e5_hi=0xFF,
+                # Tone-chip marker: keeps instrument rebasing in step and lets
+                # the writer put volume steps on the note row.  `tone_pitch_pts`
+                # lets a per-note instrument carry the driver's pitch motion;
+                # `sweep` stays as the all-on-the-columns fallback.
+                tone_pitch_pts=tuple(h.pitch_pts) if h.voice != 3 else (),
+                tone_clock=nes_clock,
+                tone_div=NES_CPU_DIVIDER,
+                tone_period_offset=1,
+                tone_chip=4,
+            )
+            events.append(ev)
+            nes_tone_events.append(ev)
+        for off in nes_offs:
+            events.append(NoteEvent(
+                sample=off.sample_time, ch=nes_base + off.voice, on=False,
+                note=180, ins=-1, vol=-1, e5=0x80, pan=0,
+            ))
+        # DPCM: the note value selects the DMC rate (60 + rate index); one
+        # instrument per sample body. PCM: note 108 plays an 8-bit body at its
+        # stored rate.
+        nes_dpcm_events: list[tuple[NoteEvent, int]] = []
+        for hit in nes_dpcm_hits:
+            ch = nes_base + 4
+            channel_fx.append((hit.sample_time, ch, 0x18, 1))
+            channel_fx.append((hit.sample_time, ch, 0x11, 0))
+            ev = NoteEvent(
+                sample=hit.sample_time, ch=ch, on=True,
+                note=60 + (hit.rate_index & 0x0F), ins=-1, vol=15,
+                e5=0x80, pan=0, end=hit.end_time, no_pan=True, pcm=True,
+            )
+            events.append(ev)
+            nes_dpcm_events.append((ev, hit.sample_index))
+        nes_pcm_events: list[tuple[NoteEvent, int]] = []
+        for hit in nes_pcm_hits:
+            ch = nes_base + 4
+            channel_fx.append((hit.sample_time, ch, 0x18, 0))
+            ev = NoteEvent(
+                sample=hit.sample_time, ch=ch, on=True, note=108, ins=-1,
+                vol=15, e5=0x80, pan=0, end=hit.end_time, no_pan=True,
+                pcm=True,
+            )
+            events.append(ev)
+            nes_pcm_events.append((ev, hit.sample_index))
+    else:
+        nes_base = None
+        nes_tone_events = []
+        nes_dpcm_events = []
+        nes_pcm_events = []
 
     # The YM2203 SSG rides in the same six-channel system: 0-2 FM, 3-5 PSG. Its
     # notes share the AY instrument list.
@@ -6650,6 +6856,12 @@ def analyze(
     ssg_pcm_ins_base = tone_ins_base
     if n_ssg_pcm:
         tone_ins_base += n_ssg_pcm
+    # NES DPCM/PCM sample instruments follow the SSG PCM group, still before
+    # the SCC/AY/PSG tone list.
+    nes_dpcm_ins_base = tone_ins_base
+    tone_ins_base += n_nes_dpcm_ins
+    nes_pcm_ins_base = tone_ins_base
+    tone_ins_base += n_nes_pcm_ins
 
     events.sort(key=lambda e: (e.sample, e.ch, 0 if e.on else 1))
 
@@ -6887,6 +7099,10 @@ def analyze(
         )
         ssg_pcm_ins_base = tone_ins_base
         tone_ins_base += n_ssg_pcm
+        nes_dpcm_ins_base = tone_ins_base
+        tone_ins_base += n_nes_dpcm_ins
+        nes_pcm_ins_base = tone_ins_base
+        tone_ins_base += n_nes_pcm_ins
     if pms_lost:
         warnings.append(
             f"{pms_lost} YM2151 PMS/AMS ramps stayed on the base instrument: "
@@ -6914,15 +7130,22 @@ def analyze(
     # once per tick, so building it before condense (or before the musical
     # row is chosen) plays the driver's trajectory at the wrong speed.
     _bind_tone_instruments(
-        events, scc_ins, ay_ins, psg_ins, tone_ins_base,
+        events, scc_ins, ay_ins, psg_ins, nes_ins, tone_ins_base,
         vgm.k051649_clock or SCC_DEFAULT_CLOCK,
-        vgm.ay8910_clock or AY_DEFAULT_CLOCK,
+        ay_note_clock,
         psg_clock,
+        nes_clock,
         hz, vgm.total_samples,
     )
     # SSG PCM instruments sit immediately before the tone list.
     for ev, idx in ssg_pcm_events:
         ev.ins = ssg_pcm_ins_base + idx // 120
+    # NES tone instruments are bound by `_bind_tone_instruments`; the sample
+    # instruments follow the SSG PCM group.
+    for ev, idx in nes_dpcm_events:
+        ev.ins = nes_dpcm_ins_base + idx
+    for ev, idx in nes_pcm_events:
+        ev.ins = nes_pcm_ins_base + idx
 
     loop_sample = vgm.loop_sample
     if loop_sample is not None and loop_sample < 0:
@@ -6936,6 +7159,7 @@ def analyze(
         or ym2610_a_samples or ym2610_b_samples
         or ym2608_b_samples or ym2608_rhythm_events
         or y8950_b_samples or opl4_wave_samples or ssg_pcm_samples
+        or nes_ids or nes_dpcm_samples or nes_pcm_samples
         or any(s.length >= 8 for s in pcm_samples)
         or scc_waves or ay_count or dac_samples or psg_count
     )
@@ -7071,6 +7295,12 @@ def analyze(
         opl_drums=opl_drums,
         opll_ids=opll_ids,
         opll_drums=opll_drums,
+        opll_vrc7=opll_vrc7,
+        nes_ids=nes_ids,
+        nes_ins=nes_ins,
+        nes_dpcm_samples=nes_dpcm_samples,
+        nes_pcm_samples=nes_pcm_samples,
+        nes_count=len(nes_tones) + len(nes_dpcm_hits) + len(nes_pcm_hits),
         fm_vol_max=_fm_vol_max(fm_systems, is_opll=is_opll, is_opl=is_opl),
         fm_notes=(
             opll_stats.get("notes", 0) if is_opll else

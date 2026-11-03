@@ -17,6 +17,7 @@ from vgm2151fur.analyze import Song, ToneIns
 from vgm2151fur.c140 import c140_furnace_clock
 from vgm2151fur.c352 import C352_DEFAULT_CLOCK
 from vgm2151fur.fm import CARRIERS, OPN_CARRIERS
+from vgm2151fur.nes import nes_dpcm_rate
 from vgm2151fur.oki import msm6258_flag_text, oki_flag_text, oki_needs_banked
 from vgm2151fur.opl import (
     FURNACE_CLOCK, FURNACE_CLOCK_OPL3, opl_module_clock, opll_clock_flag,
@@ -126,6 +127,10 @@ OPL_CHIP = {("opl", False): CHIP_OPL, ("opl2", False): CHIP_OPL2,
 # separate system whose last three hardware channels become five kit columns.
 CHIP_OPLL = 0x89
 CHIP_OPLL_DRUMS = 0xA7
+# DIV_SYSTEM_VRC7: the same OPLL core with six channels and the VRC7 preset
+# ROM.  DIV_SYSTEM_NES: five channels (two pulses, triangle, noise, DPCM).
+CHIP_VRC7 = 0x9D
+CHIP_NES = 0x06
 OPLL_CHANNELS = 9
 OPLL_DRUMS_CHANNELS = 11
 OPLL_DRUMS_MELODIC = 6
@@ -182,9 +187,11 @@ def opl_channel_names(kind: str, drums: bool) -> tuple[list[str], list[str]]:
     return long_names, short_names
 
 
-def opll_channel_names(drums: bool) -> tuple[list[str], list[str]]:
-    """The long and short channel names of the OPLL and its drums sibling."""
-    total = OPLL_DRUMS_CHANNELS if drums else OPLL_CHANNELS
+def opll_channel_names(
+    drums: bool, vrc7: bool = False,
+) -> tuple[list[str], list[str]]:
+    """The long and short channel names of the OPLL, VRC7 and drums sibling."""
+    total = 6 if vrc7 else (OPLL_DRUMS_CHANNELS if drums else OPLL_CHANNELS)
     long_names: list[str] = []
     short_names: list[str] = []
     for ch in range(total):
@@ -227,6 +234,10 @@ INS_C352 = 4
 INS_AY = 6
 INS_STD = 0
 INS_SCC = 18
+# DIV_INS_NES: the 2A03 pulse/triangle/noise and DPCM instrument.  The DPCM
+# sample rides the same `amiga` sample feature (1-bit DPCM or 8-bit PCM).
+INS_NES = 34
+SMP_DEPTH_DPCM = 1
 SMP_DEPTH_ADPCM_K = 7
 SMP_DEPTH_ADPCM_A = 5
 SMP_DEPTH_ADPCM_B = 6
@@ -808,6 +819,61 @@ def _write_ins_ay(b: Buf, name: str, ins=None) -> None:
     b.end_block(size_off, start)
 
 
+def _write_ins_nes(b: Buf, name: str, ins=None) -> None:
+    """DIV_INS_NES: a plain tone instrument (duty/volume ride the pattern).
+
+    Duty/noise mode, envelope mode and the triangle linear counter are row
+    effects, so the instrument only needs a name and (optionally) the pitch
+    macro the shared tone writer already knows how to emit.
+    """
+    size_off, start = b.begin_block(b"INS2")
+    b.u16(FUR_VERSION)
+    b.u16(INS_NES)
+    b.raw(b"NA")
+    na_size = len(b.b)
+    b.u16(0)
+    na_start = len(b.b)
+    b.strz(name)
+    b.b[na_size:na_size + 2] = int(len(b.b) - na_start).to_bytes(2, "little")
+    _write_tone_macros(b, ins or ToneIns(), wave=False)
+    b.raw(b"EN")
+    b.end_block(size_off, start)
+
+
+def _write_sample_dpcm(
+    b: Buf, name: str, data: bytes, c4_rate: int, loop: bool = False,
+) -> None:
+    """NES 1-bit DPCM body.
+
+    Furnace's ``DivSample::init`` pads a DPCM sample to
+    ``1 + ((bytes + 14) & ~15)``; a source DMC length is always ``16k+1``
+    bytes, which lands on that same value, so the panel's length register
+    round-trips.  The bit order is LSB-first, the same as the APU RAM.
+    """
+    bits = len(data) * 8
+    length_dpcm = 1 + ((len(data) + 14) & ~15)
+    body = bytes(data) + b"\xAA" * max(0, length_dpcm - len(data))
+    size_off, start = b.begin_block(b"SMP2")
+    b.strz(name)
+    b.u32(bits)
+    b.u32(c4_rate)
+    b.u32(c4_rate)
+    b.u8(SMP_DEPTH_DPCM)
+    b.u8(0)
+    b.u8(0)
+    b.u8(0)
+    if loop:
+        b.s32(0)
+        b.s32(bits)
+    else:
+        b.s32(-1)
+        b.s32(-1)
+    for _ in range(4):
+        b.u32(0xFFFFFFFF)
+    b.raw(body)
+    b.end_block(size_off, start)
+
+
 def _write_wave(b: Buf, name: str, data: bytes) -> int:
     """DivWavetable::putWaveData: the 32-byte waveform an SCC instrument plays."""
     ptr = len(b)
@@ -1042,12 +1108,19 @@ def c140_flag_text(clock: int, c140_type: int) -> str:
     return "\n".join(parts)
 
 
-def ay8910_flag_text(clock: int, chip_type: int) -> str:
+def ay8910_flag_text(
+    clock: int, chip_type: int, *, sunsoft5b: bool = False,
+) -> str:
     """AY-8910 system flags: chip type and clock.
 
-    YM2149 family types 0x10/0x11 select Furnace's YM2149 core. Anything
-    but COLOR_NTSC/2 is written as a custom clock.
+    A Famicom's AY is a Sunsoft 5B (SEL tied low), so the module uses the 5B
+    type and keeps the logged CPU clock.  The analyzer already labelled its
+    notes at half speed because the tracker's pitch table ignores that pin.
+    Other files use YM2149 for types 0x10/0x11, else AY-8910.
     """
+    if sunsoft5b:
+        parts = ["chipType=2", f"customClock={clock}"]
+        return "\n".join(parts)
     parts = [f"chipType={1 if chip_type in (0x10, 0x11) else 0}"]
     if module_clock(clock) != FURNACE_CLOCK_DEFAULT:
         parts.append(f"customClock={clock}")
@@ -2917,9 +2990,15 @@ def _legacy_system(song: Song):
         ]
     if kind == "opll":
         drums = bool(getattr(song, "opll_drums", False))
+        vrc7 = bool(getattr(song, "opll_vrc7", False))
         ids = list(getattr(song, "opll_ids", ()) or ()) or [0]
-        channels = OPLL_DRUMS_CHANNELS if drums else OPLL_CHANNELS
-        return [FmSystem("opll", cid, channels, drums=drums) for cid in ids]
+        channels = 6 if vrc7 else (
+            OPLL_DRUMS_CHANNELS if drums else OPLL_CHANNELS
+        )
+        return [
+            FmSystem("opll", cid, channels, drums=drums, vrc7=vrc7)
+            for cid in ids
+        ]
     ids = list(getattr(song, f"{kind}_ids", ()) or ()) or [0]
     if kind == "ym2610":
         fm = 6 if getattr(song, "ym2610_b", False) else 4
@@ -3077,7 +3156,9 @@ def _append_system_names(
                     )
         elif kind == "opll":
             for i, (long_name, short_name) in enumerate(
-                    zip(*opll_channel_names(bool(system.drums)))):
+                    zip(*opll_channel_names(
+                        bool(system.drums), bool(getattr(system, "vrc7", False)),
+                    ))):
                 longs.append(f"{long_name}{suffix}")
                 if mixed and i < (
                     OPLL_DRUMS_MELODIC if system.drums else OPLL_CHANNELS
@@ -3245,10 +3326,20 @@ def write_fur(
     ay_specs = list(getattr(song, "ay_ins", ()) or ())
     psg_ids = list(getattr(song, "psg_ids", ()) or ())
     psg_specs = list(getattr(song, "psg_ins", ()) or ())
+    nes_ids = list(getattr(song, "nes_ids", ()) or ())
+    nes_specs = list(getattr(song, "nes_ins", ()) or ())
+    nes_dpcm_smps = list(getattr(song, "nes_dpcm_samples", ()) or ())
+    nes_pcm_smps = list(getattr(song, "nes_pcm_samples", ()) or ())
     scc_chip = CHIP_K052539 if song.vgm.k051649_plus else CHIP_K051649
     n_scc = 5 * len(scc_ids)
     n_ay = 3 * len(ay_ids)
     n_psg = 4 * len(psg_ids)
+    n_nes = 5 * len(nes_ids)
+    n_nes_dpcm_ins = len(nes_dpcm_smps)
+    n_nes_pcm_ins = len(nes_pcm_smps)
+    # NES DPCM (1-bit) and direct-DAC (8-bit) bodies follow the SSG PCM group.
+    nes_dpcm_smp_base = ssg_pcm_smp_base + len(ssg_pcm_smps)
+    nes_pcm_smp_base = nes_dpcm_smp_base + len(nes_dpcm_smps)
     # K007232 appears only when the source carried usable samples for it, and
     # never beside another sample chip.
     want_k007 = bool(pcm_smps)
@@ -3282,7 +3373,7 @@ def write_fur(
         + 4 * len(oki_ids) + len(adpcm_ids)
         + (16 if spcm_smps else 0) + n_rf5c
         + 24 * len(c140_ids) + 32 * len(c352_ids)
-        + 4 * len(k053260_ids) + n_scc + n_ay
+        + 4 * len(k053260_ids) + n_scc + n_ay + n_nes
     )
     if n_ch == 0:
         raise ValueError("write_fur: need include_fm and/or include_pcm")
@@ -3302,7 +3393,8 @@ def write_fur(
         + n_ym2610_a_ins + n_ym2610_b_ins
         + n_ym2608_rhythm_ins + n_ym2608_b_ins
         + n_y8950_b_ins + n_opl4_wave_ins + n_ssg_pcm_ins
-        + len(scc_specs) + len(ay_specs) + len(psg_specs)
+        + n_nes_dpcm_ins + n_nes_pcm_ins
+        + len(scc_specs) + len(ay_specs) + len(psg_specs) + len(nes_specs)
     )
     n_smp = (
         len(pcm_smps) + len(oki_smps) + len(adpcm_smps)
@@ -3311,6 +3403,7 @@ def write_fur(
         + len(k053260_smps) + len(dac_smps)
         + len(ym2610_a_smps) + len(ym2610_b_smps) + len(ym2608_b_smps)
         + len(y8950_b_smps) + len(opl4_wave_smps) + len(ssg_pcm_smps)
+        + len(nes_dpcm_smps) + len(nes_pcm_smps)
     )
     n_wav = len(scc_waves)
 
@@ -3390,6 +3483,11 @@ def write_fur(
         for voice in range(3):
             names_long.append(f"PSG {cid + 1}-{voice + 1}")
             names_short.append(f"P{cid + 1}-{voice + 1}")
+    nes_labels = ("Pulse 1", "Pulse 2", "Triangle", "Noise", "DPCM")
+    for cid in nes_ids:
+        for voice, label in enumerate(nes_labels):
+            names_long.append(f"{label} ({cid + 1})")
+            names_short.append(f"N{cid + 1}-{voice + 1}")
 
     label_parts: list[str] = []
     if fm_present:
@@ -3447,6 +3545,8 @@ def write_fur(
         label_parts.append("SCC+" if song.vgm.k051649_plus else "SCC")
     if ay_ids:
         label_parts.append("AY-8910")
+    if nes_ids:
+        label_parts.append("NES APU")
     chip_label = " + ".join(label_parts) or "empty"
 
     comment = (
@@ -3579,7 +3679,10 @@ def write_fur(
                 )
                 continue
             if kind == "opll":
-                chips.append(CHIP_OPLL_DRUMS if system.drums else CHIP_OPLL)
+                chips.append(
+                    CHIP_VRC7 if getattr(system, "vrc7", False) else
+                    CHIP_OPLL_DRUMS if system.drums else CHIP_OPLL
+                )
                 # DivPlatformOPLL's named clock selections cover the usual MSX
                 # and arcade clocks exactly; use those before a custom clock.
                 flag_texts.append(opll_clock_flag(song.vgm.ym2413_clock))
@@ -3678,11 +3781,24 @@ def write_fur(
     for cid in scc_ids:
         chips.append(scc_chip)
         flag_texts.append(k051649_flag_text(song.vgm.k051649_clock))
+    # A Famicom's AY is always a Sunsoft 5B (SEL tied low).  Its module type
+    # carries the /2, and the analyzer labelled the notes at half speed so the
+    # tracker's pitch table writes the doubled period.
+    ay_sunsoft5b = bool(nes_ids)
     for cid in ay_ids:
         chips.append(CHIP_AY8910)
         flag_texts.append(ay8910_flag_text(
             song.vgm.ay8910_clock, song.vgm.ay8910_type,
+            sunsoft5b=ay_sunsoft5b,
         ))
+    for cid in nes_ids:
+        chips.append(CHIP_NES)
+        # NTSC vs PAL selects the CPU clock; a dump based on the FDS/NSF mapper
+        # still runs the same 2A03.
+        clock = song.vgm.nes_clock or 1789773
+        flag_texts.append(
+            "" if abs(clock - 1789773) <= 2 else f"customClock={clock}"
+        )
     n_chips = len(chips)
 
     info_size_off, info_start = b.begin_block(b"INFO")
@@ -3957,6 +4073,18 @@ def write_fur(
         _write_ins_sample_map(
             b, f"PSG PCM {group + 1}", 0, maps, INS_AY, flags=0x03,
         )
+    for i, smp in enumerate(nes_dpcm_smps):
+        ins_ptrs.append(len(b))
+        # Note 60+rate selects the DMC rate; this instrument names the body.
+        _write_ins_pcm(
+            b, f"NES DPCM {i:02d}", nes_dpcm_smp_base + i, INS_NES,
+        )
+    for i, smp in enumerate(nes_pcm_smps):
+        ins_ptrs.append(len(b))
+        # Note 108 (C-4) plays the 8-bit body at its stored rate in PCM mode.
+        _write_ins_pcm(
+            b, f"NES PCM {i:02d}", nes_pcm_smp_base + i, INS_C352,
+        )
     for i, spec in enumerate(scc_specs):
         ins_ptrs.append(len(b))
         wave = scc_waves[spec.wave] if spec.wave < len(scc_waves) else b""
@@ -3972,6 +4100,9 @@ def write_fur(
     for spec in psg_specs:
         ins_ptrs.append(len(b))
         _write_ins_psg(b, "SN" + ("+pitch" if spec.pitch else ""), spec)
+    for spec in nes_specs:
+        ins_ptrs.append(len(b))
+        _write_ins_nes(b, "NES", spec)
 
     smp_ptrs: list[int] = []
     for i, smp in enumerate(pcm_smps):
@@ -4121,6 +4252,17 @@ def write_fur(
         smp_ptrs.append(len(b))
         # The bodies are already 8-bit levels encoded for the AY DAC table;
         # `rate` is the source write rate and note 108 plays it 1:1.
+        _write_sample_s8(b, smp.name, smp.data, smp.rate)
+    nes_clock = song.vgm.nes_clock or 1789773
+    for smp in nes_dpcm_smps:
+        smp_ptrs.append(len(b))
+        _write_sample_dpcm(
+            b, f"nes_dpcm_{smp.start:04x}", smp.data,
+            nes_dpcm_rate(nes_clock, smp.rate_index), loop=smp.loop,
+        )
+    for smp in nes_pcm_smps:
+        smp_ptrs.append(len(b))
+        # 8-bit signed bodies; note 108 plays them at their write rate.
         _write_sample_s8(b, smp.name, smp.data, smp.rate)
 
     pat_ptrs: list[int] = []

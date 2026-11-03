@@ -66,7 +66,8 @@ triples start 31 bytes plus 12 per chip before the first ADIR pointer.
   `0x03` SN76489 (SMS), `0xC6` K007232, `0xAA` MSM6295, `0xAB` MSM6258,
   `0x9B` SegaPCM, `0xCE` C140, `0xCC` Konami K053260, `0xD0` C352,
   `0xA1` Konami SCC (K051649),
-  `0xB4` Konami SCC+ (K052539), `0x80` AY-3-8910. A module lists
+  `0xB4` Konami SCC+ (K052539), `0x80` AY-3-8910, `0x9D` Konami VRC7,
+  `0x06` NES APU (five channels: two pulses, triangle, noise, DPCM). A module lists
   the chips the source had usable samples for: a melody-only track opens with
   the YM2151 alone, with no K007232 pair and no PCM channels it never plays.
   The SCC and AY are tone chips, not sample players: they are written whenever
