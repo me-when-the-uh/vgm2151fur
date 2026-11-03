@@ -225,6 +225,16 @@ they can be run from anywhere.
   PATH.
 - `VGM2151FUR_VGM2WAV`: path to `vgm2wav-mute.exe` for the soundcheck and
   chroma tools.
+- `VGM2151FUR_OPNA_RIPS`: the folder of YM2608 and YM2413 rips
+  (`F:\NASbackup\JamesAlan\_devspace\grbsd\ripwip\_finished`). Only
+  `TestYm2608RealRips` and the OPLL real-rip tests read it; without it they
+  skip silently, which is how a broken converter looks green.
+- `VGM2151FUR_MERGED_RIPS`: the folder of merged logs - arcade chip plus OPL
+  card in one file (`F:\NASbackup\JamesAlan\_devspace\grbsd`).
+  `TestMergedRips` in `tests/test_vgm2151fur_combo.py` converts each one and
+  exports it back through Furnace. Unset, it falls back to the grandparent of
+  `VGM2151FUR_OPNA_RIPS`; if neither has a `*_merged.vgm`, the tests skip.
+  See docs/merged-logs.md for what each log holds.
 
 ## Exit codes
 

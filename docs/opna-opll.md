@@ -312,20 +312,23 @@ Done, each with a test that drives Furnace and reads the registers back:
   with the `$11` fold, delta-T samples - machines `0x8e` and `0xb7`, verified
   on N.G. (Ext) and The Great Priest Bellias (base layout). Both rips come
   back with nothing in the audit left to explain and no pitch divergence.
+- z66 (YM2612 + YM3812 with a DAC stream) end to end, and with it the general
+  rule that a log may keep more than one FM family. `$90`-`$95` record a
+  `DacStreamPlay` per `$93`; the bank is sliced into rate-exact chunks inside
+  the same release budget; `Song.fm_systems` carries every pitched system and
+  `write_fur` builds its chips, flags, column counts and labels from it.
+  Verified on Cosmic Dance (OPM + YMF262), Zone 66 (DAC stream + OPL2) and
+  `29test` (OPN2 Ext + YM2413 kit + SN76489). `docs/merged-logs.md` is the
+  reference, `tests/test_vgm2151fur_combo.py` the regression net.
 
 Left:
 
-1. **z66** (YM2612 + YM3812 with a DAC stream). `vgm.py` must honour the modern
-   `$90-$95` control - type-0x00 data block, `$92` rate, `$95` play - and stop
-   reporting "PCM data block present but no DAC play stream" for a log whose
-   stream *is* defined, just not through `$80-$8F`. Then a machine carrying an
-   OPN2 system and an OPL2 system side by side has to survive `analyze`'s
-   one-family-per-log rule: today the two compete and the loser is dropped
-   with a warning, which is right for a mis-rip and wrong here.
-2. **OPLL drums in the corpus sweep**: `mado123-opll` and any rip toggling
-`$0E`,
-   which exercises the two-machine writer for the first time.
-3. **Corpus sweep**: convert every rip under `gs-opna\done`, `ed4-opna\done`
-and
-   `mado123-opll` and audit each - that is where an assumption that happened to
-   suit two tracks gets caught by a third.
+1. **OPLL drums in the corpus sweep**: `mado123-opll` and any rip toggling
+   `$0E`, which exercises the two-machine writer outside a hand-built test.
+2. **Corpus sweep**: convert every rip under `gs-opna\done`, `ed4-opna\done`
+   and `mado123-opll` and audit each - that is where an assumption that happened
+   to suit two tracks gets caught by a third.
+3. **Per-family `--verify`**: `diag.pitch_runs()` still chooses its stream from
+   the source's chip census, so on a combined module it follows one family no
+   matter which channel it is asked about. The merged tests read each chip's
+   own registers instead.

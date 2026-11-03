@@ -3246,6 +3246,9 @@ def _family_keyons(vgm: VgmFile, chips: set[str]) -> int:
     fm_mask: dict[tuple[str, int, int], int] = {}
     opl_on: dict[tuple[int, int, int], bool] = {}
     rhythm: dict[int, int] = {}
+    # The YM2413's rhythm mode: which chips have it on right now. Its kit is
+    # latched through $0e, so a melodic key on those channels means nothing.
+    opll_mode: dict[int, bool] = {}
     for w in vgm.writes:
         if w.chip not in chips:
             continue
@@ -3295,18 +3298,20 @@ def _family_keyons(vgm: VgmFile, chips: set[str]) -> int:
                     count += 1
                 fm_mask[key] = mask
         elif w.chip == "opll":
-            # The YM2413 keys with bit 5 of $30+ch; $38 is the kit latch.
+            # Bit 4 of $2x keys a melodic voice; in rhythm mode the last three
+            # belong to the chip's own kit and $0e's five low bits latch it.
+            # ($3x is the instrument and volume nibble, never a key.)
             r = w.reg & 0xFF
-            if 0x30 <= r <= 0x38:
+            mode = opll_mode.get(w.chip_id, False)
+            if 0x20 <= r <= 0x28:
                 key = ("opll", w.chip_id, r)
-                on = bool(w.val & 0x20) and r != 0x38
+                on = bool(w.val & 0x10) and not (mode and r >= 0x26)
                 if on and not opl_on.get(key, False):
                     count += 1
                 opl_on[key] = on
-            elif r == 0x38:
-                # $38 is a key-on when the instrument nibble names a drum and
-                # one of the five select bits is set.
-                sel = w.val & 0x1F if (w.val >> 5) & 3 else 0
+            elif r == 0x0E:
+                opll_mode[w.chip_id] = bool(w.val & 0x20)
+                sel = (w.val & 0x1F) if opll_mode[w.chip_id] else 0
                 prev = rhythm.get(("opll", w.chip_id), 0)
                 count += (sel & ~prev).bit_count()
                 rhythm[("opll", w.chip_id)] = sel
