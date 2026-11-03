@@ -5427,19 +5427,65 @@ def analyze(
                 vol = max(0, min(127, 0x7F - (h.level & 0x7F)))
                 if (h.pan & 0x0F) == 8:
                     vol = 0          # both sides off: a silent slot
-                # A $5n write during the note is a volume step. Keep only
-                # changes after the attack, and drop repeats of the level
-                # the note already started on.
+                # $5n level and pan moves during the note are row steps.
+                # Interleave the two streams so a pan write between two level
+                # writes still lands in the right order. Pan 8 ("both sides
+                # off") has no 08xy form; it rides the volume column as zero.
+                motion: list[tuple[int, int, int]] = [
+                    (t, 0, level) for t, level in h.vol_pts
+                ] + [
+                    (t, 1, pan) for t, pan in h.pan_pts
+                ]
+                motion.sort(key=lambda p: p[0])
+                last_vol = vol
+                last_pan = h.pan & 0x0F
+                written_vol = vol
+                written_pan = last_pan
                 vol_pts: list[tuple[int, int, int | None]] = []
-                for when, level in h.vol_pts:
+                for when, kind, value in motion:
                     if when <= h.sample_time:
                         continue
                     if h.end_time and when >= h.end_time:
                         break
-                    value = max(0, min(127, 0x7F - (level & 0x7F)))
-                    last = vol_pts[-1][1] if vol_pts else vol
-                    if value != last:
-                        vol_pts.append((when, value, None))
+                    if kind == 0:
+                        last_vol = max(0, min(127, 0x7F - (value & 0x7F)))
+                    else:
+                        last_pan = value & 0x0F
+                    target_vol = 0 if last_pan == 8 else last_vol
+                    if target_vol == written_vol and last_pan == written_pan:
+                        continue
+                    pan_fx = (
+                        opl4_pan_fx(last_pan)
+                        if last_pan != 8 and last_pan != written_pan
+                        else None
+                    )
+                    vol_pts.append((when, target_vol, pan_fx))
+                    written_vol = target_vol
+                    written_pan = last_pan
+                # The driver silences a slot by writing TL=0x7F just before
+                # its key-off. The key-off row already stops the note, so the
+                # trailing zero is not heard in the source; keeping it only
+                # adds a volume-00 row (often on a row with no note) and can
+                # outlive the following key-on after row rounding. Keep a zero
+                # only when a later write raises the level again.
+                while vol_pts and vol_pts[-1][1] == 0:
+                    vol_pts.pop()
+                # Held f-num/octave writes are pitch bends. A sample channel
+                # takes them as 1/64-semitone row steps, like ADPCM-B.
+                pitch_steps: list[tuple[int, int]] = []
+                if h.step:
+                    previous = 0
+                    for when, step in h.pitch_pts:
+                        if when <= h.sample_time:
+                            continue
+                        if h.end_time and when >= h.end_time:
+                            break
+                        delta = int(round(
+                            64.0 * 12.0 * math.log2(step / h.step)
+                        ))
+                        if delta != previous:
+                            pitch_steps.append((when, delta))
+                            previous = delta
                 ev = NoteEvent(
                     sample=h.sample_time,
                     ch=wave_base.get(0, 0) + h.slot,
@@ -5452,7 +5498,11 @@ def analyze(
                     pcm=True,
                     end=h.end_time,
                     vol_pts=tuple(vol_pts),
+                    pitch_steps=tuple(pitch_steps),
                 )
+                if pitch_steps:
+                    ev.e5_lo = 0x00
+                    ev.e5_hi = 0xFF
                 events.append(ev)
                 opl4_wave_events.append((ev, i))
         for smp in opl4_wave_samples:

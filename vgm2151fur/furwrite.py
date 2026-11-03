@@ -2730,6 +2730,17 @@ def _build_patterns(song: Song, n_ch: int, pat_len_max: int, fx_cols: int,
             ev_ch = ev.ch + ch_offset
             if not (ev.on and ev.vol_pts) or ev_ch < 0 or ev_ch >= n_ch:
                 continue
+            own_row = placed_note_row(ev)
+            if own_row < 0:
+                continue
+            # A step may not spill into the next note on this channel. The
+            # source's final TL=0x7F (silence) lands just before its key-off,
+            # and row rounding used to push it past the following key-on, where
+            # it muted a note that had just started.
+            next_row = next(
+                (r for r in note_rows.get(ev_ch, ()) if r > own_row),
+                total_rows,
+            )
             last_pan = None if ev.no_pan else ev.pan
             note_vol_done = False
             for sample, value, pan in ev.vol_pts:
@@ -2738,7 +2749,12 @@ def _build_patterns(song: Song, n_ch: int, pat_len_max: int, fx_cols: int,
                 row, delay = song.place(sample, stats)
                 if not ev.vol_slide:
                     delay = 0
-                if row < 0 or row >= total_rows:
+                if row < 0 or row >= total_rows or row >= next_row:
+                    continue
+                if ev.pcm and row <= own_row:
+                    # The note row already carries the attack level (or the
+                    # first real level after a muted key-on). A later step
+                    # rounded onto the same row cannot be heard separately.
                     continue
                 cell = grid[ev_ch].get(row)
                 if cell is None:
