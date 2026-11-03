@@ -6724,8 +6724,10 @@ def analyze(
     has_sample_ins = bool(
         oki_samples or adpcm_samples or spcm_audible or c140_audible
         or c352_audible or k053260_audible
+        or rf5c68_audible or rf5c164_audible
         or ym2610_a_samples or ym2610_b_samples
         or ym2608_b_samples or ym2608_rhythm_events
+        or y8950_b_samples or opl4_wave_samples
         or any(s.length >= 8 for s in pcm_samples)
         or scc_waves or ay_count or dac_samples or psg_count
     )

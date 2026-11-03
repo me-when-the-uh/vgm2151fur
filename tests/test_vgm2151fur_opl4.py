@@ -232,6 +232,21 @@ class TestOpl4Writer(unittest.TestCase):
         self.assertIn(INS_OPL, types)
         self.assertIn(INS_MULTIPCM, types)
 
+    def test_wave_only_module_does_not_shift_the_sample_instruments(self):
+        # "06 TIME'S UP!" has no FM notes. A placeholder at instrument 0 used
+        # to be written even though the wave samples already filled the list,
+        # which pointed every PCM channel at the previous sample.
+        song = analyze(_vgm(_wave_note(100, wave=16), roms=[
+            RomSlice(0, 0, 0, _rom(16, bytes(range(1, 21))), "ymf278b_rom"),
+        ]))
+        data = write_fur(song)
+        m = parse_fur(data)
+        self.assertEqual(m.ins_sample, [0])
+        rows = m.patterns.get((18, m.orders[18][0]), [])
+        notes = [(row.note, row.ins) for row in rows if row.note != -1]
+        self.assertTrue(notes)
+        self.assertEqual(notes[0][1], 0)
+
 
 def _sample_root() -> Path | None:
     raw = os.environ.get("VGM2151FUR_OPL4_RIPS")
