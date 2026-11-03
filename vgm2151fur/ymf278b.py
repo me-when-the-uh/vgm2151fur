@@ -239,17 +239,9 @@ def collect_opl4_wave(
     warnings: list[str] = []
     slots = [_Slot() for _ in range(OPL4_WAVE_SLOTS)]
     hits: list[Opl4WaveHit] = []
-    pending_off: list[int | None] = [None] * OPL4_WAVE_SLOTS
-
-    def flush_off(i: int) -> None:
-        if pending_off[i] is not None:
-            if hits:
-                # Attach to the most recent hit on this slot.
-                for hit in reversed(hits):
-                    if hit.slot == i and not hit.end_time:
-                        hit.end_time = pending_off[i]
-                        break
-            pending_off[i] = None
+    # The hit currently sounding on a slot, so a $5n level write inside the
+    # note becomes a volume step instead of being lost.
+    active: list[Opl4WaveHit | None] = [None] * OPL4_WAVE_SLOTS
 
     for w in vgm.writes:
         if w.chip != "ymf278b" or (w.reg >> 8) != 2:
@@ -270,12 +262,23 @@ def collect_opl4_wave(
             octave = (w.val >> 4) & 0x0F
             st.octave = octave - 16 if octave & 0x08 else octave
         elif sub == 3:
-            st.tl = (w.val >> 1) & 0x7F
+            level = (w.val >> 1) & 0x7F
+            hit = active[slot]
+            if st.key and hit is not None:
+                if w.sample == hit.sample_time:
+                    # Same write group as the key-on: the note attacks at
+                    # this level, so it belongs in the instrument column
+                    # rather than in a step on the note row.
+                    hit.level = level
+                else:
+                    last = hit.vol_pts[-1][1] if hit.vol_pts else hit.level
+                    if level != last:
+                        hit.vol_pts.append((w.sample, level))
+            st.tl = level
         elif sub == 4:
             st.pan = w.val & 0x0F
             key = bool(w.val & 0x80)
             if key and not st.key:
-                pending_off[slot] = None
                 hit = Opl4WaveHit(
                     sample_time=w.sample,
                     slot=slot,
@@ -285,12 +288,15 @@ def collect_opl4_wave(
                     pan=st.pan,
                 )
                 hits.append(hit)
+                active[slot] = hit
             elif st.key and not key:
-                pending_off[slot] = w.sample
+                # Attach the release now. Waiting for the next key-on (or
+                # the end of the file) lost every intermediate note-off.
+                hit = active[slot]
+                if hit is not None and not hit.end_time:
+                    hit.end_time = w.sample
+                active[slot] = None
             st.key = key
-
-    for i in range(OPL4_WAVE_SLOTS):
-        flush_off(i)
 
     if not hits:
         return [], warnings
@@ -323,17 +329,19 @@ def collect_opl4_wave(
             continue
         sample = by_wave.get(wave)
         if sample is None:
-            data = _body(mem, offset, frames, bits)
-            # The slot's position counter is 16 bits wide. A body of 0x10000
-            # frames wraps it naturally, so the loop is the whole sample and
-            # the descriptor's loop address never takes effect. Wave 384 of
-            # "06 TIME'S UP!" is exactly this: loop 50000 over a 64K body,
-            # which hardware plays from 0. Treating it as 50000..65536, or
-            # as a one-frame loop, is audible as wrong pitch/click.
+            # A loop point in the last two frames is the descriptor's loop
+            # padding, not a sustain: the reference modules trim the body to
+            # the loop point and play it once. A full 0x10000-frame body
+            # wraps the slot's 16-bit position counter, so its loop address
+            # cannot take effect either; those are one-shot too.
             if frames >= 0x10000:
-                loop_start = 0
+                loop_start = None
+            elif loop >= frames - 2 and loop > 0:
+                frames = loop
+                loop_start = None
             else:
                 loop_start = loop if 0 < loop < frames else None
+            data = _body(mem, offset, frames, bits)
             sample = Opl4WaveSample(
                 wave=wave, data=data, loop_start=loop_start,
                 loop_end=frames if loop_start is not None else None,

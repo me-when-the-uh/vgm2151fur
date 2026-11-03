@@ -160,9 +160,10 @@ class TestOpl4Wave(unittest.TestCase):
         self.assertEqual(samples[0].wave, 384)
         self.assertEqual(samples[0].frames, 8)
 
-    def test_full_64k_sample_loops_from_zero(self):
+    def test_full_64k_sample_is_one_shot(self):
         # A 0x10000-frame body wraps the slot's 16-bit position counter, so
         # the descriptor's loop address never takes effect (06 TIME'S UP!).
+        # The reference module stores these as one-shot bodies.
         ram = bytearray(0x200 + 0x10000)
         ram[0:12] = _descriptor(0, 0x200200, 50000, 0x10000)
         v = _vgm(_wave_note(100, wave=384))
@@ -170,7 +171,25 @@ class TestOpl4Wave(unittest.TestCase):
         self.assertEqual(len(samples), 1)
         smp = samples[0]
         self.assertEqual(smp.frames, 0x10000)
-        self.assertEqual((smp.loop_start, smp.loop_end), (0, 0x10000))
+        self.assertIsNone(smp.loop_start)
+        self.assertIsNone(smp.loop_end)
+
+    def test_key_off_ends_the_hit(self):
+        sample = bytes(range(1, 21))
+        v = _vgm(_wave_note(100, wave=16, off=900),
+                 roms=[RomSlice(0, 0, 0, _rom(16, sample), "ymf278b_rom")])
+        samples, _warn = collect_opl4_wave(v, rom=_rom(16, sample))
+        self.assertEqual(samples[0].hits[0].end_time, 900)
+
+    def test_level_write_while_keyed_is_a_volume_point(self):
+        sample = bytes(range(1, 21))
+        writes = _wave_note(100, wave=16, off=9000)
+        writes.insert(5, ChipWrite(500, "ymf278b", 0, _wave_reg(0, 3), 0x20))
+        v = _vgm(writes, roms=[
+            RomSlice(0, 0, 0, _rom(16, sample), "ymf278b_rom"),
+        ])
+        samples, _warn = collect_opl4_wave(v, rom=_rom(16, sample))
+        self.assertEqual(samples[0].hits[0].vol_pts, [(500, 16)])
 
     def test_pan_inverts_furnace_conversion(self):
         # opl.cpp:2267 turns 08xy into the slot nibble as

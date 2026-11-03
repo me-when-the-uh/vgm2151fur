@@ -171,7 +171,7 @@ Per-operator am, vibrato and sustain stay in the instrument. The chip-wide depth
 where the log wrote them: `0x10` for amplitude-modulation depth and `0x17` for
 vibrato depth.
 
-## Operator macros: a level the log moves under a sounding note
+## Operator levels: row effects and macros
 
 Tyrian's engine scripts the **modulator** output level (`$4n`) hundreds of times
 per channel while a note holds. On `14 Gyges, Will You Please Help Me` the four
@@ -182,15 +182,25 @@ frozen one sounds like brightness that never evolves, and it hides from any
 attack-time check, because every byte written at key-on was correct.
 
 The volume column cannot carry it: `opl.cpp` scales only an operator that is both
-marked KVS and an output (its `KVSL` macro). A modulator has no path at all.
-Furnace's per-operator macros do. Each operator keeps its own macro list in an
-`O1`..`O4` feature, and code 6 (`DIV_MACRO_OP_TL`) is applied as
-`op.tl = val & 63`; for a non-KVS operator the register write is
-`op.tl | op.ksl << 6`. There is one measured surprise: pushing a ramp
-`3, 7, 11 ... 62` through the player came back as `$4n = 60, 56, 52 ... 1`.
-**The macro stores a level, not an attenuation**: up is louder. The writer
-inverts (`furwrite._write_op_ma`). Everything above it, including `analyze`,
-keeps speaking `$4n`.
+marked KVS and an output (its `KVSL` macro). A modulator has no path at all. Two
+routes exist, and the converter picks by shape:
+
+- A level that differs **once per note** (the common MoonDriver case) becomes the
+  platform's own operator-level effect: `12xx`..`15xx` (`DIV_CMD_FM_TL`, operator
+  1-4, value `00`-`3F`, 0 loudest). The shared instrument keeps the loudest
+  modulator level (`shape_key`/`loudest`), and each quieter note writes an effect
+  on its row. No instrument copy is needed. `06 TIME'S UP!` uses this for the
+  `$5n` wave levels too, and `05 encounter the unknown environment` reduces from
+  89 to **6 FM instruments** (plus 22 wave bodies) with 2,586 `12xx` effects.
+- A **fast intra-note ramp** puts several levels inside one row, where only one
+  effect per operator can sound. Those notes keep the per-operator macro on a
+  `+lvl` copy. Each operator has an `O1`..`O4` feature and code 6
+  (`DIV_MACRO_OP_TL`) is applied as `op.tl = val & 63`; for a non-KVS operator the
+  register write is `op.tl | op.ksl << 6`. There is one measured surprise:
+  pushing a ramp `3, 7, 11 ... 62` through the player came back as
+  `$4n = 60, 56, 52 ... 1`. **The macro stores a level, not an attenuation**: up
+  is louder. The writer inverts (`furwrite._write_op_ma`). Everything above it,
+  including `analyze`, keeps speaking `$4n`.
 
 The other operator codes live in `DivMacroTypeOp` - 0 AM, 1 AR, 2 DR, 3 MULT,
 4 RR, 5 SL, 6 TL, and 15 KSL, 16 SUS, 17 VIB, 18 WS, 19 KSR. Today only TL is
@@ -202,24 +212,19 @@ waveform change (`2Axy`). Each of those codes needs its own measured polarity an
 mask before it can be trusted. The TL inversion is exactly that warning.
 
 `analyze._collect_opl` records `$4n` per operator while a voice sounds
-(`NoteEvent.opl_op_tl`, primed from the instrument at key-on so a stretch with no
-movement adds nothing), and `analyze._bind_op_macros` cuts the curve onto a copy of
-the instrument named `+lvl`: one entry every `speed` ticks, running from the
-key-on. An operator macro has **no delay**: it starts with the note, and Furnace
+(`NoteEvent.opl_op_tl`, primed from the instrument at key-on with the attack
+level), and `analyze._bind_op_macros` decides between the row effect and the
+macro. An operator macro has **no delay**: it starts with the note, and Furnace
 ignores the field on these (measured: an entry list written with `delay=5` still
 stepped from tick zero). A level that first moves several ticks in repeats its
 starting entry across that hold, and the sweep's resolution pays for those
-entries. Speed is
-the smallest that fits a macro's 255 entries - 1 to 5 ticks (2-10 ms) on these
-songs.
+entries. Speed is the smallest that fits a macro's 255 entries - 1 to 5 ticks
+(2-10 ms) on these songs.
 
-Re-exported through the bundled console build, mid-note `$4n` writes go from zero
-to **6,358 of 7,046** on Gyges (69-82% of sampled moments exact, 87-97% within two
-levels) and **13,253 of 15,222** on Savara (67-85% exact, 93-100% within two). The
-gap is inherent: several writes fall inside one tick, and a long note trades
-resolution for the entry limit. `report` lists each curve as
-`op1 $4n x158@2t`, and `tests/test_opl_operator_macro.py` pins the capture,
-the inverted file encoding, and a round trip through the real player.
+Re-exported through the bundled console build, the macro path still reproduces
+the dense Tyrian ramps (`tests/test_opl_operator_macro.py` pins the capture, the
+inverted file encoding, the all-levels playback, and the per-note `12xx` effect),
+while sparse modulator changes survive exactly at the note row.
 
 ## Attack order: comparing two streams
 
@@ -347,10 +352,17 @@ Playback rate is `clock * step / (768 * 65536)` with
 sample body into a `.fur` sample (signed 16-bit), one `DIV_INS_MULTIPCM`
 instrument per body, and writes the pattern note as the pitch ratio to the
 body's most common step. The body's own C-4 rate is that step's rate. A
-descriptor whose loop point sits inside the body loops there; a body of exactly
-`0x10000` frames wraps the slot's 16-bit position counter and therefore loops
-from 0 regardless of the loop address (the three 64 KB RAM loops in "06 TIME'S
-UP!" are this case). Loop-at-end bodies stay one-shot.
+descriptor whose loop point sits before the last two frames loops there. A loop
+point in the last two frames is the descriptor's padding: the reference modules
+trim the body to the loop point and play it once. A body of exactly `0x10000`
+frames wraps the slot's 16-bit position counter, so its loop address cannot
+take effect; the three 64 KB RAM bodies in "06 TIME'S UP!" are one-shot too.
+
+A TL write (`$50 + slot`) while a slot sounds becomes a volume step on the
+pattern rows (the writer's `vol_pts` path), and a key-off (bit 7 of `$68 + slot`
+falling) becomes an explicit note-off row. Both are carried per hit, so a drum
+sample stops when the log stops it and a fade is no longer frozen at its
+attack level.
 
 The hardware pan table is 0 = centre, 1-7 = right (left falls), 8 = both off,
 9-15 = left (right falls). Furnace's PCM path derives the slot nibble from the
@@ -374,30 +386,34 @@ instruments with one byte (at most 256). MoonDriver ramps the modulator's
 `$4n` per note (22, 23, 24... on `$40`-`$42`) to fade the FM brightness, which
 would otherwise make one instrument per step: the two minutes of "05 encounter
 the unknown environment" needed 1106. `_collect_opl` folds the modulator level
-out of the patch key (`shape_key`), keeps the loudest level seen for the shared
-shape (`loudest`), and leaves a move *inside* a held note to the existing
-operator-TL macro. Base patches are capped at 200, with same-shape reuse and an
-`ins_reused` warning past that. Wave bodies add one instrument each. An OPL4
-with no FM notes keeps the empty FM placeholder at instrument 0, so the wave
-instruments are 1-based: `0x01` is wave 017, `0x18` is wave 384 and `0x19` is
-wave 385. The sample index follows the placeholder, so each PCM column points
-at exactly the sample the log loaded. (An older build emitted the placeholder
-without reserving its instrument slot, so every PCM column played the previous
-sample: "06 TIME'S UP!"'s Ch 0, which loads sample `0x181`, played the `0x180`
-RAM sample.)
+out of the patch key (`shape_key`) and keeps the loudest level seen for the
+shared shape (`loudest`); the per-note levels then travel as `12xx` effects on
+the note rows (see "Operator levels" above). Only a fast intra-note ramp, which
+would need several levels inside one row, keeps an operator-TL macro copy.
+Base patches are capped at 200, with same-shape reuse and an `ins_reused`
+warning past that. Wave bodies add one instrument each. An OPL4 with no FM
+notes keeps the empty FM placeholder at instrument 0, so the wave instruments
+are 1-based: `0x01` is wave 017, `0x18` is wave 384 and `0x19` is wave 385.
+The sample index follows the placeholder, so each PCM column points at exactly
+the sample the log loaded. (An older build emitted the placeholder without
+reserving its instrument slot, so every PCM column played the previous sample:
+"06 TIME'S UP!"'s Ch 0, which loads sample `0x181`, played the `0x180` RAM
+sample.)
 
 Verified against the two MoonDriver rips: "05 encounter the unknown
-environment" (6 FM shapes + 83 level-macro copies + 22 YRW801 bodies = 111
-`INS2`, 10641 FM key-ons and 7810 wave key-ons) and "06 TIME'S UP!" (one empty
-FM instrument + 26 bodies, 7538 wave key-ons). Both export through the bundled
-Furnace build, and the FM key-on pitch and the wave pan nibble match the source
+environment" (6 FM shapes + 22 YRW801 bodies = 28 `INS2`, 10641 FM key-ons,
+7810 wave key-ons, 2586 `12xx` level effects) and "06 TIME'S UP!" (one empty FM
+instrument + 26 bodies = 27 `INS2`, 7538 wave key-ons, 7530 note-offs and 80
+mid-note volume steps). Both export through the bundled Furnace build, and the
+FM key-on pitch, the wave pan nibble and the wave TL at key-on match the source
 exactly.
 
 ## Limits
 
 - Waveform and envelope writes inside a held note move at the next key-on. A
-  modulator *level* no longer waits: it travels as that operator's `TL` macro, so
-  the remaining cases are `$6n`, `$8n`, `$2n` and `$En` moves.
+  modulator *level* no longer waits: a sparse change is a `12xx`-`15xx` row
+  effect, and a fast ramp keeps that operator's `TL` macro. The remaining cases
+  are `$6n`, `$8n`, `$2n` and `$En` moves.
 - Below `note 24` one table step is wider than a half tone, so an unplayably
   deep register lands on the nearest cell; `opl_note_for` clamps into the note
   range instead of raising.

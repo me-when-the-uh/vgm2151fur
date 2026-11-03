@@ -2673,6 +2673,28 @@ def _build_patterns(song: Song, n_ch: int, pat_len_max: int, fx_cols: int,
                 _add_quad_fx(cell, four, fx_cols, stats, prev)
                 prev = four
 
+    # An OPL modulator level that differs from the shared instrument baseline
+    # (12xx..15xx: operator 1-4 TL, 0 highest, 3F lowest). The note row can
+    # carry the attack level alongside its note; later rows carry the moves.
+    if song.events:
+        for ev in song.events:
+            ev_ch = ev.ch + ch_offset
+            if not (ev.on and ev.op_tl_fx) or ev_ch < 0 or ev_ch >= n_ch:
+                continue
+            for sample, op, value in ev.op_tl_fx:
+                if content_cut is not None and sample >= content_cut:
+                    continue
+                row, delay = song.place(sample, stats)
+                if row < 0 or row >= total_rows:
+                    continue
+                cell = grid[ev_ch].get(row)
+                if cell is None:
+                    cell = _blank_row()
+                    grid[ev_ch][row] = cell
+                _add_fx(cell, 0x12 + op, value & 0x3F, fx_cols, stats)
+                if delay:
+                    _add_fx(cell, 0xED, delay, fx_cols, stats)
+
     for ch in range(n_ch):
         cur_e5 = 0x80
         rows = sorted(

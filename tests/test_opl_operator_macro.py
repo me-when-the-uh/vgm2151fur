@@ -30,7 +30,7 @@ if str(ROOT) not in sys.path:
 
 from vgm2151fur.analyze import VGM_RATE, analyze  # noqa: E402
 from vgm2151fur.furwrite import write_fur  # noqa: E402
-from vgm2151fur.furio import decompress_fur, iter_blocks  # noqa: E402
+from vgm2151fur.furio import decompress_fur, iter_blocks, parse_fur  # noqa: E402
 from vgm2151fur.vgm import ChipWrite, VgmFile  # noqa: E402
 
 CH = 2
@@ -117,7 +117,8 @@ class TestOperatorMacroCapture(unittest.TestCase):
         got = dict(self.ev.opl_op_tl)
         self.assertIn(0, got, "the modulator's levels were never recorded")
         levels = [v for _s, v in got[0]]
-        self.assertEqual(levels, RAMP)
+        # Entry zero is the level the note attacks with; the ramp follows.
+        self.assertEqual(levels, [25, *RAMP])
 
     def test_macro_targets_the_modulator_with_absolute_levels(self):
         entries = {oi: (values, speed)
@@ -176,6 +177,44 @@ class TestOperatorMacroCapture(unittest.TestCase):
         self.assertIn("+lvl", self.patch.name)
         plain = [p for p in self.song.fm_patches if not p.op_tl_macro]
         self.assertTrue(plain, "the instrument without a macro must survive")
+
+    def test_a_per_note_modulator_level_is_a_row_effect(self):
+        """A single level per note stays on the shared instrument.
+
+        The loudest level is the instrument's modulator TL; the quieter notes
+        carry 12xx (operator 1 level) instead of one instrument copy each.
+        """
+        w = []
+        for k in range(1, 40):
+            w += [_wr(k * 5000, 0xA0 | 5, 0x57),
+                  _wr(k * 5000, 0xB0 | 5, 0x35),
+                  _wr(k * 5000 + 20, 0xB0 | 5, 0x15)]
+        for k, tl in enumerate((3, 7, 11, 15)):
+            t = 30_000 + k * 20_000
+            for base in (MOD, CAR):
+                w += [_wr(t, 0x20 | base, 0x01),
+                      _wr(t, 0x40 | base, tl if base == MOD else 21),
+                      _wr(t, 0x60 | base, 0xF8),
+                      _wr(t, 0x80 | base, 0xF4),
+                      _wr(t, 0xE0 | base, 0x00)]
+            w += [_wr(t, 0xC0 | CH, 0x0A),
+                  _wr(t + 100, 0xA0 | CH, 0x57),
+                  _wr(t + 100, 0xB0 | CH, 0x31),
+                  _wr(t + 9000, 0xB0 | CH, 0x11)]
+        song = analyze(_vgm(w), pcm=False)
+        evs = [e for e in song.events if e.on and e.ch == CH]
+        self.assertEqual({e.ins for e in evs}, {evs[0].ins})
+        fx = [e.op_tl_fx[0][2] for e in evs if e.op_tl_fx]
+        self.assertEqual(fx, [7, 11, 15])
+        m = parse_fur(write_fur(song, include_pcm=False))
+        coded = {
+            val
+            for order in m.orders[CH]
+            for row in m.patterns.get((CH, order), [])
+            for code, val in row.fx
+            if code == 0x12
+        }
+        self.assertTrue({7, 11, 15} <= coded, sorted(coded))
 
 
 @unittest.skipUnless(

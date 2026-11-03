@@ -392,10 +392,13 @@ class NoteEvent:
     # stay under the 250-instrument limit.
     pitch_steps: tuple[tuple[int, int], ...] = ()
     # OPL only: output level writes per operator while the note is held,
-    # (operator index, ((sample, $4n low six bits), ...)). `_bind_op_macros`
-    # turns these into an operator macro; the carrier's own levels already ride
-    # the volume column through `tl_pts`.
+    # (operator index, ((sample, $4n low six bits), ...)). The carrier's own
+    # levels already ride the volume column through `tl_pts`; a modulator's
+    # go to `op_tl_fx` as 12xx-15xx effects instead of an instrument copy.
     opl_op_tl: tuple[tuple[int, tuple[tuple[int, int], ...]], ...] = ()
+    # OPL only: (sample, operator index, level) on the rows where the
+    # modulator's level differs from the instrument baseline.
+    op_tl_fx: tuple[tuple[int, int, int], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1886,13 +1889,16 @@ def _bind_op_macros(
     tick_samples: float,
     cap: int = 250,
 ) -> tuple[int, int]:
-    """Turn a scripted operator level into that operator's macro.
+    """Turn a scripted modulator level into row effects.
 
     On FM the ``$4n`` register is the modulator's output and sets how much of
     the carrier each harmonic gets. The volume column reaches only an
-    operator marked KVS. A scripted modulator level therefore travels as
-    that operator's own macro (``O1``..``O4``, code 6), which the platform
-    assigns as an absolute level. Returns ``(copies, skipped)``.
+    operator marked KVS, so a modulator move cannot ride it. The baseline
+    instrument is already shared by shape (``shape_key`` keeps the loudest
+    modulator level), so a quieter level travels as that operator's own
+    pattern effect (``12xx``..``15xx``), which the OPL platform stores as an
+    absolute level. That avoids one instrument copy per ramp. Carriers still
+    ride the volume column through ``tl_pts``. Returns ``(notes, 0)``.
     """
     made = fallbacks = 0
     idx_map: dict[tuple, int] = {}
@@ -1903,69 +1909,85 @@ def _bind_op_macros(
             continue
         if not (0 <= e.ins < len(patch_order)):
             continue
-        base_key = patch_order[e.ins]
-        base = patches[base_key]
+        base = patches[patch_order[e.ins]]
         carriers = set(base.carriers())
-        entries: list[tuple[int, tuple[int, ...], int]] = []
+        # A fast ramp has several levels inside one row, and a row holds one
+        # 12xx/13xx effect per operator. Those notes keep the operator macro
+        # (an instrument copy); a note whose level differs only at its attack
+        # (the common per-note case) stays on the shared instrument and uses
+        # the row effect.
+        if any(oi not in carriers and len(pts) > 2
+               for oi, pts in e.opl_op_tl):
+            entries: list[tuple[int, tuple[int, ...], int]] = []
+            for oi, pts in e.opl_op_tl:
+                if oi in carriers or not pts:
+                    continue
+                last_s = pts[-1][0]
+                span_end = e.end if (e.end and e.end > last_s) else last_s
+                span_ticks = max(1.0, (span_end - e.sample) / tick_samples)
+                speed = max(1, min(254, int(span_ticks // 240) + 1))
+                marks: list[tuple[int, int]] = []
+                for s, val in pts:
+                    slot = max(0, int((s - e.sample) // tick_samples)) // speed
+                    if slot > 254:
+                        break
+                    if marks and marks[-1][0] == slot:
+                        marks[-1] = (slot, val)
+                    else:
+                        marks.append((slot, val))
+                if not marks:
+                    continue
+                start = base.ops[oi].tl & 0x3F
+                values: list[int] = []
+                mi = 0
+                cur = start
+                for slot in range(0, marks[-1][0] + 1):
+                    while mi < len(marks) and marks[mi][0] <= slot:
+                        cur = marks[mi][1]
+                        mi += 1
+                    values.append(cur)
+                if len(set(values)) < 2 and values[0] == start:
+                    continue
+                entries.append((oi, tuple(values), speed))
+            if not entries:
+                continue
+            key = ("op-tl", patch_order[e.ins], tuple(entries))
+            idx = idx_map.get(key)
+            if idx is None:
+                if len(patch_order) >= cap:
+                    fallbacks += 1
+                    continue
+                copy = replace(base, op_tl_macro=tuple(entries), uses=1,
+                               name=f"{base.name}+lvl")
+                patches[key] = copy
+                patch_order.append(key)
+                idx = len(patch_order) - 1
+                idx_map[key] = idx
+            else:
+                patches[patch_order[idx]].uses += 1
+            e.ins = idx
+            made += 1
+            continue
+
+        fx: list[tuple[int, int, int]] = []
         for oi, pts in e.opl_op_tl:
             if oi in carriers or not pts:
                 continue          # the volume column already carries that one
-            last_s = pts[-1][0]
-            span_end = e.end if (e.end and e.end > last_s) else last_s
-            span_ticks = max(1.0, (span_end - e.sample) / tick_samples)
-            # One value per `speed` ticks, coarse enough that the part of the note
-            # where this operator moves fits the entries a macro can hold. Any
-            # coarser and the sweep would step in plain sight.
-            speed = max(1, min(254, int(span_ticks // 240) + 1))
-            # Which macro entry each logged level lands on, last write winning:
-            # only one level can sound per tick.
-            marks: list[tuple[int, int]] = []
-            for s, val in pts:
-                slot = max(0, int((s - e.sample) // tick_samples)) // speed
-                if slot > 254:
-                    break
-                if marks and marks[-1][0] == slot:
-                    marks[-1] = (slot, val)
+            baseline = base.ops[oi].tl & 0x3F
+            for sample, value in pts:
+                value &= 0x3F
+                if value == baseline:
+                    continue
+                item = (sample, oi, value)
+                # Only one level can sound per row; a later write at the same
+                # sample wins.
+                if fx and fx[-1][0] == sample and fx[-1][1] == oi:
+                    fx[-1] = item
                 else:
-                    marks.append((slot, val))
-            if not marks:
-                continue
-            start = base.ops[oi].tl & 0x3F
-            if (len(marks) == 1 and marks[0][1] == start):
-                continue          # nothing this operator ever moved
-            # An operator macro has no delay: it starts running at the key-on,
-            # and entry 0 is the level the note attacks with. Every tick before
-            # the first logged move therefore has to be written out as its own
-            # entry, and the resolution of the sweep is paid for with those
-            # entries.
-            values: list[int] = []
-            mi = 0
-            cur = start
-            for slot in range(0, marks[-1][0] + 1):
-                while mi < len(marks) and marks[mi][0] <= slot:
-                    cur = marks[mi][1]
-                    mi += 1
-                values.append(cur)
-            if len(set(values)) < 2 and values[0] == start:
-                continue
-            entries.append((oi, tuple(values), speed))
-        if not entries:
+                    fx.append(item)
+        if not fx:
             continue
-        key = ("op-tl", base_key, tuple(entries))
-        idx = idx_map.get(key)
-        if idx is None:
-            if len(patch_order) >= cap:
-                fallbacks += 1
-                continue
-            copy = replace(base, op_tl_macro=tuple(entries), uses=1,
-                           name=f"{base.name}+lvl")
-            patches[key] = copy
-            patch_order.append(key)
-            idx = len(patch_order) - 1
-            idx_map[key] = idx
-        else:
-            patches[patch_order[idx]].uses += 1
-        e.ins = idx
+        e.op_tl_fx = tuple(fx)
         made += 1
     return made, fallbacks
 
@@ -2397,12 +2419,18 @@ def _collect_opl(
             for fch, slot in enumerate(st.slots[row]):
                 if slot == OPL_N:
                     continue
+                four = st.is_four_op(fch if not (row > 1 and fch & 1)
+                                     else fch - 1)
+                # Rows 2/3 are the second bank's operators for the even
+                # channels that *can* head a 4-op pair. A two-operator voice
+                # does not own them; treating them as its ops proposed
+                # modulator effects on operators the platform ignores.
+                if row > 1 and not four:
+                    continue
                 addr = SLOT_ADDR[slot]
                 owners = omap.setdefault(addr, [])
                 if fch not in owners:
                     owners.append(fch)
-                four = st.is_four_op(fch if not (row > 1 and fch & 1)
-                                     else fch - 1)
                 imap.setdefault((addr, fch),
                                 ORDERED_OPS_L[row] if four else row)
                 # Same pair, grouped the other way: what to prime at key-on.
@@ -2659,8 +2687,13 @@ def _collect_opl(
         op_tl_pts[key] = {}
         owned: set[int] = set()
         for oi, addr in chan_ops[cid].get(fch, ()):
-            op_tl_last[(cid, fch, oi)] = st.regs[0x40 | addr] & 0x3F
+            level = st.regs[0x40 | addr] & 0x3F
+            op_tl_last[(cid, fch, oi)] = level
             owned.add(oi)
+            if not op_is_carrier(cid, fch, oi):
+                # Entry zero of the effect/macro curve: the level the note
+                # attacks with, before any later $4n write.
+                op_tl_pts[key][oi] = [(sample, level)]
         for stale in [k for k in op_tl_last if k[0] == cid and k[1] == fch
                       and k[2] not in owned]:
             op_tl_last.pop(stale, None)
@@ -5114,6 +5147,19 @@ def analyze(
                 vol = max(0, min(127, 0x7F - (h.level & 0x7F)))
                 if (h.pan & 0x0F) == 8:
                     vol = 0          # both sides off: a silent slot
+                # A $5n write during the note is a volume step. Keep only
+                # changes after the attack, and drop repeats of the level
+                # the note already started on.
+                vol_pts: list[tuple[int, int, int | None]] = []
+                for when, level in h.vol_pts:
+                    if when <= h.sample_time:
+                        continue
+                    if h.end_time and when >= h.end_time:
+                        break
+                    value = max(0, min(127, 0x7F - (level & 0x7F)))
+                    last = vol_pts[-1][1] if vol_pts else vol
+                    if value != last:
+                        vol_pts.append((when, value, None))
                 ev = NoteEvent(
                     sample=h.sample_time,
                     ch=wave_base.get(0, 0) + h.slot,
@@ -5125,6 +5171,7 @@ def analyze(
                     pan=wave_pan,
                     pcm=True,
                     end=h.end_time,
+                    vol_pts=tuple(vol_pts),
                 )
                 events.append(ev)
                 opl4_wave_events.append((ev, i))
