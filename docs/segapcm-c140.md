@@ -56,9 +56,10 @@ field is absent.
   signed bytes. C140 mulaw (mode bit 3) is stored as 16-bit linear
   (`depth` 16) from the full table, so Furnace does not decode it again.
   Loop points are in frames.
-- Pitch per trigger as note + E5 fine tune (ratios in semitones); the volume
-  column carries the chip's own register value (7-bit for SegaPCM, 8-bit for
-  C140); pan comes from the L/R registers via `08xy`.
+- Pitch at key-on as note + E5 fine tune (ratios in semitones); mid-note
+  pitch writes become row sweeps. The volume column carries the chip's own
+  register value (7-bit for SegaPCM, 8-bit for C140), with mid-note changes
+  as column steps; pan comes from the L/R registers via `08xy`.
 - A C140 voice key-off (mode bit 7 clear) emits a note-off on that channel,
   so a looping sample stops when the chip stops it instead of ringing until
   the next note on the voice.
@@ -108,24 +109,36 @@ subdivision.
 
 Drivers rewrite the volume and frequency registers while a voice is keyed;
 the register mirror keeps both step streams instead of only the key-on
-values:
+values. SegaPCM uses 0x02/0x03 (7-bit L/R) and 0x07 (8-bit delta); C140
+uses 0x00/0x01 (8-bit R/L) and 0x02/0x03 (12-bit frequency):
 
-- volume (0x00/0x01): a fade steps both registers; each pair change lands
-  in the volume column (level = loud side) on rows without a note, with the
-  L/R balance riding along as 08xx when the pair's ratio changes. Furnace
-  feeds the column into the voice gain live (`chVol = outVol*pan/255`), so
-  fades survive.
+- volume: a fade steps both registers; each pair change lands in the volume
+  column (level = loud side) on rows without a note, with the L/R balance
+  riding along as 08xx when the pair's ratio changes. Furnace feeds the
+  column into the voice gain live (`chVol = outVol*pan/255` on C140,
+  `outVol*pan/127` on SegaPCM), so fades survive. The SegaPCM note level is
+  the raw 7-bit register value, matching the platform's own range.
 - fade-in keys: a hit whose volume registers are still zero at key-on
   (typical for the first trigger of a voice, and for every fade-in) used to
   write 08 00 from the zero balance, "both off", which no later volume step
   can undo, so the note stayed silent forever. Such hits now start silent
   on the default balance and the ramp steps carry the balance; hits whose
-  registers stay zero (drivers that mute by zeroing both) keep the 08 00.
-- frequency (0x02/0x03): MSB/LSB pairs within 16 samples merge to the final
-  value (the intermediate is a write-order transient); a write within 120
-  samples of key-on is the note's own pitch (the same refit the FM sweeps
-  use), the rest become 1/64-semitone deltas and go through the FM sweep
-  encoder as 01xx/02xx ramps with E5 pins.
+  registers stay zero (drivers that mute by zeroing both) keep 08 00. A
+  hit that stays at zero is silent instead of being forced to full volume.
+- frequency (C140 0x02/0x03): MSB/LSB pairs within 16 samples merge to the
+  final value (the intermediate is a write-order transient); a write within
+  120 samples of key-on is the note's own pitch (the same refit the FM
+  sweeps use), the rest become 1/64-semitone deltas and go through the FM
+  sweep encoder as 01xx/02xx ramps with E5 pins.
+- frequency (SegaPCM 0x07): one byte, so every change is a real step. The
+  pitch is part of the key-on register dump, so the snapshot is normally
+  the note. A voice keyed with a zero delta takes the first later write as
+  its pitch instead. Later changes become the same 1/64-semitone sweep; an
+  instant jump also lands through E8xx/E9xx.
+- The volume/frequency writes in a key-on dump are the new note's values,
+  not steps away from the previous note. A write burst that retriggers
+  discards its pending steps; a burst with no retrigger is a mid-note
+  update.
 - start/end/loop/bank changes mid-note are still not converted (the sample
   body is fixed at key-on).
 
@@ -134,12 +147,14 @@ values:
 Drivers often key a voice on before writing its frequency, so the key-on
 snapshot holds zeros or the previous note's leftover. The sample's
 reference rate (what its C-4 plays at) must use each hit's played frequency:
-the key-on value, unless a frequency write lands within 120 samples of
-key-on. A later write still wins when the key-on value was zero, because
+the key-on value, unless C140's post-key-on refit write lands within 120
+samples. A later write still wins when the key-on value was zero, because
 nothing was playing yet; zeros are ignored when picking a sample's most
-common frequency. SegaPCM's reference ignores zero key-ons the same way.
-Taking the raw key-on mode instead pins a sample mostly keyed that way at
-rate 0, about five octaves off and invisible to octave-blind checks.
+common frequency. SegaPCM's dump already carries the frequency, so its
+reference uses the key-on value and only falls back to the first later
+write when that value is zero. Taking the raw key-on mode instead pins a
+sample mostly keyed that way at rate 0, about five octaves off and
+invisible to octave-blind checks.
 
 ## PCM slides and transpose
 
@@ -213,8 +228,6 @@ off. The loop is cut on the off so a looping sample does not ring forever.
 
 ## Limits
 
-- SegaPCM mid-note volume/frequency writes are not converted; each note
-  keeps its trigger-time values. C140's are.
 - C140 sign-flip (mode bit6) and sign-magnitude (bit0) are ignored. libvgm,
   which these VGMs are logged against, does not apply them either.
 - A C140 voice keyed with an invalid sample window (end below start) is

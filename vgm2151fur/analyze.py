@@ -115,7 +115,10 @@ from vgm2151fur.rf5c import (
     collect_rf5c,
     rf5c_rate,
 )
-from vgm2151fur.segapcm import SegapcmSample, collect_segapcm, segapcm_rate
+from vgm2151fur.segapcm import (
+    SegapcmSample, collect_segapcm, hit_played_freq as segapcm_played_freq,
+    segapcm_rate,
+)
 from vgm2151fur.timing import (
     MIN_ROW_SAMPLES,
     TARGET_TICK_SAMPLES,
@@ -5965,22 +5968,51 @@ def analyze(
             ins = ins2 + i
             ref = segapcm_rate(spcm_clock, smp.mode_freq())
             for h in smp.hits:
-                note, e5 = rate_to_note(segapcm_rate(spcm_clock, h.freq), ref)
+                base_f = segapcm_played_freq(h)
+                note, e5 = rate_to_note(
+                    segapcm_rate(spcm_clock, base_f), ref,
+                )
+                # Mid-note frequency writes are a bend around the key-on
+                # pitch.  Row ramps carry sub-semitone motion; a large step
+                # lands through the sweep encoder's E8/E9 as well.
+                sweep: tuple[tuple[int, int], ...] = ()
+                if h.freq_pts and base_f:
+                    deltas = tuple(
+                        (t, int(round(64.0 * 12.0 * math.log2(f / base_f))))
+                        for t, f in h.freq_pts
+                        if f
+                    )
+                    vals = [d for _t, d in deltas]
+                    if deltas and max(vals + [0]) - min(vals + [0]) >= 4:
+                        sweep = deltas
                 vl = vol15(h.vol_l, spcm_scale)
                 vr = vol15(h.vol_r, spcm_scale)
                 # Furnace passes the pattern volume through to the chip, whose
                 # register is 7-bit: use the register value's own range.
                 vol = max(h.vol_l, h.vol_r) & 0x7F
+                pts = tuple(
+                    (t, max(a, b) & 0x7F,
+                     pcm_pan_fx(vol15(a, spcm_scale), vol15(b, spcm_scale))
+                     if max(a, b) else None)
+                    for t, a, b in h.vol_pts
+                )
+                # A hit keyed with both registers at zero is a fade-in or a
+                # mute. Start silent on Furnace's default balance; 08 00 would
+                # mute the voice forever.
+                fade_in = vol == 0 and any(v > 0 for _t, v, _p in pts)
                 events.append(NoteEvent(
                     sample=h.sample_time,
                     ch=spcm_base + h.voice,
                     on=True,
                     note=note,
                     ins=ins,
-                    vol=vol if vol else 15,
+                    vol=0 if fade_in else vol,
                     e5=e5,
-                    pan=pcm_pan_fx(vl, vr),
+                    pan=0 if fade_in else pcm_pan_fx(vl, vr),
                     pcm=True,
+                    sweep=sweep,
+                    vol_pts=pts,
+                    no_pan=fade_in,
                 ))
 
         # Namco C140: 24 voices per instance, rate = clock*freq/32768 words.
