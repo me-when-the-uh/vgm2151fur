@@ -17,15 +17,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-# YM2151 (OPM) carrier sets in its register order (0x40/0x48/0x50/0x58 are
-# op1..op4, so the index is the slot number minus one). Algorithms 0-3 are
-# chains ending on op4, 5 and 6 add op1-fed carriers, 7 is additive.
-# Algorithm 4 outputs on op3 and op4: across the 49 YM2151 rips of the
-# Batrider/Garegga corpus every mid-note TL automation is op3+op4 paired
-# (138 writes each, e.g. "Purple Twilight"'s build-up). Automation marks what
-# the platform scales, so that pair is the carrier set. OPN's table names the
-# same slots S2,S4 only because its operator array is register order while
-# OPM's is plain S1..S4. See OPN_CARRIERS and OPM_OP_TO_MASK.
+
+# YM2151 (OPM) carrier sets in its register order (0x40/0x48/0x50/0x58).
+# Algorithms 0-3 are chains ending on op4, 5 and 6 add op1-fed carriers, 7 is
+# additive. Algorithm 4 outputs on op3 and op4. Across 49 YM2151 rips every
+# mid-note TL automation is on that pair, always together, and a driver
+# automates what the platform scales. The register order is plain S1..S4 (see
+# OPM_OP_TO_MASK), so indices are slot numbers minus one.
 CARRIERS = {
     0: (3,),
     1: (3,),
@@ -93,17 +91,25 @@ def carriers_for(alg: int, opn: bool, opl: bool = False, four: bool = False) -> 
 # S1,S3,S2,S4.  Index by *register* operator: which mask bit enables it.
 OPN_OP_TO_MASK = (0, 2, 1, 3)
 
-# Ext channel-3 layout: which ``ops[]`` entry each operator column plays.
-# DivPlatformYM2203Ext::dispatch maps its four columns through orderedOps =
-# {0,2,1,3} (fmsharedbase.h), so column 1 plays ops[2]. Same tuple as
-# OPN_OP_TO_MASK, different axis: operator per column vs mask bit per
-# operator. DIV_CMD_VOLUME scales the addressed op unconditionally (no KVS
-# gate), so each column's level must ride its own volume.
+
+# Ext channel-3 layout: which ops[] entry an operator column plays.
+# DivPlatformYM2203Ext::dispatch maps its four columns (channels 2..5) as
+# `int ch = c.chan - 2; int ordch = orderedOps[ch];` and writes the volume
+# column's scaling to `chan[2].state.op[ordch]`. Channel 3 (column 1) therefore
+# plays ops[2], not ops[1]. orderedOps is {0,2,1,3} in fmsharedbase.h.
+# DIV_CMD_VOLUME applies scaling unconditionally, so every column's level is
+# reachable through its own volume. DIV_CMD_FM_TL gates on KVS. The tuple
+# matches OPN_OP_TO_MASK but means operator indices per column, not mask bits
+# per operator.
 OPN_ORDERED_OPS = (0, 2, 1, 3)
 
-# The register-order operator a channel-3 TL write names: pages step by four
-# within the channel, so $42/$46/$4A/$4E are S1/S3/S2/S4 = ops[0..3].
+
 def opn_tl_op(reg: int) -> int:
+    """Return the ops[] index a channel-3 TL write names.
+
+    Pages advance by four within the channel, so $42/$46/$4A/$4E are
+    S1/S3/S2/S4 = ops[0..3].
+    """
     return (reg >> 2) & 0x03
 
 # The YM2151 key-on byte is twisted the same way: DivPlatformArcade::
