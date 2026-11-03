@@ -38,7 +38,8 @@ def _raw_vgm(cmds: bytes, rom_blocks=(), nes_clock: int = 1789773,
     buf[0x10:0x14] = (ym2413 & 0xFFFFFFFF).to_bytes(4, "little")
     buf[0x18:0x1C] = (44100).to_bytes(4, "little")
     buf[0x34:0x38] = (0xC0 - 0x34).to_bytes(4, "little")
-    buf[0x80:0x84] = (nes_clock & 0xFFFFFFFF).to_bytes(4, "little")
+    # The NES clock lives at 0x84; 0x80 is the Game Boy DMG clock.
+    buf[0x84:0x88] = (nes_clock & 0xFFFFFFFF).to_bytes(4, "little")
     body = bytearray()
     for typ, start, data in rom_blocks:
         # Database blocks (< 0x40) carry no start address; ROM/RAM dumps do.
@@ -328,8 +329,10 @@ class TestNesModule(unittest.TestCase):
         self.assertEqual(song.nes_ids, [0])
         data = write_fur(song, include_pcm=True)
         mod = parse_fur(data)
-        self.assertEqual(mod.chips, [0x82, CHIP_NES])
-        self.assertEqual(mod.n_ch, 8 + 5)
+        # An NES-only rip has no FM write, so the empty YM2151 placeholder is
+        # dropped and the APU owns all five columns.
+        self.assertEqual(mod.chips, [CHIP_NES])
+        self.assertEqual(mod.n_ch, 5)
         types = [
             struct.unpack_from("<H", blk, 2)[0]
             for _off, mag, _size, blk in iter_blocks(data)

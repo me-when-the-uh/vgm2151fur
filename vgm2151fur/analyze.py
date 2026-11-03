@@ -116,6 +116,7 @@ from vgm2151fur.rf5c import (
     rf5c_rate,
 )
 from vgm2151fur.nes import (
+    NES_CHANNELS,
     NES_CPU_DIVIDER,
     NES_DEFAULT_CLOCK,
     NES_FURNACE_CLOCK,
@@ -129,6 +130,19 @@ from vgm2151fur.nes import (
     collect_nes_pcm,
     collect_nes_tones,
     nes_note,
+)
+from vgm2151fur.huc6280 import (
+    HUC6280_CHANNELS,
+    HUC6280_DEFAULT_CLOCK,
+    HUC6280_MAX_PERIOD,
+    HUC6280_REFIT_SAMPLES,
+    NOISE_ENABLE,
+    Huc6280PcmHit,
+    Huc6280PcmSample,
+    collect_huc6280,
+    collect_huc6280_pcm,
+    huc6280_noise_note,
+    huc6280_note,
 )
 from vgm2151fur.segapcm import (
     SegapcmSample, collect_segapcm, hit_played_freq as segapcm_played_freq,
@@ -393,6 +407,13 @@ class NoteEvent:
     # 0 = not a tone-chip note, 1 = SCC, 2 = AY. The phase-2 pass finds the
     # instrument for these once the tick rate is known.
     tone_chip: int = 0
+    # PCE noise-mode note: its "pitch" is the 0-31 noise register, which the
+    # platform adds ``std.pitch`` to directly, not a period-table value.
+    tone_noise: bool = False
+    # The sample where noise ends and the tone tail begins (0 = pure noise).
+    # Set only on `tone_noise` notes; the pitch points before it are noise
+    # registers, the ones at/after it are tone periods.
+    tone_noise_end: int = 0
     # Tone chip clock and divider: SCC 16, AY-8910 8, YM2203 SSG 16.
     tone_clock: int = 0
     tone_div: int = 8
@@ -577,6 +598,11 @@ class Song:
     # family's chips here; the YM2612 DAC system comes before the OPL one so
     # its six columns match `ym_base`.
     fm_systems: list[FmSystem] = field(default_factory=list)
+    # True when the source log carried an FM chip at all. A PCE/SCC/NES-only
+    # rip leaves this false so the writer drops the analyzer's legacy YM2151
+    # placeholder instead of emitting an empty OPM device. Defaults to true so
+    # hand-built Songs (tests, the older entry points) keep their FM system.
+    has_fm_source: bool = True
     # YM2203 instances that appear in the module, in channel order. Each one
     # owns six channels: three FM then three SSG.
     ym2203_ids: list[int] = field(default_factory=list)
@@ -699,6 +725,16 @@ class Song:
     nes_dpcm_samples: list[NesDpcmSample] = field(default_factory=list)
     nes_pcm_samples: list[NesPcmSample] = field(default_factory=list)
     nes_count: int = 0
+    # HuC6280 (PC Engine): six wavetable voices per instance. `huc6280_waves`
+    # is the deduplicated 32x5-bit wavetable list, `huc6280_ins` one instrument
+    # per distinct (wave, pitch macro, wave macro), `huc6280_count` notes.
+    # Direct-D/A stream bodies become 8-bit sample instruments.
+    huc6280_ids: list[int] = field(default_factory=list)
+    huc6280_waves: list[bytes] = field(default_factory=list)
+    huc6280_ins: list[ToneIns] = field(default_factory=list)
+    huc6280_pcm_samples: list[Huc6280PcmSample] = field(default_factory=list)
+    huc6280_count: int = 0
+    huc6280_pcm_count: int = 0
     # Genesis SN76489: four channels (three tone + noise) after the FM block.
     psg_ids: list[int] = field(default_factory=list)
     psg_ins: list[ToneIns] = field(default_factory=list)
@@ -1081,7 +1117,8 @@ def _macro_if_moving(
 
 def _plain_tone(spec: ToneIns, tone_chip: int) -> ToneIns:
     """The same timbre with no per-note motion, so notes can share it."""
-    if tone_chip == 1:
+    if tone_chip in (1, 5):
+        # SCC and PCE are wavetable chips: the wave is the timbre.
         return ToneIns(wave=spec.wave)
     return ToneIns()
 
@@ -1127,11 +1164,13 @@ def _bind_tone_instruments(
     ay_ins: list[ToneIns],
     psg_ins: list[ToneIns],
     nes_ins: list[ToneIns],
+    huc6280_ins: list[ToneIns],
     tone_ins_base: int,
     scc_clock: int,
     ay_clock: int,
     psg_clock: int,
     nes_clock: int,
+    huc6280_clock: int,
     hz: float,
     total_samples: int,
 ) -> None:
@@ -1148,12 +1187,14 @@ def _bind_tone_instruments(
     ay_map: dict[ToneIns, int] = {}
     psg_map: dict[ToneIns, int] = {}
     nes_map: dict[ToneIns, int] = {}
+    huc6280_map: dict[ToneIns, int] = {}
     ins_cap = max(1, 250 - tone_ins_base)
     bound: list[tuple[NoteEvent, int]] = []
     tone_order = [e for e in events if e.on and e.tone_chip == 2]
     tone_order += [e for e in events if e.on and e.tone_chip == 1]
     tone_order += [e for e in events if e.on and e.tone_chip == 3]
     tone_order += [e for e in events if e.on and e.tone_chip == 4]
+    tone_order += [e for e in events if e.on and e.tone_chip == 5]
     for e in tone_order:
         end = e.end or track_end
         # 255 macro values times the largest speed byte. Long SSG pads can
@@ -1178,6 +1219,13 @@ def _bind_tone_instruments(
                 clock = NES_FURNACE_CLOCK
             divider = NES_CPU_DIVIDER
             maximum = 0x7FF
+        elif e.tone_chip == 5:
+            # The PCE core's pitch table runs from the doubled PSG clock with
+            # a divider of 64, which is the PSG clock with a divider of 32;
+            # the period register maps straight through.
+            clock = e.tone_clock or huc6280_clock or HUC6280_DEFAULT_CLOCK
+            divider = 32
+            maximum = HUC6280_MAX_PERIOD
         else:
             # AY and the YM2203's SSG share the instrument path but not the
             # clock or Furnace's divider (8 vs 16).
@@ -1186,21 +1234,42 @@ def _bind_tone_instruments(
             maximum = 0xFFF
         tbl = (
             pitch_table(float(clock), divider, maximum=maximum)
-            if e.tone_chip in (3, 4)
+            if e.tone_chip in (3, 4, 5)
             else pitch_table(module_clock(clock), divider)
         )
         base_off = (e.note << 7) + (e.e5 - E5_CENTER)
         pitch: tuple[int, ...] = ()
         pitch_speed, pitch_loop = 1, 255
         if e.tone_pitch_pts:
-            pts = [(e.sample, 0)] + [
-                (t, tbl.offset_for(e.note, per + e.tone_period_offset) - base_off)
-                for t, per in e.tone_pitch_pts
-            ]
+            pts = [(e.sample, 0)]
+            if e.tone_noise:
+                # PCE noise: the register follows note-60 and ``pitch2``
+                # directly, so the macro value is the raw register offset.  A
+                # noise transient followed by a tone tail has both kinds of
+                # point in one list; `tone_noise_end` marks the switch.
+                gate_n = e.note - 60
+                for t, per in e.tone_pitch_pts:
+                    if e.tone_noise_end == 0 or t < e.tone_noise_end:
+                        pts.append((t, per - gate_n))
+                    else:
+                        pts.append((
+                            t,
+                            tbl.offset_for(e.note, per + e.tone_period_offset)
+                            - base_off,
+                        ))
+            else:
+                pts += [
+                    (t, tbl.offset_for(e.note, per + e.tone_period_offset)
+                     - base_off)
+                    for t, per in e.tone_pitch_pts
+                ]
             series = _tick_values(pts, e.sample, ticks, tick_samples)
             if any(series):
                 pitch, pitch_speed, pitch_loop = _macro_series(series)
-                pitch = _absorb_detune(e, pitch, pitch_speed)
+                if not e.tone_noise:
+                    # Folding a constant offset into E5 would be lost on a
+                    # noise note: the register reads ``pitch2``, not the note.
+                    pitch = _absorb_detune(e, pitch, pitch_speed)
         wave_vals: tuple[int, ...] = ()
         wave_speed, wave_loop = 1, 255
         if e.tone_wave_pts:
@@ -1212,9 +1281,10 @@ def _bind_tone_instruments(
         vol_vals: tuple[int, ...] = ()
         vol_speed, vol_loop = 1, 255
         series: list[int] = []
-        if e.vol_pts and e.tone_chip != 3:
+        if e.vol_pts and e.tone_chip not in (3, 5):
             # PSG volume is the raw 4-bit register and the SMS platform reads
             # it straight from the column; a std.vol macro would scale it.
+            # The PCE likewise keeps its balance envelope as 08xy row steps.
             pts = [(e.sample, max(0, e.vol))] + [
                 (t, max(0, v)) for t, v, _ in e.vol_pts
             ]
@@ -1279,6 +1349,15 @@ def _bind_tone_instruments(
             env_period, env_period_speed, env_period_loop = _macro_if_moving(
                 period_pts, e.sample, ticks, tick_samples,
             )
+        if e.tone_chip == 5 and not noise:
+            # Every PCE instrument carries the noise mode explicitly: 1 for a
+            # noise hit, 0 (tone) otherwise. A constant mode lives on the
+            # instrument so it does not depend on a row effect that may land
+            # off-grid, and a following tone note always clears the previous
+            # hit's noise.
+            noise, noise_speed, noise_loop = (
+                1 if e.tone_noise else 0,
+            ), 1, 255
         spec = ToneIns(
             wave=max(0, e.tone_wave),
             pitch=pitch, pitch_speed=pitch_speed, pitch_loop=pitch_loop,
@@ -1302,6 +1381,12 @@ def _bind_tone_instruments(
                 spec, nes_map, nes_ins,
                 len(scc_ins) + len(ay_ins) + len(psg_ins), ins_cap, 4,
             )
+        elif e.tone_chip == 5:
+            idx, kept = _take_tone(
+                spec, huc6280_map, huc6280_ins,
+                len(scc_ins) + len(ay_ins) + len(psg_ins) + len(nes_ins),
+                ins_cap, 5,
+            )
         else:
             # AY runs first, so the SCC list is still empty and `others` is 0.
             idx, kept = _take_tone(spec, ay_map, ay_ins, 0, ins_cap, 2)
@@ -1310,15 +1395,19 @@ def _bind_tone_instruments(
             # The instrument now carries the pitch trajectory; the row ramp
             # would double it.
             e.sweep = ()
-        if e.tone_chip == 3:
+        if e.tone_chip == 5:
+            # The PCE column is the control volume; `vol_pts` carry the
+            # balance register and any control-volume steps as row effects.
+            e.vol = column_vol
+        elif e.tone_chip == 3:
             # The SMS column is the raw 4-bit register; keep vol_pts as
             # pattern steps rather than folding them into a volume macro.
             pass
         elif kept.vol:
-            # Column 15 makes the macro the register (SCC: vol*macro/15,
-            # AY: macro + column - 15).
+            # The column that makes the macro the register: SCC vol*macro/15,
+            # AY macro + column - 15, PCE vol*macro/31.
             e.vol_pts = ()
-            e.vol = 15
+            e.vol = 31 if e.tone_chip == 5 else 15
             e.vol_slide = 0
         elif e.vol_slide or (vol_vals and series and _unit_saw(vol_vals)):
             # No volume macro on the instrument the note actually got, so the
@@ -1338,6 +1427,7 @@ def _bind_tone_instruments(
     n_scc = len(scc_ins)
     n_ay = len(ay_ins)
     n_psg = len(psg_ins)
+    n_nes = len(nes_ins)
     for event, idx in bound:
         if event.tone_chip == 1:
             event.ins = tone_ins_base + idx
@@ -1345,6 +1435,8 @@ def _bind_tone_instruments(
             event.ins = tone_ins_base + n_scc + n_ay + idx
         elif event.tone_chip == 4:
             event.ins = tone_ins_base + n_scc + n_ay + n_psg + idx
+        elif event.tone_chip == 5:
+            event.ins = tone_ins_base + n_scc + n_ay + n_psg + n_nes + idx
         else:
             event.ins = tone_ins_base + n_scc + idx
 
@@ -6773,6 +6865,204 @@ def analyze(
         nes_dpcm_events = []
         nes_pcm_events = []
 
+    # HuC6280 (PC Engine) columns: six wavetable voices. They follow the NES
+    # block in module order. A note's instrument is its 32x5-bit wavetable;
+    # the control volume is the column and the balance register rides as 08xy.
+    huc6280_ids: list[int] = []
+    huc6280_waves: list[bytes] = []
+    huc6280_ins: list[ToneIns] = []
+    huc_pcm_samples: list[Huc6280PcmSample] = []
+    huc6280_count = 0
+    huc6280_pcm_count = 0
+    huc6280_pcm_events: list[tuple[NoteEvent, int]] = []
+    huc_notes, huc_offs, huc_wave_list, huc_warn = collect_huc6280(vgm)
+    warnings.extend(huc_warn)
+    if pcm:
+        huc_pcm_samples, huc_pcm_hits, huc_warn = collect_huc6280_pcm(vgm)
+    else:
+        huc_pcm_samples, huc_pcm_hits = [], []
+    warnings.extend(huc_warn)
+    n_huc6280_pcm_ins = len(huc_pcm_samples)
+    huc6280_clock = vgm.huc6280_clock or HUC6280_DEFAULT_CLOCK
+    huc_cids = sorted(
+        {n.hit.chip_id for n in huc_notes}
+        | {hit.chip_id for hit in huc_pcm_hits}
+    )
+    if huc_cids:
+        for cid in huc_cids:
+            huc6280_ids.append(cid)
+        huc_base = (
+            tone_base + SCC_VOICES * len(scc_ids) + AY_VOICES * len(ay_ids)
+            + (NES_CHANNELS if nes_ids else 0)
+        )
+        huc_at = {
+            cid: huc_base + HUC6280_CHANNELS * i
+            for i, cid in enumerate(huc6280_ids)
+        }
+        huc_clock = huc6280_clock
+        huc6280_waves = list(huc_wave_list)
+        huc_wave_index = {img: i for i, img in enumerate(huc6280_waves)}
+
+        def _merge_vol_balance(hit):
+            evs = [(t, 0, v) for t, v in hit.vol_pts]
+            evs += [(t, 1, b) for t, b in hit.balance_pts]
+            evs.sort(key=lambda x: (x[0], x[1]))
+            out: list[tuple[int, int, int | None]] = []
+            cur = hit.vol
+            for t, kind, val in evs:
+                if kind == 0:
+                    cur = val
+                    out.append((t, cur, None))
+                else:
+                    out.append((t, cur, val))
+            return out
+
+        for n in huc_notes:
+            h = n.hit
+            ch = huc_at.get(h.chip_id)
+            if ch is None:
+                continue
+            voice_ch = ch + h.voice
+            gate_end = h.off_sample or (vgm.total_samples or h.sample_time)
+            noise_mode = h.voice >= 4 and bool(h.noise & 0x80)
+            if noise_mode:
+                # These drivers build a percussion hit from a short noise
+                # transient and a longer tone tail (the noise is only ~14% of
+                # the gate on the LOX2 rips).  While bit 7 is set the noise
+                # period sweeps; a 0x07 write with it clear switches the
+                # channel back to the waveform.  Keep one note and carry the
+                # switch in the instrument's noise macro so it lands on the
+                # tick, not the row.
+                noise_off = 0
+                for t, reg in h.noise_pts:
+                    if h.sample_time < t < gate_end and not (reg & NOISE_ENABLE):
+                        noise_off = t
+                        break
+                base_n = h.noise & 0x1F
+                noise_pts = [(h.sample_time, base_n)]
+                noise_pts += [
+                    (t, reg & 0x1F) for t, reg in h.noise_pts
+                    if h.sample_time < t < (noise_off or gate_end)
+                    and (reg & NOISE_ENABLE)
+                    and (reg & 0x1F) != noise_pts[-1][1]
+                ]
+                pitch_pts = list(noise_pts)
+                if noise_off:
+                    # The note value is the tone tail's pitch so the tail is
+                    # correct; the noise register is reached through the same
+                    # pitch macro while the noise macro is 1.
+                    note, e5 = huc6280_note(
+                        huc_clock, _value_at(h.pitch_pts, noise_off, h.period),
+                    )
+                    pitch_pts += [
+                        (t, p) for t, p in h.pitch_pts if t >= noise_off
+                    ]
+                    tone_fx = (
+                        (h.sample_time, FX_NOISE, 1),
+                        (noise_off, FX_NOISE, 0),
+                    )
+                else:
+                    note, e5 = huc6280_noise_note(h.noise), 0x80
+                    tone_fx = ()
+                vol_pts = tuple(
+                    (t, h.vol, b) for t, b in h.balance_pts
+                    if h.sample_time < t < gate_end
+                )
+                channel_fx.append((h.sample_time, voice_ch, 0x11, 1))
+                events.append(NoteEvent(
+                    sample=h.sample_time, ch=voice_ch, on=True,
+                    note=note, ins=tone_ins_base, vol=h.vol, e5=e5,
+                    pan=h.balance, end=h.off_sample,
+                    vol_pts=vol_pts,
+                    tone_pitch_pts=(
+                        tuple(pitch_pts) if len(pitch_pts) > 1 else ()
+                    ),
+                    tone_fx_pts=tone_fx,
+                    tone_noise=True,
+                    tone_noise_end=noise_off,
+                    tone_wave=n.wave_index,
+                    tone_chip=5,
+                ))
+                huc6280_count += 1
+                continue
+            if not any(h.wave):
+                # A tone note needs a waveform; a noise note above does not.
+                continue
+            if h.voice >= 4:
+                channel_fx.append((h.sample_time, voice_ch, 0x11, 0))
+            seg_pts = [(h.sample_time, h.period)]
+            seg_pts += list(h.pitch_pts)
+            segs = segment_periods(seg_pts, gate_end, huc_clock, 32, 0)
+            for i, (st, period, intra) in enumerate(segs):
+                nxt = segs[i + 1][0] if i + 1 < len(segs) else 0
+                seg_end = nxt or h.off_sample
+                wave = _value_at(h.wave_pts, st, h.wave)
+                if not any(wave):
+                    events.append(NoteEvent(
+                        sample=st, ch=voice_ch, on=False, note=180,
+                        ins=-1, vol=-1, e5=0x80, pan=0,
+                    ))
+                    continue
+                bound = nxt or gate_end
+                vol = _value_at(h.vol_pts, st, h.vol)
+                balance = _value_at(h.balance_pts, st, h.balance)
+                vol_pts = tuple(
+                    p for p in _merge_vol_balance(h) if st < p[0] < bound
+                )
+                steps = _tone_steps(
+                    intra, st, HUC6280_REFIT_SAMPLES if i == 0 else 0,
+                )
+                wave_steps: list[tuple[int, int]] = []
+                for t, img in merge_step_writes(
+                    [(t, img) for t, img in h.wave_pts if st < t < bound],
+                    gap=64,
+                ):
+                    idx = huc_wave_index.get(img)
+                    if idx is None:
+                        idx = len(huc6280_waves)
+                        huc_wave_index[img] = idx
+                        huc6280_waves.append(img)
+                    if wave_steps and wave_steps[-1][1] == idx:
+                        continue
+                    wave_steps.append((t, idx))
+                wave_index = huc_wave_index.get(wave)
+                if wave_index is None:
+                    wave_index = len(huc6280_waves)
+                    huc_wave_index[wave] = wave_index
+                    huc6280_waves.append(wave)
+                note, e5 = huc6280_note(huc_clock, period)
+                events.append(NoteEvent(
+                    sample=st, ch=voice_ch, on=True, note=note,
+                    ins=tone_ins_base, vol=vol, e5=e5, pan=balance,
+                    end=seg_end, vol_pts=vol_pts,
+                    tone_pitch_pts=tuple(steps),
+                    tone_wave_pts=tuple(wave_steps),
+                    tone_wave=wave_index,
+                    tone_period_offset=0,
+                    tone_chip=5,
+                ))
+                huc6280_count += 1
+        for off in huc_offs:
+            base = huc_at.get(off.chip_id)
+            if base is None:
+                continue
+            events.append(NoteEvent(
+                sample=off.sample_time, ch=base + off.voice, on=False,
+                note=180, ins=-1, vol=-1, e5=0x80, pan=0,
+            ))
+        # Direct-D/A stream bodies: note 108 plays an 8-bit sample at its
+        # stored rate from a DIV_INS_AMIGA instrument.
+        for hit in huc_pcm_hits:
+            base = huc_at.get(hit.chip_id, huc_base)
+            ev = NoteEvent(
+                sample=hit.sample_time, ch=base + hit.voice, on=True,
+                note=108, ins=-1, vol=31, e5=0x80, pan=0,
+                end=hit.end_time, no_pan=True, pcm=True,
+            )
+            events.append(ev)
+            huc6280_pcm_events.append((ev, hit.sample_index))
+        huc6280_pcm_count = len(huc_pcm_hits)
+
     # The YM2203 SSG rides in the same six-channel system: 0-2 FM, 3-5 PSG. Its
     # notes share the AY instrument list.
     ssg_pcm, ssg_pcm_hits = _ssg_pcm("ym2203_ssg")
@@ -6862,6 +7152,10 @@ def analyze(
     tone_ins_base += n_nes_dpcm_ins
     nes_pcm_ins_base = tone_ins_base
     tone_ins_base += n_nes_pcm_ins
+    # HuC6280 direct-D/A bodies are plain 8-bit sample instruments after the
+    # NES group.
+    huc6280_pcm_ins_base = tone_ins_base
+    tone_ins_base += n_huc6280_pcm_ins
 
     events.sort(key=lambda e: (e.sample, e.ch, 0 if e.on else 1))
 
@@ -7103,6 +7397,8 @@ def analyze(
         tone_ins_base += n_nes_dpcm_ins
         nes_pcm_ins_base = tone_ins_base
         tone_ins_base += n_nes_pcm_ins
+        huc6280_pcm_ins_base = tone_ins_base
+        tone_ins_base += n_huc6280_pcm_ins
     if pms_lost:
         warnings.append(
             f"{pms_lost} YM2151 PMS/AMS ramps stayed on the base instrument: "
@@ -7130,11 +7426,12 @@ def analyze(
     # once per tick, so building it before condense (or before the musical
     # row is chosen) plays the driver's trajectory at the wrong speed.
     _bind_tone_instruments(
-        events, scc_ins, ay_ins, psg_ins, nes_ins, tone_ins_base,
+        events, scc_ins, ay_ins, psg_ins, nes_ins, huc6280_ins, tone_ins_base,
         vgm.k051649_clock or SCC_DEFAULT_CLOCK,
         ay_note_clock,
         psg_clock,
         nes_clock,
+        huc6280_clock,
         hz, vgm.total_samples,
     )
     # SSG PCM instruments sit immediately before the tone list.
@@ -7146,6 +7443,9 @@ def analyze(
         ev.ins = nes_dpcm_ins_base + idx
     for ev, idx in nes_pcm_events:
         ev.ins = nes_pcm_ins_base + idx
+    # HuC6280 direct-D/A bodies follow the NES sample group.
+    for ev, idx in huc6280_pcm_events:
+        ev.ins = huc6280_pcm_ins_base + idx
 
     loop_sample = vgm.loop_sample
     if loop_sample is not None and loop_sample < 0:
@@ -7160,6 +7460,7 @@ def analyze(
         or ym2608_b_samples or ym2608_rhythm_events
         or y8950_b_samples or opl4_wave_samples or ssg_pcm_samples
         or nes_ids or nes_dpcm_samples or nes_pcm_samples
+        or huc_pcm_samples
         or any(s.length >= 8 for s in pcm_samples)
         or scc_waves or ay_count or dac_samples or psg_count
     )
@@ -7285,6 +7586,20 @@ def analyze(
              ("ym2203" if is_opn else ("ym2612" if is_opn2 else "ym2151")))
         ),
         fm_systems=fm_systems,
+        # A PCE/SCC/NES-only log has no FM write, so the writer drops the
+        # analyzer's legacy YM2151 placeholder instead of adding an empty OPM.
+        has_fm_source=(
+            # A header-only VGM (no register writes) keeps the legacy YM2151
+            # so the worker/batch paths still produce a silent module.
+            not vgm.writes
+            or any(
+                w.chip in (
+                    "ym2151", "ym2203", "ym2612", "ym2610", "ym2608",
+                    "opll", "opl", "opl2", "opl3", "y8950", "ymf278b",
+                )
+                for w in vgm.writes
+            )
+        ),
         ym2203_ids=ym_ids,
         ym2203_ext=ym2203_ext,
         ym2203_ssg_count=ym2203_ssg_count,
@@ -7301,6 +7616,12 @@ def analyze(
         nes_dpcm_samples=nes_dpcm_samples,
         nes_pcm_samples=nes_pcm_samples,
         nes_count=len(nes_tones) + len(nes_dpcm_hits) + len(nes_pcm_hits),
+        huc6280_ids=huc6280_ids,
+        huc6280_waves=huc6280_waves,
+        huc6280_ins=huc6280_ins,
+        huc6280_pcm_samples=huc_pcm_samples,
+        huc6280_count=huc6280_count,
+        huc6280_pcm_count=huc6280_pcm_count,
         fm_vol_max=_fm_vol_max(fm_systems, is_opll=is_opll, is_opl=is_opl),
         fm_notes=(
             opll_stats.get("notes", 0) if is_opll else
@@ -7582,6 +7903,18 @@ def format_report(song: Song) -> str:
         lines.append(
             f"AY notes    {song.ay_count}  ({len(song.ay_ids)} chip"
             f"{'s' if len(song.ay_ids) > 1 else ''}, {song.vgm.ay8910_clock} Hz)"
+        )
+    if song.huc6280_ids or song.huc6280_pcm_samples:
+        lines.append(
+            f"PCE notes   {song.huc6280_count}  ({len(song.huc6280_ids)} chip"
+            f"{'s' if len(song.huc6280_ids) > 1 else ''}, "
+            f"{len(song.huc6280_waves)} waveforms, "
+            f"{song.vgm.huc6280_clock or 3579545} Hz)"
+        )
+    if song.huc6280_pcm_samples:
+        lines.append(
+            f"PCE PCM     {song.huc6280_pcm_count} note(s) in "
+            f"{len(song.huc6280_pcm_samples)} 8-bit sample(s)"
         )
     if song.ssg_pcm_samples:
         lines.append(
