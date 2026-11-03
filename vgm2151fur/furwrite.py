@@ -805,6 +805,35 @@ def _write_ins_ay(b: Buf, name: str, ins=None) -> None:
     b.end_block(size_off, start)
 
 
+def _write_ins_ay_pcm(b: Buf, name: str, sample_index: int) -> None:
+    """DIV_INS_AY playing one raw sample body.
+
+    This is the shape ``SSGPCM-test.fur`` uses: the SM feature names the body
+    and sets ``useSample`` only (no note map), so the pattern note selects the
+    playback rate and note 108 (C-4) plays the body at its stored ``c4_rate``.
+    """
+    size_off, start = b.begin_block(b"INS2")
+    b.u16(FUR_VERSION)
+    b.u16(INS_AY)
+    b.raw(b"NA")
+    na_size = len(b.b)
+    b.u16(0)
+    na_start = len(b.b)
+    b.strz(name)
+    b.b[na_size:na_size + 2] = int(len(b.b) - na_start).to_bytes(2, "little")
+    b.raw(b"SM")
+    sm_size = len(b.b)
+    b.u16(0)
+    sm_start = len(b.b)
+    b.u16(sample_index)
+    b.u8(0x02)  # useSample
+    b.u8(31)    # waveLen (unused for samples)
+    b.b[sm_size:sm_size + 2] = int(len(b.b) - sm_start).to_bytes(2, "little")
+    _write_ma(b)
+    b.raw(b"EN")
+    b.end_block(size_off, start)
+
+
 def _write_wave(b: Buf, name: str, data: bytes) -> int:
     """DivWavetable::putWaveData: the 32-byte waveform an SCC instrument plays."""
     ptr = len(b)
@@ -3206,6 +3235,14 @@ def write_fur(
     )
     n_opl4_wave_ins = len(opl4_wave_smps)
     opl4_wave_smp_base = y8950_b_smp_base + len(y8950_b_smps)
+    # SSG/PSG PCM: one DIV_INS_AY sample instrument per 8-bit body. The writer
+    # places these instruments just before the SCC/AY/PSG tone instruments and
+    # the sample blocks after the OPL4 wave bodies.
+    ssg_pcm_smps = (
+        list(getattr(song, "ssg_pcm_samples", ()) or ()) if include_pcm else []
+    )
+    n_ssg_pcm_ins = len(ssg_pcm_smps)
+    ssg_pcm_smp_base = opl4_wave_smp_base + len(opl4_wave_smps)
     oki_ids, oki_groups = _grouped(oki_smps)
     adpcm_ids, adpcm_groups = _grouped(adpcm_smps)
     c140_ids: list[int] = []
@@ -3289,7 +3326,7 @@ def write_fur(
         + len(c140_smps) + len(c352_smps) + len(k053260_smps)
         + n_ym2610_a_ins + n_ym2610_b_ins
         + n_ym2608_rhythm_ins + n_ym2608_b_ins
-        + n_y8950_b_ins + n_opl4_wave_ins
+        + n_y8950_b_ins + n_opl4_wave_ins + n_ssg_pcm_ins
         + len(scc_specs) + len(ay_specs) + len(psg_specs)
     )
     n_smp = (
@@ -3298,7 +3335,7 @@ def write_fur(
         + len(c140_smps) + len(c352_smps)
         + len(k053260_smps) + len(dac_smps)
         + len(ym2610_a_smps) + len(ym2610_b_smps) + len(ym2608_b_smps)
-        + len(y8950_b_smps) + len(opl4_wave_smps)
+        + len(y8950_b_smps) + len(opl4_wave_smps) + len(ssg_pcm_smps)
     )
     n_wav = len(scc_waves)
 
@@ -3931,6 +3968,12 @@ def write_fur(
             b, f"OPL4 WAVE {smp.wave:03d}", opl4_wave_smp_base + i,
             INS_MULTIPCM,
         )
+    for i, smp in enumerate(ssg_pcm_smps):
+        ins_ptrs.append(len(b))
+        _write_ins_ay_pcm(
+            b, f"PSG PCM {i:02d} {smp.start:08x}",
+            ssg_pcm_smp_base + i,
+        )
     for i, spec in enumerate(scc_specs):
         ins_ptrs.append(len(b))
         wave = scc_waves[spec.wave] if spec.wave < len(scc_waves) else b""
@@ -4091,6 +4134,11 @@ def write_fur(
             loop=(smp.loop_start, smp.loop_end),
             depth=SMP_DEPTH_16BIT,
         )
+    for smp in ssg_pcm_smps:
+        smp_ptrs.append(len(b))
+        # The bodies are already 8-bit levels encoded for the AY DAC table;
+        # `rate` is the source write rate and note 108 plays it 1:1.
+        _write_sample_s8(b, smp.name, smp.data, smp.rate)
 
     pat_ptrs: list[int] = []
     for ch, idx, rows in patterns:

@@ -157,6 +157,11 @@ from vgm2151fur.ymf278b import (
     opl4_pan_fx,
     opl4_rate,
 )
+from vgm2151fur.ssgpcm import (
+    SsgPcmHit,
+    SsgPcmSample,
+    collect_ssg_pcm,
+)
 from vgm2151fur.ym2203 import (
     YM2203_DEFAULT_CLOCK,
     YM2203_SSG_DIVIDER,
@@ -655,6 +660,12 @@ class Song:
     ay_ids: list[int] = field(default_factory=list)
     ay_ins: list[ToneIns] = field(default_factory=list)
     ay_count: int = 0
+    # SSG/PSG PCM streams: volume-register spamming while the voice's mixer
+    # bits are off. Each body becomes a DIV_INS_AY sample instrument played at
+    # note 108 (C-4), matching the reference modules. One instance per body;
+    # `ssg_pcm_count` notes.
+    ssg_pcm_samples: list[SsgPcmSample] = field(default_factory=list)
+    ssg_pcm_count: int = 0
     # Genesis SN76489: four channels (three tone + noise) after the FM block.
     psg_ids: list[int] = field(default_factory=list)
     psg_ins: list[ToneIns] = field(default_factory=list)
@@ -1739,6 +1750,43 @@ def _emit_ay_notes(
             ins=-1, vol=-1, e5=0x80, pan=0,
         ))
     return count
+
+
+def _emit_ssg_pcm_notes(
+    events: list[NoteEvent],
+    hits: list[SsgPcmHit],
+    at: dict[int, int],
+    sample_base: int,
+) -> tuple[int, list[tuple[NoteEvent, int]]]:
+    """Emit one sample-playback note per SSG PCM segment.
+
+    The instrument index is relative to the module's SSG PCM list; the caller
+    binds it once every instrument base is known. Note 108 is C-4, where the
+    AY platform plays the body at its stored ``c4_rate``.
+    """
+    count = 0
+    bound: list[tuple[NoteEvent, int]] = []
+    for h in hits:
+        base = at.get(h.chip_id)
+        if base is None:
+            continue
+        ev = NoteEvent(
+            sample=h.sample_time,
+            ch=base + h.voice,
+            on=True,
+            note=108,
+            ins=-1,
+            vol=15,
+            e5=0x80,
+            pan=0,
+            pcm=True,
+            end=h.end_time,
+            no_pan=True,
+        )
+        events.append(ev)
+        bound.append((ev, sample_base + h.sample_index))
+        count += 1
+    return count, bound
 
 
 def _steppable_pitch(
@@ -6353,6 +6401,11 @@ def analyze(
     psg_ins: list[ToneIns] = []
     scc_count = 0
     ay_count = 0
+    # SSG/PSG PCM bodies and the notes that play them. The instrument indices
+    # are bound after the tone instrument list is final.
+    ssg_pcm_samples: list[SsgPcmSample] = []
+    ssg_pcm_events: list[tuple[NoteEvent, int]] = []
+    ssg_pcm_count = 0
     scc_notes, scc_offs, scc_wave_list, scc_warn = collect_scc(vgm)
     warnings.extend(scc_warn)
     if scc_notes:
@@ -6441,71 +6494,113 @@ def analyze(
                 ins=-1, vol=-1, e5=0x80, pan=0,
             ))
 
+    # Each SSG stream can carry PCM (volume-register DAC) as well as tones.
+    # Collect both. The tone walker ignores DAC-mode writes because the mixer
+    # turns the voice off, so the two never claim the same time.
+    def _ssg_pcm(chip_name: str):
+        if not pcm:
+            return [], []
+        got, got_hits, got_warn = collect_ssg_pcm(vgm, chip=chip_name)
+        warnings.extend(got_warn)
+        return got, got_hits
+
+    def _emit_pcm(got, got_hits, at) -> None:
+        nonlocal ssg_pcm_count
+        if not got_hits:
+            return
+        base = len(ssg_pcm_samples)
+        ssg_pcm_samples.extend(got)
+        n, bound = _emit_ssg_pcm_notes(events, got_hits, at, base)
+        ssg_pcm_count += n
+        ssg_pcm_events.extend(bound)
+
+    ay_pcm, ay_pcm_hits = _ssg_pcm("ay8910")
     ay_hits, ay_offs, ay_warn = collect_ay8910(vgm)
     warnings.extend(ay_warn)
-    if ay_hits:
-        for cid in sorted({h.chip_id for h in ay_hits}):
+    ay_clock = vgm.ay8910_clock or AY_DEFAULT_CLOCK
+    ay_cids = sorted(
+        {h.chip_id for h in ay_hits} | {h.chip_id for h in ay_pcm_hits}
+    )
+    if ay_cids:
+        for cid in ay_cids:
             ay_ids.append(cid)
         ay_at = {cid: tone_base + SCC_VOICES * len(scc_ids) + AY_VOICES * i
                  for i, cid in enumerate(ay_ids)}
-        ay_clock = vgm.ay8910_clock or AY_DEFAULT_CLOCK
-        ay_count = _emit_ay_notes(
-            events, channel_fx, ay_hits, ay_offs, ay_at, ay_clock, 8,
-            tone_ins_base + len(scc_ins), vgm.total_samples or 0,
-        )
+        if ay_hits:
+            ay_count = _emit_ay_notes(
+                events, channel_fx, ay_hits, ay_offs, ay_at, ay_clock, 8,
+                tone_ins_base + len(scc_ins), vgm.total_samples or 0,
+            )
+        _emit_pcm(ay_pcm, ay_pcm_hits, ay_at)
 
     # The YM2203 SSG rides in the same six-channel system: 0-2 FM, 3-5 PSG. Its
     # notes share the AY instrument list.
+    ssg_pcm, ssg_pcm_hits = _ssg_pcm("ym2203_ssg")
     ssg_hits, ssg_offs, ssg_warn = collect_ay8910(
         vgm, chip="ym2203_ssg", clock=ym_clock, divider=YM2203_SSG_DIVIDER,
     )
     warnings.extend(ssg_warn)
-    if ssg_hits and ym_ids:
+    if (ssg_hits or ssg_pcm_hits) and ym_ids:
         ssg_at = {
             cid: ym_base[cid] + (6 if ym2203_ext else 3) for cid in ym_ids
         }
-        ym2203_ssg_count = _emit_ay_notes(
-            events, channel_fx, ssg_hits, ssg_offs, ssg_at, ym_clock,
-            YM2203_SSG_DIVIDER, tone_ins_base + len(scc_ins),
-            vgm.total_samples or 0,
-        )
-        # The SSG voices share the AY instrument path; count them with the
-        # other PSG notes so the placeholder logic and reports see them.
-        ay_count += ym2203_ssg_count
+        if ssg_hits:
+            ym2203_ssg_count = _emit_ay_notes(
+                events, channel_fx, ssg_hits, ssg_offs, ssg_at, ym_clock,
+                YM2203_SSG_DIVIDER, tone_ins_base + len(scc_ins),
+                vgm.total_samples or 0,
+            )
+            # The SSG voices share the AY instrument path; count them with the
+            # other PSG notes so the placeholder logic and reports see them.
+            ay_count += ym2203_ssg_count
+        _emit_pcm(ssg_pcm, ssg_pcm_hits, ssg_at)
 
     # The YM2610's SSG is inside the same system, after the FM block.
+    ym2610_pcm, ym2610_pcm_hits = _ssg_pcm("ym2610_ssg")
     ym2610_ssg_hits, ym2610_ssg_offs, ym2610_ssg_warn = collect_ay8910(
         vgm, chip="ym2610_ssg", clock=ym2610_clock,
         divider=YM2610_SSG_DIVIDER,
     )
     warnings.extend(ym2610_ssg_warn)
-    if ym2610_ssg_hits and ym2610_ids:
+    if (ym2610_ssg_hits or ym2610_pcm_hits) and ym2610_ids:
         ssg_at = {
             cid: ym_base[cid] + ym2610_fm_count for cid in ym2610_ids
         }
-        ym2610_ssg_count = _emit_ay_notes(
-            events, channel_fx, ym2610_ssg_hits, ym2610_ssg_offs, ssg_at,
-            ym2610_clock, YM2610_SSG_DIVIDER,
-            tone_ins_base + len(scc_ins), vgm.total_samples or 0,
-        )
-        ay_count += ym2610_ssg_count
+        if ym2610_ssg_hits:
+            ym2610_ssg_count = _emit_ay_notes(
+                events, channel_fx, ym2610_ssg_hits, ym2610_ssg_offs, ssg_at,
+                ym2610_clock, YM2610_SSG_DIVIDER,
+                tone_ins_base + len(scc_ins), vgm.total_samples or 0,
+            )
+            ay_count += ym2610_ssg_count
+        _emit_pcm(ym2610_pcm, ym2610_pcm_hits, ssg_at)
 
     # The OPNA's SSG sits after its FM block and divides the same way.
+    ym2608_pcm, ym2608_pcm_hits = _ssg_pcm("ym2608_ssg")
     ym2608_ssg_hits, ym2608_ssg_offs, ym2608_ssg_warn = collect_ay8910(
         vgm, chip="ym2608_ssg", clock=ym2608_clock,
         divider=YM2608_SSG_DIVIDER,
     )
     warnings.extend(ym2608_ssg_warn)
-    if ym2608_ssg_hits and ym2608_ids:
+    if (ym2608_ssg_hits or ym2608_pcm_hits) and ym2608_ids:
         ssg_at = {
             cid: ym_base[cid] + ym2608_fm_count for cid in ym2608_ids
         }
-        ym2608_ssg_count = _emit_ay_notes(
-            events, channel_fx, ym2608_ssg_hits, ym2608_ssg_offs, ssg_at,
-            ym2608_clock, YM2608_SSG_DIVIDER,
-            tone_ins_base + len(scc_ins), vgm.total_samples or 0,
-        )
-        ay_count += ym2608_ssg_count
+        if ym2608_ssg_hits:
+            ym2608_ssg_count = _emit_ay_notes(
+                events, channel_fx, ym2608_ssg_hits, ym2608_ssg_offs, ssg_at,
+                ym2608_clock, YM2608_SSG_DIVIDER,
+                tone_ins_base + len(scc_ins), vgm.total_samples or 0,
+            )
+            ay_count += ym2608_ssg_count
+        _emit_pcm(ym2608_pcm, ym2608_pcm_hits, ssg_at)
+
+    # The writer places the SSG PCM instruments right before the SCC/AY/PSG
+    # tone instruments, so the tone bases move up by their count.
+    n_ssg_pcm = len(ssg_pcm_samples)
+    ssg_pcm_ins_base = tone_ins_base
+    if n_ssg_pcm:
+        tone_ins_base += n_ssg_pcm
 
     events.sort(key=lambda e: (e.sample, e.ch, 0 if e.on else 1))
 
@@ -6727,15 +6822,22 @@ def analyze(
         )
     _rebase_non_fm_ins(events, fm_before_pitch, len(patch_order))
     if fm_pitch_copies:
-        # Keep the DAC maps when recomputing after pitch copies.
+        # Keep the DAC maps and the non-FM sample blocks when recomputing
+        # after pitch copies.
+        fm_ins_count = len(patch_order)
+        if not fm_ins_count and is_opl and opl4_wave_samples:
+            fm_ins_count = 1
         tone_ins_base = (
-            len(patch_order) + n_dac_ins
+            fm_ins_count + n_dac_ins
             + (len(audible) if pcm else 0) + len(oki_samples)
             + n_adpcm_ins + len(spcm_audible) + len(c140_audible)
             + len(c352_audible) + len(k053260_audible)
             + n_ym2610_a_ins + n_ym2610_b_ins
             + n_ym2608_rhythm_ins + n_ym2608_b_ins
+            + n_y8950_b_ins + n_opl4_wave_ins
         )
+        ssg_pcm_ins_base = tone_ins_base
+        tone_ins_base += n_ssg_pcm
     if pms_lost:
         warnings.append(
             f"{pms_lost} YM2151 PMS/AMS ramps stayed on the base instrument: "
@@ -6769,6 +6871,9 @@ def analyze(
         psg_clock,
         hz, vgm.total_samples,
     )
+    # SSG PCM instruments sit immediately before the tone list.
+    for ev, idx in ssg_pcm_events:
+        ev.ins = ssg_pcm_ins_base + idx
 
     loop_sample = vgm.loop_sample
     if loop_sample is not None and loop_sample < 0:
@@ -6781,7 +6886,7 @@ def analyze(
         or rf5c68_audible or rf5c164_audible
         or ym2610_a_samples or ym2610_b_samples
         or ym2608_b_samples or ym2608_rhythm_events
-        or y8950_b_samples or opl4_wave_samples
+        or y8950_b_samples or opl4_wave_samples or ssg_pcm_samples
         or any(s.length >= 8 for s in pcm_samples)
         or scc_waves or ay_count or dac_samples or psg_count
     )
@@ -6839,6 +6944,7 @@ def analyze(
         + len(k053260_audible) + n_ym2610_a_ins + n_ym2610_b_ins
         + len(scc_ins) + len(ay_ins) + len(psg_ins)
         + n_ym2608_rhythm_ins + n_ym2608_b_ins
+        + len(ssg_pcm_samples)
     )
     if n_total_ins > 250:
         warnings.append(
@@ -6850,7 +6956,7 @@ def analyze(
         + len(spcm_audible) + len(c140_audible) + len(c352_audible)
         + len(k053260_audible) + len(dac_samples)
         + len(ym2610_a_samples) + len(ym2610_b_samples)
-        + len(ym2608_b_samples)
+        + len(ym2608_b_samples) + len(ssg_pcm_samples)
     )
     if n_total_smp > 65535:
         warnings.append(
@@ -6950,6 +7056,8 @@ def analyze(
         ay_ids=ay_ids,
         ay_ins=ay_ins,
         ay_count=ay_count,
+        ssg_pcm_samples=ssg_pcm_samples,
+        ssg_pcm_count=ssg_pcm_count,
         psg_ids=psg_ids,
         psg_ins=psg_ins,
         psg_count=psg_count,
@@ -7195,6 +7303,11 @@ def format_report(song: Song) -> str:
         lines.append(
             f"AY notes    {song.ay_count}  ({len(song.ay_ids)} chip"
             f"{'s' if len(song.ay_ids) > 1 else ''}, {song.vgm.ay8910_clock} Hz)"
+        )
+    if song.ssg_pcm_samples:
+        lines.append(
+            f"SSG PCM     {song.ssg_pcm_count} note(s) in "
+            f"{len(song.ssg_pcm_samples)} 8-bit sample(s)"
         )
     if song.pcm_samples:
         lines.append(f"PCM level   {song.k007232_volume:.4g}x of the YM2151 (rip mix)")
