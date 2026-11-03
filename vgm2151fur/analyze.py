@@ -5966,16 +5966,22 @@ def analyze(
             ch = psg_base + h.voice
             if h.noise:
                 spec = h.noise_mode & 3
-                # The SMS noise channel's note selects the fixed-rate preset;
-                # mode 3 takes its period from PSG channel 3.
-                note = 60 + (spec if spec < 3 else 0)
-                e5 = 0x80
+                # The SMS noise channel's note selects the fixed-rate preset
+                # (`note % 12` is 2, 1, 0 in Furnace for hardware rates 0-2).
+                # Mode 3 takes its period from PSG channel 3, so its note is
+                # that channel's note and its pitch points follow that period.
+                if spec == 3:
+                    note, e5 = psg_note(h.period)
+                    pitch = tuple(h.pitch_pts)
+                else:
+                    note = 62 - spec
+                    e5 = 0x80
+                    pitch = ()
                 fmode = ((h.noise_mode >> 2) & 1) | (0x10 if spec == 3 else 0)
                 channel_fx.append((h.sample_time, ch, 0x20, fmode))
                 for t, mode in h.mode_pts:
                     mf = ((mode >> 2) & 1) | (0x10 if (mode & 3) == 3 else 0)
                     channel_fx.append((t, ch, 0x20, mf))
-                pitch: tuple[tuple[int, int], ...] = ()
             else:
                 note, e5 = psg_note(h.period)
                 pitch = tuple(h.pitch_pts)

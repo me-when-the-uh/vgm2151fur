@@ -251,6 +251,43 @@ class TestGenesisPsgDac(unittest.TestCase):
         noise = next(h for h in hits if h.noise)
         self.assertEqual((noise.vol, noise.noise_mode), (9, 7))
 
+    def test_psg_period_zero_is_a_gate_off(self):
+        # A driver silences a tone voice by writing period 0, then its volume
+        # mute. The period write must end the note; otherwise the pattern has
+        # no note-off and the low note sustains into the next one.
+        ws = [
+            ChipWrite(0, "ym2612", 0, 0x22, 0),
+            ChipWrite(100, "sn76489", 0, 0, 0xCF),  # ch2 tone period 1023
+            ChipWrite(100, "sn76489", 0, 0, 0x3F),
+            ChipWrite(100, "sn76489", 0, 0, 0xD0),  # ch2 volume 0
+            ChipWrite(500, "sn76489", 0, 0, 0xC0),  # period 0: gate off
+            ChipWrite(500, "sn76489", 0, 0, 0x00),
+            ChipWrite(500, "sn76489", 0, 0, 0xDF),
+        ]
+        hits, offs, _warn = collect_sn76489(_vgm(ws, sn76489_clock=3579545))
+        tone = next(h for h in hits if h.voice == 2)
+        self.assertEqual((tone.period, tone.off_sample), (1023, 500))
+        self.assertIn((500, 2), [(o.sample_time, o.voice) for o in offs])
+
+    def test_psg_noise_mode_3_tracks_tone_channel_3(self):
+        # Noise mode 3 borrows tone generator 3's period. The noise note must
+        # follow that register, or Furnace writes a fixed low period and the
+        # channel goes effectively silent.
+        ws = [
+            ChipWrite(0, "ym2612", 0, 0x22, 0),
+            ChipWrite(0, "sn76489", 0, 0, 0xCE),  # ch2 tone period 14
+            ChipWrite(0, "sn76489", 0, 0, 0x00),
+            ChipWrite(100, "sn76489", 0, 0, 0xE7),  # mode 3 + white
+            ChipWrite(100, "sn76489", 0, 0, 0xF0),
+            ChipWrite(400, "sn76489", 0, 0, 0xCE),  # ch2 period 30
+            ChipWrite(400, "sn76489", 0, 0, 0x01),
+            ChipWrite(800, "sn76489", 0, 0, 0xFF),
+        ]
+        hits, _offs, _warn = collect_sn76489(_vgm(ws, sn76489_clock=3579545))
+        noise = next(h for h in hits if h.noise)
+        self.assertEqual((noise.period, noise.noise_mode), (14, 7))
+        self.assertEqual(noise.pitch_pts, [(400, 30)])
+
     def test_psg_note_is_the_same_period(self):
         tbl = psg_pitch_table()
         for period in (2, 14, 31, 100, 511, 1023):
