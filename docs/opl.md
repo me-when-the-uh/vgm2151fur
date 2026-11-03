@@ -377,12 +377,14 @@ the unknown environment" needed 1106. `_collect_opl` folds the modulator level
 out of the patch key (`shape_key`), keeps the loudest level seen for the shared
 shape (`loudest`), and leaves a move *inside* a held note to the existing
 operator-TL macro. Base patches are capped at 200, with same-shape reuse and an
-`ins_reused` warning past that. Wave bodies add one instrument each. A module
-whose OPL4 has no FM notes gets no placeholder FM instrument: the wave sample
-instruments start at index 0 and the pattern's PCM columns point at exactly the
-sample the log loaded. (An old placeholder shifted every PCM channel by one
-sample, so "06 TIME'S UP!"'s Ch 0, which loads sample `0x181`, played the
-`0x180` RAM sample instead.)
+`ins_reused` warning past that. Wave bodies add one instrument each. An OPL4
+with no FM notes keeps the empty FM placeholder at instrument 0, so the wave
+instruments are 1-based: `0x01` is wave 017, `0x18` is wave 384 and `0x19` is
+wave 385. The sample index follows the placeholder, so each PCM column points
+at exactly the sample the log loaded. (An older build emitted the placeholder
+without reserving its instrument slot, so every PCM column played the previous
+sample: "06 TIME'S UP!"'s Ch 0, which loads sample `0x181`, played the `0x180`
+RAM sample.)
 
 Verified against the two MoonDriver rips: "05 encounter the unknown
 environment" (6 FM shapes + 83 level-macro copies + 22 YRW801 bodies = 111

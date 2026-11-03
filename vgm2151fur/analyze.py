@@ -6262,8 +6262,15 @@ def analyze(
     )
     # One instrument per wave sample: the note is the pitch, not a slot.
     n_opl4_wave_ins = len(opl4_wave_samples)
+    # An OPL4 with wave samples but no FM notes keeps the empty FM
+    # placeholder at instrument 0 (the writer emits it below). The wave
+    # instruments then start at 1, so instrument 0x01 is wave 017 and
+    # 0x19 is wave 385, matching the reference modules' numbering.
+    fm_ins_count = len(patch_order)
+    if not fm_ins_count and is_opl and opl4_wave_samples:
+        fm_ins_count = 1
     tone_ins_base = (
-        len(patch_order)
+        fm_ins_count
         + (len(audible) if pcm else 0) + len(oki_samples)
         + n_adpcm_ins + len(spcm_audible)
         + len(rf5c68_audible) + len(rf5c164_audible) + len(c140_audible)
@@ -6750,9 +6757,11 @@ def analyze(
                 "no YM2203 key-ons found" if is_opn
                 else "no YM2151 key-ons found"
             )
-        # The placeholder would occupy instrument 0 and shift every sample
-        # instrument. Keep it only when the module would otherwise be empty.
-        if not has_sample_ins:
+        # Keep the placeholder when the module would otherwise be empty,
+        # and on an OPL4 with wave samples: it keeps the wave instruments
+        # 1-based (0x01 = wave 017, 0x19 = wave 385). The sample bases above
+        # already reserve its slot.
+        if not has_sample_ins or (is_opl and opl4_wave_samples):
             fm_list = [FMPatch(
                 0 if is_opl else 7, 0, 0, 0,
                 tuple(OpRegs(tl=63 if is_opl else 0) for _ in range(4)),
