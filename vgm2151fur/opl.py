@@ -155,18 +155,28 @@ def opl_carrier_octave(patch) -> int:
     1 unison and then multiples up. Only an exact power of two can be cancelled
     by a whole-octave note move. A multiplier of 3/5/6/... leaves the note
     where it is.
+
+    The YM2413 shares that table except at zero: Nuked-OPLL's ``pg_multi``
+    starts ``1, 2, 4, 6...``, so a multiplier of 0 is unison and never an
+    octave down. An OPLL preset has no readable operators at all, so only the
+    user patch can move.
     """
     if not getattr(patch, "opl", False) or getattr(patch, "drum", False):
         return 0
-    best_tl = 0x40
+    opll = bool(getattr(patch, "opll", False))
+    best_tl = 0x40 if not opll else 0x10
     best_octave: int | None = None
     for i in patch.carriers():
         op = patch.ops[i]
-        tl = op.tl & 0x3F
-        if tl >= 0x3F:
+        mask = 0x0F if opll else 0x3F
+        tl = op.tl & mask
+        if tl >= mask:
             continue
         mult = op.mult & 15
-        ratio = 0.5 if mult == 0 else float(mult)
+        if opll and mult == 0:
+            ratio = 1.0
+        else:
+            ratio = 0.5 if mult == 0 else float(mult)
         octave = (
             int(round(math.log2(ratio)))
             if ratio in (0.5, 1.0, 2.0, 4.0, 8.0)
@@ -258,6 +268,16 @@ _TABLES: dict[tuple[float, int], FreqPitchTable] = {}
 FURNACE_CLOCK = 315_000_000.0 / 88.0
 FURNACE_CLOCK_OPL3 = FURNACE_CLOCK * 4.0
 CLOCK_DEFAULT_TOLERANCE = 1  # Hz; the writer omits customClock inside it
+
+# The YM2413 platform's own clock presets (``DivPlatformOPLL::setFlags``).
+# ``clockSel`` is how Furnace names them in the UI, and matching one exactly
+# keeps the module on a built-in selection instead of a custom clock.
+OPLL_CLOCK_SEL = (
+    (0, FURNACE_CLOCK),                             # COLOR_NTSC
+    (1, (283.75 * 15625.0 + 25.0) * 4.0 / 5.0),     # COLOR_PAL x4/5
+    (2, 4_000_000.0),
+    (3, FURNACE_CLOCK / 2.0),
+)
 
 
 def opl_module_clock(clock: int | float, opl3: bool = False) -> float:
@@ -379,6 +399,119 @@ def opl_note_for(
     assert best is not None
     out = (best[2], best[3])
     _NOTES[key] = out
+    return out
+
+
+# --- OPLL (YM2413) pitch ----------------------------------------------------
+#
+# The YM2413 platform is a separate core: DivPlatformOPLL has its own
+# CHIP_FREQBASE (1180068), a maximum unit of 0xffff and OPLL_C_NUM 343, and its
+# f-num is nine bits wide. The note/E5 search is the same, only the table and
+# the split differ.
+
+OPLL_DEFAULT_CLOCK = 3579545
+OPLL_FREQ_BASE = 1180068
+OPLL_MAX_UNIT = 0xFFFF
+OPLL_C_NUM = 343
+OPLL_MAX_FNUM = 0x1FF
+
+_OPLL_TABLES: dict[float, FreqPitchTable] = {}
+_OPLL_NOTES: dict[tuple[int, int, float], tuple[int, int]] = {}
+
+
+def opll_module_clock(clock: int | float) -> float:
+    """The clock the OPLL module will run at: Furnace's default or the rip's."""
+    if not clock or abs(float(clock) - FURNACE_CLOCK) <= CLOCK_DEFAULT_TOLERANCE:
+        return FURNACE_CLOCK
+    for _sel, hz in OPLL_CLOCK_SEL:
+        if abs(float(clock) - hz) <= CLOCK_DEFAULT_TOLERANCE:
+            return hz
+    return float(clock)
+
+
+def opll_clock_flag(clock: int | float) -> str:
+    """The chip flag that puts the OPLL platform at `clock`.
+
+    Furnace's four named selections are exact, so a rip whose header matches
+    one of them travels as ``clockSel`` (the way the tracker itself stores it)
+    and anything else as a custom clock.
+    """
+    if not clock:
+        return ""
+    hz = opll_module_clock(clock)
+    for sel, target in OPLL_CLOCK_SEL:
+        if abs(hz - target) <= 0.5:
+            return "" if sel == 0 else f"clockSel={sel}"
+    return f"customClock={int(round(hz))}"
+
+
+def opll_pitch_table(clock: float) -> FreqPitchTable:
+    key = round(opll_module_clock(clock), 4)
+    tbl = _OPLL_TABLES.get(key)
+    if tbl is None:
+        tbl = FreqPitchTable(key, OPLL_FREQ_BASE, maximum=OPLL_MAX_UNIT)
+        _OPLL_TABLES[key] = tbl
+    return tbl
+
+
+def opll_to_freq(unit: int) -> tuple[int, int]:
+    """DivPlatformOPLL::toFreq: the block/f-num a frequency unit becomes."""
+    block = 0
+    if unit > 0:
+        index = unit // OPLL_C_NUM
+        if index > 0:
+            block = index.bit_length()
+    block = max(0, min(7, block))
+    fnum = unit >> block
+    if fnum > OPLL_MAX_FNUM:
+        fnum = OPLL_MAX_FNUM
+    return block, fnum
+
+
+def opll_unit_for(note: int, clock: float, e5: int = 0x80) -> int:
+    return opll_pitch_table(clock).value(note, e5)
+
+
+def opll_note_fnum(note: int, clock: float, e5: int = 0x80) -> tuple[int, int]:
+    """(block, fnum) Furnace writes for a pattern note on this clock."""
+    return opll_to_freq(opll_unit_for(note, clock, e5))
+
+
+def opll_note_for(
+    block: int, fnum: int, clock: float,
+) -> tuple[int, int]:
+    """Source (block, fnum) -> (pattern note, E5 byte), OPLL layout."""
+    block = max(0, min(7, int(block)))
+    fnum = max(1, min(OPLL_MAX_FNUM, int(fnum)))
+    key = (block, fnum, round(float(clock), 4))
+    hit = _OPLL_NOTES.get(key)
+    if hit is not None:
+        return hit
+    tbl = opll_pitch_table(clock)
+    want = opl_pitch_units(block, fnum)
+    unit = max(1, fnum << block)
+    est = 57.0 + 12.0 * math.log2(unit * tbl.clock / (tbl.tuning * tbl.base))
+    center = max(0, min(179, int(math.floor(est))))
+    lo_note = max(0, min(179, center - 3))
+    hi_note = max(lo_note, min(179, center + 4))
+    best: tuple[float, int, int, int] | None = None
+    for note in range(lo_note, hi_note + 1):
+        lo, hi = -128, 127
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if opl_pitch_units(*opll_to_freq(tbl.value(note, 0x80 + mid))) < want:
+                lo = mid + 1
+            else:
+                hi = mid
+        for off in range(max(-128, lo - 2), min(127, lo + 2) + 1):
+            got = opll_to_freq(tbl.value(note, 0x80 + off))
+            err = abs(opl_pitch_units(*got) - want)
+            cand = (err, abs(off), note, 0x80 + off)
+            if best is None or cand < best:
+                best = cand
+    assert best is not None
+    out = (best[2], best[3])
+    _OPLL_NOTES[key] = out
     return out
 
 

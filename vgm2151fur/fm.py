@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+
 # YM2151 (OPM) carrier sets in its register order (0x40/0x48/0x50/0x58).
 # Algorithms 0-3 are chains ending on op4, 5 and 6 add op1-fed carriers, 7 is
 # additive. Algorithm 4 outputs on op3 and op4. Across 49 YM2151 rips every
@@ -89,6 +90,7 @@ def carriers_for(alg: int, opn: bool, opl: bool = False, four: bool = False) -> 
 # while DivInstrumentFM/OpRegs store the operators in register order
 # S1,S3,S2,S4.  Index by *register* operator: which mask bit enables it.
 OPN_OP_TO_MASK = (0, 2, 1, 3)
+
 
 # Ext channel-3 layout: which ops[] entry an operator column plays.
 # DivPlatformYM2203Ext::dispatch maps its four columns (channels 2..5) as
@@ -182,6 +184,11 @@ class FMPatch:
     opl: bool = False
     four: bool = False
     drum: bool = False
+    # True for a YM2413 (OPLL) instrument (DIV_INS_OPLL). It has two
+    # operators and one of sixteen fixed ROM presets or a single user patch
+    # (`preset` = the $3x instrument nibble; 0 is the user patch).
+    opll: bool = False
+    preset: int = 0
     # Per-note pitch motion for OPN: absolute pitch2 values in 1/128
     # semitones (the module uses Furnace's default linear pitch mode).
     pitch_macro: tuple[int, ...] = ()
@@ -207,6 +214,12 @@ class FMPatch:
         differ only in LFO sensitivity must not merge.
         """
         op_keys = tuple(self.ops[i].as_tuple(include_tl=True) for i in range(4))
+        if self.opll:
+            # The OPLL selects a ROM voice with the instrument nibble. Two
+            # presets carry the same idle operators, so the nibble is part of
+            # the timbre. `alg` is the per-operator sustain bit here.
+            return (self.alg & 1, self.fb & 7, self.pms & 1, self.ams & 1,
+                    self.opll, self.preset, op_keys)
         if self.opl:
             # The OPL platform has no channel LFO depth register, and 0xB4's
             # PMS/AMS fields do not exist; the connection bit and, on OPL3,
@@ -219,9 +232,13 @@ class FMPatch:
     def carriers(self) -> tuple[int, ...]:
         if self.drum:
             return (0, 1, 2, 3)
+        if self.opll:
+            # Two operators: op[0] modulates, op[1] is the output. `alg` is
+            # the sustain bit on this chip and does not change the connection.
+            return (1,)
         return carriers_for(self.alg & 7, self.opn, self.opl, self.four)
 
     def carrier_tl(self) -> int:
-        mask = 0x3F if self.opl else 0x7F
+        mask = 0x0F if self.opll else (0x3F if self.opl else 0x7F)
         tls = [self.ops[i].tl & mask for i in self.carriers()]
         return min(tls) if tls else mask

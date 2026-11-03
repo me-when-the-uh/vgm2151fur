@@ -19,10 +19,16 @@ from vgm2151fur.c352 import C352_DEFAULT_CLOCK
 from vgm2151fur.fm import CARRIERS, OPN_CARRIERS
 from vgm2151fur.oki import msm6258_flag_text, oki_flag_text, oki_needs_banked
 from vgm2151fur.opl import (
-    FURNACE_CLOCK, FURNACE_CLOCK_OPL3, opl_module_clock,
+    FURNACE_CLOCK, FURNACE_CLOCK_OPL3, opl_module_clock, opll_clock_flag,
+    opll_module_clock,
 )
 from vgm2151fur.pcm import pcm7_to_s8, scale_pcm7
 from vgm2151fur.pitch import FURNACE_CLOCK_DEFAULT, module_clock
+from vgm2151fur.ym2608 import (
+    RHYTHM_VOICES,
+    YM2608_DEFAULT_CLOCK,
+    deltat_store_body,
+)
 
 # Furnace arcade.cpp: rWrite(DT, dtTable[op.dt]<<4). Inverse of
 # dtTable = (7, 6, 5, 0, 1, 2, 3, 4) so YM2151 register DT survives the
@@ -67,6 +73,11 @@ CHIP_YM2612_CSM = 0xC1
 # YM2610B (6 FM, 16 channels).
 CHIP_YM2610 = 0xA5
 CHIP_YM2610B = 0x9E
+# Furnace's YM2608 (OPNA): the YM2610B's channel order with rhythm in place of
+# ADPCM-A - 6 FM + 3 SSG + 6 rhythm + 1 ADPCM-B = 16 channels, or 19 with
+# channel 3 split into four operator columns.
+CHIP_YM2608 = 0x8E
+CHIP_YM2608_EXT = 0xB7
 # TI SN76489 (the SMS platform): three square voices then noise.  A Genesis
 # module carries it as a second system after the YM2612.
 CHIP_SMS = 0x03
@@ -100,6 +111,17 @@ CHIP_OPL3_DRUMS = 0xA4
 OPL_CHIP = {("opl", False): CHIP_OPL, ("opl2", False): CHIP_OPL2,
             ("opl3", False): CHIP_OPL3, ("opl", True): CHIP_OPL_DRUMS,
             ("opl2", True): CHIP_OPL2_DRUMS, ("opl3", True): CHIP_OPL3_DRUMS}
+# The YM2413 (OPLL) is its own core and instrument type. Rhythm mode is a
+# separate system whose last three hardware channels become five kit columns.
+CHIP_OPLL = 0x89
+CHIP_OPLL_DRUMS = 0xA7
+OPLL_CHANNELS = 9
+OPLL_DRUMS_CHANNELS = 11
+OPLL_DRUMS_MELODIC = 6
+OPLL_DRUM_LABELS = (
+    ("Kick", "BD"), ("Snare", "SD"), ("Tom", "TM"), ("Top", "TP"),
+    ("HiHat", "HH"),
+)
 OPL_CHANNELS = {("opl", False): 9, ("opl2", False): 9, ("opl3", False): 18,
                 ("opl", True): 11, ("opl2", True): 11, ("opl3", True): 20}
 OPL_MELODIC = {("opl", False): 9, ("opl2", False): 9, ("opl3", False): 18,
@@ -142,6 +164,22 @@ def opl_channel_names(kind: str, drums: bool) -> tuple[list[str], list[str]]:
         short_names.append(short_name)
     return long_names, short_names
 
+
+def opll_channel_names(drums: bool) -> tuple[list[str], list[str]]:
+    """The long and short channel names of the OPLL and its drums sibling."""
+    total = OPLL_DRUMS_CHANNELS if drums else OPLL_CHANNELS
+    long_names: list[str] = []
+    short_names: list[str] = []
+    for ch in range(total):
+        if drums and ch >= OPLL_DRUMS_MELODIC:
+            where = ch - OPLL_DRUMS_MELODIC
+            long_names.append(OPLL_DRUM_LABELS[where][0])
+            short_names.append(OPLL_DRUM_LABELS[where][1])
+        else:
+            long_names.append(f"FM {ch + 1}")
+            short_names.append(f"F{ch + 1}")
+    return long_names, short_names
+
 INS_OPM = 33
 # DIV_INS_FM: the generic OPN instrument used by the YM2203.  Furnace reads
 # its 0x70/0x90 fields from the same INS2 "FM" feature.
@@ -151,6 +189,8 @@ INS_FM = 1
 # operators in its operator slots.
 INS_OPL = 14
 INS_OPL_DRUMS = 32
+# DIV_INS_OPLL: the YM2413's own instrument type, two operators and a preset.
+INS_OPLL = 13
 INS_MSM6258 = 35
 INS_MSM6295 = 36
 INS_ADPCMA = 37
@@ -320,6 +360,10 @@ def _write_fm_feature(b: Buf, patch) -> None:
     size_off = len(b.b)
     b.u16(0)
     start = len(b.b)
+    if getattr(patch, "opll", False):
+        _write_opll_fm_feature_body(b, patch)
+        b.b[size_off:size_off + 2] = int(len(b.b) - start).to_bytes(2, "little")
+        return
     if getattr(patch, "opl", False):
         _write_opl_fm_feature_body(b, patch)
         b.b[size_off:size_off + 2] = int(len(b.b) - start).to_bytes(2, "little")
@@ -380,6 +424,34 @@ def _write_opl_fm_feature_body(b: Buf, patch) -> None:
         b.u8(((op.sl & 15) << 4) | (op.rr & 15))
         b.u8(0)  # deep vibrato and SSG-EG are not OPL fields
         b.u8(op.ws & 7)
+
+
+def _write_opll_fm_feature_body(b: Buf, patch) -> None:
+    """The 'FM' feature payload of a DIV_INS_OPLL voice.
+
+    The OPLL has two operators and no channel-level connection; ``alg`` in
+    this feature is the per-operator sustain (hold) bit. Byte 3 carries the
+    ROM preset nibble: zero selects the single user patch in ``$00-$07``,
+    1-15 a factory voice. The carrier's TL stays 0 because the chip takes the
+    level from the ``$3x`` volume nibble; the pattern volume column mirrors
+    that nibble, so a note keeps the source level.
+    """
+    b.u8(2 | 0x10 | 0x20)
+    b.u8(((patch.alg & 1) << 4) | (patch.fb & 7))
+    # The chip's $03 bits 4 and 3 are the vibrato and tremolo depth.
+    b.u8(((patch.ams & 3) << 3) | (patch.pms & 7))
+    b.u8(patch.preset & 31)
+    for idx in range(2):
+        op = patch.ops[idx]
+        b.u8(((op.ksr & 1) << 7) | (op.mult & 15))
+        b.u8(((op.sus & 1) << 7) | (op.tl & 63))
+        b.u8(((op.vib & 1) << 5) | (op.ar & 15))
+        b.u8(((op.am & 1) << 7) | ((op.ksl & 3) << 5) | (op.dr & 15))
+        b.u8(0)
+        b.u8(((op.sl & 15) << 4) | (op.rr & 15))
+        # Bit 3 of ssgEnv maps back to $00/$01 bit 5 (ET).
+        b.u8(op.ssg_eg & 0x0F)
+        b.u8(0)
 
 
 def _write_macro(
@@ -487,6 +559,7 @@ def _write_ins_opm(b: Buf, name: str, patch) -> None:
     """
     opl = bool(getattr(patch, "opl", False))
     ins_type = (
+        INS_OPLL if getattr(patch, "opll", False) else
         INS_OPL_DRUMS if getattr(patch, "drum", False) else INS_OPL
     ) if opl else (INS_FM if getattr(patch, "opn", False) else INS_OPM)
     size_off, start = b.begin_block(b"INS2")
@@ -2235,8 +2308,11 @@ def _build_patterns(song: Song, n_ch: int, pat_len_max: int, fx_cols: int,
     note_e5: dict[tuple[int, int], int] = {}
     # Mid-note carrier-TL fades ride the volume column as (max - vol) against
     # the instrument TL. Every FM note-on re-asserts the top of the column when
-    # any note fades. The OPL family's column tops out at 63 (GET_VOLMAX).
+    # any note fades. The ceiling is the chip's: 127 on the OPM and OPN family,
+    # 63 on an OPL (GET_VOLMAX), 15 on the YM2413. One module-wide value serves
+    # a single family; a combined one needs the maximum of each channel.
     fm_vol_max = max(1, int(getattr(song, "fm_vol_max", 127)))
+    vol_max = _channel_vol_max(song, n_ch, fm_vol_max, ch_offset)
     fm_tl = any(
         ev.on and not ev.pcm and ev.tl_pts and 0 <= ev.ch + ch_offset < n_ch
         for ev in song.events
@@ -2409,7 +2485,9 @@ def _build_patterns(song: Song, n_ch: int, pat_len_max: int, fx_cols: int,
                 if cell.note >= 0:
                     _bump(stats, "vol_step_dropped")
                     continue
-                cell.vol = max(0, min(fm_vol_max, fm_vol_max - (tl - t0)))
+                # The column's ceiling is the chip that owns this channel.
+                top = vol_max[ev_ch] if ev_ch < len(vol_max) else fm_vol_max
+                cell.vol = max(0, min(top, top - (tl - t0)))
 
     # Pitch sweeps run after every event is placed. The ramps can then share
     # the note-off rows and their ED delays. Note rows are known by now, and
@@ -2723,42 +2801,277 @@ def decompress_fur(data: bytes) -> bytes:
         return data
 
 
+def _system_span(system) -> int:
+    """Module columns one FM system occupies, sample engines included."""
+    return system.channels
+
+
+def _channel_vol_max(
+    song: Song, n_ch: int, default: int, ch_offset: int = 0,
+) -> list[int]:
+    """The volume column's ceiling for every module channel.
+
+    A single-family module keeps the one value analysis chose. Two families in
+    one module differ: an OPN or OPM fade tops out at 127 while an OPL reaches
+    only 63 and the YM2413 just 15, so each system's own columns carry their
+    chip's maximum.
+    """
+    table = [default] * n_ch
+    systems = list(getattr(song, "fm_systems", ()) or ())
+    # With no FM block in the module the sample chips own these indices, and
+    # their fades use their own column scale.
+    if ch_offset or len({s.kind for s in systems}) < 2:
+        return table
+    ch = 0
+    for system in systems:
+        top = (
+            15 if system.kind == "opll" else
+            63 if system.kind in ("opl", "opl2", "opl3") else 127
+        )
+        for _ in range(system.fm_channels):
+            if ch < n_ch:
+                table[ch] = top
+            ch += 1
+        # SSG and sample columns ride past that family's FM block.
+        ch += _system_span(system) - system.fm_channels
+    return table
+
+
+def _legacy_system(song: Song):
+    """One system for a Song built before `fm_systems` existed."""
+    from vgm2151fur.analyze import FmSystem
+
+    kind = getattr(song, "fm_chip", "ym2151")
+    if kind in ("opl", "opl2", "opl3"):
+        drums = bool(getattr(song, "opl_drums", False))
+        ids = list(getattr(song, "opl_ids", ()) or ()) or [0]
+        return [
+            FmSystem(kind, cid, OPL_CHANNELS[(kind, drums)], drums=drums)
+            for cid in ids
+        ]
+    if kind == "opll":
+        drums = bool(getattr(song, "opll_drums", False))
+        ids = list(getattr(song, "opll_ids", ()) or ()) or [0]
+        channels = OPLL_DRUMS_CHANNELS if drums else OPLL_CHANNELS
+        return [FmSystem("opll", cid, channels, drums=drums) for cid in ids]
+    ids = list(getattr(song, f"{kind}_ids", ()) or ()) or [0]
+    if kind == "ym2610":
+        fm = 6 if getattr(song, "ym2610_b", False) else 4
+        return [FmSystem(kind, cid, fm) for cid in ids]
+    if kind == "ym2608":
+        ext = bool(getattr(song, "ym2608_ext", False))
+        return [
+            FmSystem(kind, cid, 9 if ext else 6, ext=ext) for cid in ids
+        ]
+    if kind == "ym2612":
+        ext = bool(getattr(song, "ym2612_ext", False))
+        csm = bool(getattr(song, "ym2612_csm", False))
+        return [
+            FmSystem(kind, cid, 9 if ext else 6, ext=ext, csm=csm)
+            for cid in ids
+        ]
+    if kind == "ym2203":
+        ext = bool(getattr(song, "ym2203_ext", False))
+        return [
+            FmSystem(kind, cid, 6 if ext else 3, ext=ext) for cid in ids
+        ]
+    return [FmSystem("ym2151", 0, 8)]
+
+
+def _append_system_names(
+    song: Song, systems, names_long: list[str], names_short: list[str],
+) -> None:
+    """Channel labels for every FM system, in module order.
+
+    The tags are the column handle a player sees, so two systems in one module
+    must not answer to the same letters. An OPL family that shares a module
+    numbers its voices by their channel here; on its own it keeps the plain
+    FM 1..9 tags Furnace uses.
+    """
+    counts = Counter(s.kind for s in systems)
+    mixed = len(counts) > 1
+    seen: Counter = Counter()
+    ch0 = 0
+    for system in systems:
+        kind = system.kind
+        seen[kind] += 1
+        instance = seen[kind]
+        cid = system.chip_id
+        span = _system_span(system)
+        # An instance suffix only appears when the family has more than one
+        # chip, matching the long names the older writer produced.
+        suffix = f" ({instance})" if counts[kind] > 1 else ""
+        longs: list[str] = []
+        shorts: list[str] = []
+        if kind == "ym2610":
+            fm = system.fm_channels or (
+                6 if getattr(song, "ym2610_b", False) else 4
+            )
+            for voice in range(fm):
+                longs.append(f"FM {voice + 1}{suffix}")
+                shorts.append(f"F{cid + 1}-{voice + 1}")
+            for voice in range(3):
+                longs.append(f"PSG {voice + 1}{suffix}")
+                shorts.append(f"P{cid + 1}-{voice + 1}")
+            for voice in range(6):
+                longs.append(f"ADPCM-A {voice + 1}{suffix}")
+                shorts.append(f"A{cid + 1}-{voice + 1}")
+            longs.append(f"ADPCM-B{suffix}")
+            shorts.append(f"B{cid + 1}")
+        elif kind == "ym2608":
+            # Furnace names the OPNA's kit columns Kick, Snare, Top, HiHat,
+            # Tom and Rim (sysDef.cpp:1365-1370); delta-T is simply ADPCM.
+            if system.ext:
+                for voice, label in enumerate(("FM 1", "FM 2")):
+                    longs.append(f"{label}{suffix}")
+                    shorts.append(f"F{cid + 1}-{voice + 1}")
+                for voice in range(4):
+                    # Column c carries operator (1,2,0,3)[c]'s frequency.
+                    op_label = (1, 2, 0, 3)[voice] + 1
+                    longs.append(f"FM 3 OP{op_label}{suffix}")
+                    shorts.append(f"O{cid + 1}-{op_label}")
+                for voice in range(3):
+                    longs.append(f"FM {voice + 4}{suffix}")
+                    shorts.append(f"F{cid + 1}-{voice + 4}")
+            else:
+                for voice in range(6):
+                    longs.append(f"FM {voice + 1}{suffix}")
+                    shorts.append(f"F{cid + 1}-{voice + 1}")
+            for voice in range(3):
+                longs.append(f"PSG {voice + 1}{suffix}")
+                shorts.append(f"P{cid + 1}-{voice + 1}")
+            for tag, long_name in RHYTHM_VOICES:
+                longs.append(f"{long_name}{suffix}")
+                shorts.append(f"{tag}{cid + 1}")
+            longs.append(f"ADPCM{suffix}")
+            shorts.append(f"D{cid + 1}")
+        elif kind == "ym2612":
+            if system.ext:
+                for voice, label in enumerate(("FM 1", "FM 2")):
+                    longs.append(f"{label}{suffix}")
+                    shorts.append(f"F{cid + 1}-{voice + 1}")
+                for voice in range(4):
+                    op_label = (1, 2, 0, 3)[voice] + 1
+                    longs.append(f"FM 3 OP{op_label}{suffix}")
+                    shorts.append(f"O{cid + 1}-{op_label}")
+                for voice in range(3):
+                    longs.append(f"FM {voice + 4}{suffix}")
+                    shorts.append(f"F{cid + 1}-{voice + 4}")
+            else:
+                for voice in range(6):
+                    longs.append(f"FM {voice + 1}{suffix}")
+                    shorts.append(f"F{cid + 1}-{voice + 1}")
+        elif kind == "ym2203":
+            if system.ext:
+                for voice, label in enumerate(("FM 1", "FM 2")):
+                    longs.append(f"{label}{suffix}")
+                    shorts.append(f"F{cid + 1}-{voice + 1}")
+                for voice in range(4):
+                    op_label = (1, 2, 0, 3)[voice] + 1
+                    longs.append(f"FM 3 OP{op_label}{suffix}")
+                    shorts.append(f"O{cid + 1}-{op_label}")
+                for voice in range(3):
+                    longs.append(f"PSG {voice + 1}{suffix}")
+                    shorts.append(f"P{cid + 1}-{voice + 1}")
+            else:
+                for voice in range(3):
+                    longs.append(f"FM {cid + 1}-{voice + 1}")
+                    shorts.append(f"F{cid + 1}-{voice + 1}")
+                for voice in range(3):
+                    longs.append(f"PSG {cid + 1}-{voice + 1}")
+                    shorts.append(f"P{cid + 1}-{voice + 1}")
+        elif kind in ("opl", "opl2", "opl3"):
+            melodic = OPL_MELODIC[(kind, bool(system.drums))]
+            for i, (long_name, short_name) in enumerate(zip(*opl_channel_names(
+                    kind, bool(system.drums)))):
+                longs.append(f"{long_name}{suffix}")
+                if mixed and i < melodic:
+                    # Numbered by module channel, so the OPN family beside it
+                    # never answers to the same tag.
+                    shorts.append(f"F{ch0 + i + 1}")
+                elif counts[kind] > 1:
+                    # F2-3 is chip 2's FM 3; a kit column keeps the instance.
+                    shorts.append(
+                        f"F{cid + 1}-{short_name[1:]}"
+                        if short_name.startswith("F") and short_name[1:].isdigit()
+                        else f"{short_name}{instance}"
+                    )
+                else:
+                    shorts.append(short_name)
+        elif kind == "opll":
+            for i, (long_name, short_name) in enumerate(
+                    zip(*opll_channel_names(bool(system.drums)))):
+                longs.append(f"{long_name}{suffix}")
+                if mixed and i < (
+                    OPLL_DRUMS_MELODIC if system.drums else OPLL_CHANNELS
+                ):
+                    shorts.append(f"F{ch0 + i + 1}")
+                elif counts[kind] > 1:
+                    shorts.append(
+                        f"F{cid + 1}-{short_name[1:]}"
+                        if short_name.startswith("F") and short_name[1:].isdigit()
+                        else f"{short_name}{instance}"
+                    )
+                else:
+                    shorts.append(short_name)
+        else:
+            fm = system.fm_channels or 8
+            longs = [f"FM {i + 1}" for i in range(fm)]
+            shorts = [f"F{i + 1}" for i in range(fm)]
+        names_long.extend(longs)
+        names_short.extend(shorts)
+        ch0 += span
+
+
 def write_fur(
     song: Song, *, include_pcm: bool = True, include_fm: bool = True,
     stats: dict | None = None, compress: bool = False,
 ) -> bytes:
     gd3 = song.vgm.gd3
-    fm_family = getattr(song, "fm_chip", "ym2151")
-    ym2203 = fm_family == "ym2203"
-    ym2612 = fm_family == "ym2612"
+    # Every pitched FM system in module order. A log normally contributes one;
+    # the combined Zone 66 shape carries a PCM-only YM2612 beside the OPL that
+    # plays the music, and both need their own chip entry and channel block.
+    systems = list(getattr(song, "fm_systems", ()) or ())
+    if not systems:
+        systems = _legacy_system(song)
+    kinds = {s.kind for s in systems}
+
+    def _ids_of(kind: str | None) -> list[int]:
+        return [s.chip_id for s in systems if kind and s.kind == kind]
+
+    ym2203 = "ym2203" in kinds
+    ym2612 = "ym2612" in kinds
+    ym2610 = "ym2610" in kinds
+    ym2608 = "ym2608" in kinds
+    # The YM2413 is its own system (0x89) with a separate drums layout (0xa7).
+    opll = "opll" in kinds
+    opll_drums = any(s.drums for s in systems if s.kind == "opll")
+    opll_ids = _ids_of("opll")
     # The OPL family is one module system per chip: an OPL3 owns both register
     # banks and all eighteen channels, while a dual YM3812 log adds a second
     # OPL2 system the way a dual YM2612 log adds a second OPN2.
-    opl_kind = fm_family if fm_family in ("opl", "opl2", "opl3") else None
+    opl_kind = next((k for k in ("opl3", "opl2", "opl") if k in kinds), None)
     opl = opl_kind is not None
-    opl_drums = bool(getattr(song, "opl_drums", False))
-    opl_ids = list(getattr(song, "opl_ids", ()) or ()) if opl else []
-    ym2610 = fm_family == "ym2610"
-    ym_chip = ym2203 or ym2612 or ym2610
-    ym_ext = bool(
-        (getattr(song, "ym2203_ext", False) if ym2203 else
-         getattr(song, "ym2612_ext", False))
-    ) if (ym2203 or ym2612) else False
-    if ym2203:
-        ym_ids = list(getattr(song, "ym2203_ids", ()) or ())
-    elif ym2612:
-        ym_ids = list(getattr(song, "ym2612_ids", ()) or ())
-    elif ym2610:
-        ym_ids = list(getattr(song, "ym2610_ids", ()) or ())
-    else:
-        ym_ids = []
+    opl_drums = any(s.drums for s in systems if s.kind == opl_kind)
+    opl_ids = _ids_of(opl_kind)
+    ym_chip = ym2203 or ym2612 or ym2610 or ym2608
+    # The sample engines only ever come from one arcade family per module, so
+    # the ADPCM counters follow that chip's instances.
+    ym_kind = (
+        "ym2608" if ym2608 else "ym2610" if ym2610 else
+        "ym2612" if ym2612 else "ym2203" if ym2203 else None
+    )
+    ym_ids = _ids_of(ym_kind)
+    ym_ext = any(s.ext for s in systems if s.kind == ym_kind)
     # A YM2612 system stays when the log had the chip, even with no FM notes.
     # A YM2203 system likewise owns its three SSG voices.  A YM2610 system
     # owns FM, SSG and the two ADPCM engines, so either half keeps it.
-    if ym2610:
+    if ym2610 or ym2608:
         fm_present = (include_fm or include_pcm) and bool(ym_ids)
     elif opl:
-        fm_present = include_fm and bool(opl_ids)
+        fm_present = include_fm and (bool(opl_ids) or bool(ym_ids))
+    elif opll:
+        fm_present = include_fm and bool(opll_ids)
     else:
         fm_present = include_fm and (bool(ym_ids) if ym_chip else True)
     fm_ins = song.fm_patches if (fm_present and include_fm) else []
@@ -2790,6 +3103,17 @@ def write_fur(
     n_ym2610_b_ins = (len(ym2610_b_smps) + 119) // 120
     ym2610_a_smp_base = dac_smp_base + len(dac_smps)
     ym2610_b_smp_base = ym2610_a_smp_base + len(ym2610_a_smps)
+    # The OPNA's delta-T samples are laid out like the YM2610's B maps. Its
+    # rhythm kit needs no samples at all, just one instrument to hang the
+    # column's macros on.
+    ym2608_b_smps = (
+        list(getattr(song, "ym2608_b_samples", ()) or ()) if include_pcm else []
+    )
+    n_ym2608_b_ins = (len(ym2608_b_smps) + 119) // 120
+    n_ym2608_rhythm_ins = (
+        1 if (include_pcm and getattr(song, "ym2608_rhythm_notes", 0)) else 0
+    )
+    ym2608_b_smp_base = ym2610_b_smp_base + len(ym2610_b_smps)
     oki_ids, oki_groups = _grouped(oki_smps)
     adpcm_ids, adpcm_groups = _grouped(adpcm_smps)
     c140_ids: list[int] = []
@@ -2825,23 +3149,28 @@ def write_fur(
     # never beside another sample chip.
     want_k007 = bool(pcm_smps)
 
+    # Columns per system, summed. A single-family module gets the same totals
+    # the old branch chain produced; a combined one adds the families together.
+    n_fm = n_ssg = n_adpcm_a = n_adpcm_b = 0
     if fm_present:
-        if ym2610:
-            n_fm = (6 if song.ym2610_b else 4) * len(ym_ids)
-        elif ym2612:
-            n_fm = (9 if ym_ext else 6) * len(ym_ids)
-        elif ym2203:
-            n_fm = (6 if ym_ext else 3) * len(ym_ids)
-        elif opl:
-            n_fm = OPL_CHANNELS[(opl_kind, opl_drums)] * len(opl_ids)
-        else:
-            n_fm = 8
-    else:
-        n_fm = 0
-    # The SSG is part of each YM2203/YM2610 system, not a separate AY chip.
-    n_ssg = 3 * len(ym_ids) if ((ym2203 or ym2610) and fm_present) else 0
-    n_adpcm_a = 6 * len(ym_ids) if (ym2610 and fm_present) else 0
-    n_adpcm_b = len(ym_ids) if (ym2610 and fm_present) else 0
+        for system in systems:
+            kind = system.kind
+            if kind in ("opl", "opl2", "opl3", "opll"):
+                n_fm += _system_span(system)
+                continue
+            if kind == "ym2610" or kind == "ym2608":
+                n_fm += system.fm_channels
+                n_ssg += 3
+                # On the OPNA the six columns after the SSG are the rhythm kit;
+                # Furnace gives them the same span as the YM2610's ADPCM-A.
+                n_adpcm_a += 6
+                n_adpcm_b += 1
+            elif kind == "ym2203":
+                # The SSG is part of each YM2203 system, not a separate chip.
+                n_fm += system.fm_channels
+                n_ssg += 3
+            else:
+                n_fm += system.fm_channels or 8
     n_k007 = 2 if want_k007 else 0
     n_ch = (
         n_fm + n_ssg + n_adpcm_a + n_adpcm_b + n_psg + n_k007
@@ -2862,24 +3191,20 @@ def write_fur(
         len(fm_ins) + n_dac_ins + len(pcm_smps) + len(oki_smps) + n_adpcm_ins
         + len(spcm_smps) + len(c140_smps) + len(c352_smps) + len(k053260_smps)
         + n_ym2610_a_ins + n_ym2610_b_ins
+        + n_ym2608_rhythm_ins + n_ym2608_b_ins
         + len(scc_specs) + len(ay_specs) + len(psg_specs)
     )
     n_smp = (
         len(pcm_smps) + len(oki_smps) + len(adpcm_smps)
         + len(spcm_smps) + len(c140_smps) + len(c352_smps)
         + len(k053260_smps) + len(dac_smps)
-        + len(ym2610_a_smps) + len(ym2610_b_smps)
+        + len(ym2610_a_smps) + len(ym2610_b_smps) + len(ym2608_b_smps)
     )
     n_wav = len(scc_waves)
 
     # Analysis numbers sample-chip channels after the FM block. With no FM
     # they shift down to stay inside n_ch.
-    if ym2610:
-        fm_analysis_block = (6 if song.ym2610_b else 4) + 3 + 6 + 1
-    elif opl:
-        fm_analysis_block = OPL_CHANNELS[(opl_kind, opl_drums)] * len(opl_ids)
-    else:
-        fm_analysis_block = ((9 if ym_ext else 6) * len(ym_ids)) if ym_chip else 8
+    fm_analysis_block = sum(_system_span(s) for s in systems)
 
     orders, patterns, _loop_ord, pat_len = _build_patterns(
         song, n_ch, PAT_LEN_MAX, fx_cols,
@@ -2892,85 +3217,10 @@ def write_fur(
 
     names_long: list[str] = []
     names_short: list[str] = []
-    if ym2610 and fm_present:
-        fm_count = 6 if song.ym2610_b else 4
-        for cid in range(len(ym_ids)):
-            suffix = f" ({cid + 1})" if len(ym_ids) > 1 else ""
-            for voice in range(fm_count):
-                names_long.append(f"FM {voice + 1}{suffix}")
-                names_short.append(f"F{cid + 1}-{voice + 1}")
-            for voice in range(3):
-                names_long.append(f"PSG {voice + 1}{suffix}")
-                names_short.append(f"P{cid + 1}-{voice + 1}")
-            for voice in range(6):
-                names_long.append(f"ADPCM-A {voice + 1}{suffix}")
-                names_short.append(f"A{cid + 1}-{voice + 1}")
-            names_long.append(f"ADPCM-B{suffix}")
-            names_short.append(f"B{cid + 1}")
-    elif ym2612 and fm_present:
-        for cid in range(len(ym_ids)):
-            suffix = f" ({cid + 1})" if len(ym_ids) > 1 else ""
-            if ym_ext:
-                for voice, label in enumerate(("FM 1", "FM 2")):
-                    names_long.append(f"{label}{suffix}")
-                    names_short.append(f"F{cid + 1}-{voice + 1}")
-                for voice in range(4):
-                    # Column c carries operator (1,2,0,3)[c]'s frequency.
-                    op_label = (1, 2, 0, 3)[voice] + 1
-                    label = f"FM 3 OP{op_label}"
-                    names_long.append(f"{label}{suffix}")
-                    names_short.append(f"O{cid + 1}-{op_label}")
-                for voice in range(3):
-                    label = f"FM {voice + 4}"
-                    names_long.append(f"{label}{suffix}")
-                    names_short.append(f"F{cid + 1}-{voice + 4}")
-            else:
-                for voice in range(6):
-                    names_long.append(f"FM {voice + 1}{suffix}")
-                    names_short.append(f"F{cid + 1}-{voice + 1}")
-    elif ym_chip and fm_present:
-        for cid in range(len(ym_ids)):
-            if ym_ext:
-                for voice, label in enumerate(("FM 1", "FM 2")):
-                    names_long.append(f"{label} ({cid + 1})" if len(ym_ids) > 1 else label)
-                    names_short.append(f"F{cid + 1}-{voice + 1}")
-                for voice in range(4):
-                    # Column c carries operator (1,2,0,3)[c]'s frequency
-                    # (Furnace's ext frequency-register order).
-                    op_label = (1, 2, 0, 3)[voice] + 1
-                    label = f"FM 3 OP{op_label}"
-                    names_long.append(f"{label} ({cid + 1})" if len(ym_ids) > 1 else label)
-                    names_short.append(f"O{cid + 1}-{op_label}")
-                for voice in range(3):
-                    label = f"PSG {voice + 1}"
-                    names_long.append(f"{label} ({cid + 1})" if len(ym_ids) > 1 else label)
-                    names_short.append(f"P{cid + 1}-{voice + 1}")
-                continue
-            for voice in range(3):
-                names_long.append(f"FM {cid + 1}-{voice + 1}")
-                names_short.append(f"F{cid + 1}-{voice + 1}")
-            for voice in range(3):
-                names_long.append(f"PSG {cid + 1}-{voice + 1}")
-                names_short.append(f"P{cid + 1}-{voice + 1}")
-    elif opl and fm_present:
-        multi = len(opl_ids) > 1
-        for cid in range(len(opl_ids)):
-            for long_name, short_name in zip(*opl_channel_names(opl_kind, opl_drums)):
-                if not multi:
-                    names_long.append(long_name)
-                    names_short.append(short_name)
-                    continue
-                names_long.append(f"{long_name} ({cid + 1})")
-                # A second system needs a distinct column tag: F2-3 is chip 2's
-                # FM 3, and a rhythm column just carries the instance number.
-                names_short.append(
-                    f"F{cid + 1}-{short_name[1:]}"
-                    if short_name.startswith("F") and short_name[1:].isdigit()
-                    else f"{short_name}{cid + 1}"
-                )
-    elif n_fm:
-        names_long += [f"FM {i + 1}" for i in range(n_fm)]
-        names_short += [f"F{i + 1}" for i in range(n_fm)]
+    if fm_present:
+        _append_system_names(
+            song, systems, names_long, names_short,
+        )
     if psg_ids:
         for cid in range(len(psg_ids)):
             suffix = f" ({cid + 1})" if len(psg_ids) > 1 else ""
@@ -3020,25 +3270,32 @@ def write_fur(
 
     label_parts: list[str] = []
     if fm_present:
-        if opl:
-            base = {"opl": "OPL", "opl2": "OPL2", "opl3": "OPL3"}[opl_kind]
-            if opl_drums:
-                base += " drums"
-            label_parts.append(
-                f"{base} x{len(opl_ids)}" if len(opl_ids) > 1 else base
-            )
-        elif ym2610:
-            base = "YM2610B" if song.ym2610_b else "YM2610"
-            label_parts.append(f"{base} x{len(ym_ids)}" if len(ym_ids) > 1 else base)
-        elif ym2612:
-            base = "YM2612" + (" Ext" if ym_ext else "")
-            label_parts.append(f"{base} x{len(ym_ids)}" if len(ym_ids) > 1 else base)
-        elif ym2203:
-            label_parts.append(
-                f"YM2203 x{len(ym_ids)}" if len(ym_ids) > 1 else "YM2203"
-            )
-        else:
-            label_parts.append("YM2151")
+        # One entry per family, in module order. A combined log names the OPN2
+        # first and the OPL second, matching `systems`.
+        listed: list[str] = []
+        for system in systems:
+            kind = system.kind
+            if kind in listed:
+                continue
+            listed.append(kind)
+            n = sum(1 for s in systems if s.kind == kind)
+            if kind in ("opl", "opl2", "opl3"):
+                base = {"opl": "OPL", "opl2": "OPL2", "opl3": "OPL3"}[kind]
+                if system.drums:
+                    base += " drums"
+            elif kind == "opll":
+                base = "OPLL" + (" drums" if system.drums else "")
+            elif kind == "ym2610":
+                base = "YM2610B" if system.fm_channels > 4 else "YM2610"
+            elif kind == "ym2608":
+                base = "YM2608" + (" Ext" if system.ext else "")
+            elif kind == "ym2612":
+                base = "YM2612" + (" Ext" if system.ext else "")
+            elif kind == "ym2203":
+                base = "YM2203"
+            else:
+                base = "YM2151"
+            label_parts.append(f"{base} x{n}" if n > 1 else base)
     if psg_ids:
         label_parts.append("SN76489")
     if n_k007:
@@ -3099,6 +3356,18 @@ def write_fur(
             + ". LFO enable/speed is effect 10xy and per-channel PMS/AMS are "
             "62xx/63xx.\n"
         )
+        if dac_smps and opl:
+            # The combined shape: the OPN2 never keys an FM voice, it only
+            # feeds its DAC. Say so, or the empty FM columns look like a bug.
+            dac_channel = next(
+                (e.ch for e in song.events if e.dac and e.on), -1
+            )
+            comment += (
+                f"\nThis log's YM2612 has no FM notes: channel "
+                f"{dac_channel + 1} is the DAC, and the OPL2 beside it plays "
+                f"the music. The stream's PCM is cut into {len(dac_smps)} "
+                "rate-exact chunks; one sample-map note starts each of them.\n"
+            )
     if psg_ids:
         comment += (
             f"\nSN76489 at {song.vgm.sn76489_clock or 3579545} Hz; three "
@@ -3113,12 +3382,31 @@ def write_fur(
             "channel. ADPCM-A plays at clock/432; ADPCM-B uses the source "
             "rate register.\n"
         )
+    elif ym2608:
+        comment += (
+            f"\nYM2608 at {song.vgm.ym2608_clock or YM2608_DEFAULT_CLOCK} Hz; "
+            "each system has the FM voices"
+            + (", channel 3 split into four operator columns," if ym_ext else ",")
+            + " three SSG voices, the chip's six rhythm voices and one ADPCM-B "
+            "channel. A rhythm column IS the drum - kick, snare, top cymbal, "
+            "hi-hat, tom and rim from the ROM Furnace compiles in - so its note "
+            "carries no sample, and the source's global $11 level is folded into "
+            "each hit's volume.\n"
+        )
     elif ym_chip:
         comment += (
             f"\nYM2203 at {song.vgm.ym2203_clock or 3579545} Hz; each system "
             "has three FM voices then three SSG voices. The SSG register "
             "effects (20xx/21xx/22xy/23xx/24xx) work on the last three "
             "channels of each six-channel block.\n"
+        )
+    if opll:
+        comment += (
+            "\nYM2413: instrument 0 is the user patch in $00-$07; every other "
+            "voice picks a ROM preset (the wave column, 1-15). The volume "
+            "column is the $3x level nibble (0 loudest)."
+            + (" Rhythm mode takes channels 7-9 as BD/SD/TM/TP/HH.\n"
+               if opll_drums else "\n")
         )
 
     b = Buf()
@@ -3131,45 +3419,64 @@ def write_fur(
     chips: list[int] = []
     flag_texts: list[str] = []
     ym2610_sys: dict[int, int] = {}
+    ym2608_sys: dict[int, int] = {}
     if fm_present:
-        for _cid in (opl_ids or ym_ids or [0]):
-            if opl:
-                chips.append(OPL_CHIP[(opl_kind, opl_drums)])
-            elif ym2612:
-                chips.append(CHIP_YM2612_EXT if ym_ext else CHIP_YM2612)
-            elif ym2203:
-                chips.append(CHIP_YM2203_EXT if ym_ext else CHIP_YM2203)
-            elif ym2610:
-                chips.append(CHIP_YM2610B if song.ym2610_b else CHIP_YM2610)
-                ym2610_sys[cid] = len(chips) - 1
-            else:
-                chips.append(CHIP_YM2151)
-            if opl:
+        for system in systems:
+            # One module system per chip, in the order the channels were laid
+            # out. Each kind carries its own clock flag.
+            kind = system.kind
+            cid = system.chip_id
+            if kind in ("opl", "opl2", "opl3"):
+                chips.append(OPL_CHIP[(kind, bool(system.drums))])
                 # An OPL core defaults to COLOR_NTSC and an OPL3 to four times
                 # it. Outside that tolerance the clock decides every f-num, so
                 # it has to travel with the module.
-                fm_clock = song.vgm.opl3_clock if opl_kind == "opl3" else (
-                    song.vgm.opl2_clock if opl_kind == "opl2" else song.vgm.opl_clock
+                fm_clock = (
+                    song.vgm.opl3_clock if kind == "opl3" else
+                    song.vgm.opl2_clock if kind == "opl2" else song.vgm.opl_clock
                 )
-                default = FURNACE_CLOCK_OPL3 if opl_kind == "opl3" else FURNACE_CLOCK
-                module = opl_module_clock(fm_clock, opl_kind == "opl3")
+                default = FURNACE_CLOCK_OPL3 if kind == "opl3" else FURNACE_CLOCK
+                module = opl_module_clock(fm_clock, kind == "opl3")
                 flag_texts.append(
                     "" if module == default else f"customClock={fm_clock}"
                 )
                 continue
-            if ym2612:
+            if kind == "opll":
+                chips.append(CHIP_OPLL_DRUMS if system.drums else CHIP_OPLL)
+                # DivPlatformOPLL's named clock selections cover the usual MSX
+                # and arcade clocks exactly; use those before a custom clock.
+                flag_texts.append(opll_clock_flag(song.vgm.ym2413_clock))
+                continue
+            if kind == "ym2612":
+                chips.append(CHIP_YM2612_EXT if system.ext else CHIP_YM2612)
                 fm_clock = song.vgm.ym2612_clock
                 # Furnace's Genesis default is COLOR_NTSC*15/7 truncated to
                 # 7670454, while the VGM header normally says 7670453.  Write
                 # the source clock so the exported pitch register matches it.
                 fm_default = 7670454
-            elif ym2203:
+            elif kind == "ym2203":
+                chips.append(CHIP_YM2203_EXT if system.ext else CHIP_YM2203)
                 fm_clock = song.vgm.ym2203_clock
                 fm_default = 3579545
-            elif ym2610:
+            elif kind == "ym2610":
+                chips.append(CHIP_YM2610B if system.fm_channels > 4 else CHIP_YM2610)
+                ym2610_sys[cid] = len(chips) - 1
                 fm_clock = song.vgm.ym2610_clock
                 fm_default = 8000000
+            elif kind == "ym2608":
+                chips.append(CHIP_YM2608_EXT if system.ext else CHIP_YM2608)
+                ym2608_sys[cid] = len(chips) - 1
+                fm_clock = song.vgm.ym2608_clock or YM2608_DEFAULT_CLOCK
+                # Furnace's OPNA clock list has exactly one named entry beyond
+                # the 8 MHz default: 38400*13*16, the FM Towns oscillator a
+                # real rip reports. Ask for that instead of a custom clock so
+                # the module reads as a stock configuration.
+                if fm_clock == 38400 * 13 * 16:
+                    flag_texts.append("clockSel=1")
+                    continue
+                fm_default = 8000000
             else:
+                chips.append(CHIP_YM2151)
                 fm_clock = song.vgm.ym2151_clock
                 fm_default = 3579545
             # The cores default to their console clocks.  At any other clock
@@ -3178,6 +3485,13 @@ def write_fur(
                 f"customClock={fm_clock}"
                 if fm_clock and fm_clock != fm_default else ""
             )
+    # The dual-YM3812 balance marks the two OPL chips of that system. In a
+    # combined module they are not the first entries, so remember where they
+    # start.
+    opl_first = (
+        len(chips) - sum(1 for s in systems if s.kind == opl_kind)
+        if (fm_present and opl) else 0
+    )
     for _cid in psg_ids:
         chips.append(CHIP_SMS)
         psg_clock = song.vgm.sn76489_clock or 3579545
@@ -3265,7 +3579,7 @@ def write_fur(
         pan = 0.0
         if (opl and opl_kind == "opl2" and len(opl_ids) > 1
                 and getattr(song.vgm, "opl2_pan", False)):
-            pan = -1.0 if i == 0 else 1.0
+            pan = -1.0 if i == opl_first else 1.0
         chip_pans.append(pan)
     # A chip volume above 1.0 (the MSM6258 player default is 0x11E) does not
     # fit Furnace's 0-64 field. Raise the song master instead and scale every
@@ -3361,7 +3675,9 @@ def write_fur(
     ins_ptrs: list[int] = []
     for i, patch in enumerate(fm_ins):
         ins_ptrs.append(len(b))
-        if getattr(patch, "opl", False):
+        if getattr(patch, "opll", False):
+            fam = "OPLL"
+        elif getattr(patch, "opl", False):
             fam = "OPL3" if getattr(patch, "four", False) else "OPL"
         else:
             fam = "OPN" if getattr(patch, "opn", False) else "OPM"
@@ -3435,6 +3751,23 @@ def write_fur(
         maps = [
             first + slot
             for slot in range(min(120, len(ym2610_b_smps) - group * 120))
+        ]
+        _write_ins_sample_map(
+            b, f"ADPCM-B {group + 1}", 0, maps, INS_ADPCMB,
+        )
+    if n_ym2608_rhythm_ins:
+        # One empty map serves all six kit columns. ymfm fixes each voice to a
+        # range of the rhythm ROM, so a note names nothing: the column is the
+        # drum. The instrument exists to give the channel a macro pool and the
+        # 0-31 volume scale the platform reports.
+        ins_ptrs.append(len(b))
+        _write_ins_sample_map(b, "Rhythm", 0, [], INS_ADPCMA)
+    for group in range(n_ym2608_b_ins):
+        ins_ptrs.append(len(b))
+        first = ym2608_b_smp_base + group * 120
+        maps = [
+            first + slot
+            for slot in range(min(120, len(ym2608_b_smps) - group * 120))
         ]
         _write_ins_sample_map(
             b, f"ADPCM-B {group + 1}", 0, maps, INS_ADPCMB,
@@ -3533,6 +3866,30 @@ def write_fur(
         _write_sample_adpcm(
             b, f"adpcmB_{smp.start:06x}_{smp.rate:04x}", smp.data, rate,
             SMP_DEPTH_ADPCM_B, (0, 1 << sys, 0, 0), loop=loop,
+        )
+    ym2608_clock = song.vgm.ym2608_clock or YM2608_DEFAULT_CLOCK
+    for smp in ym2608_b_smps:
+        sys = ym2608_sys.get(smp.chip_id, 0)
+        # The delta-T engine steps its accumulator once per chipClock/144 and
+        # the platform turns a sample's rate back into that step value, so this
+        # is the register the source wrote.
+        rate = max(
+            1, int(round(
+                ym2608_clock / 144 * (smp.rate & 0xFFFF) / 65535
+                * ADPCM_B_RATE_COMPENSATION
+            )),
+        )
+        loop = any(h.loop for h in smp.hits)
+        smp_ptrs.append(len(b))
+        # The OPNA has one sample bank and reads renderOn[0] (ym2608.cpp:2032),
+        # unlike the YM2610, whose delta-T memory is bank 1. The body carries an
+        # idle tail out to Furnace's 256-byte sample quantum: the platform plays
+        # `lengthB` bytes whether or not the source range was that long, and a
+        # short body would read the next sample off its heels.
+        _write_sample_adpcm(
+            b, f"deltaT_{smp.start:06x}_{smp.rate:04x}",
+            deltat_store_body(smp.data), rate,
+            SMP_DEPTH_ADPCM_B, (1 << sys, 0, 0, 0), loop=loop,
         )
 
     pat_ptrs: list[int] = []

@@ -198,6 +198,28 @@ def compare_psg(src: VgmFile, exp: VgmFile) -> dict:
     }
 
 
+def _dac_starts(exp: VgmFile, limit: int) -> list[tuple[int, int]]:
+    """(onset, byte count) for every DAC start in an export.
+
+    Furnace answers a long PCM channel either way: `$95` replays an embedded
+    block, `$93` streams a range of the bank it uploaded. Both are one note.
+    """
+    from vgm2151fur.vgm import DAC_STREAM_YM2612
+
+    out: list[tuple[int, int]] = []
+    for t, block, _rate in exp.dac_block_plays:
+        if t < limit:
+            n = (len(exp.dac_blocks[block])
+                 if 0 <= block < len(exp.dac_blocks) else -1)
+            out.append((t, n))
+    for play in exp.dac_stream_plays:
+        if play.sample >= limit or play.chip_type != DAC_STREAM_YM2612:
+            continue
+        out.append((play.sample, play.length if play.length_mode == 1 else -1))
+    out.sort()
+    return out
+
+
 def compare_dac(src: VgmFile, exp: VgmFile) -> dict:
     """Count source DAC notes matched to an exported DAC stream start."""
     from vgm2151fur.analyze import analyze
@@ -206,14 +228,21 @@ def compare_dac(src: VgmFile, exp: VgmFile) -> dict:
     notes = [e.sample for e in song.events if e.dac and e.on]
     # Ignore the exporter's end-of-file sample flush.
     limit = src.total_samples or (max(notes, default=0) + 1)
-    starts = [t for t, _block, _rate in exp.dac_block_plays if t < limit]
+    starts = _dac_starts(exp, limit)
+    streams = sum(
+        1 for p in src.dac_stream_plays if not limit or p.sample < limit
+    )
     if not notes:
-        return {"matched": 0, "missed": 0, "extra": len(starts), "rate_bad": 0}
+        return {
+            "matched": 0, "missed": 0, "extra": len(starts),
+            "rate_bad": 0, "streams": streams, "bytes_src": 0,
+            "bytes_exp": 0,
+        }
     used: set[int] = set()
     missed = 0
     for onset in notes:
         best = None
-        for j, t in enumerate(starts):
+        for j, (t, _n) in enumerate(starts):
             if j in used:
                 continue
             d = abs(t - onset)
@@ -225,6 +254,7 @@ def compare_dac(src: VgmFile, exp: VgmFile) -> dict:
             used.add(best[1])
     # Blocks are exported in sample order; allow 2 Hz C-4 rounding.
     rate_bad = 0
+    wants = [s.c4_rate for s in song.dac_samples]
     if len(exp.dac_blocks) == len(song.dac_samples):
         for _t, block, rate in exp.dac_block_plays:
             if block >= len(song.dac_samples):
@@ -234,11 +264,27 @@ def compare_dac(src: VgmFile, exp: VgmFile) -> dict:
                 continue
             if abs(rate - want) > 2:
                 rate_bad += 1
+    # A stream start carries its own $92 rate. It has to be one of the
+    # chunk rates, or the export plays the PCM at the wrong speed.
+    for play in exp.dac_stream_plays:
+        if limit and play.sample >= limit:
+            continue
+        if not play.rate or not wants:
+            continue
+        if not any(abs(play.rate - want) <= 2 for want in wants):
+            rate_bad += 1
+    # How much PCM actually plays. A `$93` source of one long stream and the
+    # chunked module have to cover the same byte count.
+    bytes_src = sum(len(s.data) for s in song.dac_samples)
+    bytes_exp = sum(n for _t, n in starts if n > 0)
     return {
         "matched": len(notes) - missed,
         "missed": missed,
         "extra": len(starts) - len(used),
         "rate_bad": rate_bad,
+        "streams": streams,
+        "bytes_src": bytes_src,
+        "bytes_exp": bytes_exp,
     }
 
 
@@ -336,11 +382,127 @@ def compare_ym2610_samples(src: VgmFile, exp: VgmFile) -> dict:
     }
 
 
+def compare_ym2608_samples(src: VgmFile, exp: VgmFile) -> dict:
+    """Match the OPNA's rhythm hits and delta-T gates to the export.
+
+    A rhythm voice is named by its column, so the comparison pairs on voice and
+    checks the level each side computes: both sides fold their own `$11` into it,
+    which is what lets the module leave that register at Furnace's full-level
+    default and still sound like the source. A delta-T gate pairs by the span it
+    reads and the step value that drives it, because those - not the address,
+    which Furnace repacks - decide what the chip plays.
+    """
+    from vgm2151fur.vgm import assemble_rom
+    from vgm2151fur.ym2608 import (
+        collect_ym2608_delta_t,
+        collect_ym2608_rhythm,
+        deltat_store_body,
+    )
+
+    if not any(w.chip in ("ym2608", "ym2608_ssg") for w in src.writes):
+        return {}
+
+    # Furnace plays every row it owns, and a module's final pattern is padded to
+    # the declared length, so an export can run a second and a half past the end
+    # of the recording and key the loop's notes once more. Gates out there have no
+    # counterparty in the source, so both sides are cut to the shorter log.
+    limit = min(src.total_samples or (1 << 62), exp.total_samples or (1 << 62))
+
+    def audible(h) -> bool:
+        return h.pan != 0 or any(p for _t, p in h.pan_pts)
+
+    def rhythm(vgm):
+        hits, _w = collect_ym2608_rhythm(vgm)
+        return [(h, None) for h in hits if audible(h) and h.sample_time <= limit]
+
+    def deltat(vgm):
+        smp, _w = collect_ym2608_delta_t(vgm, assemble_rom(vgm, "ym2608_deltat"))
+        return [(h, s) for s in smp for h in s.hits
+                if audible(h) and h.sample_time <= limit]
+
+    def match(src_hits, exp_hits, key):
+        """Pair gates by an identity key, then by nearest time inside it.
+
+        `key` receives the (hit, sample) pair: a delta-T voice is only really
+        itself by what it reads out, and two of them can share a span and a step.
+        """
+        groups = defaultdict(list)
+        for eh, esmp in exp_hits:
+            groups[key(eh, esmp)].append((eh.sample_time, eh, esmp))
+        times = {k: sorted(t for t, _h, _s in v) for k, v in groups.items()}
+        used: set[int] = set()
+        pairs = []
+        for h, smp in src_hits:
+            k = key(h, smp)
+            cand = groups.get(k, [])
+            ts = times.get(k, [])
+            lo = bisect_left(ts, h.sample_time - WINDOW)
+            hi = bisect_right(ts, h.sample_time + WINDOW)
+            best = None
+            for i in range(lo, hi):
+                _t, eh, esmp = cand[i]
+                if id(eh) in used:
+                    continue
+                score = abs(eh.sample_time - h.sample_time)
+                if best is None or score < best[0]:
+                    best = (score, eh, esmp)
+            if best is None:
+                pairs.append((h, smp, None, None))
+            else:
+                used.add(id(best[1]))
+                pairs.append((h, smp, best[1], best[2]))
+        return pairs, len(exp_hits) - len(used)
+
+    def tally(pairs, extra, kind):
+        out = {
+            "matched": 0, "missed": 0, "extra": extra,
+            "data": 0, "length": 0, "vol": 0, "pan": 0, "rate": 0,
+        }
+        for h, smp, eh, esmp in pairs:
+            if eh is None:
+                out["missed"] += 1
+                continue
+            out["matched"] += 1
+            if kind == "delta_t":
+                # Furnace reads `lengthB` bytes, which is the body rounded up to
+                # its 256-byte quantum, so that is the span to compare - ours cut
+                # the same way. The address itself moves with repacking and says
+                # nothing about fidelity.
+                want = deltat_store_body(smp.data)
+                if len(esmp.data) != len(want):
+                    out["length"] += 1
+                if esmp.data[:len(want)] != want:
+                    out["data"] += 1
+                if abs(h.rate - eh.rate) > 4:
+                    out["rate"] += 1
+            if h.vol != eh.vol:
+                out["vol"] += 1
+            if h.pan != eh.pan and (h.vol or eh.vol):
+                out["pan"] += 1
+        return out
+
+    sr, sd = rhythm(src), deltat(src)
+    er, ed = rhythm(exp), deltat(exp)
+    pr, r_extra = match(sr, er, lambda h, _smp: h.voice)
+    # A delta-T voice is its waveform: the bytes it reads out and how many
+    # Furnace will play. Rate is deliberately not part of the key - a wrong step
+    # value still plays the same bytes, and tally is where that gets caught.
+    pd, d_extra = match(
+        sd, ed,
+        lambda h, smp: (bytes(smp.data[:32]), len(deltat_store_body(smp.data))),
+    )
+    return {
+        "rhythm": tally(pr, r_extra, "rhythm"),
+        "delta_t": tally(pd, d_extra, "delta_t"),
+    }
+
+
 def compare_keyons(src: VgmFile, exp: VgmFile) -> dict:
     fm = compare_fm(src, exp)
     psg = compare_psg(src, exp)
     dac = compare_dac(src, exp)
     ym2610 = compare_ym2610_samples(src, exp)
+    ym2608 = compare_ym2608_samples(src, exp)
     fields = dict(fm["fields"])
     missed = fm["missed"] + psg["missed"]
     matched = fm["matched"] + psg["matched"]
@@ -361,4 +523,6 @@ def compare_keyons(src: VgmFile, exp: VgmFile) -> dict:
     }
     if ym2610:
         out["ym2610"] = ym2610
+    if ym2608:
+        out["ym2608"] = ym2608
     return out

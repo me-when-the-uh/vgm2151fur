@@ -30,11 +30,13 @@ CHIP_LABELS = (
     ("ym2612", "YM2612"),
     ("ym2610", "YM2610"),
     ("ym2610_b", "YM2610B"),
+    ("ym2608", "YM2608"),
     # The OPL family: an AdLib-style log names its chip by command byte, and
     # rhythm mode is reported apart because it changes the channel layout.
     ("opl", "OPL"),
     ("opl2", "OPL2"),
     ("opl3", "OPL3"),
+    ("opll", "YM2413"),
     ("k007232", "K007232"),
     ("segapcm", "SegaPCM"),
     ("c140", "C140"),
