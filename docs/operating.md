@@ -240,6 +240,9 @@ they can be run from anywhere.
   Towns Xenon rip lives under the OPNA root (`xenon-fmtowns\done`), and a Sega
   CD pack such as Popful Mail sits outside it, so each can be named directly.
   See docs/segapcm-c140.md for the RF5C model.
+- `VGM2151FUR_Y8950_RIPS`: a folder holding the Y8950 rip the real-rip test
+  converts (`03v - Credit Inserted (with voice).vgm`). Without it that test
+  skips. See docs/opl.md for the Y8950 model.
 
 ## Exit codes
 

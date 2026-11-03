@@ -279,6 +279,25 @@ emission of both instrument types, and round trips through Furnace for synthetic
 voices and the five rips above - including `opl1_rhythmtest.vgm`, which is what
 proves the YM3526 takes rhythm mode exactly like a YM3812.
 
+## Yamaha Y8950
+
+The Y8950 is an OPL2-shaped FM chip (`KIND_Y8950`, waveform select and rhythm
+included) with one delta-T (ADPCM-B) voice bolted on. VGM carries it on
+command `0x5C` with the header clock at `0x58`, and its ROM arrives as data
+block `0x88`.
+
+The FM half runs through this same collector, so instruments, pitch, rhythm
+mode and the four-operator tables are the OPL2 ones. The ADPCM half is
+`y8950.py`: registers `$07` (control: bit 7 execute, bit 4 repeat, bit 0
+reset), `$09`/`$0A` start, `$0B`/`$0C` end (32-byte units), `$10`/`$11` pitch
+and `$12` level, decoded into the same `AdpcmBSample` the YM2608 uses.
+
+Furnace gives it system `0xB2` (9 FM + 1 ADPCM = 10 channels) or `0xB3` with
+the drums layout (11 FM + 1 ADPCM = 12). The kit is chosen only when a `$BD`
+latch actually fires. Verified on Ginga NinkyouDen's `03v`, which uses rhythm
+mode: 11 FM columns, the ADPCM voice on column 12, both ADPCM waves
+(0xBAE0 and 0x1CAE0) sliced at the chip's 32-byte granularity.
+
 ## Limits
 
 - Waveform and envelope writes inside a held note move at the next key-on. A
@@ -291,5 +310,7 @@ proves the YM3526 takes rhythm mode exactly like a YM3812.
   unaffected, keycode-based envelope attack might be.
 - Two voices on one column inside a single row collapse to the later one, and two
   percussion hits in one sample of a shared register keep the last byte written.
-- `YM2608`, `YM2413`/OPLL (fixed patches) and `YMF278b` are not converted, and
-  neither is an OPL log whose chip family cannot be told from the header alone.
+- `YM2608` and `YM2413`/OPLL have their own docs. The Y8950 is this OPL path
+  with `KIND_Y8950` (OPL2-shaped FM) plus one ADPCM column, and the YMF278B's
+  FM half will use the same OPL3 path. An OPL log whose chip family cannot be
+  told from the header alone is still not converted.

@@ -46,6 +46,9 @@ CHIP_CHANNELS = {
     CHIP_OPL_DRUMS: 11,
     CHIP_OPL2_DRUMS: 11,
     CHIP_OPL3_DRUMS: 20,
+    # YM8950: 9 FM + 1 ADPCM, or the drums layout (11 FM) + 1 ADPCM.
+    0xB2: 10,
+    0xB3: 12,
     # YM2413 (OPLL): nine melodic channels; the drums layout adds BD, SD, TM,
     # TP and HH in place of the last three hardware channels.
     CHIP_OPLL: 9,

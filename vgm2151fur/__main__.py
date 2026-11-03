@@ -124,6 +124,7 @@ def _sample_counts(info: dict) -> str:
         ("msm6258_samples", "ADPCM"),
         ("ym2610_a_samples", "ADPCM-A"),
         ("ym2610_b_samples", "ADPCM-B"),
+        ("y8950_b_samples", "Y8950 ADPCM"),
     ):
         if info.get(key):
             samples += f"  {info[key]} {label}"

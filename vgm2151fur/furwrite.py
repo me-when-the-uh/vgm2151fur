@@ -111,9 +111,13 @@ CHIP_OPL3_DRUMS = 0xA4
 # give the kick the first former FM channel and snare, tom, cymbal and hi-hat
 # the next four (sysDef.cpp); the kick keeps its two operators, so it plays a
 # normal OPL voice.
+# The Y8950 is an OPL2 with one ADPCM column after the FM block.
+CHIP_Y8950 = 0xB2
+CHIP_Y8950_DRUMS = 0xB3
 OPL_CHIP = {("opl", False): CHIP_OPL, ("opl2", False): CHIP_OPL2,
             ("opl3", False): CHIP_OPL3, ("opl", True): CHIP_OPL_DRUMS,
-            ("opl2", True): CHIP_OPL2_DRUMS, ("opl3", True): CHIP_OPL3_DRUMS}
+            ("opl2", True): CHIP_OPL2_DRUMS, ("opl3", True): CHIP_OPL3_DRUMS,
+            ("y8950", False): CHIP_Y8950, ("y8950", True): CHIP_Y8950_DRUMS}
 # The YM2413 (OPLL) is its own core and instrument type. Rhythm mode is a
 # separate system whose last three hardware channels become five kit columns.
 CHIP_OPLL = 0x89
@@ -126,9 +130,11 @@ OPLL_DRUM_LABELS = (
     ("HiHat", "HH"),
 )
 OPL_CHANNELS = {("opl", False): 9, ("opl2", False): 9, ("opl3", False): 18,
-                ("opl", True): 11, ("opl2", True): 11, ("opl3", True): 20}
+                ("opl", True): 11, ("opl2", True): 11, ("opl3", True): 20,
+                ("y8950", False): 9, ("y8950", True): 11}
 OPL_MELODIC = {("opl", False): 9, ("opl2", False): 9, ("opl3", False): 18,
-               ("opl", True): 6, ("opl2", True): 6, ("opl3", True): 15}
+               ("opl", True): 6, ("opl2", True): 6, ("opl3", True): 15,
+               ("y8950", False): 9, ("y8950", True): 6}
 # Furnace's channel labels. An OPL3 pair whose first channel is even can head a
 # four-operator voice, and the system names it that way whether or not a note
 # uses it.
@@ -2851,7 +2857,7 @@ def _channel_vol_max(
     for system in systems:
         top = (
             15 if system.kind == "opll" else
-            63 if system.kind in ("opl", "opl2", "opl3") else 127
+            63 if system.kind in ("opl", "opl2", "opl3", "y8950") else 127
         )
         for _ in range(system.fm_channels):
             if ch < n_ch:
@@ -3005,7 +3011,7 @@ def _append_system_names(
                 for voice in range(3):
                     longs.append(f"PSG {cid + 1}-{voice + 1}")
                     shorts.append(f"P{cid + 1}-{voice + 1}")
-        elif kind in ("opl", "opl2", "opl3"):
+        elif kind in ("opl", "opl2", "opl3", "y8950"):
             melodic = OPL_MELODIC[(kind, bool(system.drums))]
             for i, (long_name, short_name) in enumerate(zip(*opl_channel_names(
                     kind, bool(system.drums)))):
@@ -3023,6 +3029,10 @@ def _append_system_names(
                     )
                 else:
                     shorts.append(short_name)
+            if kind == "y8950":
+                # The ADPCM voice is one column after the FM block.
+                longs.append(f"ADPCM{suffix}")
+                shorts.append(f"P{cid + 1}" if counts[kind] > 1 else "ADPCM")
         elif kind == "opll":
             for i, (long_name, short_name) in enumerate(
                     zip(*opll_channel_names(bool(system.drums)))):
@@ -3145,6 +3155,12 @@ def write_fur(
         1 if (include_pcm and getattr(song, "ym2608_rhythm_notes", 0)) else 0
     )
     ym2608_b_smp_base = ym2610_b_smp_base + len(ym2610_b_smps)
+    # The Y8950's one ADPCM voice uses the same ADPCM-B sample format.
+    y8950_b_smps = (
+        list(getattr(song, "y8950_b_samples", ()) or ()) if include_pcm else []
+    )
+    n_y8950_b_ins = (len(y8950_b_smps) + 119) // 120
+    y8950_b_smp_base = ym2608_b_smp_base + len(ym2608_b_smps)
     oki_ids, oki_groups = _grouped(oki_smps)
     adpcm_ids, adpcm_groups = _grouped(adpcm_smps)
     c140_ids: list[int] = []
@@ -3186,7 +3202,7 @@ def write_fur(
     if fm_present:
         for system in systems:
             kind = system.kind
-            if kind in ("opl", "opl2", "opl3", "opll"):
+            if kind in ("opl", "opl2", "opl3", "opll", "y8950"):
                 n_fm += _system_span(system)
                 continue
             if kind == "ym2610" or kind == "ym2608":
@@ -3228,6 +3244,7 @@ def write_fur(
         + len(c140_smps) + len(c352_smps) + len(k053260_smps)
         + n_ym2610_a_ins + n_ym2610_b_ins
         + n_ym2608_rhythm_ins + n_ym2608_b_ins
+        + n_y8950_b_ins
         + len(scc_specs) + len(ay_specs) + len(psg_specs)
     )
     n_smp = (
@@ -3236,6 +3253,7 @@ def write_fur(
         + len(c140_smps) + len(c352_smps)
         + len(k053260_smps) + len(dac_smps)
         + len(ym2610_a_smps) + len(ym2610_b_smps) + len(ym2608_b_smps)
+        + len(y8950_b_smps)
     )
     n_wav = len(scc_waves)
 
@@ -3358,6 +3376,8 @@ def write_fur(
         label_parts.append("RF5C68")
     if rf5c164_smps:
         label_parts.append("RF5C164")
+    if fm_present and any(s.kind == "y8950" for s in systems):
+        label_parts.append("Y8950")
     if c140_ids:
         label_parts.append("C140")
     if c352_ids:
@@ -3472,20 +3492,24 @@ def write_fur(
     flag_texts: list[str] = []
     ym2610_sys: dict[int, int] = {}
     ym2608_sys: dict[int, int] = {}
+    opl_sys: dict[int, int] = {}
     if fm_present:
         for system in systems:
             # One module system per chip, in the order the channels were laid
             # out. Each kind carries its own clock flag.
             kind = system.kind
             cid = system.chip_id
-            if kind in ("opl", "opl2", "opl3"):
+            if kind in ("opl", "opl2", "opl3", "y8950"):
                 chips.append(OPL_CHIP[(kind, bool(system.drums))])
+                opl_sys[cid] = len(chips) - 1
                 # An OPL core defaults to COLOR_NTSC and an OPL3 to four times
                 # it. Outside that tolerance the clock decides every f-num, so
                 # it has to travel with the module.
                 fm_clock = (
                     song.vgm.opl3_clock if kind == "opl3" else
-                    song.vgm.opl2_clock if kind == "opl2" else song.vgm.opl_clock
+                    song.vgm.opl2_clock if kind == "opl2" else
+                    song.vgm.y8950_clock if kind == "y8950" else
+                    song.vgm.opl_clock
                 )
                 default = FURNACE_CLOCK_OPL3 if kind == "opl3" else FURNACE_CLOCK
                 module = opl_module_clock(fm_clock, kind == "opl3")
@@ -3842,6 +3866,16 @@ def write_fur(
         _write_ins_sample_map(
             b, f"ADPCM-B {group + 1}", 0, maps, INS_ADPCMB,
         )
+    for group in range(n_y8950_b_ins):
+        ins_ptrs.append(len(b))
+        first = y8950_b_smp_base + group * 120
+        maps = [
+            first + slot
+            for slot in range(min(120, len(y8950_b_smps) - group * 120))
+        ]
+        _write_ins_sample_map(
+            b, f"Y8950 ADPCM {group + 1}", 0, maps, INS_ADPCMB,
+        )
     for i, spec in enumerate(scc_specs):
         ins_ptrs.append(len(b))
         wave = scc_waves[spec.wave] if spec.wave < len(scc_waves) else b""
@@ -3972,6 +4006,23 @@ def write_fur(
         # short body would read the next sample off its heels.
         _write_sample_adpcm(
             b, f"deltaT_{smp.start:06x}_{smp.rate:04x}",
+            deltat_store_body(smp.data), rate,
+            SMP_DEPTH_ADPCM_B, (1 << sys, 0, 0, 0), loop=loop,
+        )
+    y8950_clock = song.vgm.y8950_clock or 3579545
+    for smp in y8950_b_smps:
+        sys = opl_sys.get(smp.chip_id, 0)
+        rate = max(
+            1, int(round(
+                y8950_clock / 144 * (smp.rate & 0xFFFF) / 65535
+                * ADPCM_B_RATE_COMPENSATION
+            )),
+        )
+        loop = any(h.loop for h in smp.hits)
+        smp_ptrs.append(len(b))
+        # The Y8950 has one ADPCM bank, read from renderOn[0].
+        _write_sample_adpcm(
+            b, f"y8950_{smp.start:06x}_{smp.rate:04x}",
             deltat_store_body(smp.data), rate,
             SMP_DEPTH_ADPCM_B, (1 << sys, 0, 0, 0), loop=loop,
         )

@@ -33,6 +33,9 @@ OPL3_DEFAULT_CLOCK = 14318180  # YMF262; COLOR_NTSC * 4
 KIND_OPL = "opl"
 KIND_OPL2 = "opl2"
 KIND_OPL3 = "opl3"
+# The Y8950's FM half is an OPL2 (waveform select and rhythm included); its
+# ADPCM voice is handled outside this state.
+KIND_Y8950 = "y8950"
 
 # DivPlatformOPL::chipFreqBase, keyed by whether the chip has two banks. The
 # OPL3 runs eighteen channels off four times the prescaler. At its usual
@@ -101,6 +104,10 @@ LAYOUT = {
     (KIND_OPL, True): (11, 6),
     (KIND_OPL2, True): (11, 6),
     (KIND_OPL3, True): (20, 15),
+    # The Y8950's FM half is OPL2-shaped. Its ADPCM column is appended by the
+    # caller, not part of this state.
+    (KIND_Y8950, False): (9, 9),
+    (KIND_Y8950, True): (11, 6),
 }
 
 

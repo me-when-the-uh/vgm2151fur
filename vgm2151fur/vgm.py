@@ -23,6 +23,10 @@ CMD_YM2151 = 0x54
 # YM2612's second register bank does.
 CMD_YM3526 = 0x5B
 CMD_YM3812 = 0x5A
+# The Y8950 is an OPL1 with the delta-T (ADPCM-B) engine bolted on. Register
+# writes arrive on 0x5C; the ADPCM registers are 0x07 (control), 0x08/0x09
+# (start), 0x0A/0x0B (end), 0x10/0x11 (pitch) and 0x12 (level).
+CMD_Y8950 = 0x5C
 # A dual-OPL2 log (the Sound Blaster Pro layout) keeps the second chip's
 # register stream in its own command. Confirmed on the Knights of Xentar rips:
 # header bit 30 says "Dual YM3812" and 0xAA carries chip 1's writes while
@@ -92,6 +96,7 @@ OKI_ROM_TYPE = 0x8B  # OKIM6295 ROM
 SEGAPCM_ROM_TYPE = 0x80  # SegaPCM ROM
 RF5C68_RAM_TYPE = 0xC0  # RF5C68 sample-RAM write (16-bit start + data)
 RF5C164_RAM_TYPE = 0xC1  # RF5C164 sample-RAM write (16-bit start + data)
+Y8950_DELTAT_ROM_TYPE = 0x88  # Y8950 delta-T (ADPCM-B) ROM
 C140_ROM_TYPE = 0x8D  # Namco C140 ROM
 C352_ROM_TYPE = 0x92  # Namco C352 ROM
 YM2610_ADPCM_ROM_TYPE = 0x82  # YM2610 ADPCM-A/B ROM
@@ -128,6 +133,10 @@ RF5C68_CLOCK_OFF = 0x40
 RF5C164_CLOCK_OFF = 0x6C
 RF5C68_DEFAULT_CLOCK = 8000000
 RF5C164_DEFAULT_CLOCK = 12500000
+# Y8950 header clock 0x58 (VGM 1.51+). The FM half is an OPL1 and the ADPCM
+# half the same delta-T engine the YM2608 carries; its ROM block is 0x88.
+Y8950_CLOCK_OFF = 0x58
+Y8950_DEFAULT_CLOCK = 3579545
 # YM2612 clock at 0x2C.  Bit 30 is the dual-instance flag; 0xA2/0xA3 then
 # answer for the second chip.  The field predates the 1.50 data-offset header.
 YM2612_CLOCK_OFF = 0x2C
@@ -444,6 +453,8 @@ class VgmFile:
     # 12.5 MHz. Furnace hosts both as the RF5C68 system with a chipType flag.
     rf5c68_clock: int = 0
     rf5c164_clock: int = 0
+    # Y8950 header 0x58 (VGM 1.51+): OPL1 FM plus one delta-T ADPCM voice.
+    y8950_clock: int = 0
     # K053260 header 0xAC (VGM 1.61+); bit 7 of a 0xBA register selects the
     # second instance, which shares this clock.
     k053260_clock: int = 0
@@ -715,6 +726,8 @@ def chips_in_head(buf: bytes) -> set[str]:
         kinds.add("rf5c68")
     if version >= 0x151 and 100_000 <= _header_clock(buf, RF5C164_CLOCK_OFF) <= 40_000_000:
         kinds.add("rf5c164")
+    if version >= 0x151 and 100_000 <= _header_clock(buf, Y8950_CLOCK_OFF) <= 40_000_000:
+        kinds.add("y8950")
     if version >= 0x151 and 100_000 <= _header_clock(buf, AY8910_CLOCK_OFF) <= 40_000_000:
         kinds.add("ay8910")
     # The OPL family joined the header in 1.51. A YM3812 field with bit 30 set
@@ -865,6 +878,7 @@ def load_vgm(path: Path | str) -> VgmFile:
     rf5c164_clock = (
         _clock_or_zero(buf, RF5C164_CLOCK_OFF) if ver >= 0x151 else 0
     )
+    y8950_clock = _clock_or_zero(buf, Y8950_CLOCK_OFF) if ver >= 0x151 else 0
     # Read the field for every version: the legacy System 21 rips carry
     # 21390 there even in 1.51 files, and players resolve it the same way.
     c140_raw = _header_raw(buf, C140_CLOCK_OFF) & 0x3FFFFFFF
@@ -962,6 +976,7 @@ def load_vgm(path: Path | str) -> VgmFile:
         segapcm_bankmask=spcm_mask,
         rf5c68_clock=rf5c68_clock,
         rf5c164_clock=rf5c164_clock,
+        y8950_clock=y8950_clock,
         c140_clock=c140_clock,
         c140_type=c140_type,
         k053260_clock=k053260_clock,
@@ -1049,6 +1064,7 @@ def load_vgm(path: Path | str) -> VgmFile:
                     YM2610_ADPCM_ROM_TYPE: "ym2610_adpcm",
                     YM2610_DELTAT_ROM_TYPE: "ym2610_deltat",
                     YM2608_DELTAT_ROM_TYPE: "ym2608_deltat",
+                    Y8950_DELTAT_ROM_TYPE: "y8950_deltat",
                 }.get(typ) if len(payload) >= 8 else None
                 if kind:
                     rom_size = int.from_bytes(payload[0:4], "little")
@@ -1255,6 +1271,13 @@ def load_vgm(path: Path | str) -> VgmFile:
                 vgm.writes.append(ChipWrite(
                     sample, "opl3", 0, (port << 8) | buf[pos + 1], buf[pos + 2],
                 ))
+            pos += 3
+            continue
+        if cmd == CMD_Y8950 and pos + 3 <= n:
+            # 0x5C: one flat register space. The FM half is the YM3526 map;
+            # the ADPCM half is the delta-T engine at 0x07-0x12.
+            vgm.writes.append(ChipWrite(sample, "y8950", 0, buf[pos + 1],
+                                        buf[pos + 2]))
             pos += 3
             continue
         if (
@@ -1487,6 +1510,10 @@ def load_vgm(path: Path | str) -> VgmFile:
     if any(w.chip == "rf5c164" for w in vgm.writes) and not vgm.rf5c164_clock:
         vgm.warnings.append(
             f"RF5C164 clock is missing or out of range; using {RF5C164_DEFAULT_CLOCK}"
+        )
+    if any(w.chip == "y8950" for w in vgm.writes) and not vgm.y8950_clock:
+        vgm.warnings.append(
+            f"Y8950 clock is missing or out of range; using {Y8950_DEFAULT_CLOCK}"
         )
     if any(w.chip in ("ym2203", "ym2203_ssg") for w in vgm.writes) and not vgm.ym2203_clock:
         vgm.warnings.append("YM2203 clock is missing or out of range; using 3579545")

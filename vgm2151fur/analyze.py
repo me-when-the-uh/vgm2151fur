@@ -59,6 +59,7 @@ from vgm2151fur.opl import (
     KIND_OPL,
     KIND_OPL2,
     KIND_OPL3,
+    KIND_Y8950,
     N as OPL_N,
     OPL2_DEFAULT_CLOCK,
     OPL3_DEFAULT_CLOCK,
@@ -140,6 +141,10 @@ from vgm2151fur.ym2608 import (
     YM2608State,
     collect_ym2608_delta_t,
     collect_ym2608_rhythm,
+)
+from vgm2151fur.y8950 import (
+    Y8950_DEFAULT_CLOCK,
+    collect_y8950_delta_t,
 )
 from vgm2151fur.ym2203 import (
     YM2203_DEFAULT_CLOCK,
@@ -451,6 +456,10 @@ class FmSystem:
         if self.kind in ("opl", "opl2", "opl3"):
             from vgm2151fur.opl import channel_count
             return channel_count(self.kind, self.drums)
+        if self.kind == "y8950":
+            # OPL2-shaped FM plus the one delta-T (ADPCM) column.
+            from vgm2151fur.opl import channel_count
+            return channel_count(self.kind, self.drums) + 1
         if self.kind == "opll":
             return OPLL_DRUMS_CHANNELS if self.drums else OPLL_CHANNELS
         if self.kind in ("ym2610", "ym2608"):
@@ -587,6 +596,9 @@ class Song:
     ym2608_rhythm_notes: int = 0
     ym2608_b_samples: list[AdpcmBSample] = field(default_factory=list)
     ym2608_b_count: int = 0
+    # The Y8950's one ADPCM (delta-T) voice, using the same sample-map format.
+    y8950_b_samples: list[AdpcmBSample] = field(default_factory=list)
+    y8950_b_count: int = 0
 
     # K007232 output level relative to the YM2151, from the rip's own mix
     # (extra header) when present. Written to the .fur chip output.
@@ -3326,7 +3338,7 @@ def _family_keyons(vgm: VgmFile, chips: set[str]) -> int:
                 prev = rhythm.get(("opll", w.chip_id), 0)
                 count += (sel & ~prev).bit_count()
                 rhythm[("opll", w.chip_id)] = sel
-        elif w.chip in ("opl", "opl2", "opl3"):
+        elif w.chip in ("opl", "opl2", "opl3", KIND_Y8950):
             r = w.reg & 0xFF
             port = (w.reg >> 8) & 1
             if 0xB0 <= r <= 0xB8:
@@ -3370,6 +3382,11 @@ def _family_sounds(vgm: VgmFile, names: set[str]) -> bool:
             # Port 1 of the YM2610 is ADPCM-A; $10 carries its two trigger bits.
             if reg == 0x10 and (w.val & 0xF0):
                 return True
+        elif w.chip == KIND_Y8950:
+            # $07 bit 7 starts the delta-T voice. An FM-only Y8950 already
+            # counted through _family_keyons above.
+            if reg == 0x07 and (w.val & 0x80) and not (w.val & 0x01):
+                return True
     return False
 
 
@@ -3406,7 +3423,8 @@ def analyze(
     has_ym2610 = "ym2610" in chips or "ym2610_ssg" in chips
     has_ym2608 = "ym2608" in chips or "ym2608_ssg" in chips
     has_sn76489 = "sn76489" in chips
-    has_opl = bool(chips & {"opl", "opl2", "opl3"})
+    has_opl = bool(chips & {"opl", "opl2", "opl3", KIND_Y8950})
+    has_y8950 = KIND_Y8950 in chips
     has_opll = "opll" in chips
 
     # The PCM a YM2612 streams is music even when the chip keys no FM voice,
@@ -3423,6 +3441,7 @@ def analyze(
         "opl": _family_sounds(vgm, {"opl"}),
         "opl2": _family_sounds(vgm, {"opl2"}),
         "opl3": _family_sounds(vgm, {"opl3"}),
+        "y8950": _family_sounds(vgm, {KIND_Y8950}),
         "opll": _family_sounds(vgm, {"opll"}),
     }
 
@@ -3437,7 +3456,7 @@ def analyze(
         ) if present
     }
     arcade_live = {name for name in arcade_present if sounds[name]}
-    opl_side = chips & {KIND_OPL, KIND_OPL2, KIND_OPL3}
+    opl_side = chips & {KIND_OPL, KIND_OPL2, KIND_OPL3, KIND_Y8950}
     opl_live = {name for name in opl_side if sounds[name]}
     opll_live = has_opll and sounds["opll"]
 
@@ -3505,7 +3524,9 @@ def analyze(
     # system in Furnace (it reassigns the last FM channels to the kit), and the
     # log decides which one a module gets. When several OPL kinds write, the
     # one with more key-ons carries the track.
-    opl_kinds = [k for k in (KIND_OPL, KIND_OPL2, KIND_OPL3) if k in chips]
+    opl_kinds = [
+        k for k in (KIND_OPL, KIND_OPL2, KIND_OPL3, KIND_Y8950) if k in chips
+    ]
     opl_kind = None
     if prefer_opl or is_combo or share_fm or arcade_pick is None:
         live_kinds = [k for k in opl_kinds if k in opl_live] or opl_kinds
@@ -3621,7 +3642,8 @@ def analyze(
     opl_clock = (
         opl_module_clock(
             (vgm.opl3_clock if opl_kind == KIND_OPL3 else
-             vgm.opl2_clock if opl_kind == KIND_OPL2 else vgm.opl_clock),
+             vgm.opl2_clock if opl_kind == KIND_OPL2 else
+             vgm.y8950_clock if opl_kind == KIND_Y8950 else vgm.opl_clock),
             opl_kind == KIND_OPL3,
         ) if is_opl else 0.0
     )
@@ -3720,8 +3742,12 @@ def analyze(
     ym2203_ssg_count = 0
 
     # Channels per OPL instance, in module order: nine for an OPL/OPL2,
-    # eighteen for an OPL3, plus the five kit columns when rhythm is on.
-    opl_chunk = channel_count(opl_kind, opl_drums) if is_opl else 0
+    # eighteen for an OPL3, plus the five kit columns when rhythm is on. The
+    # Y8950 adds one ADPCM column after its FM block.
+    opl_fm_count = channel_count(opl_kind, opl_drums) if is_opl else 0
+    opl_chunk = (
+        opl_fm_count + (1 if opl_kind == KIND_Y8950 else 0)
+    ) if is_opl else 0
     # A combined module lists its systems in channel order: the arcade family
     # (or the OPM's eight voices) first, then every OPL one. The bases below
     # are offsets into the module's channel space, not per-chip ones.
@@ -3789,7 +3815,7 @@ def analyze(
     if is_opl:
         for cid in opl_ids:
             fm_systems.append(FmSystem(
-                opl_kind, cid, opl_chunk, drums=opl_drums,
+                opl_kind, cid, opl_fm_count, drums=opl_drums,
                 clock=int(opl_clock),
             ))
     elif is_opll:
@@ -5358,6 +5384,56 @@ def analyze(
                         pcm=True,
                     ))
 
+    # The Y8950's ADPCM voice is one column after its FM block. It is the
+    # same delta-T engine the OPNA carries, so its samples use the ADPCM-B
+    # maps and bind with the YM2608's below.
+    y8950_b_samples: list[AdpcmBSample] = []
+    y8950_b_events: list[tuple[NoteEvent, int]] = []
+    y8950_b_count = 0
+    if is_opl and opl_kind == KIND_Y8950:
+        rom_b = assemble_rom(vgm, "y8950_deltat") if pcm else b""
+        if pcm:
+            y8950_b_samples, dt_warn = collect_y8950_delta_t(vgm, rom_b)
+            warnings.extend(dt_warn)
+        for i, smp in enumerate(y8950_b_samples):
+            for h in smp.hits:
+                y8950_b_count += 1
+                if h.pan == 0 and not any(p for _t, p in h.pan_pts):
+                    continue
+                pitch_steps, vol_pts = _adpcm_b_motion(h)
+                ev = NoteEvent(
+                    sample=h.sample_time,
+                    ch=opl_base.get(h.chip_id, 0) + opl_fm_count,
+                    on=True,
+                    note=60 + (i % YM2610_MAP_SLOTS),
+                    ins=-1,  # bound below with the ADPCM-B maps
+                    vol=max(0, min(255, h.vol)),
+                    e5=0x80,
+                    pan=h.pan,
+                    pcm=True,
+                    end=h.end_time,
+                )
+                if pitch_steps:
+                    ev.pitch_steps = pitch_steps
+                    ev.e5_lo = 0x00
+                    ev.e5_hi = 0xFF
+                if vol_pts:
+                    ev.vol_pts = vol_pts
+                events.append(ev)
+                y8950_b_events.append((ev, i))
+                if h.end_time and h.end_time > h.sample_time:
+                    events.append(NoteEvent(
+                        sample=h.end_time,
+                        ch=ev.ch,
+                        on=False,
+                        note=180,
+                        ins=-1,
+                        vol=-1,
+                        e5=0x80,
+                        pan=0,
+                        pcm=True,
+                    ))
+
     # Collect DAC runs now; group them after the row grid is known.
     dac_samples: list[DacSample] = []
     dac_plays: list[DacPlay] = []
@@ -6006,6 +6082,10 @@ def analyze(
     # note selects a sample and only the macros are read.
     n_ym2608_b_ins = (len(ym2608_b_samples) + YM2610_MAP_SLOTS - 1) // YM2610_MAP_SLOTS
     n_ym2608_rhythm_ins = 1 if ym2608_rhythm_events else 0
+    # The Y8950's ADPCM maps are the last sample instruments, after the OPNA's.
+    n_y8950_b_ins = (
+        (len(y8950_b_samples) + YM2610_MAP_SLOTS - 1) // YM2610_MAP_SLOTS
+    )
     tone_ins_base = (
         len(patch_order)
         + (len(audible) if pcm else 0) + len(oki_samples)
@@ -6014,11 +6094,15 @@ def analyze(
         + len(c352_audible) + len(k053260_audible)
         + n_ym2610_a_ins + n_ym2610_b_ins
         + n_ym2608_rhythm_ins + n_ym2608_b_ins
+        + n_y8950_b_ins
     )
-    ym2610_b_ins_base = tone_ins_base - n_ym2610_b_ins - n_ym2608_rhythm_ins - n_ym2608_b_ins
+    y8950_b_ins_base = tone_ins_base - n_y8950_b_ins
+    ym2610_b_ins_base = (
+        y8950_b_ins_base - n_ym2610_b_ins - n_ym2608_rhythm_ins - n_ym2608_b_ins
+    )
     ym2610_a_ins_base = ym2610_b_ins_base - n_ym2610_a_ins
-    ym2608_rhythm_ins_base = tone_ins_base - n_ym2608_b_ins - n_ym2608_rhythm_ins
-    ym2608_b_ins_base = tone_ins_base - n_ym2608_b_ins
+    ym2608_rhythm_ins_base = y8950_b_ins_base - n_ym2608_b_ins - n_ym2608_rhythm_ins
+    ym2608_b_ins_base = y8950_b_ins_base - n_ym2608_b_ins
     for ev, kind, idx in ym2610_events:
         base = ym2610_a_ins_base if kind == 0 else ym2610_b_ins_base
         ev.ins = base + idx // YM2610_MAP_SLOTS
@@ -6026,6 +6110,8 @@ def analyze(
         ev.ins = ym2608_rhythm_ins_base
     for ev, idx in ym2608_b_events:
         ev.ins = ym2608_b_ins_base + idx // YM2610_MAP_SLOTS
+    for ev, idx in y8950_b_events:
+        ev.ins = y8950_b_ins_base + idx // YM2610_MAP_SLOTS
     scc_ids: list[int] = []
     scc_waves: list[bytes] = []
     scc_ins: list[ToneIns] = []
@@ -6616,6 +6702,8 @@ def analyze(
         ym2608_rhythm_notes=len(ym2608_rhythm_events),
         ym2608_b_samples=ym2608_b_samples,
         ym2608_b_count=ym2608_b_count,
+        y8950_b_samples=y8950_b_samples,
+        y8950_b_count=y8950_b_count,
         scc_ids=scc_ids,
         scc_waves=scc_waves,
         scc_ins=scc_ins,
@@ -6719,7 +6807,7 @@ def format_report(song: Song) -> str:
             "ym2151": "YM2151", "ym2203": "YM2203", "ym2612": "YM2612",
             "ym2610": "YM2610B" if song.ym2610_b else "YM2610",
             "ym2608": "YM2608", "opl": "YM3526", "opl2": "YM3812",
-            "opl3": "YMF262", "opll": "YM2413",
+            "opl3": "YMF262", "y8950": "Y8950", "opll": "YM2413",
         }
         ranges = system_channel_ranges(song.fm_systems)
         parts: list[str] = []
