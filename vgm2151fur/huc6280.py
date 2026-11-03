@@ -448,6 +448,10 @@ class Huc6280PcmHit:
     sample_index: int
     voice: int  # channel the DDA stream writes (0-5)
     chip_id: int = 0
+    # The DAC stream byte rate at this play.  The driver changes it 23442
+    # times on the faceball rip, so it is the note's pitch, not a fixed
+    # per-body property.
+    rate: int = 0
 
 
 def _dda_to_s8(body: bytes) -> bytes:
@@ -541,6 +545,7 @@ def collect_huc6280_pcm(
             sample_index=idx,
             voice=voice,
             chip_id=play.chip_id,
+            rate=max(1, play.rate or 16000),
         ))
     if unreadable:
         warnings.append(

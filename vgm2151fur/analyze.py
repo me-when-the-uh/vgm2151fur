@@ -321,6 +321,30 @@ def transpose_opm_events(events: list[NoteEvent], clock: int | None) -> None:
             ev.note, ev.e5 = _shift_note_e5(ev.note, ev.e5, offset)
 
 
+def _pcm_rate_note(rate: int, reference: int) -> tuple[int, int]:
+    """Sample-playback note/E5 for a DAC-stream byte rate.
+
+    A sample body played at note 108 runs at its centre rate, so the ratio
+    ``2**((note-108)/12)`` scales that rate.  The driver retunes the HuC6280
+    DAC stream constantly (23442 byte-rate writes on the faceball rip), and
+    the E5 fine tune carries the remainder at 1/128 semitone, so the sample
+    plays at the source's rate instead of one fixed pitch.
+    """
+    if rate <= 0 or reference <= 0:
+        return 108, E5_CENTER
+    semis = 12.0 * math.log2(rate / reference)
+    base = int(math.floor(semis))
+    fine = int(round((semis - base) * 128.0))
+    note = 108 + base
+    while note < 0:
+        note += 1
+        fine -= 128
+    while note > NOTE_MAX:
+        note -= 1
+        fine += 128
+    return note, max(0, min(255, E5_CENTER + fine))
+
+
 def pcm_pan_fx(vl: int, vr: int) -> int:
     """Furnace 08xy from K007232 L/R volumes (0–15).
 
@@ -415,6 +439,10 @@ class NoteEvent:
     # Set only on `tone_noise` notes; the pitch points before it are noise
     # registers, the ones at/after it are tone periods.
     tone_noise_end: int = 0
+    # The full noise on/off timeline as (sample, 1|0).  The instrument's noise
+    # macro follows it, and the pitch points use a noise register while the
+    # mode is 1 and a tone period while it is 0.
+    tone_noise_modes: tuple[tuple[int, int], ...] = ()
     # Tone chip clock and divider: SCC 16, AY-8910 8, YM2203 SSG 16.
     tone_clock: int = 0
     tone_div: int = 8
@@ -1246,11 +1274,17 @@ def _bind_tone_instruments(
             if e.tone_noise:
                 # PCE noise: the register follows note-60 and ``pitch2``
                 # directly, so the macro value is the raw register offset.  A
-                # noise transient followed by a tone tail has both kinds of
-                # point in one list; `tone_noise_end` marks the switch.
+                # note can toggle noise on and off several times; the mode
+                # timeline says which kind each pitch point is.
                 gate_n = e.note - 60
+                modes = list(e.tone_noise_modes)
+                mode = modes[0][1] if modes else 1
+                mi = 0
                 for t, per in e.tone_pitch_pts:
-                    if e.tone_noise_end == 0 or t < e.tone_noise_end:
+                    while mi + 1 < len(modes) and modes[mi + 1][0] <= t:
+                        mi += 1
+                        mode = modes[mi][1]
+                    if mode:
                         pts.append((t, per - gate_n))
                     else:
                         pts.append((
@@ -6930,68 +6964,87 @@ def analyze(
                 continue
             voice_ch = ch + h.voice
             gate_end = h.off_sample or (vgm.total_samples or h.sample_time)
-            noise_mode = h.voice >= 4 and bool(h.noise & 0x80)
-            if noise_mode:
-                # These drivers build a percussion hit from a short noise
-                # transient and a longer tone tail (the noise is only ~14% of
-                # the gate on the LOX2 rips).  While bit 7 is set the noise
-                # period sweeps; a 0x07 write with it clear switches the
-                # channel back to the waveform.  Keep one note and carry the
-                # switch in the instrument's noise macro so it lands on the
-                # tick, not the row.
-                noise_off = 0
-                for t, reg in h.noise_pts:
-                    if h.sample_time < t < gate_end and not (reg & NOISE_ENABLE):
-                        noise_off = t
-                        break
-                base_n = h.noise & 0x1F
-                noise_pts = [(h.sample_time, base_n)]
-                noise_pts += [
-                    (t, reg & 0x1F) for t, reg in h.noise_pts
-                    if h.sample_time < t < (noise_off or gate_end)
-                    and (reg & NOISE_ENABLE)
-                    and (reg & 0x1F) != noise_pts[-1][1]
+            # A noise-capable voice can switch between periodic noise and the
+            # loaded waveform several times inside one gate (LOX1 Wave 5 turns
+            # noise off for a tone passage and back on).  Split at every
+            # transition: the note boundary is placed with EDxx (tick
+            # resolution) and the instrument's noise macro sets the mode on
+            # the note's first tick, so the switch lands on the tick instead
+            # of the nearest row.  A single macro over the whole 35 s gate
+            # would be thinned to ~140 ms per step.
+            has_noise = h.voice >= 4 and (
+                bool(h.noise & NOISE_ENABLE)
+                or any(reg & NOISE_ENABLE for _t, reg in h.noise_pts)
+            )
+            if has_noise:
+                mode_pts = [
+                    (h.sample_time, 1 if (h.noise & NOISE_ENABLE) else 0)
                 ]
-                pitch_pts = list(noise_pts)
-                if noise_off:
-                    # The note value is the tone tail's pitch so the tail is
-                    # correct; the noise register is reached through the same
-                    # pitch macro while the noise macro is 1.
-                    note, e5 = huc6280_note(
-                        huc_clock, _value_at(h.pitch_pts, noise_off, h.period),
+                for t, reg in h.noise_pts:
+                    if h.sample_time < t < gate_end:
+                        m = 1 if (reg & NOISE_ENABLE) else 0
+                        if m != mode_pts[-1][1]:
+                            mode_pts.append((t, m))
+                for i, (st, m) in enumerate(mode_pts):
+                    en = (
+                        mode_pts[i + 1][0]
+                        if i + 1 < len(mode_pts) else gate_end
                     )
-                    pitch_pts += [
-                        (t, p) for t, p in h.pitch_pts if t >= noise_off
-                    ]
-                    tone_fx = (
-                        (h.sample_time, FX_NOISE, 1),
-                        (noise_off, FX_NOISE, 0),
+                    if en <= st:
+                        continue
+                    ev_vol, ev_pan = pce_effective(
+                        _value_at(h.vol_pts, st, h.vol),
+                        _value_at(h.balance_pts, st, h.balance),
                     )
-                else:
-                    note, e5 = huc6280_noise_note(h.noise), 0x80
-                    tone_fx = ()
-                ev_vol, ev_pan = pce_effective(h.vol, h.balance)
-                vol_pts = tuple(
-                    (t, *pce_effective(h.vol, b))
-                    for t, b in h.balance_pts
-                    if h.sample_time < t < gate_end
-                )
-                channel_fx.append((h.sample_time, voice_ch, 0x11, 1))
-                events.append(NoteEvent(
-                    sample=h.sample_time, ch=voice_ch, on=True,
-                    note=note, ins=tone_ins_base, vol=ev_vol, e5=e5,
-                    pan=ev_pan, end=h.off_sample,
-                    vol_pts=vol_pts,
-                    tone_pitch_pts=(
-                        tuple(pitch_pts) if len(pitch_pts) > 1 else ()
-                    ),
-                    tone_fx_pts=tone_fx,
-                    tone_noise=True,
-                    tone_noise_end=noise_off,
-                    tone_wave=n.wave_index,
-                    tone_chip=5,
-                ))
-                huc6280_count += 1
+                    ev_vol_pts = tuple(
+                        p for p in _merge_vol_balance(h) if st < p[0] < en
+                    )
+                    if m:
+                        regs = [
+                            (st, _value_at(h.noise_pts, st, h.noise) & 0x1F)
+                        ]
+                        regs += [
+                            (t, reg & 0x1F) for t, reg in h.noise_pts
+                            if st < t < en and (reg & NOISE_ENABLE)
+                            and (reg & 0x1F) != regs[-1][1]
+                        ]
+                        note = huc6280_noise_note(
+                            _value_at(h.noise_pts, st, h.noise)
+                        )
+                        events.append(NoteEvent(
+                            sample=st, ch=voice_ch, on=True, note=note,
+                            ins=tone_ins_base, vol=ev_vol, e5=0x80,
+                            pan=ev_pan, end=en, vol_pts=ev_vol_pts,
+                            tone_pitch_pts=(
+                                tuple(regs) if len(regs) > 1 else ()
+                            ),
+                            tone_noise=True, tone_noise_end=0,
+                            tone_wave=n.wave_index, tone_chip=5,
+                        ))
+                    else:
+                        pts = [
+                            (st, _value_at(h.pitch_pts, st, h.period))
+                        ]
+                        pts += [
+                            (t, p) for t, p in h.pitch_pts if st < t < en
+                        ]
+                        # A tone passage can open before the driver writes
+                        # the frequency; use the first real period so the
+                        # note is not a bogus top-of-range blip.
+                        real = [(t, p) for t, p in pts if p > 0]
+                        if not real:
+                            continue
+                        base_t, base_p = real[0]
+                        note, e5 = huc6280_note(huc_clock, base_p)
+                        tail = [(t, p) for t, p in real if t > base_t]
+                        events.append(NoteEvent(
+                            sample=st, ch=voice_ch, on=True, note=note,
+                            ins=tone_ins_base, vol=ev_vol, e5=e5,
+                            pan=ev_pan, end=en, vol_pts=ev_vol_pts,
+                            tone_pitch_pts=tuple(tail),
+                            tone_wave=n.wave_index, tone_chip=5,
+                        ))
+                    huc6280_count += 1
                 continue
             if not any(h.wave):
                 # A tone note needs a waveform; a noise note above does not.
@@ -7064,9 +7117,14 @@ def analyze(
         # stored rate from a DIV_INS_AMIGA instrument.
         for hit in huc_pcm_hits:
             base = huc_at.get(hit.chip_id, huc_base)
+            ref = (
+                huc_pcm_samples[hit.sample_index].rate
+                if 0 <= hit.sample_index < len(huc_pcm_samples) else 0
+            )
+            note, e5 = _pcm_rate_note(hit.rate or ref, ref)
             ev = NoteEvent(
                 sample=hit.sample_time, ch=base + hit.voice, on=True,
-                note=108, ins=-1, vol=31, e5=0x80, pan=0,
+                note=note, ins=-1, vol=31, e5=e5, pan=0,
                 end=hit.end_time, no_pan=True, pcm=True,
             )
             events.append(ev)

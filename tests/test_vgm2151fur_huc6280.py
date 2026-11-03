@@ -260,16 +260,15 @@ class TestHuc6280Tones(unittest.TestCase):
         ]
         song = analyze(_vgm(writes, huc6280_clock=3579545))
         ch4 = [e for e in song.events if e.on and e.ch == 12]
-        self.assertEqual(len(ch4), 1)
-        note = ch4[0]
-        self.assertTrue(note.tone_noise)
-        self.assertEqual(note.tone_noise_end, 500)
-        # The instrument's noise macro switches on and then off.
+        # Split at the transition so each segment's note boundary is placed
+        # with EDxx (tick-accurate); its instrument states the mode.
+        self.assertEqual(len(ch4), 2)
+        self.assertTrue(ch4[0].tone_noise)
+        self.assertEqual(ch4[0].end, 500)
+        self.assertFalse(ch4[1].tone_noise)
         macros = [i.noise for i in song.huc6280_ins if i.noise]
-        self.assertTrue(macros)
-        macro = macros[0]
-        self.assertEqual(macro[0], 1)
-        self.assertIn(0, macro)
+        self.assertIn((1,), macros)
+        self.assertIn((0,), macros)
 
     def test_noise_note_before_waveform_load(self):
         # A snare can fire before the channel has loaded any waveform.  Noise
