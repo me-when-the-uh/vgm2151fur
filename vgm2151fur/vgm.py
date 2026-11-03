@@ -1,8 +1,8 @@
 """VGM / VGZ loader and command walker.
 
 Chips: YM2151, YM2203, YM2612, YM2610, YM3526 (OPL), YM3812 (OPL2),
-YMF262 (OPL3), K007232, MSM6295, MSM6258, SegaPCM, C140, C352, K053260,
-AY-3-8910, K051649/K052539 (SCC).
+YMF262 (OPL3), RF5C68, RF5C164, K007232, MSM6295, MSM6258, SegaPCM, C140,
+C352, K053260, AY-3-8910, K051649/K052539 (SCC).
 """
 
 from __future__ import annotations
@@ -71,6 +71,10 @@ CMD_AY8910 = 0xA0
 CMD_MSM6258 = 0xB7
 CMD_MSM6295 = 0xB8
 CMD_SEGAPCM = 0xC0
+CMD_RF5C68 = 0xB0
+CMD_RF5C164 = 0xB1
+CMD_RF5C68_MEM = 0xC1
+CMD_RF5C164_MEM = 0xC2
 CMD_SCC = 0xD2
 CMD_C140 = 0xD4
 CMD_C352 = 0xE1
@@ -86,6 +90,8 @@ DAC_STREAM_YM2612 = 0x02
 K007232_ROM_TYPE = 0x94  # 0x80 + 0x14
 OKI_ROM_TYPE = 0x8B  # OKIM6295 ROM
 SEGAPCM_ROM_TYPE = 0x80  # SegaPCM ROM
+RF5C68_RAM_TYPE = 0xC0  # RF5C68 sample-RAM write (16-bit start + data)
+RF5C164_RAM_TYPE = 0xC1  # RF5C164 sample-RAM write (16-bit start + data)
 C140_ROM_TYPE = 0x8D  # Namco C140 ROM
 C352_ROM_TYPE = 0x92  # Namco C352 ROM
 YM2610_ADPCM_ROM_TYPE = 0x82  # YM2610 ADPCM-A/B ROM
@@ -114,6 +120,14 @@ EXTRA_K007232 = 0x2A
 SEGAPCM_CLOCK_OFF = 0x38
 SEGAPCM_INTF_OFF = 0x3C  # bank shift; mask is the byte at 0x3E (0 → 0x70)
 SEGAPCM_MASK_OFF = 0x3E
+# RF5C68 header 0x40 and RF5C164 header 0x6C (both VGM 1.51+). The two chips
+# share one register interface: $B0/$B1 write (reg, value) and $C1/$C2 write
+# (offset, value) into sample RAM. Furnace hosts both as one system with a
+# chipType flag, so the converter reads the clock to tell them apart.
+RF5C68_CLOCK_OFF = 0x40
+RF5C164_CLOCK_OFF = 0x6C
+RF5C68_DEFAULT_CLOCK = 8000000
+RF5C164_DEFAULT_CLOCK = 12500000
 # YM2612 clock at 0x2C.  Bit 30 is the dual-instance flag; 0xA2/0xA3 then
 # answer for the second chip.  The field predates the 1.50 data-offset header.
 YM2612_CLOCK_OFF = 0x2C
@@ -179,7 +193,7 @@ CLOCK_MAX = 40_000_000
 # Sample-chip write commands this tool does not convert. Anything here that
 # shows up in a stream means samples are being dropped. Say so.
 UNCONVERTED_SAMPLE_CMDS = {
-    0xB0: "RF5C68", 0xB1: "RF5C164", 0xB2: "PWM",
+    0xB2: "PWM",
     0xB5: "MultiPCM", 0xB6: "uPD7759", 0x40: "NES APU DPCM",
 }
 
@@ -425,6 +439,11 @@ class VgmFile:
     segapcm_bankmask: int = 0
     c140_clock: int = 0
     c140_type: int = 0
+    # RF5C68 header 0x40 and RF5C164 header 0x6C (VGM 1.51+). One register
+    # interface, two clocks: FM Towns runs the 68 at 8 MHz, Sega CD the 164 at
+    # 12.5 MHz. Furnace hosts both as the RF5C68 system with a chipType flag.
+    rf5c68_clock: int = 0
+    rf5c164_clock: int = 0
     # K053260 header 0xAC (VGM 1.61+); bit 7 of a 0xBA register selects the
     # second instance, which shares this clock.
     k053260_clock: int = 0
@@ -692,6 +711,10 @@ def chips_in_head(buf: bytes) -> set[str]:
             kinds.add("opll")
     if version >= 0x151 and 100_000 <= _header_clock(buf, SEGAPCM_CLOCK_OFF) <= 40_000_000:
         kinds.add("segapcm")
+    if version >= 0x151 and 100_000 <= _header_clock(buf, RF5C68_CLOCK_OFF) <= 40_000_000:
+        kinds.add("rf5c68")
+    if version >= 0x151 and 100_000 <= _header_clock(buf, RF5C164_CLOCK_OFF) <= 40_000_000:
+        kinds.add("rf5c164")
     if version >= 0x151 and 100_000 <= _header_clock(buf, AY8910_CLOCK_OFF) <= 40_000_000:
         kinds.add("ay8910")
     # The OPL family joined the header in 1.51. A YM3812 field with bit 30 set
@@ -832,6 +855,16 @@ def load_vgm(path: Path | str) -> VgmFile:
         spcm_clock = _sane_clock(clocks.get(EXTRA_SEGAPCM, 0))
     spcm_shift = buf[SEGAPCM_INTF_OFF] if ver >= 0x151 and _field_in_header(buf, SEGAPCM_INTF_OFF, 1) else 0
     spcm_mask = buf[SEGAPCM_MASK_OFF] if ver >= 0x151 and _field_in_header(buf, SEGAPCM_MASK_OFF, 1) else 0
+    # RF5C68 and RF5C164 share the register set but ride different header
+    # clocks. The extra-header list (chip id 0x05 = RF5C68) is the fallback.
+    rf5c68_clock = (
+        _clock_or_zero(buf, RF5C68_CLOCK_OFF) if ver >= 0x151 else 0
+    )
+    if not rf5c68_clock:
+        rf5c68_clock = _sane_clock(clocks.get(0x05, 0))
+    rf5c164_clock = (
+        _clock_or_zero(buf, RF5C164_CLOCK_OFF) if ver >= 0x151 else 0
+    )
     # Read the field for every version: the legacy System 21 rips carry
     # 21390 there even in 1.51 files, and players resolve it the same way.
     c140_raw = _header_raw(buf, C140_CLOCK_OFF) & 0x3FFFFFFF
@@ -927,6 +960,8 @@ def load_vgm(path: Path | str) -> VgmFile:
         segapcm_clock=spcm_clock,
         segapcm_bankshift=spcm_shift,
         segapcm_bankmask=spcm_mask,
+        rf5c68_clock=rf5c68_clock,
+        rf5c164_clock=rf5c164_clock,
         c140_clock=c140_clock,
         c140_type=c140_type,
         k053260_clock=k053260_clock,
@@ -958,6 +993,11 @@ def load_vgm(path: Path | str) -> VgmFile:
     # stream id -> setup recorded by 0x90/0x91/0x92
     streams: dict[int, dict] = {}
     active_adpcm: dict[int, Msm6258Play] = {}
+    # The RF5C pair bank their sample RAM: register 0x07 (bit 6 clear) selects
+    # a 4 KB write bank, and 0xC1/0xC2 then address a 16-bit offset inside it.
+    # The bank is folded into the memory-write address here so the collector
+    # sees one flat 64 KB window, exactly like Furnace's core.
+    rf5c_wbank = {"rf5c68": 0, "rf5c164": 0}
 
     def close_adpcm(sid: int, end_t: int) -> None:
         play = active_adpcm.pop(sid, None)
@@ -990,6 +1030,14 @@ def load_vgm(path: Path | str) -> VgmFile:
                 vgm.adpcm_blocks.append(bytes(payload))
             elif typ == 0x44:
                 saw_adpcm_compressed = True
+            elif typ in (RF5C68_RAM_TYPE, RF5C164_RAM_TYPE):
+                # C0-DF RAM writes: a 16-bit start offset then the bytes. The
+                # two RF5C chips share one register file but each has its own
+                # sample RAM, so the kind keeps them apart for the collector.
+                if len(payload) >= 2:
+                    start = int.from_bytes(payload[0:2], "little")
+                    kind = "rf5c68" if typ == RF5C68_RAM_TYPE else "rf5c164"
+                    vgm.roms.append(RomSlice(chip_id, 0, start, payload[2:], kind))
             else:
                 kind = {
                     K007232_ROM_TYPE: "k007232",
@@ -1327,6 +1375,27 @@ def load_vgm(path: Path | str) -> VgmFile:
             vgm.writes.append(ChipWrite(sample, "segapcm", 0, addr & 0x7FF, buf[pos + 3]))
             pos += 4
             continue
+        if cmd in (CMD_RF5C68, CMD_RF5C164) and pos + 3 <= n:
+            # 0xB0/0xB1: (register, data). One shared register file; the clock
+            # tells the two chips apart. Register 0x07 selects the RAM bank.
+            name = "rf5c68" if cmd == CMD_RF5C68 else "rf5c164"
+            reg = buf[pos + 1]
+            val = buf[pos + 2]
+            if reg == 0x07 and not (val & 0x40):
+                rf5c_wbank[name] = (val & 0x0F) << 12
+            vgm.writes.append(ChipWrite(sample, name, 0, reg, val))
+            pos += 3
+            continue
+        if cmd in (CMD_RF5C68_MEM, CMD_RF5C164_MEM) and pos + 4 <= n:
+            # 0xC1/0xC2: 16-bit LE offset, then data. The offset rides on the
+            # bank register 0x07 set earlier; a "mem" chip carries the resolved
+            # flat address so the collector can just fill bytes in order.
+            name = "rf5c68" if cmd == CMD_RF5C68_MEM else "rf5c164"
+            offset = int.from_bytes(buf[pos + 1:pos + 3], "little")
+            addr = (rf5c_wbank[name] | offset) & 0xFFFF
+            vgm.writes.append(ChipWrite(sample, f"{name}_mem", 0, addr, buf[pos + 3]))
+            pos += 4
+            continue
         if cmd == CMD_SCC and pos + 4 <= n:
             # 0xD2 pp aa dd: SCC "port" (register bank), register, data. Bit 7
             # of pp selects the second chip instance. The register space is
@@ -1410,6 +1479,14 @@ def load_vgm(path: Path | str) -> VgmFile:
     if any(w.chip == "k053260" for w in vgm.writes) and not vgm.k053260_clock:
         vgm.warnings.append(
             "K053260 clock is missing or out of range; using 3579545"
+        )
+    if any(w.chip == "rf5c68" for w in vgm.writes) and not vgm.rf5c68_clock:
+        vgm.warnings.append(
+            f"RF5C68 clock is missing or out of range; using {RF5C68_DEFAULT_CLOCK}"
+        )
+    if any(w.chip == "rf5c164" for w in vgm.writes) and not vgm.rf5c164_clock:
+        vgm.warnings.append(
+            f"RF5C164 clock is missing or out of range; using {RF5C164_DEFAULT_CLOCK}"
         )
     if any(w.chip in ("ym2203", "ym2203_ssg") for w in vgm.writes) and not vgm.ym2203_clock:
         vgm.warnings.append("YM2203 clock is missing or out of range; using 3579545")

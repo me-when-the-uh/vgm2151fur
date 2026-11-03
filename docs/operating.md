@@ -235,6 +235,11 @@ they can be run from anywhere.
   exports it back through Furnace. Unset, it falls back to the grandparent of
   `VGM2151FUR_OPNA_RIPS`; if neither has a `*_merged.vgm`, the tests skip.
   See docs/merged-logs.md for what each log holds.
+- `VGM2151FUR_SAMPLE_RIPS`, `VGM2151FUR_SEGACD_RIPS`, `VGM2151FUR_FMTOWNS_RIPS`:
+  roots the RF5C real-rip tests search (in addition to the two above). The FM
+  Towns Xenon rip lives under the OPNA root (`xenon-fmtowns\done`), and a Sega
+  CD pack such as Popful Mail sits outside it, so each can be named directly.
+  See docs/segapcm-c140.md for the RF5C model.
 
 ## Exit codes
 

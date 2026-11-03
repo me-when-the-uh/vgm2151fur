@@ -115,6 +115,8 @@ def _sample_counts(info: dict) -> str:
     samples = f"{info['pcm_samples']} PCM"
     for key, label in (
         ("segapcm_samples", "SEGA"),
+        ("rf5c68_samples", "RF5C68"),
+        ("rf5c164_samples", "RF5C164"),
         ("c140_samples", "C140"),
         ("c352_samples", "C352"),
         ("k053260_samples", "K053260"),

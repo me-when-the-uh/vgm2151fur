@@ -102,6 +102,15 @@ from vgm2151fur.sn76489 import (
     collect_sn76489,
     psg_note,
 )
+from vgm2151fur.rf5c import (
+    RF5C68_DEFAULT_CLOCK,
+    RF5C164_DEFAULT_CLOCK,
+    RF5C_VOICES,
+    Rf5cOff,
+    Rf5cSample,
+    collect_rf5c,
+    rf5c_rate,
+)
 from vgm2151fur.segapcm import SegapcmSample, collect_segapcm, segapcm_rate
 from vgm2151fur.timing import (
     MIN_ROW_SAMPLES,
@@ -476,6 +485,8 @@ class Song:
     oki_samples: list[OkiSample] = field(default_factory=list)
     msm6258_samples: list[AdpcmSample] = field(default_factory=list)
     segapcm_samples: list[SegapcmSample] = field(default_factory=list)
+    rf5c68_samples: list[Rf5cSample] = field(default_factory=list)
+    rf5c164_samples: list[Rf5cSample] = field(default_factory=list)
     c140_samples: list[C140Sample] = field(default_factory=list)
     c352_samples: list[C352Sample] = field(default_factory=list)
     k053260_samples: list[K053260Sample] = field(default_factory=list)
@@ -5432,6 +5443,9 @@ def analyze(
                 "dropped"
             )
             psg_ids = []
+            # Give the four reserved columns back. Every sample chip's base is
+            # read from fm_end below, and a gap here would shift all of them.
+            fm_end -= 4
 
     # Row 0 is the start of the VGM, not the first key-on. Loop points in the
     # header are sample offsets from t=0; shifting t0 would move Bxx.
@@ -5485,6 +5499,8 @@ def analyze(
     n_adpcm_ins = 0
     n_adpcm_ch = 0
     spcm_audible: list[SegapcmSample] = []
+    rf5c68_audible: list[Rf5cSample] = []
+    rf5c164_audible: list[Rf5cSample] = []
     c140_audible: list[C140Sample] = []
     c352_audible: list[C352Sample] = []
     k053260_audible: list[K053260Sample] = []
@@ -5904,6 +5920,71 @@ def analyze(
                 pan=0,
                 pcm=True,
             ))
+
+        # Ricoh RF5C68 (FM Towns) and RF5C164 (Sega CD): eight PCM voices each,
+        # one .fur channel per voice. Rate = clock * step / 786432; the sample's
+        # usual step is C-4 and every hit's step is its ratio to that.
+        rf5c68_clock = vgm.rf5c68_clock or RF5C68_DEFAULT_CLOCK
+        rf5c164_clock = vgm.rf5c164_clock or RF5C164_DEFAULT_CLOCK
+        _ram68, rf5c68_samples, rf5c68_offs, rf5c68_warn = collect_rf5c(
+            vgm, "rf5c68", rf5c68_clock,
+        )
+        warnings.extend(rf5c68_warn)
+        _ram164, rf5c164_samples, rf5c164_offs, rf5c164_warn = collect_rf5c(
+            vgm, "rf5c164", rf5c164_clock,
+        )
+        warnings.extend(rf5c164_warn)
+        rf5c68_audible = [s for s in rf5c68_samples if s.length >= 8]
+        rf5c164_audible = [s for s in rf5c164_samples if s.length >= 8]
+        rf5c_base = k053260_base + 4 * len(k053260_ids)
+        ins6 = ins5 + len(k053260_audible)
+        rf5c68_at = rf5c_base
+        rf5c164_at = rf5c_base + (RF5C_VOICES if rf5c68_audible else 0)
+
+        def _rf5c_events(samples, clock, ch_base, ins_base, offs) -> None:
+            for i, smp in enumerate(samples):
+                ins = ins_base + i
+                ref = rf5c_rate(clock, smp.mode_step())
+                for h in smp.hits:
+                    note, e5 = rate_to_note(rf5c_rate(clock, h.step), ref)
+                    left = h.pan & 0x0F
+                    right = (h.pan >> 4) & 0x0F
+                    # The core mixes pan nibble * envelope, so the volume
+                    # column carries the peak and the pan effect the ratio.
+                    peak = max(left, right)
+                    vol = int(round(h.env * peak / 15.0)) & 0xFF
+                    events.append(NoteEvent(
+                        sample=h.sample_time,
+                        ch=ch_base + h.voice,
+                        on=True,
+                        note=note,
+                        ins=ins,
+                        vol=vol,
+                        e5=e5,
+                        pan=pcm_pan_fx(left, right),
+                        pcm=True,
+                    ))
+            for off in offs:
+                events.append(NoteEvent(
+                    sample=off.sample_time,
+                    ch=ch_base + off.voice,
+                    on=False,
+                    note=180,
+                    ins=-1,
+                    vol=-1,
+                    e5=0x80,
+                    pan=0,
+                    pcm=True,
+                ))
+
+        _rf5c_events(
+            rf5c68_audible, rf5c68_clock, rf5c68_at,
+            ins6, rf5c68_offs,
+        )
+        _rf5c_events(
+            rf5c164_audible, rf5c164_clock, rf5c164_at,
+            ins6 + len(rf5c68_audible), rf5c164_offs,
+        )
     else:
         audible = []
 
@@ -5911,7 +5992,10 @@ def analyze(
     # channels follow the FM block and every sample chip.
     tone_base = (
         fm_end + (2 if audible else 0) + 4 * len(oki_samples) + n_adpcm_ch
-        + (16 if spcm_audible else 0) + 24 * len(c140_audible)
+        + (16 if spcm_audible else 0)
+        + RF5C_VOICES * (1 if rf5c68_audible else 0)
+        + RF5C_VOICES * (1 if rf5c164_audible else 0)
+        + 24 * len(c140_audible)
         + 32 * len(c352_audible) + 4 * len(k053260_audible)
     )
     # Count the final DAC maps once, below; the collector's list is transient.
@@ -5925,7 +6009,8 @@ def analyze(
     tone_ins_base = (
         len(patch_order)
         + (len(audible) if pcm else 0) + len(oki_samples)
-        + n_adpcm_ins + len(spcm_audible) + len(c140_audible)
+        + n_adpcm_ins + len(spcm_audible)
+        + len(rf5c68_audible) + len(rf5c164_audible) + len(c140_audible)
         + len(c352_audible) + len(k053260_audible)
         + n_ym2610_a_ins + n_ym2610_b_ins
         + n_ym2608_rhythm_ins + n_ym2608_b_ins
@@ -6479,6 +6564,8 @@ def analyze(
         oki_samples=oki_samples,
         msm6258_samples=adpcm_samples,
         segapcm_samples=spcm_audible,
+        rf5c68_samples=rf5c68_audible,
+        rf5c164_samples=rf5c164_audible,
         c140_samples=c140_audible,
         c352_samples=c352_audible,
         k053260_samples=k053260_audible,
@@ -6762,7 +6849,9 @@ def format_report(song: Song) -> str:
             f"{data} bytes  ({source} source bytes{extra})"
         )
     n_regions = (
-        len(song.pcm_samples) + len(song.segapcm_samples) + len(song.c140_samples)
+        len(song.pcm_samples) + len(song.segapcm_samples)
+        + len(song.rf5c68_samples) + len(song.rf5c164_samples)
+        + len(song.c140_samples)
         + len(song.c352_samples) + len(song.k053260_samples)
         + len(song.ym2610_a_samples) + len(song.ym2610_b_samples)
     )
@@ -6806,6 +6895,8 @@ def format_report(song: Song) -> str:
         lines.append(f"MSM6258     {len(song.msm6258_samples)} bursts")
     for chip, smps in (
         ("SegaPCM", song.segapcm_samples),
+        ("RF5C68", song.rf5c68_samples),
+        ("RF5C164", song.rf5c164_samples),
         ("C140", song.c140_samples),
         ("C352", song.c352_samples),
         ("K053260", song.k053260_samples),

@@ -85,6 +85,9 @@ CHIP_MSM6295 = 0xAA
 CHIP_MSM6258 = 0xAB
 CHIP_K007232 = 0xC6
 CHIP_SEGAPCM = 0x9B
+# Furnace hosts the RF5C68 (FM Towns) and RF5C164 (Sega CD) as one system.
+# The chipType flag picks the variant: 0 = RF5C68, 1 = RF5C164.
+CHIP_RF5C68 = 0x95
 CHIP_C140 = 0xCE
 CHIP_K053260 = 0xCC
 # Furnace format.md reserves 0xD0 for Namco C352, 32 channels, and marks it
@@ -196,6 +199,7 @@ INS_MSM6295 = 36
 INS_ADPCMA = 37
 INS_ADPCMB = 38
 INS_SEGAPCM = 39
+INS_RF5C68 = 42
 INS_K007232 = 45
 INS_K053260 = 50
 INS_C140 = 53
@@ -983,6 +987,27 @@ def segapcm_flag_text(clock: int, rom_size: int) -> str:
     # 0 = 2 MB (Y board), 1 = 512 KB (the rest). Furnace addresses the ROM in
     # 8-bit units and clips to this size.
     parts.append(f"memSize={0 if rom_size > 0x80000 else 1}")
+    return "\n".join(parts)
+
+
+def rf5c68_flag_text(clock: int, chip_type: int) -> str:
+    """RF5C68 system flags: chip type and clock.
+
+    `chipType` 0 is the RF5C68 (FM Towns) and 1 the RF5C164 (Sega CD), the
+    same split `DivPlatformRF5C68::setFlags` reads. Furnace's named clocks are
+    the FM Towns 8 MHz and the Sega CD 12.5 MHz, so the usual rips need no
+    custom clock.
+    """
+    parts = [f"chipType={1 if chip_type else 0}"]
+    clk = clock or 8000000
+    if clk == 8000000:
+        parts.append("clockSel=0")
+    elif clk == 10000000:
+        parts.append("clockSel=1")
+    elif clk == 12500000:
+        parts.append("clockSel=2")
+    else:
+        parts.append(f"customClock={clk}")
     return "\n".join(parts)
 
 
@@ -3081,6 +3106,12 @@ def write_fur(
     adpcm_smps = list(song.msm6258_samples) if include_pcm else []
     n_adpcm_ins = (len(adpcm_smps) + 119) // 120
     spcm_smps = [s for s in song.segapcm_samples if s.length >= 8] if include_pcm else []
+    rf5c68_smps = (
+        [s for s in song.rf5c68_samples if s.length >= 8] if include_pcm else []
+    )
+    rf5c164_smps = (
+        [s for s in song.rf5c164_samples if s.length >= 8] if include_pcm else []
+    )
     c140_smps = [s for s in song.c140_samples if s.length >= 8] if include_pcm else []
     c352_smps = [s for s in song.c352_samples if s.length >= 8] if include_pcm else []
     k053260_smps = (
@@ -3090,8 +3121,8 @@ def write_fur(
     n_dac_ins = (len(dac_smps) + 119) // 120
     dac_smp_base = (
         len(pcm_smps) + len(oki_smps) + len(adpcm_smps)
-        + len(spcm_smps) + len(c140_smps) + len(c352_smps)
-        + len(k053260_smps)
+        + len(spcm_smps) + len(rf5c68_smps) + len(rf5c164_smps)
+        + len(c140_smps) + len(c352_smps) + len(k053260_smps)
     )
     ym2610_a_smps = (
         list(getattr(song, "ym2610_a_samples", ()) or ()) if include_pcm else []
@@ -3172,10 +3203,12 @@ def write_fur(
             else:
                 n_fm += system.fm_channels or 8
     n_k007 = 2 if want_k007 else 0
+    n_rf5c = (8 if rf5c68_smps else 0) + (8 if rf5c164_smps else 0)
     n_ch = (
         n_fm + n_ssg + n_adpcm_a + n_adpcm_b + n_psg + n_k007
         + 4 * len(oki_ids) + len(adpcm_ids)
-        + (16 if spcm_smps else 0) + 24 * len(c140_ids) + 32 * len(c352_ids)
+        + (16 if spcm_smps else 0) + n_rf5c
+        + 24 * len(c140_ids) + 32 * len(c352_ids)
         + 4 * len(k053260_ids) + n_scc + n_ay
     )
     if n_ch == 0:
@@ -3183,20 +3216,24 @@ def write_fur(
     fx_cols = 8  # room for LFO 17/18/1E/1F plus pan/E5/ED/Bxx
     k_clock = song.vgm.k007232_clock or 3579545
     spcm_clock = song.vgm.segapcm_clock or SEGAPCM_CLOCK_X
+    rf5c68_clock = song.vgm.rf5c68_clock or 8000000
+    rf5c164_clock = song.vgm.rf5c164_clock or 12500000
     c140_clock = song.vgm.c140_clock or 12288000
     c352_clock = song.vgm.c352_clock or C352_DEFAULT_CLOCK
     k053260_clock = song.vgm.k053260_clock or 3579545
 
     n_ins = (
         len(fm_ins) + n_dac_ins + len(pcm_smps) + len(oki_smps) + n_adpcm_ins
-        + len(spcm_smps) + len(c140_smps) + len(c352_smps) + len(k053260_smps)
+        + len(spcm_smps) + len(rf5c68_smps) + len(rf5c164_smps)
+        + len(c140_smps) + len(c352_smps) + len(k053260_smps)
         + n_ym2610_a_ins + n_ym2610_b_ins
         + n_ym2608_rhythm_ins + n_ym2608_b_ins
         + len(scc_specs) + len(ay_specs) + len(psg_specs)
     )
     n_smp = (
         len(pcm_smps) + len(oki_smps) + len(adpcm_smps)
-        + len(spcm_smps) + len(c140_smps) + len(c352_smps)
+        + len(spcm_smps) + len(rf5c68_smps) + len(rf5c164_smps)
+        + len(c140_smps) + len(c352_smps)
         + len(k053260_smps) + len(dac_smps)
         + len(ym2610_a_smps) + len(ym2610_b_smps) + len(ym2608_b_smps)
     )
@@ -3247,6 +3284,17 @@ def write_fur(
         for voice in range(16):
             names_long.append(f"SEGA {voice + 1}")
             names_short.append(f"S{voice + 1}")
+    # The RF5C pair are separate chips to Furnace (one system each), but share
+    # a label family: "PCM 1".."PCM 8" for the 68, "PCM 9".."PCM 16" for a 164
+    # in the same module, so a combined log never repeats a column name.
+    rf5c_n = 0
+    for smps in (rf5c68_smps, rf5c164_smps):
+        if not smps:
+            continue
+        for voice in range(8):
+            names_long.append(f"PCM {rf5c_n + voice + 1}")
+            names_short.append(f"P{rf5c_n + voice + 1}")
+        rf5c_n += 8
     for cid in c140_ids:
         for voice in range(24):
             names_long.append(f"C140 {cid + 1}-{voice + 1}")
@@ -3306,6 +3354,10 @@ def write_fur(
         label_parts.append("MSM6258")
     if spcm_smps:
         label_parts.append("SegaPCM")
+    if rf5c68_smps:
+        label_parts.append("RF5C68")
+    if rf5c164_smps:
+        label_parts.append("RF5C164")
     if c140_ids:
         label_parts.append("C140")
     if c352_ids:
@@ -3521,6 +3573,12 @@ def write_fur(
             (s.rom_size for s in song.vgm.roms if s.kind == "segapcm"), default=0
         )
         flag_texts.append(segapcm_flag_text(song.vgm.segapcm_clock, rom_size))
+    if rf5c68_smps:
+        chips.append(CHIP_RF5C68)
+        flag_texts.append(rf5c68_flag_text(song.vgm.rf5c68_clock, 0))
+    if rf5c164_smps:
+        chips.append(CHIP_RF5C68)
+        flag_texts.append(rf5c68_flag_text(song.vgm.rf5c164_clock, 1))
     for cid in c140_ids:
         chips.append(CHIP_C140)
         flag_texts.append(c140_flag_text(song.vgm.c140_clock, song.vgm.c140_type))
@@ -3716,7 +3774,19 @@ def write_fur(
         _write_ins_pcm(
             b, f"SEGA {smp.start:05x}", spcm_ins_base + i, INS_SEGAPCM,
         )
-    c140_ins_base = spcm_ins_base + len(spcm_smps)
+    rf5c68_ins_base = spcm_ins_base + len(spcm_smps)
+    for i, smp in enumerate(rf5c68_smps):
+        ins_ptrs.append(len(b))
+        _write_ins_pcm(
+            b, f"RF5C68 {smp.start:04x}", rf5c68_ins_base + i, INS_RF5C68,
+        )
+    rf5c164_ins_base = rf5c68_ins_base + len(rf5c68_smps)
+    for i, smp in enumerate(rf5c164_smps):
+        ins_ptrs.append(len(b))
+        _write_ins_pcm(
+            b, f"RF5C164 {smp.start:04x}", rf5c164_ins_base + i, INS_RF5C68,
+        )
+    c140_ins_base = rf5c164_ins_base + len(rf5c164_smps)
     for i, smp in enumerate(c140_smps):
         ins_ptrs.append(len(b))
         _write_ins_pcm(
@@ -3810,6 +3880,20 @@ def write_fur(
         smp_ptrs.append(len(b))
         _write_sample_s8(
             b, f"spcm_{smp.start:05x}", smp.data, smp.c4_rate(spcm_clock),
+            loop=(smp.loop_start, smp.loop_end),
+        )
+    for smp in rf5c68_smps:
+        smp_ptrs.append(len(b))
+        _write_sample_s8(
+            b, f"rf5c68_{smp.start:04x}", smp.data,
+            smp.c4_rate(rf5c68_clock),
+            loop=(smp.loop_start, smp.loop_end),
+        )
+    for smp in rf5c164_smps:
+        smp_ptrs.append(len(b))
+        _write_sample_s8(
+            b, f"rf5c164_{smp.start:04x}", smp.data,
+            smp.c4_rate(rf5c164_clock),
             loop=(smp.loop_start, smp.loop_end),
         )
     for smp in c140_smps:
