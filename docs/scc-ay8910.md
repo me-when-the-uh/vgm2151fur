@@ -170,9 +170,10 @@ cell; mode, noise and envelope period still follow their registers.
 
 The AY SSG can also act as a 4-bit DAC: a driver disables the voice's tone and
 noise bits and spams the volume register at audio rate. Those streams become
-`DIV_INS_AY` sample instruments (8-bit, note 108 = C-4) instead of tone notes;
-a channel that plays a tone first and drums later keeps both. See
-[`ssg-pcm.md`](ssg-pcm.md) for detection, segmentation and the level map.
+`DIV_INS_AY` sample instruments (8-bit, 120 bodies per note map, every slot
+plays C-4) instead of tone notes; a channel that plays a tone first and drums
+later keeps both. See [`ssg-pcm.md`](ssg-pcm.md) for detection, segmentation,
+DAC-stream timing and the level map.
 
 ## Volumes
 

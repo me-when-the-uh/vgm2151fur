@@ -5,11 +5,13 @@ samples without any sample hardware: the driver disables the voice's tone and
 noise in the mixer and writes the volume register at audio rate.  The volume
 register then acts as a 4-bit DAC.
 
-This module turns such a stream into ordinary 8-bit PCM bodies plus one note
-per segment.  Furnace's AY platform plays them through a ``DIV_INS_AY``
-instrument with ``amiga.useSample`` set (the reference ``SSGPCM-test.fur``
-uses exactly this shape), at note 108 = C-4, where the sample's stored
-``c4_rate`` is played 1:1.
+This module turns such a stream into ordinary 8-bit PCM bodies plus notes.
+A VGM DAC stream's ``0x93`` start is one note (bounded by its ``0x94`` stop);
+direct writes are split at pauses.  Furnace's AY platform plays the bodies
+through a ``DIV_INS_AY`` instrument with ``amiga.useSample`` set.  One
+instrument carries up to 120 bodies in its sample map (notes 60-179), every
+slot stored at C-4, so a drum track stays inside the 255-instrument module
+limit and each body plays at its stored ``c4_rate``.
 
 The level -> byte map is the inverse of Furnace's ``dacLogTableAY``
 (``platform/ay.cpp``).  ``runDAC`` computes the register level as
@@ -84,9 +86,10 @@ STREAM_CHIP = {
     0x12: "ay8910",
 }
 # A body shorter than this is a click or a segmentation fragment, not a
-# sample.  Short segments are folded into the next one on the same voice so
-# the source audio is kept instead of disappearing.
-PCM_MIN_FRAMES = 512
+# sample.  Short direct-write segments are folded into the next one on the
+# same voice so the source audio is kept instead of disappearing; a short
+# DAC-stream play is dropped outright.
+PCM_MIN_FRAMES = 128
 
 
 @dataclass
@@ -187,22 +190,33 @@ def _stream_body(vgm: VgmFile, play) -> bytes:
         return b""
     step = play.step if play.step > 1 else 1
     body = bank[start:min(end, len(bank)):step]
-    return body[::-1] if play.reverse else body
+    if play.reverse:
+        body = body[::-1]
+    # A 0x94 stop (or the next 0x93 start) is the real end of the play.  The
+    # declared length normally matches it; a driver that stops early keeps
+    # only the bytes it had time to write.
+    if play.stop_sample > play.sample and body:
+        rate = play.rate or VGM_RATE
+        played = int(round((play.stop_sample - play.sample) * rate / VGM_RATE))
+        if 0 < played < len(body):
+            body = body[:played]
+    return body
 
 
 def _stream_points(
     vgm: VgmFile, chip: str,
-) -> tuple[dict[tuple[int, int], list[tuple[int, int]]], dict[int, list[int]], int]:
+) -> tuple[list[tuple[int, int, int, list[tuple[int, int]]]], int]:
     """Expand DAC-stream plays that write an SSG volume register.
 
-    Returns per-(chip instance, voice) ``(sample, level)`` points, the
-    declared stream rate per instance, and a count of looping streams.
+    Every ``0x93`` start is its own note, at its own rate, bounded by its
+    ``0x94`` stop.  Returns ``[(chip_id, voice, rate, points)]`` and a count
+    of looping streams.  Plays are never merged with each other: the start
+    and stop commands are the note timing.
     """
-    out: dict[tuple[int, int], list[tuple[int, int]]] = {}
-    rates: dict[int, list[int]] = {}
+    out: list[tuple[int, int, int, list[tuple[int, int]]]] = []
     loops = 0
     if not vgm.dac_stream_plays or not vgm.dac_data:
-        return out, rates, loops
+        return out, loops
     for play in vgm.dac_stream_plays:
         if STREAM_CHIP.get(play.chip_type) != chip:
             continue
@@ -214,16 +228,15 @@ def _stream_points(
             continue
         voice = REG_VOL.index(reg)
         rate = play.rate or VGM_RATE
-        rates.setdefault(play.chip_id, []).append(rate)
         if play.loop:
             loops += 1
         step = VGM_RATE / rate
-        times = out.setdefault((play.chip_id, voice), [])
-        for i, byte in enumerate(body):
-            times.append((int(round(play.sample + i * step)), byte & 0x0F))
-    for times in out.values():
-        times.sort()
-    return out, rates, loops
+        points = [
+            (int(round(play.sample + i * step)), byte & 0x0F)
+            for i, byte in enumerate(body)
+        ]
+        out.append((play.chip_id, voice, rate, points))
+    return out, loops
 
 
 def _bursts(
@@ -383,30 +396,16 @@ def collect_ssg_pcm(
     """
     warnings: list[str] = []
     direct = _volume_streams(vgm, chip)
-    streamed, stream_rates, stream_loops = _stream_points(vgm, chip)
+    streamed, stream_loops = _stream_points(vgm, chip)
     if not direct and not streamed:
         return [], [], warnings
 
-    streams: dict[tuple[int, int], list[tuple[int, int]]] = {}
-    for key, points in direct.items():
-        streams.setdefault(key, []).extend(points)
-    for key, points in streamed.items():
-        streams.setdefault(key, []).extend(points)
-    for points in streams.values():
-        points.sort()
-        # Same-sample writes: the last value is the one that sounds.
-        deduped: list[tuple[int, int]] = []
-        for point in points:
-            if deduped and deduped[-1][0] == point[0]:
-                deduped[-1] = point
-            else:
-                deduped.append(point)
-        points[:] = deduped
-
-    # Per chip instance: gather bursts, pick a rate, split into segments, and
-    # fall back to a coarser split if the instrument budget would be exceeded.
+    # Direct register writes: group into bursts, split at pauses, and merge
+    # fragments under the minimum length.  DAC streams are handled separately:
+    # each 0x93 start is already one note, and the stop/start gap is only a
+    # few samples, so merging them would rebuild the giant body this avoids.
     per_chip: dict[int, list[tuple[int, list[tuple[int, int]]]]] = {}
-    for (cid, voice), points in streams.items():
+    for (cid, voice), points in direct.items():
         per_chip.setdefault(cid, []).append((voice, points))
 
     def build(cid: int, split_gap: int):
@@ -419,8 +418,7 @@ def collect_ssg_pcm(
                 segments.append((voice, seg))
         return segments
 
-    all_segments: list[tuple[int, int, list[tuple[int, int]]]] = []
-    rate_by_cid: dict[int, int] = {}
+    all_segments: list[tuple[int, int, int, list[tuple[int, int]]]] = []
     for cid in sorted(per_chip):
         gap = PCM_SPLIT_GAP
         while True:
@@ -430,35 +428,25 @@ def collect_ssg_pcm(
             if gap >= 1 << 20:
                 break
             gap *= 2
-        # A DAC stream states its own byte rate; use it rather than inferring
-        # from the 44.1 kHz-rounded timestamps.  Direct-write streams fall
-        # back to the median spacing.
-        if stream_rates.get(cid):
-            declared = sorted(stream_rates[cid])
-            rate = max(
-                PCM_MIN_RATE,
-                min(PCM_MAX_RATE, int(round(declared[len(declared) // 2]))),
-            )
-        else:
-            rate = _shared_rate([seg for _v, seg in segments])
-        rate_by_cid[cid] = rate
+        rate = _shared_rate([seg for _v, seg in segments])
+        by_voice: dict[int, list[list[tuple[int, int]]]] = {}
         for voice, seg in segments:
-            all_segments.append((cid, voice, seg))
+            by_voice.setdefault(voice, []).append(seg)
+        for voice, segs in by_voice.items():
+            for seg in _merge_short(segs, rate):
+                all_segments.append((cid, voice, rate, seg))
 
-    # Fold fragments under the minimum length into their neighbours, per
-    # voice so two simultaneous streams never join.
-    by_voice: dict[tuple[int, int], list[list[tuple[int, int]]]] = {}
-    for cid, voice, seg in all_segments:
-        by_voice.setdefault((cid, voice), []).append(seg)
-    merged_segments: list[tuple[int, int, list[tuple[int, int]]]] = []
-    for (cid, voice), segs in by_voice.items():
-        for seg in _merge_short(segs, rate_by_cid[cid]):
-            merged_segments.append((cid, voice, seg))
+    # One note per DAC-stream play, at its declared rate.  These are explicit
+    # triggers, so the note timing survives; a body under the minimum is still
+    # not worth storing.
+    for cid, voice, rate, points in streamed:
+        if len(points) < 2 or _body_frames(points, rate) < PCM_MIN_FRAMES:
+            continue
+        all_segments.append((cid, voice, rate, points))
 
     samples: list[SsgPcmSample] = []
     hits: list[SsgPcmHit] = []
-    for cid, voice, seg in merged_segments:
-        rate = rate_by_cid[cid]
+    for cid, voice, rate, seg in all_segments:
         data = _resample(seg, rate)
         if len(data) < 2:
             continue

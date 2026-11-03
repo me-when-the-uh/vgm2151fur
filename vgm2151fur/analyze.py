@@ -1760,9 +1760,10 @@ def _emit_ssg_pcm_notes(
 ) -> tuple[int, list[tuple[NoteEvent, int]]]:
     """Emit one sample-playback note per SSG PCM segment.
 
-    The instrument index is relative to the module's SSG PCM list; the caller
-    binds it once every instrument base is known. Note 108 is C-4, where the
-    AY platform plays the body at its stored ``c4_rate``.
+    Bodies are grouped 120 to a ``DIV_INS_AY`` sample map.  The pattern note
+    is ``60 + slot`` (60..179); the map stores C-4 for every slot, so the body
+    plays at its stored ``c4_rate``.  The caller binds the instrument once the
+    bases are known.
     """
     count = 0
     bound: list[tuple[NoteEvent, int]] = []
@@ -1770,11 +1771,12 @@ def _emit_ssg_pcm_notes(
         base = at.get(h.chip_id)
         if base is None:
             continue
+        idx = sample_base + h.sample_index
         ev = NoteEvent(
             sample=h.sample_time,
             ch=base + h.voice,
             on=True,
-            note=108,
+            note=60 + (idx % 120),
             ins=-1,
             vol=15,
             e5=0x80,
@@ -1784,7 +1786,7 @@ def _emit_ssg_pcm_notes(
             no_pan=True,
         )
         events.append(ev)
-        bound.append((ev, sample_base + h.sample_index))
+        bound.append((ev, idx))
         count += 1
     return count, bound
 
@@ -6595,9 +6597,24 @@ def analyze(
             ay_count += ym2608_ssg_count
         _emit_pcm(ym2608_pcm, ym2608_pcm_hits, ssg_at)
 
+    # Drop bodies no emitted note references.  A chip whose channel map is
+    # absent (or a segment the writer will not place) would otherwise leave an
+    # unused SMP2 block and a sample-map slot behind, which is pure file size.
+    if ssg_pcm_events:
+        used = sorted({idx for _ev, idx in ssg_pcm_events})
+        if len(used) != len(ssg_pcm_samples):
+            remap = {old: new for new, old in enumerate(used)}
+            ssg_pcm_samples = [ssg_pcm_samples[i] for i in used]
+            ssg_pcm_events = [(ev, remap[idx]) for ev, idx in ssg_pcm_events]
+            for ev, idx in ssg_pcm_events:
+                ev.note = 60 + (idx % 120)
+    else:
+        ssg_pcm_samples = []
+
     # The writer places the SSG PCM instruments right before the SCC/AY/PSG
-    # tone instruments, so the tone bases move up by their count.
-    n_ssg_pcm = len(ssg_pcm_samples)
+    # tone instruments, so the tone bases move up by their count.  One
+    # instrument holds up to 120 bodies through its sample map.
+    n_ssg_pcm = (len(ssg_pcm_samples) + 119) // 120
     ssg_pcm_ins_base = tone_ins_base
     if n_ssg_pcm:
         tone_ins_base += n_ssg_pcm
@@ -6873,7 +6890,7 @@ def analyze(
     )
     # SSG PCM instruments sit immediately before the tone list.
     for ev, idx in ssg_pcm_events:
-        ev.ins = ssg_pcm_ins_base + idx
+        ev.ins = ssg_pcm_ins_base + idx // 120
 
     loop_sample = vgm.loop_sample
     if loop_sample is not None and loop_sample < 0:
@@ -6944,7 +6961,7 @@ def analyze(
         + len(k053260_audible) + n_ym2610_a_ins + n_ym2610_b_ins
         + len(scc_ins) + len(ay_ins) + len(psg_ins)
         + n_ym2608_rhythm_ins + n_ym2608_b_ins
-        + len(ssg_pcm_samples)
+        + n_ssg_pcm
     )
     if n_total_ins > 250:
         warnings.append(

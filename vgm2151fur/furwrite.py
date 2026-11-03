@@ -601,13 +601,16 @@ def _write_ins_opm(b: Buf, name: str, patch) -> None:
 
 def _write_ins_sample_map(
     b: Buf, name: str, first_sample: int, maps: list[int],
-    ins_type: int = INS_C352,
+    ins_type: int = INS_C352, flags: int = 0x01,
 ) -> None:
     """120 note slots, one sample per slot.
 
     Each slot stores freq 48, which the reader adds to note 60. Every slice
     plays at C-4 and uses the sample's own rate. `first_sample` stays 0:
     Furnace 0.6.8.3 reads a nonzero base as an embedded sample count.
+
+    `flags` selects the SM feature bits: 1 = useNoteMap, 2 = useSample,
+    3 = both.  The AY sample path needs useSample too, so SSG PCM passes 3.
     """
     size_off, start = b.begin_block(b"INS2")
     b.u16(FUR_VERSION)
@@ -623,7 +626,7 @@ def _write_ins_sample_map(
     b.u16(0)
     sm_start = len(b.b)
     b.u16(first_sample)
-    b.u8(1)   # use the note map
+    b.u8(flags & 0xFF)
     b.u8(31)  # wave length field (unused for samples)
     for slot in range(120):
         b.u16(48)  # note 60 + 48 = C-4 in the pre-246 encoding
@@ -801,35 +804,6 @@ def _write_ins_ay(b: Buf, name: str, ins=None) -> None:
     if ins is None:
         ins = ToneIns()
     _write_tone_macros(b, ins, wave=False, reset=True)
-    b.raw(b"EN")
-    b.end_block(size_off, start)
-
-
-def _write_ins_ay_pcm(b: Buf, name: str, sample_index: int) -> None:
-    """DIV_INS_AY playing one raw sample body.
-
-    This is the shape ``SSGPCM-test.fur`` uses: the SM feature names the body
-    and sets ``useSample`` only (no note map), so the pattern note selects the
-    playback rate and note 108 (C-4) plays the body at its stored ``c4_rate``.
-    """
-    size_off, start = b.begin_block(b"INS2")
-    b.u16(FUR_VERSION)
-    b.u16(INS_AY)
-    b.raw(b"NA")
-    na_size = len(b.b)
-    b.u16(0)
-    na_start = len(b.b)
-    b.strz(name)
-    b.b[na_size:na_size + 2] = int(len(b.b) - na_start).to_bytes(2, "little")
-    b.raw(b"SM")
-    sm_size = len(b.b)
-    b.u16(0)
-    sm_start = len(b.b)
-    b.u16(sample_index)
-    b.u8(0x02)  # useSample
-    b.u8(31)    # waveLen (unused for samples)
-    b.b[sm_size:sm_size + 2] = int(len(b.b) - sm_start).to_bytes(2, "little")
-    _write_ma(b)
     b.raw(b"EN")
     b.end_block(size_off, start)
 
@@ -3241,7 +3215,8 @@ def write_fur(
     ssg_pcm_smps = (
         list(getattr(song, "ssg_pcm_samples", ()) or ()) if include_pcm else []
     )
-    n_ssg_pcm_ins = len(ssg_pcm_smps)
+    # 120 bodies per AY sample-map instrument.
+    n_ssg_pcm_ins = (len(ssg_pcm_smps) + 119) // 120
     ssg_pcm_smp_base = opl4_wave_smp_base + len(opl4_wave_smps)
     oki_ids, oki_groups = _grouped(oki_smps)
     adpcm_ids, adpcm_groups = _grouped(adpcm_smps)
@@ -3968,11 +3943,19 @@ def write_fur(
             b, f"OPL4 WAVE {smp.wave:03d}", opl4_wave_smp_base + i,
             INS_MULTIPCM,
         )
-    for i, smp in enumerate(ssg_pcm_smps):
+    # The AY sample path allows 120 bodies per instrument through a note map;
+    # notes 60-179 select a slot and every slot plays at C-4.  This keeps a
+    # drum-heavy track (hundreds of distinct bodies) inside the 255-instrument
+    # module limit.
+    for group in range(n_ssg_pcm_ins):
         ins_ptrs.append(len(b))
-        _write_ins_ay_pcm(
-            b, f"PSG PCM {i:02d} {smp.start:08x}",
-            ssg_pcm_smp_base + i,
+        first = group * 120
+        maps = [
+            ssg_pcm_smp_base + first + slot
+            for slot in range(min(120, len(ssg_pcm_smps) - first))
+        ]
+        _write_ins_sample_map(
+            b, f"PSG PCM {group + 1}", 0, maps, INS_AY, flags=0x03,
         )
     for i, spec in enumerate(scc_specs):
         ins_ptrs.append(len(b))

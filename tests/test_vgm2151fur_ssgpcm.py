@@ -64,6 +64,31 @@ def _ins_types(data: bytes) -> list[int]:
     return out
 
 
+def _ins_sm_maps(data: bytes, index: int) -> list[int]:
+    """The 120 note-map sample indices of the INS2 at block position `index`."""
+    n = 0
+    for _off, mag, _size, blk in iter_blocks(decompress_fur(data)):
+        if mag != b"INS2":
+            continue
+        if n == index:
+            pos = 4
+            while pos + 2 <= len(blk):
+                feat = blk[pos:pos + 2]
+                if feat == b"EN":
+                    break
+                fsz = struct.unpack_from("<H", blk, pos + 2)[0]
+                body = blk[pos + 4:pos + 4 + fsz]
+                if feat == b"SM":
+                    return [
+                        struct.unpack_from("<h", body, 4 + i * 4 + 2)[0]
+                        for i in range(120)
+                    ]
+                pos += 4 + fsz
+            return []
+        n += 1
+    return []
+
+
 class TestSsgPcmDetect(unittest.TestCase):
     def test_mixer_off_fast_volume_writes_become_one_sample(self):
         samples, hits, _warn = collect_ssg_pcm(
@@ -194,6 +219,44 @@ class TestSsgPcmDacStream(unittest.TestCase):
         self.assertEqual(len(hits), 1)
         self.assertGreater(len(samples[0].data), 1400)
 
+    def test_stop_sample_ends_the_play_early(self):
+        body = bytes([(i // 8) % 16 for i in range(3000)])
+        vgm = self._stream(body, length=3000, rate=15964, sample=1000)
+        # A 0x94 600 frames in cuts the 3,000-byte declared length short.
+        vgm.dac_stream_plays[0].stop_sample = 1000 + int(round(600 * 44100 / 15964))
+        samples, hits, _warn = collect_ssg_pcm(vgm, chip="ym2203_ssg")
+        self.assertEqual(len(hits), 1)
+        self.assertGreater(len(samples[0].data), 500)
+        self.assertLess(len(samples[0].data), 800)
+
+
+class TestSsgPcmUnused(unittest.TestCase):
+    def test_unreferenced_bodies_are_not_written(self):
+        # A stream aimed at a second YM2203 instance the module does not have.
+        # The body must not survive as an unused SMP2 block.
+        vgm = VgmFile(
+            path=Path("unused.vgm"), buf=b"", version=0x161,
+            total_samples=50000, loop_samples=0, loop_file_pos=None,
+            loop_sample=None, ym2151_clock=3579545, k007232_clock=0,
+            gd3={}, roms=[],
+            writes=[ChipWrite(0, "ym2203", 0, 0x27, 0)],
+            ym2203_clock=YM2203_CLOCK,
+            dac_data=bytearray([15] * 600),
+            dac_stream_plays=[DacStreamPlay(
+                sample=1000, chip_type=0x06, chip_id=1, stream=0,
+                port=0, reg=10, offset=0, length=600, mode=1,
+                rate=15964, loop=False, reverse=False, step=1,
+                step_base=0, bank=0,
+            )],
+        )
+        song = analyze(vgm)
+        self.assertEqual(song.ssg_pcm_samples, [])
+        self.assertEqual(song.ssg_pcm_count, 0)
+        data = write_fur(song)
+        m = parse_fur(data)
+        self.assertEqual(len(m.samples), 0)
+        self.assertFalse([t for t in _ins_types(data) if t == INS_AY])
+
 
 class TestSsgPcmEmission(unittest.TestCase):
     def _song(self):
@@ -218,7 +281,8 @@ class TestSsgPcmEmission(unittest.TestCase):
     def test_pcm_note_is_c4_and_8_bit(self):
         song = self._song()
         pcm = [e for e in song.events if e.on and e.pcm][0]
-        self.assertEqual(pcm.note, 108)  # C-4: the sample's c4_rate
+        # Slot 0 of the sample map; every map slot stores C-4.
+        self.assertEqual(pcm.note, 60)
         self.assertEqual(pcm.vol, 15)
         self.assertTrue(pcm.no_pan)
         data = write_fur(song)
@@ -226,8 +290,8 @@ class TestSsgPcmEmission(unittest.TestCase):
         self.assertEqual(len(song.ssg_pcm_samples), 1)
         self.assertEqual(m.samples[-1].depth, 8)
         self.assertEqual(m.samples[-1].c4_rate, 8820)
-        self.assertEqual(m.ins_sample[pcm.ins], len(m.samples) - 1)
         self.assertEqual(_ins_types(data)[pcm.ins], INS_AY)
+        self.assertEqual(_ins_sm_maps(data, pcm.ins)[pcm.note - 60], 0)
 
     def test_three_pcm_notes_get_three_channels(self):
         writes = [_ay(0, 7, 0xBF)]
@@ -241,6 +305,12 @@ class TestSsgPcmEmission(unittest.TestCase):
         data = write_fur(song)
         m = parse_fur(data)
         self.assertEqual(len(m.samples), 3)
+        # All three bodies fit one sample-map instrument.
+        self.assertEqual(len({e.ins for e in pcm}), 1)
+        maps = _ins_sm_maps(data, pcm[0].ins)
+        self.assertEqual(
+            [maps[e.note - 60] for e in pcm], [0, 1, 2],
+        )
 
 
 class TestSsgPcmRealRips(unittest.TestCase):
@@ -277,10 +347,11 @@ class TestSsgPcmRealRips(unittest.TestCase):
         vgm = load_vgm(EYE)
         samples, hits, _warn = collect_ssg_pcm(vgm, chip="ym2203_ssg")
         self.assertGreaterEqual(len(hits), 5)
-        # Every body clears the tiny-fragment minimum and uses the declared
-        # ~15.9 kHz stream rate, not a truncated block.
-        self.assertTrue(all(len(s.data) >= 512 for s in samples))
-        self.assertTrue(all(s.rate > 10000 for s in samples))
+        # Every body clears the tiny-fragment minimum.  The file has both
+        # DAC-stream notes (~15.9 kHz) and direct-write PCM sections, so the
+        # rates are not all the same.
+        self.assertTrue(all(len(s.data) >= 128 for s in samples))
+        self.assertTrue(any(s.rate > 10000 for s in samples))
 
 
 if __name__ == "__main__":

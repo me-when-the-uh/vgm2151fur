@@ -352,6 +352,9 @@ class DacStreamPlay:
     step: int = 1
     step_base: int = 0
     bank: int = 0
+    # The 0x94 stop (or the next 0x93 start) that ends this play.  0 = the
+    # stream ran to its declared length.
+    stop_sample: int = 0
 
     @property
     def length_mode(self) -> int:
@@ -1026,6 +1029,9 @@ def load_vgm(path: Path | str) -> VgmFile:
     # stream id -> setup recorded by 0x90/0x91/0x92
     streams: dict[int, dict] = {}
     active_adpcm: dict[int, Msm6258Play] = {}
+    # Generic 0x93 plays that a 0x94 (or the next 0x93) ends. The stream's
+    # declared length is usually the same span, but a driver may stop early.
+    active_stream: dict[int, DacStreamPlay] = {}
     # The RF5C pair bank their sample RAM: register 0x07 (bit 6 clear) selects
     # a 4 KB write bank, and 0xC1/0xC2 then address a 16-bit offset inside it.
     # The bank is folded into the memory-write address here so the collector
@@ -1218,7 +1224,11 @@ def load_vgm(path: Path | str) -> VgmFile:
                 # register the 0x90 named, at the 0x92 rate.  The YM2612 DAC
                 # is the only one this tool reconstructs, but the record is
                 # chip-agnostic.
-                vgm.dac_stream_plays.append(DacStreamPlay(
+                # A new start on the same stream ends the previous play.
+                prev = active_stream.pop(sid, None)
+                if prev is not None:
+                    prev.stop_sample = sample
+                play = DacStreamPlay(
                     sample=sample,
                     chip_type=st["type"],
                     chip_id=st["chip_id"],
@@ -1236,7 +1246,9 @@ def load_vgm(path: Path | str) -> VgmFile:
                     step=st["step"],
                     step_base=st["base"],
                     bank=st["bank"],
-                ))
+                )
+                vgm.dac_stream_plays.append(play)
+                active_stream[sid] = play
             pos += 11
             continue
         if cmd == 0x94 and pos + 2 <= n:
@@ -1244,8 +1256,13 @@ def load_vgm(path: Path | str) -> VgmFile:
             if sid == 0xFF:
                 for key in list(active_adpcm):
                     close_adpcm(key, sample)
+                for key in list(active_stream):
+                    active_stream.pop(key).stop_sample = sample
             else:
                 close_adpcm(sid, sample)
+                play = active_stream.pop(sid, None)
+                if play is not None:
+                    play.stop_sample = sample
             pos += 2
             continue
         if cmd == CMD_DAC_WRITE and pos + 2 <= n:

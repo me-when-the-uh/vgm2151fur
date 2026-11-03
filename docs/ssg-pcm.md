@@ -20,7 +20,10 @@ SMP2: 8-bit, c4_rate = the source write rate
 
 Note 108 is C-4 in Furnace's engine numbering (`dispatch.h`: note 60 = C-0),
 which is exactly the sample's stored `c4_rate`; the body therefore plays 1:1.
-`ssgpcm.py` writes the same shape.
+A drum track can have far more bodies than the module has instrument slots, so
+`ssgpcm.py` groups 120 bodies into the same `DIV_INS_AY` instrument through
+`useNoteMap` (flags `0x03`): notes 60-179 select a slot and every slot stores
+C-4.  See "Instruments" below.
 
 ## Detection
 
@@ -70,30 +73,42 @@ same register carries drum bursts.
   level (`_LEVEL_BYTE`), so `runDAC` writes the exact source register value
   back.  Level 1 is absent from Furnace's table; it maps to level 2.
 - Bodies are one-shot and 8-bit (`SMP_DEPTH_8BIT`).
-- A body shorter than **512 frames** is a click or a segmentation fragment:
-  it is folded into the next body on the same voice (or the previous one),
-  never written as a tiny sample.  The source audio is kept, including the
-  pause, rather than dropped.
+- A direct-write body shorter than **128 frames** is a click or a
+  segmentation fragment: it is folded into the next body on the same voice
+  (or the previous one), never written as a tiny sample.  A DAC-stream play
+  under 128 frames is dropped (it is a real short click, not a sample), but
+  its ``0x93`` start still defines the other notes.
 
 ## Segmentation
 
-A PCM stretch is split into notes at pauses of at least 46 ms (`2048`
+Direct writes are split into notes at pauses of at least 46 ms (`2048`
 samples).  A short hole (the 12-16 sample waits a driver leaves between
 groups) stays inside one body.  Identical bodies share one instrument.  If a
-chip would exceed the 160-instrument PCM budget, the split gap doubles
-(92 ms, 184 ms, …) until it fits, so a dense drum track degrades to longer
-bodies instead of running out of instrument slots.
+chip would exceed the 160-instrument candidate budget, the split gap doubles
+(92 ms, 184 ms, …) until it fits.
 
-DAC-stream plays are contiguous slices of one stream, so they normally join
-into one body per continuous run (the OPNA example below is one 4.5 s body).
+A DAC stream is different: **each `0x93` start is one note**, and its
+`0x94` stop (or the next `0x93` start) is the end.  The declared length is
+truncated to the stop when the driver stops early.  Stream plays are never
+merged with each other or with direct writes: the gap between a stop and the
+next start is only a few samples, and joining them would rebuild the one
+giant body this avoids.  `0x92` sets the rate for the play that follows.
 
-## Layout
+## Instruments
 
-The writer emits the `DIV_INS_AY` sample instruments immediately before the
-SCC/AY/PSG tone instruments and the `SMP2` bodies after the OPL4 wave bodies.
-The analyzer shifts the tone instrument bases by the PCM count and binds the
-PCM notes after the FM list is final, so the instrument byte in each pattern
-cell addresses the right body.
+A drum track can have hundreds of distinct bodies (`03 Rusty [Title]` has
+148).  One instrument per body would blow through Furnace's 255-instrument
+module limit, especially beside a large FM patch list.  Each `DIV_INS_AY`
+instrument therefore carries a **sample map**: 120 bodies per instrument,
+selected by notes 60-179.  Every slot stores C-4, so a body still plays at its
+own `c4_rate`; the note is only a slot id.  `03 Rusty` fits its 148 bodies in
+2 instruments (250 total instruments with 225 FM and 22 tone AY), and
+`29 Shooting Star` fits 275 in 3.
+
+The writer emits the `DIV_INS_AY` sample-map instruments immediately before
+the SCC/AY/PSG tone instruments and the `SMP2` bodies after the OPL4 wave
+bodies.  The analyzer shifts the tone instrument bases by the PCM instrument
+count and binds the PCM notes after the FM list is final.
 
 ## Validation
 
@@ -102,13 +117,16 @@ ramps, gap splitting, dedupe, the level round-trip and the three-voice case.
 A rendered rate check (200 Hz square written at 8820 Hz) comes back at
 200.5 Hz through the real Furnace build.  The reference rips:
 
-| file | chip | source | bodies | notes |
-| --- | --- | --- | --- | --- |
-| `02 Blood Soon Castle [Intro]` | YM2203 SSG3 | DAC stream | 27 | 47 |
-| `20 Eye Catch` | YM2203 SSG3 | DAC stream | 9 | 9 |
-| `SELECT-ay` | AY-8910 PSG3 | direct writes | 32 | 32 |
-| `19 Dance Dance [Clear]` | YM2608 SSG3 | DAC stream | 1 | 1 |
-| `rforce` | YM2203 SSG1-3 | direct writes | 3 | 3 |
+| file | chip | source | bodies | notes | instr |
+| --- | --- | --- | --- | --- | --- |
+| `02 Blood Soon Castle [Intro]` | YM2203 SSG3 | stream + direct | 73 | 124 | 1 |
+| `20 Eye Catch` | YM2203 SSG3 | stream + direct | 70 | 78 | 1 |
+| `SELECT-ay` | AY-8910 PSG3 | direct writes | 32 | 32 | 1 |
+| `19 Dance Dance [Clear]` | YM2608 SSG3 | DAC stream | 56 | 57 | 1 |
+| `rforce` | YM2203 SSG1-3 | direct writes | 3 | 3 | 1 |
+| `03 Rusty [Title]` | YM2608 SSG3 | DAC stream | 148 | 780 | 2 |
+| `29 Shooting Star [Visual 4]` | YM2608 SSG3 | DAC stream | 275 | 567 | 3 |
 
 `rforce` keeps one 5.2 s body per voice (three simultaneous PCM voices);
-`SELECT-ay` keeps one body per phrase; the OPNA stream is one 4.5 s body.
+`SELECT-ay` keeps one body per phrase; each OPNA `0x93` start is its own note
+(`19 Dance` is 57 notes, not one 4.5 s body).
