@@ -162,7 +162,11 @@ A pure-noise AY voice has no audible pitch, and its period writes stay off
 the pattern. A tone voice keeps every period written while the tone bit was
 set, including a glide that finishes with the tone bit off. A step held for
 two frames is its own cell. A shorter step is that note's pitch macro. The
-low and high bytes of one period are one update. A later cell from a pitch
+low and high bytes of one period are one update. While the hardware envelope
+drives the voice, the envelope is one continuous contour: a held step stays
+on the same cell so the envelope is not retriggered, and the whole pitch
+trajectory becomes that note's macro. An envelope retrigger (a shape write)
+still restarts it as a macro on the same note. A later cell from a pitch
 split writes the envelope shape only when register 13 was written in that
 cell; mode, noise and envelope period still follow their registers.
 
@@ -226,8 +230,9 @@ The MSX2 packs were checked three ways per track: the register stream of a
 Furnace `-vgmout` export against the source, the note registers at every gate
 (`tools/fur_soundcheck.py`), and the rendered audio (chroma pitch alignment,
 median over the track's windows). The table is that gate-level check. A held
-period change is now its own cell, so a module has more notes than gates; the
-pitch at each gate is the same note the table counted.
+period change is its own cell unless the hardware envelope is driving the
+voice, so a module can have more notes than gates; the pitch at each gate is
+the same note the table counted.
 
 | track | SCC notes exact | AY notes exact | notes | chroma, .fur | chroma, export |
 | --- | --- | --- | --- | --- | --- |

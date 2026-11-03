@@ -729,9 +729,10 @@ class TestToneMacros(unittest.TestCase):
         span = max(pitched[0].pitch) - min(pitched[0].pitch)
         self.assertGreater(span, 256)
 
-    def test_ay_pitch_split_writes_the_envelope_once(self):
-        # A held period change is a second cell. Register 13 was written at
-        # the gate, and the second cell leaves it alone.
+    def test_ay_envelope_pitch_change_stays_one_note(self):
+        # The hardware envelope is a continuous volume contour. A held period
+        # change must stay on one note; splitting it would retrigger the
+        # envelope (the phase-reset macro) and turn one decay into two attacks.
         writes = [
             ChipWrite(0, "ay8910", 0, 7, 0xFE),
             ChipWrite(0, "ay8910", 0, 0, 254),
@@ -746,11 +747,16 @@ class TestToneMacros(unittest.TestCase):
         ]
         song = analyze(_vgm(writes, ay8910_clock=1789772))
         notes = [e for e in song.events if e.on and e.tone_chip == 2]
-        self.assertEqual(len(notes), 2)
+        self.assertEqual(len(notes), 1)
+        self.assertEqual(notes[0].vol, 15)
         shapes = [
             sample for sample, _ch, cmd, _val in song.channel_fx if cmd == 0x22
         ]
         self.assertEqual(shapes, [notes[0].sample])
+        pitched = [spec for spec in song.ay_ins if spec.pitch]
+        self.assertEqual(len(pitched), 1)
+        span = max(pitched[0].pitch) - min(pitched[0].pitch)
+        self.assertGreater(span, 256)
 
     def test_ay_envelope_sweep_is_a_macro(self):
         writes = [

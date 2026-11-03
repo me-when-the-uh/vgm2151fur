@@ -1866,7 +1866,19 @@ def _emit_ay_notes(
         ch = base + h.voice
         st = h.sample_time
         gate_end = h.off_sample or (total_samples or st)
-        if h.opened_tone or h.freq_pts:
+        # A hardware envelope is a continuous volume contour. Splitting the
+        # hit on a pitch step would trigger a new note and restart that
+        # envelope (the phase-reset macro), turning one percussion decay into
+        # several attacks. Keep the whole hit as one note and put the pitch
+        # motion on its macro instead.
+        env_hit = h.env or any(
+            cmd == FX_MODE and ((val + 1) & 4) for _t, cmd, val in h.fx_pts
+        )
+        first_mode = next(
+            (val for _t, cmd, val in h.fx_pts if cmd == FX_MODE), None,
+        )
+        env_open = first_mode is not None and ((first_mode + 1) & 4)
+        if (h.opened_tone or h.freq_pts) and not env_hit:
             segs = segment_periods(
                 [(h.sample_time, h.period), *h.freq_pts],
                 gate_end, clock, divider, 0,
@@ -1875,7 +1887,8 @@ def _emit_ay_notes(
                 drop_short=False,
             )
         else:
-            segs = [(h.sample_time, h.period, [])]
+            intra = list(h.freq_pts) if env_hit else []
+            segs = [(h.sample_time, h.period, intra)]
         buckets: list[list[tuple[int, int, int]]] = [[] for _ in segs]
         for t, fx, val in h.fx_pts:
             idx = 0
@@ -1893,6 +1906,12 @@ def _emit_ay_notes(
             steps = _tone_steps(intra, sst, 0, _AY_MERGE_GAP)
             trim = _SSG_VOLUME_TRIM if divider >= 16 else 0
             vol = max(0, _value_at(h.vol_pts, sst, h.vol) - trim)
+            if env_open:
+                # The envelope generator drives the level; the register's low
+                # nibble is ignored. Writing that nibble (usually 0) as the
+                # column makes the pattern look like a silent note. The column
+                # is 15 whenever a volume macro carries the level.
+                vol = 15
             vol_pts = tuple(
                 (t, max(0, v - trim), None)
                 for t, v in h.vol_pts if sst < t < bound
