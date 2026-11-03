@@ -1,25 +1,32 @@
 # TODO
 
-Open follow-ups. The loop, legato and mixed-family selection work is in the
-tree. These items are the parts that are not.
+Open follow-ups. The loop, legato, multi-family writing and the newer chip
+paths are in the tree. These items are the parts that are not.
 
-## Mixed OPL + arcade logs convert one family
+## Mixed chip families in one module
 
-The analyzer now counts rising key-ons per family and converts the side with
-more, and the report names both counts and the loss. Bubble Bobble track 02
-keeps its OPL main theme and reports the 12 dropped YM2203 notes.
+`Song.fm_systems` now carries every pitched system, so a YM2151 or YM2612 log
+beside an OPL family writes both sets of registers, instruments and volume
+ceilings into one module. The analyzer scores each family from its own rising
+key-ons and drops a chip that only received its init block. `docs/merged-logs.md`
+is the reference and `tests/test_vgm2151fur_combo.py` converts real merged rips
+and reads each chip's registers back.
 
 Remaining:
 
-- Support two FM families in one module. The writer already carries a chip
-  list and a channel offset. A mixed module would need both family blocks,
-  both instrument lists and per-system volume maxima. Check Furnace's system
-  table and multi-chip playback first.
-- OPL2 with OPL3 now selects the denser kind and warns. Two crystals of the
-  same core still share one system and the header clock. A second crystal
-  would need a second system.
-- The warning now carries writes, key-ons and the selected family. Keep it
-  that way when two-family modules land.
+- A YM2610 or YM2608 beside an OPL family still converts one side only. Their
+  sample engines and SSG already claim columns a second pitched chip cannot
+  share cleanly.
+- OPL2 with OPL3 selects the denser kind and warns. Two crystals of the same
+  core still share one system and the header clock. A second crystal would need
+  a second system.
+- `diag.pitch_runs()` chooses its stream from the source log's chip census, so
+  `report --verify` on a combined module follows one family whatever channel it
+  is asked about. Per-family verification today lives in `TestMergedRips`.
+- An OPL4 (YMF278B) side of a merged log is not converted; the module keeps
+  only whatever else writes.
+- The warning carries writes, key-ons and the selected family. Keep it that
+  way.
 
 Related OPL audit gaps on the same pack:
 
@@ -73,6 +80,30 @@ Remaining:
 - The key-on audit and the `keys`/`miss` counts say nothing about operator macros.
   The instrument listing shows `op1 $4n x168@2t`; a per-track total would make
   the difference visible without reading every patch.
+
+## OPNA, OPLL and the newer sample paths
+
+YM2608, YM2413, Y8950, RF5C68/RF5C164, SegaPCM, C140/C219, SSG PCM and OPL4
+wave playback are in the tree, with unit tests and Furnace-backed checks where
+the real rips are available. Open:
+
+- **OPLL drums in the corpus sweep.** `mado123-opll` and any rip that toggles
+  `$0E` exercise the two-machine writer outside the hand-built test.
+- **Corpus sweep.** Convert every rip under `gs-opna\done`, `ed4-opna\done` and
+  `mado123-opll` and audit each. Two reference tracks are not a corpus.
+- **YM2608 CSM.** Channel-3 Ext, the rhythm kit and delta-T ADPCM-B convert.
+  CSM timer key-ons are not synthesized, the same as the rest of the OPN family.
+- **OPL4 ROM waves need a YRW801 image.** `VGM2151FUR_YRW801` must point at the
+  `.rom` or `.zip`; a missing image drops ROM wave notes and warns. RAM-only
+  rips need the RAM dump in the VGM.
+- **Looping SSG PCM DAC streams play once.** The AY sample instrument is
+  one-shot, so a looping `$93` stream is flattened and reported.
+- **SegaPCM mid-note writes.** Volume and frequency rewrites under a held voice
+  are not converted; the C140's are. Start/end/loop/bank changes mid-note stay
+  at the key-on values on both chips.
+- **AY volume decays.** Per-tick volume steps still lose drum decays at
+  condense factors. Moving them into the instrument's volume macro is the next
+  step (`docs/psg-open-items.md`).
 
 ## From the 2026-11 batch (PSG default, Ext columns, OPM key-on bits, OKI length)
 

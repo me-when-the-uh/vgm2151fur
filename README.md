@@ -1,20 +1,33 @@
 # vgm2151fur
 
-Converts arcade VGM/VGZ rips into Furnace Tracker modules.
+Converts arcade and console VGM/VGZ rips into Furnace Tracker modules.
 Supported chips:
 - Yamaha YM2151 (OPM)
 - Yamaha YM2203 (OPN)
 - Yamaha YM2612 (OPN2), including channel-3 special/CSM frequency layouts
 - Yamaha YM2610 / YM2610B (OPNB)
+- Yamaha YM2608 (OPNA): FM, SSG, channel-3 Ext, the rhythm kit and delta-T ADPCM
+- Yamaha YM2413 (OPLL): presets, the user bank and the drum kit
 - Yamaha YM3526 (OPL), YM3812 (OPL2) and YMF262 (OPL3), including rhythm mode
   as its own system and OPL3 four-operator voices
+- Yamaha Y8950: OPL FM plus its delta-T ADPCM voice
+- Yamaha YMF278B (OPL4): OPL3 FM plus 24 wave channels. ROM wave samples are
+  extracted into the module from a YRW801 image (`VGM2151FUR_YRW801`)
+- Yamaha YM2149 / General Instrument AY-3-8910 (PSG), including volume-register
+  PCM playback
+- Texas Instruments SN76489 (PSG)
 - Konami K007232 (experimental)
 - Konami K053260
-- Konami SCC / SCC+ (K051649/K052539) (experimental)
+- Konami SCC / SCC+ (K051649/K052539)
 - OKI MSM6295
 - OKI MSM6258 (Sharp X68000 ADPCM)
-- Namco C140
+- SegaPCM (315-5218)
+- Namco C140 and C219
 - Namco C352 (requires a development build of Furnace from a compatible fork. A build with C352 support (built from https://github.com/me-when-the-uh/furnace-ports) is located in `./furnace-c352` - use at your own risk, since it's always a good idea to build from source instead of relying on someone else's builds)
+- Ricoh RF5C68 (FM Towns) and RF5C164 (Sega CD)
+
+A log that mixes several chip families is written as one module when the
+combination is supported. `docs/merged-logs.md` lists the rules.
 
 It runs on Windows and Linux with Python 3.11 or newer.
 
@@ -88,14 +101,17 @@ tests/          pytest suite
 docs/           operating guide, format notes, chip notes
 ```
 
-Project state and workflow are in `docs/portable-context.md` and `docs/implementation-notes.md`. Chip details are in `docs/opm-notes.md`, `docs/ym2203.md`, `docs/ym2612.md`, `docs/ym2610.md`, `docs/k053260.md` and `docs/opl.md`.
+Project state and workflow are in `docs/portable-context.md` and `docs/implementation-notes.md`. Chip details are in `docs/opm-notes.md`, `docs/ym2203.md`, `docs/ym2612.md`, `docs/ym2610.md`, `docs/opna-opll.md`, `docs/opl.md`, `docs/k053260.md`, `docs/scc-ay8910.md`, `docs/segapcm-c140.md`, `docs/ssg-pcm.md` and `docs/c352.md`. `docs/merged-logs.md` covers multi-family modules, and `docs/psg-open-items.md` tracks the remaining AY accuracy gaps.
 
 Open follow-ups are tracked in [TODO.md](./TODO.md).
 
 ## Known limits
 
-- The YM2151, YM2203, YM2612 and YM2610 models cover the OPM/OPN/OPN2/OPNB register sets the arcade and Genesis drivers use; the YM3526, YM3812 and YMF262 models cover the OPL family (`docs/opl.md`). Other chips (YM2608, YM2413/OPLL, YMF278b) are not supported.
-- An OPL track whose log mixes chip families (OPL2 with OPL3, or two different crystals) is converted on the family that plays most of it and the report says so. Below about C-3 one f-num step is wider than a half tone, so a very deep register lands on the nearest cell; a waveform or envelope change written inside a held note is picked up at the next key-on instead, while a modulator level the log moves mid-note travels as an operator macro. `docs/opl.md` lists both with the measured numbers.
+- The YM2151, YM2203, YM2612, YM2610 and YM2608 models cover the OPM/OPN register sets the arcade and console drivers use; the YM3526, YM3812, YMF262, Y8950 and YMF278B models cover the OPL family (`docs/opl.md`). The YM2608 converts channel-3 Ext, its rhythm kit and delta-T ADPCM-B, but CSM timer key-ons are not synthesized (`docs/opna-opll.md`).
+- The YMF278B's ROM wave samples need the YRW801 image; point `VGM2151FUR_YRW801` at the `.rom` or `.zip`. Furnace's OPL4 core does not load the ROM itself, so the converter embeds the extracted bodies. RAM wave IDs need the RAM dump in the VGM. The Y8950's ADPCM voice is silent when the file carries no delta-T data block (`$88`).
+- SegaPCM mid-note volume and frequency writes are not converted; the C140's are. The C140 sign-flip and sign-magnitude mode bits are ignored, as libvgm ignores them (`docs/segapcm-c140.md`).
+- The RF5C68 and RF5C164 share one Furnace system, selected by `chipType`. A looping SSG PCM DAC stream plays once because the AY sample instrument is one-shot (`docs/ssg-pcm.md`).
+- An OPL track whose log mixes OPL2 with OPL3, or two different crystals, is converted on the family that plays most of it and the report says so. Two pitched families share a module only for the combinations in `docs/merged-logs.md`. Below about C-3 one f-num step is wider than a half tone, so a very deep register lands on the nearest cell; a waveform or envelope change written inside a held note is picked up at the next key-on instead, while a modulator level the log moves mid-note travels as an operator macro. `docs/opl.md` lists both with the measured numbers.
 - YM2203 notes are labelled at the highest carrier's octave when a patch uses a power-of-two carrier MULT. A constant pitch macro on the instrument keeps the source f-num/block/audio unchanged, so the pattern note matches the audible carrier.
 - The YM2203's channel-3 3-slot chord is reduced to one operator, CSM timer key-ons are not synthesized, and LFO writes are skipped; the report throws a warning when it sees them. Very fast SSG ornaments shorter than a pattern row are simplified (`docs/ym2203.md`).
 - The Genesis SN76489 PSG is converted as four extra channels (three tone + noise). Extreme periods below the musical table range and two PSG notes on the same channel/row are approximated. The converter's default `.fur` SN76489 system volume is 0.500; an absolute VGM extra-header volume entry still overrides it.
