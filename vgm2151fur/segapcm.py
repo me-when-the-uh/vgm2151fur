@@ -88,6 +88,11 @@ class _Burst:
     retrigger: bool = False
     when: int | None = None
     window: int | None = None
+    # Mid-note volume (L, R) and frequency writes seen before this burst
+    # commits.  A retrigger dump discards them: its values are the new note's
+    # snapshot, not a step away from the previous note.
+    pending_vol: list[tuple[int, int, int]] = field(default_factory=list)
+    pending_freq: list[tuple[int, int]] = field(default_factory=list)
 
 
 def _ticks_until_stop(addr: int, freq: int, stop_page: int) -> int:
@@ -210,6 +215,25 @@ class SegapcmHit:
     vol_l: int
     vol_r: int
     ctrl: int = 0
+    # Mid-note register writes while the voice stays keyed: the (L, R) volume
+    # pair (the balance is part of the write) and the 8-bit frequency.
+    vol_pts: list[tuple[int, int, int]] = field(default_factory=list)
+    freq_pts: list[tuple[int, int]] = field(default_factory=list)
+
+
+def hit_played_freq(hit: SegapcmHit) -> int:
+    """The frequency a hit actually plays at (0 when the driver never set one).
+
+    The register dump carries the pitch, so the key-on snapshot is usually
+    right.  A voice keyed with a zero frequency takes the first later write,
+    which is the note's own pitch rather than a bend.
+    """
+    if hit.freq & 0xFF:
+        return hit.freq & 0xFF
+    for _t, f in hit.freq_pts:
+        if f & 0xFF:
+            return f & 0xFF
+    return 0
 
 
 @dataclass
@@ -232,7 +256,7 @@ class SegapcmSample:
         """
         if not self.hits:
             return 0
-        freqs = Counter(h.freq for h in self.hits if h.freq)
+        freqs = Counter(f for h in self.hits if (f := hit_played_freq(h)))
         if not freqs:
             return 0
         return freqs.most_common(1)[0][0]
@@ -260,6 +284,9 @@ def collect_segapcm(vgm: VgmFile) -> tuple[bytes, list[SegapcmSample], list[str]
     voices = [_Voice() for _ in range(SEGAPCM_VOICES)]
     open_burst: list[_Burst | None] = [None] * SEGAPCM_VOICES
     hits: list[SegapcmHit] = []
+    active: list[SegapcmHit | None] = [None] * SEGAPCM_VOICES
+    vol_last = [(0, 0)] * SEGAPCM_VOICES
+    freq_last = [0] * SEGAPCM_VOICES
     bankmask = segapcm_bankmask(
         getattr(vgm, "segapcm_bankshift", 0),
         getattr(vgm, "segapcm_bankmask", 0),
@@ -284,23 +311,46 @@ def collect_segapcm(vgm: VgmFile) -> tuple[bytes, list[SegapcmSample], list[str]
     def commit(i: int) -> None:
         burst = open_burst[i]
         open_burst[i] = None
-        if burst is None or not burst.retrigger or burst.window is None:
+        if burst is None:
             return
         voice = voices[i]
-        if voice.ctrl & 1:
+        if burst.retrigger and burst.window is not None:
+            if voice.ctrl & 1:
+                active[i] = None
+                return
+            hit = SegapcmHit(
+                sample_time=burst.when if burst.when is not None else burst.start,
+                voice=i,
+                start=burst.window & 0xFFFF,
+                end=voice.end & 0xFF,
+                loop=voice.loop & 0xFFFF,
+                loop_on=not bool(voice.ctrl & 2),
+                freq=voice.freq & 0xFF,
+                vol_l=voice.lvol & 0x7F,
+                vol_r=voice.rvol & 0x7F,
+                ctrl=voice.ctrl & 0xFF,
+            )
+            hits.append(hit)
+            active[i] = hit
+            vol_last[i] = (hit.vol_l, hit.vol_r)
+            freq_last[i] = hit.freq
             return
-        hits.append(SegapcmHit(
-            sample_time=burst.when if burst.when is not None else burst.start,
-            voice=i,
-            start=burst.window & 0xFFFF,
-            end=voice.end & 0xFF,
-            loop=voice.loop & 0xFFFF,
-            loop_on=not bool(voice.ctrl & 2),
-            freq=voice.freq & 0xFF,
-            vol_l=voice.lvol & 0x7F,
-            vol_r=voice.rvol & 0x7F,
-            ctrl=voice.ctrl & 0xFF,
-        ))
+        # A burst without a retrigger is a mid-note register update.  Flush
+        # the volume and frequency steps it carried to the sounding note.
+        # The steps were captured while it was still playing, so the last
+        # one before a disable (usually a fade to zero) still counts.
+        hit = active[i]
+        if hit is not None:
+            for t, left, right in burst.pending_vol:
+                if (left, right) != vol_last[i]:
+                    hit.vol_pts.append((t, left, right))
+                    vol_last[i] = (left, right)
+            for t, freq in burst.pending_freq:
+                if freq != freq_last[i]:
+                    hit.freq_pts.append((t, freq))
+                    freq_last[i] = freq
+        if voice.ctrl & 1:
+            active[i] = None
 
     def close_expired(t: int) -> None:
         for i, burst in enumerate(open_burst):
@@ -325,6 +375,25 @@ def collect_segapcm(vgm: VgmFile) -> tuple[bytes, list[SegapcmSample], list[str]
                 burst.when = w.sample
             if seek or burst.window is None:
                 burst.window = window
+        # Collect volume/pitch changes made while the voice keeps playing.
+        # The burst decides later whether they are steps or the next note's
+        # key-on values.
+        if not (voices[vi].ctrl & 1) and not (off & 0x80):
+            r = off & 7
+            if r in (2, 3):
+                pair = (voices[vi].lvol & 0x7F, voices[vi].rvol & 0x7F)
+                if pair != vol_last[vi]:
+                    if burst.pending_vol and burst.pending_vol[-1][0] == w.sample:
+                        burst.pending_vol[-1] = (w.sample, pair[0], pair[1])
+                    else:
+                        burst.pending_vol.append((w.sample, pair[0], pair[1]))
+            elif r == 7:
+                freq = voices[vi].freq & 0xFF
+                if freq != freq_last[vi]:
+                    if burst.pending_freq and burst.pending_freq[-1][0] == w.sample:
+                        burst.pending_freq[-1] = (w.sample, freq)
+                    else:
+                        burst.pending_freq.append((w.sample, freq))
     for i in range(SEGAPCM_VOICES):
         commit(i)
 

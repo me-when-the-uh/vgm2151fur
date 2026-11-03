@@ -59,10 +59,14 @@ CMD_YM2608_B_P0 = 0xA6
 CMD_YM2608_B_P1 = 0xA7
 # 0x51 is the YM2413; its dual instance uses 0xA1 (YM family: +0x50). The chip
 # addresses one flat space; the banked user-instrument registers are < 0x10 and
-# rhythm control is $0E.
+# rhythm control is $0E.  Bit 31 of the clock field flags a Konami VRC7, which
+# is the same core with six channels and a different preset ROM.
 CMD_YM2413 = 0x51
 CMD_YM2413_2 = 0xA1
 CMD_SN76489 = 0x50
+# 0xB4 is the NES APU (2A03): register, data.  Reg 0x00-0x17 map $4000-$4017;
+# bit 7 of the register selects the second APU instance.
+CMD_NES = 0xB4
 CMD_DAC_WRITE = 0x2A
 CMD_DAC_ENABLE = 0x2B
 # 0x55 is the first YM2203's register port; 0xA5 is the second instance in a
@@ -97,6 +101,13 @@ DAC_STREAM_YM2612 = 0x02
 K007232_ROM_TYPE = 0x94  # 0x80 + 0x14
 OKI_ROM_TYPE = 0x8B  # OKIM6295 ROM
 SEGAPCM_ROM_TYPE = 0x80  # SegaPCM ROM
+# NES APU DPCM sample RAM (data-block type 0xC2): 16-bit start then bytes.
+# It shares the 0xC2 number with the RF5C164 memory command, but this is the
+# data-block type byte, not a stream command.
+NES_DPCM_RAM_TYPE = 0xC2
+# Type 0x07 is the NES APU DPCM *database*: a flat bank the 0x68 RAM-write
+# command copies into $C000/$D000 while the song plays.
+NES_DPCM_BANK_TYPE = 0x07
 RF5C68_RAM_TYPE = 0xC0  # RF5C68 sample-RAM write (16-bit start + data)
 RF5C164_RAM_TYPE = 0xC1  # RF5C164 sample-RAM write (16-bit start + data)
 Y8950_DELTAT_ROM_TYPE = 0x88  # Y8950 delta-T (ADPCM-B) ROM
@@ -175,7 +186,17 @@ YM2610_DUAL_BIT = 0x40000000
 YM2608_CLOCK_OFF = 0x48
 YM2608_DUAL_BIT = 0x40000000
 YM2413_CLOCK_OFF = 0x10
+# Bit 31 of the YM2413 clock field flags a Konami VRC7 (same OPLL core, six
+# channels, its own preset ROM); the low 30 bits stay the clock.
+YM2413_VRC7_BIT = 0x80000000
 YM2610_DEFAULT_CLOCK = 8000000
+# NES APU header 0x80 (VGM 1.51+).  Bit 30 marks a second APU, bit 31 an FDS
+# channel.  The clock is the CPU clock: COLOR_NTSC / 2 on an NTSC console.
+NES_CLOCK_OFF = 0x80
+NES_DUAL_BIT = 0x40000000
+NES_FDS_BIT = 0x80000000
+NES_DEFAULT_CLOCK = 1789773  # COLOR_NTSC / 2
+EXTRA_NES = 0x14             # extra-header clock-list chip id
 # The OPL family joined the header in 1.51: YM3812 at 0x50, YM3526 at 0x54 and
 # YMF262 at 0x5C. Bit 30 of the YM3812 field is the dual-chip flag that lets
 # command 0xAA address the second one (the Sound Blaster Pro pair); rips also
@@ -325,6 +346,23 @@ class Msm6258Play:
 
 
 @dataclass
+class PcmRamWrite:
+    """One 0x68 PCM RAM write (a chunk copied from a data-block bank).
+
+    NES DPCM drivers bank their sample RAM by copying 4 KB windows out of a
+    type-0x07 database into ``$C000``/``$D000`` as the song plays, so the DPCM
+    collector has to replay these in time order before reading a sample.
+    """
+
+    sample: int
+    type: int
+    chip_id: int
+    src: int
+    dest: int
+    length: int
+
+
+@dataclass
 class DacStreamPlay:
     """One generic DAC-stream start (0x93) for a chip other than the OKIM6258.
 
@@ -409,9 +447,20 @@ class VgmFile:
     ym2608_clock: int = 0
     ym2608_dual: bool = False
     # YM2413 header 0x10 (the first chip-clock field the format ever had).
-    # The dual instance writes via 0xA1 with bit 30 set here.
+    # The dual instance writes via 0xA1 with bit 30 set here.  Bit 31 asks for
+    # a Konami VRC7: same OPLL register stream, different preset ROM.
     ym2413_clock: int = 0
     ym2413_dual: bool = False
+    ym2413_vrc7: bool = False
+    # NES APU (2A03) header 0x80 (VGM 1.51+).  Writes arrive on command 0xB4;
+    # bit 30 of the clock field is a second APU and bit 31 an FDS channel.
+    nes_clock: int = 0
+    nes_dual: bool = False
+    nes_fds: bool = False
+    # DPCM sample data.  The type-0x07 database is concatenated here and the
+    # 0x68 commands copy windows of it into the $C000/$D000 RAM as they play.
+    nes_dpcm_bank: bytearray = field(default_factory=bytearray)
+    pcm_ram_writes: list[PcmRamWrite] = field(default_factory=list)
     # Genesis SN76489 header 0x0C.  The data bytes arrive as 0x50 writes;
     # they are a serial register stream, not address/data pairs.
     sn76489_clock: int = 0
@@ -734,7 +783,13 @@ def chips_in_head(buf: bytes) -> set[str]:
     # chips_in_head callers cross-check against the parsed writes.
     if version >= 0x150 and _field_in_header(buf, YM2413_CLOCK_OFF, 4):
         if 100_000 <= _header_clock(buf, YM2413_CLOCK_OFF) <= 40_000_000:
-            kinds.add("opll")
+            kinds.add("vrc7" if (_header_raw(buf, YM2413_CLOCK_OFF) & YM2413_VRC7_BIT) else "opll")
+    # NES APU (header 0x80, 1.51+). The extra-header clock list is not in this
+    # prefix, so a file that carries it only there still converts; the census
+    # just will not list it.
+    if version >= 0x151 and _field_in_header(buf, NES_CLOCK_OFF, 4):
+        if 100_000 <= _header_clock(buf, NES_CLOCK_OFF) <= 40_000_000:
+            kinds.add("nes")
     if version >= 0x151 and 100_000 <= _header_clock(buf, SEGAPCM_CLOCK_OFF) <= 40_000_000:
         kinds.add("segapcm")
     if version >= 0x151 and 100_000 <= _header_clock(buf, RF5C68_CLOCK_OFF) <= 40_000_000:
@@ -862,10 +917,19 @@ def load_vgm(path: Path | str) -> VgmFile:
     ym2608_raw = _header_raw(buf, YM2608_CLOCK_OFF) if ver >= 0x151 else 0
     ym2608_dual = bool(ym2608_raw & YM2608_DUAL_BIT)
     ym2608_clock = _sane_clock(ym2608_raw)
-    # YM2413: the header's first chip clock, 0x10.
+    # YM2413: the header's first chip clock, 0x10.  Bit 31 asks for a Konami
+    # VRC7 (six channels, its own preset ROM) on the same OPLL register stream.
     ym2413_raw = _header_raw(buf, YM2413_CLOCK_OFF) if ver >= 0x150 else 0
     ym2413_dual = bool(ym2413_raw & YM2608_DUAL_BIT)
+    ym2413_vrc7 = bool(ym2413_raw & YM2413_VRC7_BIT)
     ym2413_clock = _sane_clock(ym2413_raw)
+    # NES APU clock 0x80 (1.51+), falling back to extra-header id 0x14.
+    nes_raw = _header_raw(buf, NES_CLOCK_OFF) if ver >= 0x151 else 0
+    nes_clock = _sane_clock(nes_raw)
+    if not nes_clock:
+        nes_clock = _sane_clock(clocks.get(EXTRA_NES, 0))
+    nes_dual = bool(nes_raw & NES_DUAL_BIT)
+    nes_fds = bool(nes_raw & NES_FDS_BIT)
     # OPL family. The three chips share the header's 1.51 block and each of
     # their clock fields carries a second-instance bit; only the YM3812 has a
     # command for the pair (0xAA), and bit 31 there pans them hard.
@@ -981,6 +1045,10 @@ def load_vgm(path: Path | str) -> VgmFile:
         ym2608_dual=ym2608_dual,
         ym2413_clock=ym2413_clock,
         ym2413_dual=ym2413_dual,
+        ym2413_vrc7=ym2413_vrc7,
+        nes_clock=nes_clock,
+        nes_dual=nes_dual,
+        nes_fds=nes_fds,
         opl_clock=opl_clock,
         opl2_clock=opl2_clock,
         opl2_dual=opl2_dual,
@@ -1064,18 +1132,27 @@ def load_vgm(path: Path | str) -> VgmFile:
                 # one through 0x95 block ids.
                 vgm.dac_blocks.append(payload)
                 vgm.dac_data.extend(payload)
+            elif typ == NES_DPCM_BANK_TYPE:
+                # NES DPCM database. 0x68 commands copy windows of this flat
+                # bank into the $C000/$D000 sample RAM as the driver switches
+                # banks, so keep the concatenation in file order.
+                vgm.nes_dpcm_bank.extend(payload)
             elif typ == 0x04:
                 # OKIM6258 ADPCM bank. 0x95 block ids index these in order.
                 vgm.adpcm_blocks.append(bytes(payload))
             elif typ == 0x44:
                 saw_adpcm_compressed = True
-            elif typ in (RF5C68_RAM_TYPE, RF5C164_RAM_TYPE):
+            elif typ in (RF5C68_RAM_TYPE, RF5C164_RAM_TYPE, NES_DPCM_RAM_TYPE):
                 # C0-DF RAM writes: a 16-bit start offset then the bytes. The
                 # two RF5C chips share one register file but each has its own
                 # sample RAM, so the kind keeps them apart for the collector.
+                # 0xC2 is the NES APU's DPCM RAM (16 KB at $C000).
                 if len(payload) >= 2:
                     start = int.from_bytes(payload[0:2], "little")
-                    kind = "rf5c68" if typ == RF5C68_RAM_TYPE else "rf5c164"
+                    kind = (
+                        "rf5c68" if typ == RF5C68_RAM_TYPE else
+                        "rf5c164" if typ == RF5C164_RAM_TYPE else "nes_dpcm"
+                    )
                     vgm.roms.append(RomSlice(chip_id, 0, start, payload[2:], kind))
             else:
                 kind = {
@@ -1445,6 +1522,15 @@ def load_vgm(path: Path | str) -> VgmFile:
             vgm.writes.append(ChipWrite(sample, "segapcm", 0, addr & 0x7FF, buf[pos + 3]))
             pos += 4
             continue
+        if cmd == CMD_NES and pos + 3 <= n:
+            # 0xB4: register, data. Bit 7 of the register selects the second
+            # APU instance (0x00-0x17 = $4000-$4017).
+            rr = buf[pos + 1]
+            vgm.writes.append(ChipWrite(
+                sample, "nes", (rr >> 7) & 1, rr & 0x7F, buf[pos + 2],
+            ))
+            pos += 3
+            continue
         if cmd in (CMD_RF5C68, CMD_RF5C164) and pos + 3 <= n:
             # 0xB0/0xB1: (register, data). One shared register file; the clock
             # tells the two chips apart. Register 0x07 selects the RAM bank.
@@ -1503,7 +1589,17 @@ def load_vgm(path: Path | str) -> VgmFile:
             continue
         if cmd == CMD_STREAM_SETUP:
             vgm.stream_setups += 1
-        if cmd == 0x68:
+        if cmd == 0x68 and pos + 12 <= n:
+            # 68 tt dd dd dd aa aa aa ll ll ll: copy a data-block window into
+            # chip RAM.  The NES DPCM bank uses this to switch 4 KB windows.
+            typ = buf[pos + 2]
+            src = int.from_bytes(buf[pos + 3:pos + 6], "little")
+            dest = int.from_bytes(buf[pos + 6:pos + 9], "little")
+            length = int.from_bytes(buf[pos + 9:pos + 12], "little")
+            vgm.pcm_ram_writes.append(PcmRamWrite(
+                sample=sample, type=typ & 0x7F, chip_id=(typ >> 7) & 1,
+                src=src, dest=dest, length=length or 0x1000000,
+            ))
             pos += 12
             continue
         if cmd not in KNOWN_CMDS:
@@ -1612,6 +1708,10 @@ def load_vgm(path: Path | str) -> VgmFile:
     if any(w.chip == "opll" for w in vgm.writes) and not vgm.ym2413_clock:
         vgm.warnings.append(
             "YM2413 clock is missing or out of range; using the standard clock"
+        )
+    if any(w.chip == "nes" for w in vgm.writes) and not vgm.nes_clock:
+        vgm.warnings.append(
+            f"NES APU clock is missing or out of range; using {NES_DEFAULT_CLOCK}"
         )
     if any(w.chip == "ym2612" for w in vgm.writes) and not vgm.ym2612_clock:
         vgm.warnings.append(

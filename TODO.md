@@ -98,9 +98,9 @@ the real rips are available. Open:
   rips need the RAM dump in the VGM.
 - **Looping SSG PCM DAC streams play once.** The AY sample instrument is
   one-shot, so a looping `$93` stream is flattened and reported.
-- **SegaPCM mid-note writes.** Volume and frequency rewrites under a held voice
-  are not converted; the C140's are. Start/end/loop/bank changes mid-note stay
-  at the key-on values on both chips.
+- **SegaPCM/C140 mid-note window writes.** Start/end/loop/bank changes under a
+  held voice stay at the key-on values; only volume and frequency follow the
+  register stream.
 - **AY volume decays.** Per-tick volume steps still lose drum decays at
   condense factors. Moving them into the instrument's volume macro is the next
   step (`docs/psg-open-items.md`).

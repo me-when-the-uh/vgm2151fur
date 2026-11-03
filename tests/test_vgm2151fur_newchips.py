@@ -350,6 +350,102 @@ class TestSegapcm(unittest.TestCase):
             self.assertEqual(fast.ctrl, slow.ctrl)
 
 
+class TestSegapcmFadesAndSlides(unittest.TestCase):
+    @staticmethod
+    def _all_rows(mod, ch):
+        rows = []
+        for (c, _idx), pat in mod.patterns.items():
+            if c == ch:
+                rows.extend(pat)
+        return rows
+
+    def _song(self, tail, *, delta=0x80, volume=0x40):
+        rom = TestSegapcm()._region()
+        writes = _lattice() + TestSegapcm()._key(
+            100000, delta=delta, ctrl=0x00,
+        )
+        # _key always writes 0x40/0x40. Replace the volume with this hit's own
+        # value when the test needs a different key-on level.
+        if volume != 0x40:
+            writes = [
+                ChipWrite(w.sample, w.chip, w.chip_id, w.reg,
+                          volume if w.reg in (0x02, 0x03) else w.val)
+                for w in writes
+            ]
+        writes += tail
+        roms = [RomSlice(0, 0x1000, 0, bytes(rom), "segapcm")]
+        return analyze(_vgm(writes, roms, segapcm_clock=4000000), pcm=True)
+
+    def test_mid_note_volume_steps_and_pitch_bend(self):
+        tail = [
+            ChipWrite(110000, "segapcm", 0, 0x02, 0x20),
+            ChipWrite(110000, "segapcm", 0, 0x03, 0x20),
+            ChipWrite(120000, "segapcm", 0, 0x02, 0x00),
+            ChipWrite(120000, "segapcm", 0, 0x03, 0x00),
+            ChipWrite(130000, "segapcm", 0, 0x07, 0xA0),
+        ]
+        song = self._song(tail)
+        ons = [e for e in song.events if e.on and e.pcm]
+        self.assertEqual(len(ons), 1)
+        ev = ons[0]
+        self.assertEqual(ev.vol, 0x40)
+        self.assertEqual(
+            [(t, v, p) for t, v, p in ev.vol_pts],
+            [(110000, 0x20, 0xFF), (120000, 0x00, None)],
+        )
+        # 0x80 -> 0xA0 is 3.86 semitones above the key-on pitch.
+        self.assertEqual(len(ev.sweep), 1)
+        self.assertAlmostEqual(ev.sweep[0][1], 247, delta=1)
+
+        data = write_fur(song, include_pcm=True, include_fm=True)
+        rows = self._all_rows(parse_fur(data), 8)
+        self.assertIn(0x20, [r.vol for r in rows])
+        self.assertIn(0x00, [r.vol for r in rows])
+        pitch_fx = [
+            c for r in rows for c, _v in r.fx
+            if c in (0x01, 0x02, 0xE8, 0xE9, 0xE5)
+        ]
+        self.assertTrue(pitch_fx)
+
+    def test_key_on_volume_in_the_dump_is_not_a_step(self):
+        # A second note while the voice is still keyed: its volume/end/delta
+        # dump carries the note's own level, not a step away from the first.
+        rom = TestSegapcm()._region()
+        writes = _lattice() + TestSegapcm()._key(100000, delta=0x80)
+        writes += TestSegapcm()._key(120000, delta=0xA0)
+        roms = [RomSlice(0, 0x1000, 0, bytes(rom), "segapcm")]
+        song = analyze(_vgm(writes, roms, segapcm_clock=4000000), pcm=True)
+        hits = [h for s in song.segapcm_samples for h in s.hits]
+        self.assertEqual(len(hits), 2)
+        self.assertTrue(all(h.vol_pts == [] for h in hits))
+        # The second note's pitch came in its dump and is not a bend.
+        self.assertTrue(all(h.freq_pts == [] for h in hits))
+        self.assertEqual(hits[1].freq, 0xA0)
+
+    def test_fade_in_starts_silent(self):
+        tail = [
+            ChipWrite(110000, "segapcm", 0, 0x02, 0x20),
+            ChipWrite(110000, "segapcm", 0, 0x03, 0x20),
+        ]
+        song = self._song(tail, volume=0x00)
+        ev = [e for e in song.events if e.on and e.pcm][0]
+        self.assertEqual(ev.vol, 0)
+        self.assertTrue(ev.no_pan)
+        self.assertEqual([v for _t, v, _p in ev.vol_pts], [0x20])
+
+    def test_zero_key_on_frequency_takes_the_first_later_write(self):
+        # Some drivers key the voice before setting its pitch. The hit's
+        # reference rate comes from that write, not from the zero snapshot.
+        song = self._song(
+            [ChipWrite(110000, "segapcm", 0, 0x07, 0x80)], delta=0x00,
+        )
+        smp = song.segapcm_samples[0]
+        self.assertEqual(smp.mode_freq(), 0x80)
+        ev = [e for e in song.events if e.on and e.pcm][0]
+        self.assertEqual(ev.note, 108)
+        self.assertEqual(ev.sweep, ())
+
+
 class TestC140(unittest.TestCase):
     def _body(self) -> bytes:
         # No zero bytes, so trailing-silence trim keeps all 200 frames.

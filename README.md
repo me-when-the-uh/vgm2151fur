@@ -8,6 +8,8 @@ Supported chips:
 - Yamaha YM2610 / YM2610B (OPNB)
 - Yamaha YM2608 (OPNA): FM, SSG, channel-3 Ext, the rhythm kit and delta-T ADPCM
 - Yamaha YM2413 (OPLL): presets, the user bank and the drum kit
+- Konami VRC7: the same OPLL core with six channels and its own preset ROM
+  (flagged by bit 31 of the YM2413 clock field)
 - Yamaha YM3526 (OPL), YM3812 (OPL2) and YMF262 (OPL3), including rhythm mode
   as its own system and OPL3 four-operator voices
 - Yamaha Y8950: OPL FM plus its delta-T ADPCM voice
@@ -25,6 +27,9 @@ Supported chips:
 - Namco C140 and C219
 - Namco C352 (requires a development build of Furnace from a compatible fork. A build with C352 support (built from https://github.com/me-when-the-uh/furnace-ports) is located in `./furnace-c352` - use at your own risk, since it's always a good idea to build from source instead of relying on someone else's builds)
 - Ricoh RF5C68 (FM Towns) and RF5C164 (Sega CD)
+- NES APU (Ricoh 2A03): two pulses, triangle, noise, and the DPCM channel
+  (1-bit samples and direct `$4011` PCM). A Famicom AY is written as a
+  Sunsoft 5B and its notes are pitched at the chip's half clock
 
 A log that mixes several chip families is written as one module when the
 combination is supported. `docs/merged-logs.md` lists the rules.
@@ -101,7 +106,7 @@ tests/          pytest suite
 docs/           operating guide, format notes, chip notes
 ```
 
-Project state and workflow are in `docs/portable-context.md` and `docs/implementation-notes.md`. Chip details are in `docs/opm-notes.md`, `docs/ym2203.md`, `docs/ym2612.md`, `docs/ym2610.md`, `docs/opna-opll.md`, `docs/opl.md`, `docs/k053260.md`, `docs/scc-ay8910.md`, `docs/segapcm-c140.md`, `docs/ssg-pcm.md` and `docs/c352.md`. `docs/merged-logs.md` covers multi-family modules, and `docs/psg-open-items.md` tracks the remaining AY accuracy gaps.
+Project state and workflow are in `docs/portable-context.md` and `docs/implementation-notes.md`. Chip details are in `docs/opm-notes.md`, `docs/ym2203.md`, `docs/ym2612.md`, `docs/ym2610.md`, `docs/opna-opll.md`, `docs/opl.md`, `docs/k053260.md`, `docs/scc-ay8910.md`, `docs/segapcm-c140.md`, `docs/ssg-pcm.md`, `docs/nes-vrc7.md` and `docs/c352.md`. `docs/merged-logs.md` covers multi-family modules, and `docs/psg-open-items.md` tracks the remaining AY accuracy gaps.
 
 Open follow-ups are tracked in [TODO.md](./TODO.md).
 
@@ -109,7 +114,7 @@ Open follow-ups are tracked in [TODO.md](./TODO.md).
 
 - The YM2151, YM2203, YM2612, YM2610 and YM2608 models cover the OPM/OPN register sets the arcade and console drivers use; the YM3526, YM3812, YMF262, Y8950 and YMF278B models cover the OPL family (`docs/opl.md`). The YM2608 converts channel-3 Ext, its rhythm kit and delta-T ADPCM-B, but CSM timer key-ons are not synthesized (`docs/opna-opll.md`).
 - The YMF278B's ROM wave samples need the YRW801 image; point `VGM2151FUR_YRW801` at the `.rom` or `.zip`. Furnace's OPL4 core does not load the ROM itself, so the converter embeds the extracted bodies. RAM wave IDs need the RAM dump in the VGM. The Y8950's ADPCM voice is silent when the file carries no delta-T data block (`$88`).
-- SegaPCM mid-note volume and frequency writes are not converted; the C140's are. The C140 sign-flip and sign-magnitude mode bits are ignored, as libvgm ignores them (`docs/segapcm-c140.md`).
+- SegaPCM and C140 mid-note volume and frequency writes become volume-column steps and pitch sweeps; start/end/loop/bank changes mid-note stay at the key-on values. The C140 sign-flip and sign-magnitude mode bits are ignored, as libvgm ignores them (`docs/segapcm-c140.md`).
 - The RF5C68 and RF5C164 share one Furnace system, selected by `chipType`. A looping SSG PCM DAC stream plays once because the AY sample instrument is one-shot (`docs/ssg-pcm.md`).
 - An OPL track whose log mixes OPL2 with OPL3, or two different crystals, is converted on the family that plays most of it and the report says so. Two pitched families share a module only for the combinations in `docs/merged-logs.md`. Below about C-3 one f-num step is wider than a half tone, so a very deep register lands on the nearest cell; a waveform or envelope change written inside a held note is picked up at the next key-on instead, while a modulator level the log moves mid-note travels as an operator macro. `docs/opl.md` lists both with the measured numbers.
 - YM2203 notes are labelled at the highest carrier's octave when a patch uses a power-of-two carrier MULT. A constant pitch macro on the instrument keeps the source f-num/block/audio unchanged, so the pattern note matches the audible carrier.
@@ -117,6 +122,7 @@ Open follow-ups are tracked in [TODO.md](./TODO.md).
 - The Genesis SN76489 PSG is converted as four extra channels (three tone + noise). Extreme periods below the musical table range and two PSG notes on the same channel/row are approximated. The converter's default `.fur` SN76489 system volume is 0.500; an absolute VGM extra-header volume entry still overrides it.
 - The YM2612 DAC is converted from the type-0 PCM bank, direct `0x2A` writes and modern `0x92`/`0x95` blocks. The default is release-capped PCM chunks: one FM6 note per chunk, split at every `0xB6` pan change and at most every 0.25 s, with a small sample budget so release Furnace loads the module. Silence-only chunks and leading silence get no note. The per-run slice representation remains available as `collect_dac(..., slices=True)` for editing, and `timeline=True` is the old 22.05 kHz comparison body. A source that writes `0x2B` without setting bit 7 has no DAC audio, so its FM6 key-ons stay FM notes. Channel-3 special and CSM per-operator frequencies are converted (the Ext system); CSM timer key-ons are not synthesized. LFO, PMS/AMS, pan and SSG-EG are converted (`docs/ym2612.md`).
 - The YM2610 uses the base 14-channel layout (16 on the B variant). Channel-2 special/CSM mode is not split into per-operator FM3 columns, and timer key-ons are not synthesized. ADPCM-B uses the source's `0x83` block, a source with 8-bit delta-T mode would need a transcode. ADPCM-A/B gates carry explicit note-offs. A different sample whose trigger shares a row moves to the next free row, and a same-sample repeat within a row keeps the later start. The source tail past the loop finder's bar is kept, so post-bar A/B gates and their stops are not dropped (`docs/ym2610.md`).
+- The NES APU converts its pulses, triangle, noise and DPCM channel; duty, envelope mode and the triangle linear counter are row effects while pitch and volume become per-note instrument macros. When the 256-instrument budget is full those notes fall back to the columns. DPCM needs the sample data (a type-`0x07` database plus `0x68` bank copies, or a `0xC2` RAM dump); without it the notes are written silent and the report warns. `$4011` bit-bang PCM becomes 8-bit samples. A Famicom's AY is inferred to be a Sunsoft 5B and pitched at its half clock (`docs/nes-vrc7.md`).
 - Furnace 0.6.8.3 has no C352 core. A build with the ported core can play those modules (`docs/c352.md`).
 - K053260 loops the whole sample. A source loop maps to the full body. Mid-note loop, KADPCM or direction changes use the key-on value. A voice keyed with pan 0 is written silent and raised when its pan moves (`docs/k053260.md`).
 - Chip volumes above unity only exist in INF2 files.
