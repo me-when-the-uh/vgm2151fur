@@ -86,6 +86,39 @@ BALANCE_SCALE = (
 )
 
 
+def _scale_inv(att: int) -> int:
+    """The balance nibble whose BALANCE_SCALE entry is closest to `att`."""
+    return min(range(16), key=lambda i: abs(BALANCE_SCALE[i] - att))
+
+
+_BALANCE_INV = tuple(_scale_inv(a) for a in range(32))
+
+
+def pce_effective(control_vol: int, balance: int) -> tuple[int, int]:
+    """Split the PCE attenuators into (volume column, 08xy pan).
+
+    The chip's per-side level is ``0x1F - min(0x1F, gbal + bal + al)`` where
+    ``al = 0x1F - control_vol`` and each balance nibble becomes
+    ``0x1F - BALANCE_SCALE[nibble]``.  A driver may use the control volume or
+    the balance register (or both) for its envelope, so the converter puts the
+    louder side's level on the volume column and the left/right ratio on the
+    pan.  Feeding that back through the same chip model reproduces the original
+    two levels exactly: the louder side is nibble 15 with ``al = 0x1F - peak``,
+    and the quieter side picks the nibble whose attenuation closes the gap.
+    """
+    al = 0x1F - (control_vol & 0x1F)
+    bl = 0x1F - BALANCE_SCALE[(balance >> 4) & 0x0F]
+    br = 0x1F - BALANCE_SCALE[balance & 0x0F]
+    left = 0x1F - min(0x1F, bl + al)
+    right = 0x1F - min(0x1F, br + al)
+    peak = max(left, right)
+    if peak <= 0:
+        return 0, 0
+    pl = _BALANCE_INV[left + 0x1F - peak]
+    pr = _BALANCE_INV[right + 0x1F - peak]
+    return peak, ((pl & 15) << 4) | (pr & 15)
+
+
 def huc6280_period_hz(clock: int, period: int) -> float:
     """Voice frequency for a 12-bit period register, in Hz."""
     p = period if period else 4096

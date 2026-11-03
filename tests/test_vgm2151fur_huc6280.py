@@ -231,7 +231,10 @@ class TestHuc6280Tones(unittest.TestCase):
         song = analyze(_vgm(writes, huc6280_clock=3579545))
         note = [e for e in song.events if e.on and e.ch >= 8][0]
         self.assertTrue(note.vol_pts)
-        self.assertEqual(note.vol_pts[-1][2], 0x87)
+        # The balance 0x87 attenuates to an effective level of 16/31, carried
+        # on the volume column; the normalized L/R goes on 08xy.
+        self.assertEqual(note.vol_pts[-1][1], 16)
+        self.assertEqual(note.vol_pts[-1][2], 0xFE)
         # And the module still writes (it would fail if the row steps were
         # dropped and the empty macro left the note without a level).
         data = write_fur(song, include_pcm=True, include_fm=False)

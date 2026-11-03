@@ -143,6 +143,7 @@ from vgm2151fur.huc6280 import (
     collect_huc6280_pcm,
     huc6280_noise_note,
     huc6280_note,
+    pce_effective,
 )
 from vgm2151fur.segapcm import (
     SegapcmSample, collect_segapcm, hit_played_freq as segapcm_played_freq,
@@ -6904,17 +6905,22 @@ def analyze(
         huc_wave_index = {img: i for i, img in enumerate(huc6280_waves)}
 
         def _merge_vol_balance(hit):
+            # Collapse the control-volume and balance timelines into the
+            # effective volume column plus the normalized L/R pan, so the
+            # pattern's volume column carries the envelope rather than showing
+            # 31 with all of it hidden in the balance register.
             evs = [(t, 0, v) for t, v in hit.vol_pts]
             evs += [(t, 1, b) for t, b in hit.balance_pts]
             evs.sort(key=lambda x: (x[0], x[1]))
             out: list[tuple[int, int, int | None]] = []
-            cur = hit.vol
+            cur_vol, cur_bal = hit.vol, hit.balance
             for t, kind, val in evs:
                 if kind == 0:
-                    cur = val
-                    out.append((t, cur, None))
+                    cur_vol = val
                 else:
-                    out.append((t, cur, val))
+                    cur_bal = val
+                v, p = pce_effective(cur_vol, cur_bal)
+                out.append((t, v, p))
             return out
 
         for n in huc_notes:
@@ -6964,15 +6970,17 @@ def analyze(
                 else:
                     note, e5 = huc6280_noise_note(h.noise), 0x80
                     tone_fx = ()
+                ev_vol, ev_pan = pce_effective(h.vol, h.balance)
                 vol_pts = tuple(
-                    (t, h.vol, b) for t, b in h.balance_pts
+                    (t, *pce_effective(h.vol, b))
+                    for t, b in h.balance_pts
                     if h.sample_time < t < gate_end
                 )
                 channel_fx.append((h.sample_time, voice_ch, 0x11, 1))
                 events.append(NoteEvent(
                     sample=h.sample_time, ch=voice_ch, on=True,
-                    note=note, ins=tone_ins_base, vol=h.vol, e5=e5,
-                    pan=h.balance, end=h.off_sample,
+                    note=note, ins=tone_ins_base, vol=ev_vol, e5=e5,
+                    pan=ev_pan, end=h.off_sample,
                     vol_pts=vol_pts,
                     tone_pitch_pts=(
                         tuple(pitch_pts) if len(pitch_pts) > 1 else ()
@@ -7004,8 +7012,10 @@ def analyze(
                     ))
                     continue
                 bound = nxt or gate_end
-                vol = _value_at(h.vol_pts, st, h.vol)
-                balance = _value_at(h.balance_pts, st, h.balance)
+                vol, balance = pce_effective(
+                    _value_at(h.vol_pts, st, h.vol),
+                    _value_at(h.balance_pts, st, h.balance),
+                )
                 vol_pts = tuple(
                     p for p in _merge_vol_balance(h) if st < p[0] < bound
                 )
