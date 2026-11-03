@@ -243,6 +243,17 @@ they can be run from anywhere.
 - `VGM2151FUR_Y8950_RIPS`: a folder holding the Y8950 rip the real-rip test
   converts (`03v - Credit Inserted (with voice).vgm`). Without it that test
   skips. See docs/opl.md for the Y8950 model.
+- `VGM2151FUR_YRW801`: path to the 2 MB YMF278B wave ROM (a `.rom`, or a
+  `.zip` containing one). The OPL4 converter embeds the ROM sample bodies
+  because Furnace does not load the ROM itself. Without the variable it also
+  looks for `furnace/yrw801.rom` under the project and the current directory,
+  then `yrw801.rom` in the current directory. A log whose wave slots address
+  ROM sample IDs loses those notes if the ROM cannot be found, and the
+  converter warns.
+- `VGM2151FUR_OPL4_RIPS`: a folder holding the MoonDriver OPL4 rips the
+  real-rip tests convert (`05 encounter the unknown environment.vgz` and
+  `06 TIME'S UP!.vgz`). Without it those tests skip. See docs/opl.md for the
+  YMF278B model, the wave descriptor format and the pan table.
 
 ## Exit codes
 

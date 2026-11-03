@@ -298,6 +298,94 @@ latch actually fires. Verified on Ginga NinkyouDen's `03v`, which uses rhythm
 mode: 11 FM columns, the ADPCM voice on column 12, both ADPCM waves
 (0xBAE0 and 0x1CAE0) sliced at the chip's 32-byte granularity.
 
+## Yamaha YMF278B (OPL4)
+
+The YMF278B is an OPL3-shaped FM half plus 24 wave (PCM) slots. VGM carries it
+on the four-byte command `0xD0 pp aa dd`: port `pp = 0`/`1` is the FM register
+space of the two banks, and port `pp = 2` is the wave register space. The clock
+lives at header `0x60` (usually 33868800), ROM images arrive as data block
+`0x84` and RAM images as `0x87`. The parser folds the port into bit 8 of
+`ChipWrite.reg`, and the FM collector skips port 2; otherwise a wave pitch byte
+such as `0xB5 = 0x20` would be read as an FM key-on.
+
+The FM half runs through this same OPL3 path with `KIND_OPL4`, but the pitch
+table is its own: `DivPlatformOPL::setOPLType` overrides the OPL3 base with
+`32768 * 684` for `chipType = 4` (`opl.cpp:3390`). Using the OPL3 base
+(`32768 * 288`) at the OPL4 clock puts every FM note about 1.25 octaves flat, so
+`opl.pitch_table` carries an optional `freq_base` and `analyze` passes the OPL4
+value through `_collect_opl`. Furnace gives the FM half 18 columns (system
+`0xAE`, 42 channels with the 24 wave slots) or 15 + 5 kit columns with rhythm
+(system `0xAF`, 44). Rhythm follows the OPL3 rule: port 1's `0x1BD`.
+
+### Wave slots
+
+Each slot has ten registers at `0x08 + slot + n*24`:
+
+| n | register |
+|---|----------|
+| 0 | sample ID low |
+| 1 | f-num LSB + sample ID bit 8 |
+| 2 | f-num MSB + octave (signed 4-bit, `-8` freezes) |
+| 3 | total level (7-bit attenuation) |
+| 4 | key/damp/LFO/pan |
+| 5-9 | LFO speed, AR/D1R, D1L/D2R, RC/RR, AM |
+
+The sample ID selects a 12-byte descriptor in the wave memory. IDs below 384
+read the YRW801 ROM at `id * 12`; the rest read the card RAM at
+`(id - 384) * 12`. A descriptor is:
+
+| byte | meaning |
+|------|---------|
+| 0 | bits 7-6 format (0 = 8-bit signed, 1 = 12-bit, 2 = 16-bit big-endian), bits 5-0 start address bits 16-21 |
+| 1-2 | start address bits 8-15, 0-7 |
+| 3-4 | loop address (`high << 8 \\| low`, in frames) |
+| 5-6 | end address, a *negative* length: frames = `0x10000 - end` |
+| 7-11 | envelope/LFO defaults (not converted) |
+
+Playback rate is `clock * step / (768 * 65536)` with
+`step = (fnum + 1024) << (5 + octave)`. The converter extracts each distinct
+sample body into a `.fur` sample (signed 16-bit), one `DIV_INS_MULTIPCM`
+instrument per body, and writes the pattern note as the pitch ratio to the
+body's most common step. The body's own C-4 rate is that step's rate. A
+descriptor whose loop point sits inside the body loops there; a body of exactly
+`0x10000` frames wraps the slot's 16-bit position counter and therefore loops
+from 0 regardless of the loop address (the three 64 KB RAM loops in "06 TIME'S
+UP!" are this case). Loop-at-end bodies stay one-shot.
+
+The hardware pan table is 0 = centre, 1-7 = right (left falls), 8 = both off,
+9-15 = left (right falls). Furnace's PCM path derives the slot nibble from the
+`08xy` effect as `8 ^ min(convertPanSplitToLinearLR(x, y, 15) + 1, 15)`
+(`opl.cpp:2267`), which is not a naive gain split: pan 0 is centre, not hard
+left, and the sides are reversed. `ymf278b.opl4_pan_fx` inverts that formula so
+the exported slot keeps the source nibble; pan 8 has no `08xy` form and is
+muted through the volume instead. Treating pan 0 as hard left is what made the
+drum slots sound wrong.
+
+Furnace does not load the YRW801 ROM itself, so the ROM bodies are extracted
+and embedded. The ROM is looked up in this order: an explicit path,
+`VGM2151FUR_YRW801`, `<repo>/furnace/yrw801.rom`, `<cwd>/furnace/yrw801.rom`,
+then `<cwd>/yrw801.rom`; a `.zip` containing a 2 MB `.rom` is accepted. Without
+it, an OPL4 log that addresses ROM sample IDs loses those notes and the
+converter prints a warning naming the variable. Logs that only use RAM sample
+IDs need no ROM.
+
+Instrument sharing matters on this chip. A Furnace module addresses
+instruments with one byte (at most 256). MoonDriver ramps the modulator's
+`$4n` per note (22, 23, 24... on `$40`-`$42`) to fade the FM brightness, which
+would otherwise make one instrument per step: the two minutes of "05 encounter
+the unknown environment" needed 1106. `_collect_opl` folds the modulator level
+out of the patch key (`shape_key`), keeps the loudest level seen for the shared
+shape (`loudest`), and leaves a move *inside* a held note to the existing
+operator-TL macro. Base patches are capped at 200, with same-shape reuse and an
+`ins_reused` warning past that. Wave bodies add one instrument each.
+
+Verified against the two MoonDriver rips: "05 encounter the unknown
+environment" (6 FM shapes + 83 level-macro copies + 22 YRW801 bodies = 111
+`INS2`, 10641 FM key-ons and 7810 wave key-ons) and "06 TIME'S UP!" (one empty
+FM instrument + 26 bodies, 7538 wave key-ons). Both export through the bundled
+Furnace build, and the FM key-on pitch and the wave pan nibble match the source
+exactly.
+
 ## Limits
 
 - Waveform and envelope writes inside a held note move at the next key-on. A

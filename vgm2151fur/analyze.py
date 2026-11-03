@@ -56,9 +56,11 @@ from vgm2151fur.oki import (
 )
 from vgm2151fur.opl import (
     DRUM_BITS,
+    FREQ_BASE_OPL4,
     KIND_OPL,
     KIND_OPL2,
     KIND_OPL3,
+    KIND_OPL4,
     KIND_Y8950,
     N as OPL_N,
     OPL2_DEFAULT_CLOCK,
@@ -69,6 +71,7 @@ from vgm2151fur.opl import (
     OPLState,
     channel_count,
     drum_channel,
+    opl3_like,
     opl_carrier_octave,
     opl_module_clock,
     opl_note_for,
@@ -145,6 +148,14 @@ from vgm2151fur.ym2608 import (
 from vgm2151fur.y8950 import (
     Y8950_DEFAULT_CLOCK,
     collect_y8950_delta_t,
+)
+from vgm2151fur.ymf278b import (
+    OPL4_WAVE_SLOTS,
+    Opl4WaveSample,
+    collect_opl4_wave,
+    load_yrw801,
+    opl4_pan_fx,
+    opl4_rate,
 )
 from vgm2151fur.ym2203 import (
     YM2203_DEFAULT_CLOCK,
@@ -460,6 +471,10 @@ class FmSystem:
             # OPL2-shaped FM plus the one delta-T (ADPCM) column.
             from vgm2151fur.opl import channel_count
             return channel_count(self.kind, self.drums) + 1
+        if self.kind == "opl4":
+            # OPL3-shaped FM plus the 24 wave columns.
+            from vgm2151fur.opl import channel_count
+            return channel_count(self.kind, self.drums) + 24
         if self.kind == "opll":
             return OPLL_DRUMS_CHANNELS if self.drums else OPLL_CHANNELS
         if self.kind in ("ym2610", "ym2608"):
@@ -599,6 +614,9 @@ class Song:
     # The Y8950's one ADPCM (delta-T) voice, using the same sample-map format.
     y8950_b_samples: list[AdpcmBSample] = field(default_factory=list)
     y8950_b_count: int = 0
+    # The YMF278B/OPL4 wave slots, extracted from the YRW801/ROM or the RAM.
+    opl4_wave_samples: list[Opl4WaveSample] = field(default_factory=list)
+    opl4_wave_count: int = 0
 
     # K007232 output level relative to the YM2151, from the rip's own mix
     # (extra header) when present. Written to the .fur chip output.
@@ -2334,6 +2352,8 @@ def _collect_opl(
     base: dict[int, int],
     clock: float,
     drums: bool,
+    chip_name: str | None = None,
+    freq_base: int | None = None,
 ) -> tuple[dict, list[str]]:
     """Turn an OPL-family register stream into notes and instruments.
 
@@ -2347,8 +2367,10 @@ def _collect_opl(
     down stays a bend inside that note.
 
     Returns counters for the report and the warnings the caller should show.
+    ``freq_base`` is the variant's frequency divider (the OPL4 is not the
+    OPL3's ``32768*288``), so the note mapping matches Furnace's own table.
     """
-    opl3 = kind == KIND_OPL3
+    opl3 = opl3_like(kind)
     states = {cid: OPLState(kind, drums) for cid in ids}
     # Which Furnace channels a register drives. An OPL3 four-operator pair is
     # keyed and tuned on its first channel but takes two operators from each.
@@ -2415,7 +2437,7 @@ def _collect_opl(
     stats = {
         "notes": 0, "drums": 0, "four_op": 0,
         "mode_midnote": 0, "lost_melodic": 0, "repeat_keyon": 0,
-        "midnote_ops": 0,
+        "midnote_ops": 0, "ins_reused": 0,
     }
     warnings: list[str] = []
 
@@ -2448,6 +2470,56 @@ def _collect_opl(
             ops[i] = replace(ops[i], tl=(ops[i].tl & 0x3F) - floor)
         return replace(patch, ops=tuple(ops)), 63 - min(floor, 63)  # type: ignore[arg-type]
 
+    # A Furnace module stores instrument indices as one byte, so 256 is the
+    # hard ceiling. Leave room for the sample instruments the writer adds.
+    ins_cap = 200
+    reuse_by_shape: dict[tuple, tuple] = {}
+
+    def shape_key(snap) -> tuple:
+        """Timbre with the modulator level folded out.
+
+        A driver that ramps the FM depth per note (MoonDriver does: 22, 23,
+        24... on registers ``$40``-``$42``) would otherwise need one
+        instrument per step, and a 2-minute track crossed Furnace's one-byte
+        instrument index. The loudest depth is the instrument; the carrier
+        level still rides the volume column.
+        """
+        carriers = snap.carriers()
+        ops = tuple(
+            (i, snap.ops[i].as_tuple(include_tl=(i in carriers)))
+            for i in range(4)
+        )
+        return ("opl-shape", snap.alg & 3, snap.fb & 7, snap.opl, snap.four,
+                snap.drum, ops)
+
+    def reuse(snap) -> tuple:
+        """An existing patch with the same carrier shape, else the first."""
+        shape = (snap.alg & 7, snap.carriers())
+        key = reuse_by_shape.get(shape)
+        if key is None or key not in patches:
+            key = patch_order[0]
+        return key
+
+    def loudest(base: FMPatch, snap: FMPatch) -> FMPatch:
+        """Keep the deepest modulator level seen for a shared shape.
+
+        A driver that fades the FM depth by raising a modulator's ``$4n``
+        writes a different byte on every note. Those levels share one patch
+        (``shape_key`` folds them out), so the patch keeps the loudest one
+        instead of whichever note happened to arrive first.
+        """
+        carriers = set(base.carriers())
+        ops = list(base.ops)
+        changed = False
+        for i in range(4):
+            if i in carriers:
+                continue
+            here = snap.ops[i].tl & 0x3F
+            if here < (ops[i].tl & 0x3F):
+                ops[i] = replace(ops[i], tl=here)
+                changed = True
+        return replace(base, ops=tuple(ops)) if changed else base
+
     def intern(cid: int, fch: int) -> tuple[int, int]:
         """Instrument index and volume column for the voice a channel holds."""
         st = states[cid]
@@ -2455,21 +2527,34 @@ def _collect_opl(
             snap = st.drum_snapshot()
             key = ("drum",) + snap.identity()
             if key not in patches:
-                snap.name = f"OPL drum {len(patch_order):02d}"
-                patches[key] = snap
-                patch_order.append(key)
+                if len(patch_order) >= ins_cap:
+                    key = reuse(snap)
+                    stats["ins_reused"] += 1
+                else:
+                    snap.name = f"OPL drum {len(patch_order):02d}"
+                    patches[key] = snap
+                    patch_order.append(key)
             p = patches[key]
             p.uses += 1
             return patch_order.index(key), 63
         snap, vol = normalized_opl(st.snapshot(fch))
         if st.is_four_op(fch):
             stats["four_op"] += 1
-        key = snap.identity()
+        key = shape_key(snap)
         if key not in patches:
-            fam = "OPL3 4op" if st.is_four_op(fch) else kind.upper()
-            snap.name = f"{fam} {len(patch_order):02d}"
-            patches[key] = snap
-            patch_order.append(key)
+            if len(patch_order) >= ins_cap:
+                key = reuse(snap)
+                stats["ins_reused"] += 1
+            else:
+                fam = "OPL3 4op" if st.is_four_op(fch) else kind.upper()
+                snap.name = f"{fam} {len(patch_order):02d}"
+                patches[key] = snap
+                patch_order.append(key)
+                reuse_by_shape.setdefault(
+                    (snap.alg & 7, snap.carriers()), key,
+                )
+        else:
+            patches[key] = loudest(patches[key], snap)
         p = patches[key]
         p.uses += 1
         return patch_order.index(key), vol
@@ -2490,7 +2575,7 @@ def _collect_opl(
                     merged.append(p)
             if merged and merged[0][0] - ev.sample <= 120 and merged[0][1:] != pitch_base[key]:
                 ev.note, ev.e5 = opl_note_for(
-                    merged[0][1], merged[0][2], clock, opl3,
+                    merged[0][1], merged[0][2], clock, opl3, freq_base,
                 )
                 merged = [(ev.sample, *merged[0][1:])] + merged[1:]
                 pitch_base[key] = merged[0][1:]
@@ -2540,7 +2625,7 @@ def _collect_opl(
         kit = drums and fch > st.melodic
         close_note(cid, fch, sample, off=False)
         block, fnum = st.frequency(fch)
-        note, e5 = opl_note_for(block, fnum, clock, opl3)
+        note, e5 = opl_note_for(block, fnum, clock, opl3, freq_base)
         ins, vol = intern(cid, fch)
         events.append(NoteEvent(
             sample=sample,
@@ -2632,12 +2717,18 @@ def _collect_opl(
             i = j
         return out
 
+    source = chip_name or kind
     for w in ordered(vgm.writes):
-        if w.chip != kind:
+        if w.chip != source:
             continue
         cid = w.chip_id
         st = states.get(cid)
         if st is None:
+            continue
+        # The OPL4's port 2 is its wave half, not a third FM bank. Feeding
+        # those bytes to the FM image invents key-ons: wave register 0xB5 holds
+        # a pitch byte whose bit 5 then reads as an FM key.
+        if (w.reg >> 8) > 1:
             continue
         port = (w.reg >> 8) & 1 if opl3 else 0
         r = w.reg & 0xFF
@@ -3165,7 +3256,9 @@ def _collect_opll(
     return stats, warnings
 
 
-def _opl_rhythm_plan(vgm, kind: str) -> tuple[bool, dict]:
+def _opl_rhythm_plan(
+    vgm, kind: str, chip_name: str | None = None,
+) -> tuple[bool, dict]:
     """Decide which OPL layout a log should become, and count what each costs.
 
     Rhythm mode is one bit of one register, but it moves bank A's last three FM
@@ -3186,7 +3279,8 @@ def _opl_rhythm_plan(vgm, kind: str) -> tuple[bool, dict]:
     registers a kit takes over. Only OPL3's port-1 ``$1BD`` and the flat
     ``$BD`` of an OPL or OPL2 are rhythm registers.
     """
-    st = OPLState(kind, False)
+    # The OPL4's FM half is OPL3-shaped.
+    st = OPLState(KIND_OPL3 if kind == "opl4" else kind, False)
     kit_regs = {fch for fch, cm in enumerate(st.chan_map)
                 if ((cm >> 8) & 1) == 0 and (cm & 0xFF) >= 6}
     chan_of: dict[tuple[int, int], list[int]] = {}
@@ -3196,8 +3290,9 @@ def _opl_rhythm_plan(vgm, kind: str) -> tuple[bool, dict]:
 
     stats = {"latches": 0, "mode_samples": 0, "melodic_on_kit": 0}
     per: dict[int, list] = {}
+    source = chip_name or kind
     for w in vgm.writes:
-        if w.chip == kind:
+        if w.chip == source:
             per.setdefault(w.chip_id, []).append(w)
     end = int(vgm.total_samples or 0)
     for ws in per.values():
@@ -3425,6 +3520,7 @@ def analyze(
     has_sn76489 = "sn76489" in chips
     has_opl = bool(chips & {"opl", "opl2", "opl3", KIND_Y8950})
     has_y8950 = KIND_Y8950 in chips
+    has_opl4 = "ymf278b" in chips
     has_opll = "opll" in chips
 
     # The PCM a YM2612 streams is music even when the chip keys no FM voice,
@@ -3442,6 +3538,7 @@ def analyze(
         "opl2": _family_sounds(vgm, {"opl2"}),
         "opl3": _family_sounds(vgm, {"opl3"}),
         "y8950": _family_sounds(vgm, {KIND_Y8950}),
+        "opl4": _family_sounds(vgm, {"ymf278b"}),
         "opll": _family_sounds(vgm, {"opll"}),
     }
 
@@ -3457,6 +3554,8 @@ def analyze(
     }
     arcade_live = {name for name in arcade_present if sounds[name]}
     opl_side = chips & {KIND_OPL, KIND_OPL2, KIND_OPL3, KIND_Y8950}
+    if has_opl4:
+        opl_side.add("opl4")
     opl_live = {name for name in opl_side if sounds[name]}
     opll_live = has_opll and sounds["opll"]
 
@@ -3527,6 +3626,8 @@ def analyze(
     opl_kinds = [
         k for k in (KIND_OPL, KIND_OPL2, KIND_OPL3, KIND_Y8950) if k in chips
     ]
+    if has_opl4:
+        opl_kinds.append("opl4")
     opl_kind = None
     if prefer_opl or is_combo or share_fm or arcade_pick is None:
         live_kinds = [k for k in opl_kinds if k in opl_live] or opl_kinds
@@ -3629,8 +3730,10 @@ def analyze(
             f"key-ons, {arcade_writes} writes) plays beside {_names(home)} "
             f"({_family_keyons(vgm, home)} key-ons); each keeps its own system"
         )
+    # The OPL4's registers live under the "ymf278b" chip name, not "opl4".
+    opl_source = "ymf278b" if opl_kind == "opl4" else opl_kind
     opl_ids = (
-        sorted({w.chip_id for w in vgm.writes if w.chip == opl_kind})
+        sorted({w.chip_id for w in vgm.writes if w.chip == opl_source})
         if is_opl else []
     )
     # Bit 5 of the rhythm register is the mode switch, but a driver may poke it
@@ -3638,13 +3741,18 @@ def analyze(
     # drum. The layout is stored in the Furnace system id. A track gets the
     # drums layout only when the log shows a kit voice actually latching.
     opl_drums, opl_rhythm = (
-        _opl_rhythm_plan(vgm, opl_kind) if is_opl else (False, {}))
+        _opl_rhythm_plan(
+            vgm, opl_kind,
+            chip_name="ymf278b" if opl_kind == "opl4" else None,
+        ) if is_opl else (False, {}))
+    opl_is_opl3 = opl_kind in (KIND_OPL3, "opl4")
     opl_clock = (
         opl_module_clock(
             (vgm.opl3_clock if opl_kind == KIND_OPL3 else
              vgm.opl2_clock if opl_kind == KIND_OPL2 else
-             vgm.y8950_clock if opl_kind == KIND_Y8950 else vgm.opl_clock),
-            opl_kind == KIND_OPL3,
+             vgm.y8950_clock if opl_kind == KIND_Y8950 else
+             vgm.ymf278b_clock if opl_kind == "opl4" else vgm.opl_clock),
+            opl_is_opl3,
         ) if is_opl else 0.0
     )
     opll_ids = (
@@ -3744,9 +3852,11 @@ def analyze(
     # Channels per OPL instance, in module order: nine for an OPL/OPL2,
     # eighteen for an OPL3, plus the five kit columns when rhythm is on. The
     # Y8950 adds one ADPCM column after its FM block.
-    opl_fm_count = channel_count(opl_kind, opl_drums) if is_opl else 0
+    opl_state_kind = opl_kind
+    opl_fm_count = channel_count(opl_state_kind, opl_drums) if is_opl else 0
     opl_chunk = (
         opl_fm_count + (1 if opl_kind == KIND_Y8950 else 0)
+        + (OPL4_WAVE_SLOTS if opl_kind == "opl4" else 0)
     ) if is_opl else 0
     # A combined module lists its systems in channel order: the arcade family
     # (or the OPM's eight voices) first, then every OPL one. The bases below
@@ -4959,8 +5069,10 @@ def analyze(
     if is_opl:
         opl_stats, opl_warn = _collect_opl(
             vgm, events, patches, patch_order, keyon_times, channel_fx, chip_fx,
-            kind=opl_kind, ids=opl_ids, base=opl_base, clock=opl_clock,
+            kind=opl_state_kind, ids=opl_ids, base=opl_base, clock=opl_clock,
             drums=opl_drums,
+            chip_name="ymf278b" if opl_kind == KIND_OPL4 else None,
+            freq_base=FREQ_BASE_OPL4 if opl_kind == KIND_OPL4 else None,
         )
         warnings.extend(opl_warn)
         if opl_stats.get("four_op"):
@@ -4968,6 +5080,68 @@ def analyze(
                 f"{opl_stats['four_op']} note-on(s) read as an OPL3 "
                 "four-operator voice (0x104 pair bit)"
             )
+        if opl_stats.get("ins_reused"):
+            warnings.append(
+                f"{opl_stats['ins_reused']} note(s) past the 200-instrument "
+                "limit share a patch of the same carrier shape; a Furnace "
+                "module stores only 256 instruments in total"
+            )
+
+    # OPL4 wave part: 24 columns after the FM block. Furnace does not load the
+    # YRW801 ROM itself, so the ROM samples are extracted and embedded.
+    opl4_wave_samples: list[Opl4WaveSample] = []
+    opl4_wave_events: list[tuple[NoteEvent, int]] = []
+    opl4_wave_count = 0
+    if is_opl and opl_kind == "opl4":
+        rom = assemble_rom(vgm, "ymf278b_rom") or load_yrw801()
+        ram = assemble_rom(vgm, "ymf278b_ram")
+        if pcm:
+            opl4_wave_samples, wave_warn = collect_opl4_wave(
+                vgm, rom=rom, ram=ram,
+            )
+            warnings.extend(wave_warn)
+        wave_base = {
+            cid: opl_base[cid] + opl_fm_count for cid in opl_ids
+        }
+        for i, smp in enumerate(opl4_wave_samples):
+            ref = opl4_rate(opl_clock, smp.mode_step())
+            for h in smp.hits:
+                opl4_wave_count += 1
+                note, e5 = rate_to_note(opl4_rate(opl_clock, h.step), ref)
+                wave_pan = opl4_pan_fx(h.pan)
+                # TL is attenuation: 0 loudest, 0x7F silent. The platform maps
+                # the column as 0x7f - volume.
+                vol = max(0, min(127, 0x7F - (h.level & 0x7F)))
+                if (h.pan & 0x0F) == 8:
+                    vol = 0          # both sides off: a silent slot
+                ev = NoteEvent(
+                    sample=h.sample_time,
+                    ch=wave_base.get(0, 0) + h.slot,
+                    on=True,
+                    note=note,
+                    ins=-1,  # bound below with the wave map
+                    vol=vol,
+                    e5=e5,
+                    pan=wave_pan,
+                    pcm=True,
+                    end=h.end_time,
+                )
+                events.append(ev)
+                opl4_wave_events.append((ev, i))
+        for smp in opl4_wave_samples:
+            for h in smp.hits:
+                if h.end_time and h.end_time > h.sample_time:
+                    events.append(NoteEvent(
+                        sample=h.end_time,
+                        ch=wave_base.get(0, 0) + h.slot,
+                        on=False,
+                        note=180,
+                        ins=-1,
+                        vol=-1,
+                        e5=0x80,
+                        pan=0,
+                        pcm=True,
+                    ))
 
     opll_stats: dict = {}
     if is_opll:
@@ -6086,6 +6260,8 @@ def analyze(
     n_y8950_b_ins = (
         (len(y8950_b_samples) + YM2610_MAP_SLOTS - 1) // YM2610_MAP_SLOTS
     )
+    # One instrument per wave sample: the note is the pitch, not a slot.
+    n_opl4_wave_ins = len(opl4_wave_samples)
     tone_ins_base = (
         len(patch_order)
         + (len(audible) if pcm else 0) + len(oki_samples)
@@ -6094,9 +6270,10 @@ def analyze(
         + len(c352_audible) + len(k053260_audible)
         + n_ym2610_a_ins + n_ym2610_b_ins
         + n_ym2608_rhythm_ins + n_ym2608_b_ins
-        + n_y8950_b_ins
+        + n_y8950_b_ins + n_opl4_wave_ins
     )
-    y8950_b_ins_base = tone_ins_base - n_y8950_b_ins
+    opl4_wave_ins_base = tone_ins_base - n_opl4_wave_ins
+    y8950_b_ins_base = opl4_wave_ins_base - n_y8950_b_ins
     ym2610_b_ins_base = (
         y8950_b_ins_base - n_ym2610_b_ins - n_ym2608_rhythm_ins - n_ym2608_b_ins
     )
@@ -6112,6 +6289,8 @@ def analyze(
         ev.ins = ym2608_b_ins_base + idx // YM2610_MAP_SLOTS
     for ev, idx in y8950_b_events:
         ev.ins = y8950_b_ins_base + idx // YM2610_MAP_SLOTS
+    for ev, idx in opl4_wave_events:
+        ev.ins = opl4_wave_ins_base + idx
     scc_ids: list[int] = []
     scc_waves: list[bytes] = []
     scc_ins: list[ToneIns] = []
@@ -6704,6 +6883,8 @@ def analyze(
         ym2608_b_count=ym2608_b_count,
         y8950_b_samples=y8950_b_samples,
         y8950_b_count=y8950_b_count,
+        opl4_wave_samples=opl4_wave_samples,
+        opl4_wave_count=opl4_wave_count,
         scc_ids=scc_ids,
         scc_waves=scc_waves,
         scc_ins=scc_ins,
@@ -6807,7 +6988,8 @@ def format_report(song: Song) -> str:
             "ym2151": "YM2151", "ym2203": "YM2203", "ym2612": "YM2612",
             "ym2610": "YM2610B" if song.ym2610_b else "YM2610",
             "ym2608": "YM2608", "opl": "YM3526", "opl2": "YM3812",
-            "opl3": "YMF262", "y8950": "Y8950", "opll": "YM2413",
+            "opl3": "YMF262", "y8950": "Y8950", "opl4": "YMF278B",
+            "opll": "YM2413",
         }
         ranges = system_channel_ranges(song.fm_systems)
         parts: list[str] = []
