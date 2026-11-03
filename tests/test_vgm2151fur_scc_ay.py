@@ -253,6 +253,38 @@ class TestAyCollect(unittest.TestCase):
         table = PeriodPitchTable(440.0, 1789773.0, 8)
         self.assertEqual(table.value(note, e5 - 0x80), 254)
 
+    def test_percussion_attack_keeps_its_peak(self):
+        # Gate at 15, then the first decay step a frame later.  That is a
+        # normal attack, not a gate-opening trick, so the opening stays 15 and
+        # the decay step is a volume point (not absorbed).
+        writes = [
+            ChipWrite(0, "ay8910", 0, 7, 0xFE),
+            ChipWrite(0, "ay8910", 0, 0, 254),
+            ChipWrite(0, "ay8910", 0, 1, 0),
+            ChipWrite(100, "ay8910", 0, 8, 0x0F),
+            ChipWrite(800, "ay8910", 0, 8, 0x0E),
+            ChipWrite(1500, "ay8910", 0, 8, 0x0D),
+            ChipWrite(6000, "ay8910", 0, 8, 0x00),
+        ]
+        hits, _offs, _warn = collect_ay8910(_vgm(writes, ay8910_clock=1789773))
+        hit = hits[0]
+        self.assertEqual(hit.vol, 15)
+        self.assertIn((800, 14), hit.vol_pts)
+
+    def test_gate_opening_trick_is_absorbed(self):
+        # A loud level written only to open the gate, then the real quiet
+        # level within a frame: the note opens at the quiet level.
+        writes = [
+            ChipWrite(0, "ay8910", 0, 7, 0xFE),
+            ChipWrite(0, "ay8910", 0, 0, 254),
+            ChipWrite(0, "ay8910", 0, 1, 0),
+            ChipWrite(100, "ay8910", 0, 8, 0x0F),
+            ChipWrite(300, "ay8910", 0, 8, 0x04),
+            ChipWrite(6000, "ay8910", 0, 8, 0x00),
+        ]
+        hits, _offs, _warn = collect_ay8910(_vgm(writes, ay8910_clock=1789773))
+        self.assertEqual(hits[0].vol, 4)
+
     def test_noise_note(self):
         vgm = _vgm(self._writes(mixer=0xF7, noise=8), ay8910_clock=1789773)
         hits, _offs, _warn = collect_ay8910(vgm)

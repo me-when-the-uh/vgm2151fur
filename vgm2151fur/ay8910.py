@@ -44,6 +44,10 @@ AY_DEFAULT_CLOCK = 1789772  # COLOR_NTSC/2, the MSX/ZX Spectrum PSG clock
 AY_MIN_NOTE = 100
 # A loud gate level followed by the real level this soon is one note.
 AY_GATE_PAIR = 1000
+# ...but only when the drop is large enough to be a gate-opening trick.  A
+# percussion attack decays by a step or two per frame, so absorbing the first
+# frame would throw away the peak (and make the transient too quiet).
+AY_GATE_DROP = 3
 
 REG_TONE_LO = (0, 2, 4)
 REG_TONE_HI = (1, 3, 5)
@@ -303,9 +307,12 @@ def collect_ay8910(
                 update_gate(st, cid, voice, w.sample, retrigger=True)
                 continue
             level = val & 0x0F
-            if w.sample - hit.sample_time <= AY_GATE_PAIR and level < hit.vol:
+            if (w.sample - hit.sample_time <= AY_GATE_PAIR
+                    and hit.vol - level >= AY_GATE_DROP):
                 # Loud gate then the real quiet level: keep the quiet level
-                # as the note's opening, not a separate volume step.
+                # as the note's opening, not a separate volume step.  A small
+                # drop is the first frame of a normal decay and must keep the
+                # loud attack.
                 hit.vol = level
                 window = hit.sample_time + AY_GATE_PAIR
                 hit.vol_pts = [p for p in hit.vol_pts if p[0] > window]
