@@ -11,7 +11,9 @@ import math
 from dataclasses import dataclass
 
 from vgm2151fur.timing import place_tick
-from vgm2151fur.vgm import VGM_RATE, VgmFile
+from vgm2151fur.vgm import (
+    VGM_RATE, DAC_STREAM_YM2612, DacStreamPlay, VgmFile,
+)
 
 DAC_GAP = 512
 DAC_MIN_SAMPLES = 8
@@ -178,7 +180,7 @@ def _collect_slices(
     vgm: VgmFile,
 ) -> tuple[list[DacSample], list[DacPlay], list[str], dict]:
     """Explicit per-run slice representation for editing."""
-    if not vgm.dac_events and not vgm.dac_block_plays:
+    if not vgm.dac_events and not vgm.dac_block_plays and not vgm.dac_stream_plays:
         return [], [], [], {}
 
     stats: dict = {}
@@ -274,6 +276,24 @@ def _collect_slices(
         plays.append(DacPlay(t, idx, _pan_at(pan_timeline, t), span, False))
         stats["dac_block_plays"] = stats.get("dac_block_plays", 0) + 1
 
+    # Stream starts (0x93): each one is a contiguous slice of the PCM bank.
+    for play in vgm.dac_stream_plays:
+        if not _stream_is_dac(vgm, play, stats):
+            continue
+        body = _stream_body(vgm, play)
+        if not body:
+            continue
+        if not _dac_enabled_at(enable_tl, play.sample):
+            stats["dac_disabled_bytes"] = stats.get("dac_disabled_bytes", 0) + 1
+            continue
+        rate = _clamp_rate(play.rate or VGM_RATE, stats)
+        span = int(round(len(body) * VGM_RATE / rate))
+        idx = _add_sample(samples, by_key, body, rate, play.sample)
+        plays.append(DacPlay(
+            play.sample, idx, _pan_at(pan_timeline, play.sample), span, False,
+        ))
+        stats["dac_stream_plays"] = stats.get("dac_stream_plays", 0) + 1
+
     plays.sort(key=lambda p: p.onset)
     stats["dac_unique_samples"] = len(samples)
     stats["dac_sample_bytes"] = sum(len(s.data) for s in samples)
@@ -361,26 +381,12 @@ def _packed_words(
     return reduced
 
 
-def _collect_packed(
-    vgm: VgmFile,
-) -> tuple[list[DacSample], list[DacPlay], list[str], dict]:
-    """Build release-capped PCM chunks, split at pan changes and pauses."""
-    if not vgm.dac_events and not vgm.dac_block_plays:
-        return [], [], [], {}
-    stats: dict = {}
-    warnings: list[str] = []
-    pan_timeline = _pan_timeline(vgm)
-    enable_tl = _dac_enable_timeline(vgm)
-    words = _packed_words(vgm, stats, enable_tl)
-
-    if not words:
-        if stats.get("dac_disabled_bytes"):
-            warnings.append(
-                f"{stats['dac_disabled_bytes']} YM2612 DAC writes while the DAC "
-                "is disabled (0x2B bit 7 clear); no DAC audio"
-            )
-        return [], [], warnings, stats
-
+def _chunk_words(
+    words: list[tuple[float, int, int]],
+    stats: dict,
+    pan_timeline: list[tuple[int, int]],
+) -> tuple[list[DacSample], list[DacPlay], int, int]:
+    """Turn per-byte DAC writes into release-capped rate-exact PCM chunks."""
     phrases: list[list[tuple[float, int, int]]] = []
     current: list[tuple[float, int, int]] = []
     for word in words:
@@ -520,9 +526,170 @@ def _collect_packed(
         stats["dac_release_trimmed"] = len(samples) - DAC_RELEASE_SAMPLES
         del samples[DAC_RELEASE_SAMPLES:]
         plays = [p for p in plays if p.sample < DAC_RELEASE_SAMPLES]
+    return samples, plays, pan_chunks, trimmed
+
+
+def _stream_is_dac(vgm: VgmFile, play: DacStreamPlay, stats: dict) -> bool:
+    """Whether a 0x93 start is the first YM2612's DAC and inside the song.
+
+    Both collection modes take every PCM byte from `dac_data`, so a stream on
+    another chip, another register, or the exporter's end-of-file flush has to
+    be refused rather than played twice.
+    """
+    if play.chip_type != DAC_STREAM_YM2612:
+        stats["dac_stream_other_chip"] = (
+            stats.get("dac_stream_other_chip", 0) + 1
+        )
+        return False
+    if play.reg != 0x2A:
+        # The DAC takes only $2A. A stream aimed at another register is an FM
+        # write stream, not PCM this tool can host in a sample map.
+        stats["dac_stream_other_reg"] = (
+            stats.get("dac_stream_other_reg", 0) + 1
+        )
+        return False
+    if play.chip_id:
+        stats["dac_stream_second_chip"] = (
+            stats.get("dac_stream_second_chip", 0) + 1
+        )
+        return False
+    if vgm.total_samples and play.sample >= vgm.total_samples:
+        # The exporter flushes a final start at the end-of-file offset; the
+        # song has already stopped there.
+        stats["dac_stream_tail_plays"] = (
+            stats.get("dac_stream_tail_plays", 0) + 1
+        )
+        return False
+    return True
+
+
+def _stream_body(vgm: VgmFile, play: DacStreamPlay) -> bytes:
+    """The byte range a 0x93 start plays out of the stream's data bank.
+
+    The YM2612's bank is the concatenated type-0x00 PCM database, which the
+    loader keeps in `dac_data`.  Mode 1 counts commands (one byte each on the
+    YM2612), mode 2 milliseconds of the 0x92 rate, mode 3 the rest of the bank.
+    The 0x91 step size is in command units, so a step of two plays every other
+    byte.
+    """
+    bank = bytes(vgm.dac_data)
+    start = max(0, min(len(bank), play.offset))
+    if play.length_mode == 1:
+        end = start + max(0, play.length)
+    elif play.length_mode == 2:
+        rate = play.rate or VGM_RATE
+        end = start + max(0, int(round(play.length * rate / 1000.0)))
+    elif play.length_mode == 3:
+        end = len(bank)
+    else:
+        end = start
+    step = play.step if play.step > 1 else 1
+    body = bank[start:min(end, len(bank)):step]
+    return body[::-1] if play.reverse else body
+
+
+def _stream_chunks(
+    vgm: VgmFile, stats: dict,
+) -> list[tuple[int, bytes, int]]:
+    """(onset, body, rate) chunks for YM2612 0x93 stream starts.
+
+    A stream is already contiguous PCM at one rate, so it never needs the
+    per-byte word expansion.  The release sample budget is spread over the
+    plays by duration, which keeps a minute-long drum stream inside the same
+    240-sample cap the direct-write path uses.
+    """
+    if not vgm.dac_stream_plays:
+        return []
+    bodies: list[tuple[int, bytes, int]] = []
+    for play in vgm.dac_stream_plays:
+        if not _stream_is_dac(vgm, play, stats):
+            continue
+        body = _stream_body(vgm, play)
+        if not body:
+            stats["dac_stream_empty"] = (
+                stats.get("dac_stream_empty", 0) + 1
+            )
+            continue
+        rate = _clamp_rate(play.rate or VGM_RATE, stats)
+        if play.loop:
+            stats["dac_stream_loops"] = (
+                stats.get("dac_stream_loops", 0) + 1
+            )
+        bodies.append((play.sample, body, rate))
+    if not bodies:
+        return []
+    spans = [len(body) * VGM_RATE / rate for _t, body, rate in bodies]
+    total_span = max(1.0, sum(spans))
+    target = max(1, min(
+        DAC_RELEASE_SAMPLES,
+        int(total_span / (VGM_RATE * DAC_CHUNK_SECONDS) + 0.9999),
+    ))
+    stats["dac_stream_plays"] = len(bodies)
+    stats["dac_stream_target_chunks"] = target
+    out: list[tuple[int, bytes, int]] = []
+    for (onset, body, rate), span in zip(bodies, spans):
+        count = max(1, int(round(target * span / total_span)))
+        count = min(count, len(body))
+        for k in range(count):
+            i0 = (k * len(body)) // count
+            i1 = ((k + 1) * len(body)) // count
+            if i1 <= i0:
+                continue
+            start = onset + int(round(i0 * VGM_RATE / rate))
+            out.append((start, body[i0:i1], rate))
+            stats["dac_stream_chunks"] = (
+                stats.get("dac_stream_chunks", 0) + 1
+            )
+    out.sort(key=lambda c: c[0])
+    return out
+
+
+def _collect_packed(
+    vgm: VgmFile,
+) -> tuple[list[DacSample], list[DacPlay], list[str], dict]:
+    """Build release-capped PCM chunks, split at pan changes and pauses."""
+    if not (
+        vgm.dac_events or vgm.dac_block_plays or vgm.dac_stream_plays
+    ):
+        return [], [], [], {}
+    stats: dict = {}
+    warnings: list[str] = []
+    pan_timeline = _pan_timeline(vgm)
+    enable_tl = _dac_enable_timeline(vgm)
+    words = _packed_words(vgm, stats, enable_tl)
+    chunks = _stream_chunks(vgm, stats)
+
+    if not words and not chunks:
+        if stats.get("dac_disabled_bytes"):
+            warnings.append(
+                f"{stats['dac_disabled_bytes']} YM2612 DAC writes while the DAC "
+                "is disabled (0x2B bit 7 clear); no DAC audio"
+            )
+        return [], [], warnings, stats
+
+    if words:
+        samples, plays, pan_chunks, trimmed = _chunk_words(
+            words, stats, pan_timeline,
+        )
+    else:
+        samples, plays, pan_chunks, trimmed = [], [], 0, 0
+    for onset, body, rate in chunks:
+        idx = len(samples)
+        samples.append(DacSample(0, len(body), body, rate, onset))
+        plays.append(DacPlay(
+            onset, idx, _pan_at(pan_timeline, onset),
+            int(round(len(body) * VGM_RATE / rate)),
+        ))
+    plays.sort(key=lambda p: p.onset)
+    if len(samples) > DAC_RELEASE_SAMPLES:
+        stats["dac_release_trimmed"] = len(samples) - DAC_RELEASE_SAMPLES
+        del samples[DAC_RELEASE_SAMPLES:]
+        plays = [p for p in plays if p.sample < DAC_RELEASE_SAMPLES]
 
     stats["dac_mode"] = "chunks"
-    stats["dac_source_bytes"] = len(words)
+    stats["dac_source_bytes"] = len(words) + sum(
+        len(body) for _t, body, _r in chunks
+    )
     stats["dac_trimmed_silence_bytes"] = trimmed
     stats["dac_chunks"] = len(samples)
     stats["dac_pan_chunks"] = pan_chunks

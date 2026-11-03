@@ -198,6 +198,28 @@ def compare_psg(src: VgmFile, exp: VgmFile) -> dict:
     }
 
 
+def _dac_starts(exp: VgmFile, limit: int) -> list[tuple[int, int]]:
+    """(onset, byte count) for every DAC start in an export.
+
+    Furnace answers a long PCM channel either way: `$95` replays an embedded
+    block, `$93` streams a range of the bank it uploaded. Both are one note.
+    """
+    from vgm2151fur.vgm import DAC_STREAM_YM2612
+
+    out: list[tuple[int, int]] = []
+    for t, block, _rate in exp.dac_block_plays:
+        if t < limit:
+            n = (len(exp.dac_blocks[block])
+                 if 0 <= block < len(exp.dac_blocks) else -1)
+            out.append((t, n))
+    for play in exp.dac_stream_plays:
+        if play.sample >= limit or play.chip_type != DAC_STREAM_YM2612:
+            continue
+        out.append((play.sample, play.length if play.length_mode == 1 else -1))
+    out.sort()
+    return out
+
+
 def compare_dac(src: VgmFile, exp: VgmFile) -> dict:
     """Count source DAC notes matched to an exported DAC stream start."""
     from vgm2151fur.analyze import analyze
@@ -206,14 +228,21 @@ def compare_dac(src: VgmFile, exp: VgmFile) -> dict:
     notes = [e.sample for e in song.events if e.dac and e.on]
     # Ignore the exporter's end-of-file sample flush.
     limit = src.total_samples or (max(notes, default=0) + 1)
-    starts = [t for t, _block, _rate in exp.dac_block_plays if t < limit]
+    starts = _dac_starts(exp, limit)
+    streams = sum(
+        1 for p in src.dac_stream_plays if not limit or p.sample < limit
+    )
     if not notes:
-        return {"matched": 0, "missed": 0, "extra": len(starts), "rate_bad": 0}
+        return {
+            "matched": 0, "missed": 0, "extra": len(starts),
+            "rate_bad": 0, "streams": streams, "bytes_src": 0,
+            "bytes_exp": 0,
+        }
     used: set[int] = set()
     missed = 0
     for onset in notes:
         best = None
-        for j, t in enumerate(starts):
+        for j, (t, _n) in enumerate(starts):
             if j in used:
                 continue
             d = abs(t - onset)
@@ -225,6 +254,7 @@ def compare_dac(src: VgmFile, exp: VgmFile) -> dict:
             used.add(best[1])
     # Blocks are exported in sample order; allow 2 Hz C-4 rounding.
     rate_bad = 0
+    wants = [s.c4_rate for s in song.dac_samples]
     if len(exp.dac_blocks) == len(song.dac_samples):
         for _t, block, rate in exp.dac_block_plays:
             if block >= len(song.dac_samples):
@@ -234,11 +264,27 @@ def compare_dac(src: VgmFile, exp: VgmFile) -> dict:
                 continue
             if abs(rate - want) > 2:
                 rate_bad += 1
+    # A stream start carries its own $92 rate. It has to be one of the
+    # chunk rates, or the export plays the PCM at the wrong speed.
+    for play in exp.dac_stream_plays:
+        if limit and play.sample >= limit:
+            continue
+        if not play.rate or not wants:
+            continue
+        if not any(abs(play.rate - want) <= 2 for want in wants):
+            rate_bad += 1
+    # How much PCM actually plays. A `$93` source of one long stream and the
+    # chunked module have to cover the same byte count.
+    bytes_src = sum(len(s.data) for s in song.dac_samples)
+    bytes_exp = sum(n for _t, n in starts if n > 0)
     return {
         "matched": len(notes) - missed,
         "missed": missed,
         "extra": len(starts) - len(used),
         "rate_bad": rate_bad,
+        "streams": streams,
+        "bytes_src": bytes_src,
+        "bytes_exp": bytes_exp,
     }
 
 

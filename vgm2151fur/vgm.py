@@ -80,6 +80,9 @@ CMD_END = 0x66
 CMD_STREAM_SETUP = 0x90
 # Stream-control chip type (0x90 tt), not the extra-header id. OKIM6258 is 0x17.
 STREAM_OKIM6258 = 0x17
+# The YM2612 DAC stream driver, the other type this tool reconstructs. Its data
+# bank is the type-0x00 PCM database and its register is $2A.
+DAC_STREAM_YM2612 = 0x02
 K007232_ROM_TYPE = 0x94  # 0x80 + 0x14
 OKI_ROM_TYPE = 0x8B  # OKIM6295 ROM
 SEGAPCM_ROM_TYPE = 0x80  # SegaPCM ROM
@@ -289,6 +292,40 @@ class Msm6258Play:
 
 
 @dataclass
+class DacStreamPlay:
+    """One generic DAC-stream start (0x93) for a chip other than the OKIM6258.
+
+    `offset` and `length` address the bank the stream's 0x91 selected.  For the
+    YM2612 that bank is the concatenated type-0x00 PCM database (`VgmFile.
+    dac_data`), so the pair is a byte range of the sample ROM.  `mode` is the
+    raw 0x93 byte: bits 0-2 choose the length unit (1 = commands/bytes, 2 =
+    milliseconds, 3 = the rest of the bank), bit 7 loops and bit 4 reverses.
+    `rate` is the 0x92 byte rate (bytes per second), and `step`/`step_base`
+    are the 0x91 values.
+    """
+
+    sample: int
+    chip_type: int
+    chip_id: int
+    stream: int
+    port: int
+    reg: int
+    offset: int
+    length: int
+    mode: int
+    rate: int = 0
+    loop: bool = False
+    reverse: bool = False
+    step: int = 1
+    step_base: int = 0
+    bank: int = 0
+
+    @property
+    def length_mode(self) -> int:
+        return self.mode & 0x07
+
+
+@dataclass
 class ChipWrite:
     sample: int
     chip: str  # "ym2151" | "ym2203" | "ym2612" | "ym2610" | "opl" | "opl2" |
@@ -352,6 +389,10 @@ class VgmFile:
     # 0x90/0x91 once, then 0x92 (rate) + 0x95 (one type-0 block) per sample.
     dac_blocks: list[bytes] = field(default_factory=list)
     dac_block_plays: list[tuple[int, int, int]] = field(default_factory=list)
+    # 0x93 starts a stream at an offset/length inside a data bank.  Furnace
+    # exports a long PCM play this way, so the YM2612 path slices dac_data with
+    # these instead of replaying a whole block.
+    dac_stream_plays: list[DacStreamPlay] = field(default_factory=list)
     dac_stream_rates: dict[int, int] = field(default_factory=dict)
     # YM2203 header 0x44.  A dual-chip log carries bit 30 in the clock field;
     # both instances share the clock.  0x55 targets the first chip, 0xA5 the
@@ -1045,6 +1086,7 @@ def load_vgm(path: Path | str) -> VgmFile:
                 "bank": 0,
                 "step": 1,
                 "base": 0,
+                "pos": 0,
                 "rate": vgm.dac_stream_rates.get(sid, 0),
             }
             vgm.stream_setups += 1
@@ -1068,6 +1110,8 @@ def load_vgm(path: Path | str) -> VgmFile:
             length = int.from_bytes(buf[pos + 7:pos + 11], "little")
             st = streams.get(sid)
             kind = mode & 0x07
+            if st is not None and offset != 0xFFFFFFFF:
+                st["pos"] = offset
             if st is not None and st["type"] == STREAM_OKIM6258 and kind != 0:
                 close_adpcm(sid, sample)
                 play = Msm6258Play(
@@ -1085,6 +1129,30 @@ def load_vgm(path: Path | str) -> VgmFile:
                 )
                 vgm.msm6258_plays.append(play)
                 active_adpcm[sid] = play
+            elif st is not None and kind != 0:
+                # Any other chip: the stream writes its data bank to the
+                # register the 0x90 named, at the 0x92 rate.  The YM2612 DAC
+                # is the only one this tool reconstructs, but the record is
+                # chip-agnostic.
+                vgm.dac_stream_plays.append(DacStreamPlay(
+                    sample=sample,
+                    chip_type=st["type"],
+                    chip_id=st["chip_id"],
+                    stream=sid,
+                    port=st["port"],
+                    reg=st["reg"],
+                    offset=(
+                        st.get("pos", 0) if offset == 0xFFFFFFFF else offset
+                    ),
+                    length=length,
+                    mode=mode,
+                    rate=st["rate"] or vgm.dac_stream_rates.get(sid, 0),
+                    loop=bool(mode & 0x80),
+                    reverse=bool(mode & 0x10),
+                    step=st["step"],
+                    step_base=st["base"],
+                    bank=st["bank"],
+                ))
             pos += 11
             continue
         if cmd == 0x94 and pos + 2 <= n:
@@ -1418,7 +1486,10 @@ def load_vgm(path: Path | str) -> VgmFile:
         vgm.warnings.append(
             f"SN76489 clock is missing or out of range; using {SN76489_DEFAULT_CLOCK}"
         )
-    if vgm.dac_data and not vgm.dac_events and not vgm.dac_block_plays:
+    if (
+        vgm.dac_data and not vgm.dac_events and not vgm.dac_block_plays
+        and not vgm.dac_stream_plays
+    ):
         vgm.warnings.append(
             "YM2612 PCM data block present but no DAC play stream; "
             "the DAC data is unused"
@@ -1439,6 +1510,11 @@ def load_vgm(path: Path | str) -> VgmFile:
         vgm.warnings.append(
             "modern 0x95 DAC stream control is parsed for the audit but not "
             "converted as source PCM"
+        )
+    if vgm.dac_stream_plays and not vgm.dac_data:
+        vgm.warnings.append(
+            "DAC stream start commands present but no PCM data block; "
+            "the stream cannot be reconstructed"
         )
     if stray_ym2612_second:
         vgm.warnings.append(
