@@ -2803,20 +2803,7 @@ def decompress_fur(data: bytes) -> bytes:
 
 def _system_span(system) -> int:
     """Module columns one FM system occupies, sample engines included."""
-    kind = system.kind
-    if kind in ("opl", "opl2", "opl3"):
-        return OPL_CHANNELS[(kind, bool(system.drums))]
-    if kind == "opll":
-        return OPLL_DRUMS_CHANNELS if system.drums else OPLL_CHANNELS
-    if kind == "ym2610":
-        return system.fm_channels + 3 + 6 + 1
-    if kind == "ym2608":
-        return system.fm_channels + 3 + 6 + 1
-    if kind == "ym2203":
-        return system.fm_channels + 3
-    if kind == "ym2612":
-        return system.fm_channels
-    return system.fm_channels or 8
+    return system.channels
 
 
 def _channel_vol_max(

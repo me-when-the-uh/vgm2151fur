@@ -432,6 +432,35 @@ class FmSystem:
     drums: bool = False
     clock: int = 0
 
+    @property
+    def channels(self) -> int:
+        """Module columns this system occupies, its sample engines included.
+
+        The report and the writer both walk systems in channel order, so the
+        span belongs with the system rather than in a second table.
+        """
+        if self.kind in ("opl", "opl2", "opl3"):
+            from vgm2151fur.opl import channel_count
+            return channel_count(self.kind, self.drums)
+        if self.kind == "opll":
+            return OPLL_DRUMS_CHANNELS if self.drums else OPLL_CHANNELS
+        if self.kind in ("ym2610", "ym2608"):
+            # FM, three SSG voices, six kit or ADPCM-A voices and one delta-T.
+            return self.fm_channels + 3 + 6 + 1
+        if self.kind == "ym2203":
+            return self.fm_channels + 3
+        return self.fm_channels or 8
+
+
+def system_channel_ranges(systems) -> list[tuple[FmSystem, int]]:
+    """(system, first module channel) in module order."""
+    out: list[tuple[FmSystem, int]] = []
+    ch = 0
+    for system in systems:
+        out.append((system, ch))
+        ch += system.channels
+    return out
+
 
 @dataclass
 class Song:
@@ -3187,6 +3216,25 @@ def _opl_rhythm_plan(vgm, kind: str) -> tuple[bool, dict]:
     return bool(stats["latches"]), stats
 
 
+def _fm_vol_max(systems, *, is_opll: bool = False,
+                is_opl: bool = False) -> int:
+    """The volume column's ceiling for a module's main FM family.
+
+    The ceiling is a chip property: 127 on the OPM and OPN family, 63 on an
+    OPL, 15 on the YM2413. A combined module takes it from the family whose
+    channels come first, and the writer's `_channel_vol_max` gives every column
+    its own chip's value on top of that.
+    """
+    kind = systems[0].kind if systems else (
+        "opll" if is_opll else "opl" if is_opl else "ym2151"
+    )
+    if kind == "opll":
+        return 15
+    if kind in ("opl", "opl2", "opl3"):
+        return 63
+    return 127
+
+
 def _family_keyons(vgm: VgmFile, chips: set[str]) -> int:
     """Rising key-on edges of the named chip families.
 
@@ -3202,11 +3250,16 @@ def _family_keyons(vgm: VgmFile, chips: set[str]) -> int:
         if w.chip not in chips:
             continue
         if w.chip == "ym2151":
-            if w.reg == 0x08 and (w.val & 0x78):
-                key = ("ym2151", w.chip_id, w.val & 7)
-                if not fm_mask.get(key):
+            # Mirror the collector: the voice is in bits 2-0, the operator mask
+            # in bits 6-3, and a key-off write clears the mask. Counting only
+            # the non-zero writes would call a whole channel one note.
+            if w.reg == 0x08:
+                ch = w.val & 7
+                mask = (w.val & 0x78) >> 3
+                key = ("ym2151", w.chip_id, ch)
+                if mask and not fm_mask.get(key):
                     count += 1
-                fm_mask[key] = w.val & 0x78
+                fm_mask[key] = mask
         elif w.chip == "ym2203":
             if (w.reg & 0xFF) == 0x28:
                 ch = w.val & 3
@@ -3514,7 +3567,7 @@ def analyze(
             selected_fm_chips.add(name)
             if f"{name}_ssg" in chips:
                 selected_fm_chips.add(f"{name}_ssg")
-    if has_opl and arcade_present and "ym2612" not in converted:
+    if has_opl and arcade_present and lost:
         other = _names(arcade_present)
         opl_writes = sum(1 for w in vgm.writes if w.chip in opl_side)
         arcade_writes = sum(1 for w in vgm.writes if w.chip in arcade_present)
@@ -3530,6 +3583,15 @@ def analyze(
                 f"({opl_keys}); writes {other} {arcade_writes}, OPL "
                 f"{opl_writes}; only the {other} side was converted"
             )
+    if share_fm and not is_combo:
+        # Both sides play, so both are kept. Say which is which.
+        arcade_writes = sum(1 for w in vgm.writes if w.chip == arcade_pick)
+        home = opl_side | ({"opll"} if is_opll else set())
+        warnings.append(
+            f"{_names({arcade_pick})} ({_family_keyons(vgm, {arcade_pick})} "
+            f"key-ons, {arcade_writes} writes) plays beside {_names(home)} "
+            f"({_family_keyons(vgm, home)} key-ons); each keeps its own system"
+        )
     opl_ids = (
         sorted({w.chip_id for w in vgm.writes if w.chip == opl_kind})
         if is_opl else []
@@ -6439,7 +6501,7 @@ def analyze(
         opl_drums=opl_drums,
         opll_ids=opll_ids,
         opll_drums=opll_drums,
-        fm_vol_max=15 if is_opll else (63 if is_opl else 127),
+        fm_vol_max=_fm_vol_max(fm_systems, is_opll=is_opll, is_opl=is_opl),
         fm_notes=(
             opll_stats.get("notes", 0) if is_opll else
             opl_stats.get("notes", 0) if is_opl else 0
@@ -6549,6 +6611,48 @@ def format_report(song: Song) -> str:
             f"{song.ym2608_ssg_count} SSG notes, "
             f"{song.ym2608_rhythm_count} rhythm, {song.ym2608_b_count} ADPCM-B"
         ))
+    elif song.fm_chip == "ym2151":
+        # The OPM was the tool's first target and needs no header to explain
+        # itself, but a module that also carries an OPL family does.
+        if len({s.kind for s in song.fm_systems}) > 1:
+            lines.insert(-1, (
+                f"FM chip     YM2151 @ "
+                f"{(v.ym2151_clock or 3579545) / 1e6:.6g} MHz, eight voices"
+            ))
+    families = {s.kind for s in song.fm_systems}
+    if len(families) > 1:
+        # A merged log converts more than one family. Name each with its own
+        # clock and note count, so the report says who played what.
+        label = {
+            "ym2151": "YM2151", "ym2203": "YM2203", "ym2612": "YM2612",
+            "ym2610": "YM2610B" if song.ym2610_b else "YM2610",
+            "ym2608": "YM2608", "opl": "YM3526", "opl2": "YM3812",
+            "opl3": "YMF262", "opll": "YM2413",
+        }
+        ranges = system_channel_ranges(song.fm_systems)
+        parts: list[str] = []
+        for kind in dict.fromkeys(s.kind for s in song.fm_systems):
+            group = [(s, base) for s, base in ranges if s.kind == kind]
+            first = group[0][0]
+            name = label.get(kind, kind)
+            if first.ext:
+                name += " Ext"
+            if first.drums:
+                name += " kit"
+            notes = 0
+            for system, base in group:
+                end = base + system.fm_channels
+                notes += sum(
+                    1 for e in song.events
+                    if e.on and not e.pcm and not e.dac and not e.tone_chip
+                    and base <= e.ch < end
+                )
+            clock = first.clock or 0
+            parts.append(
+                f"{name} x{len(group)} @ {clock / 1e6:.6g} MHz, {notes} notes"
+            )
+        lines.insert(-1, "FM systems  " + "; ".join(parts))
+
     for i, p in enumerate(song.fm_patches):
         lfo = ""
         if p.fms_macro:
@@ -6566,7 +6670,9 @@ def format_report(song: Song) -> str:
         )
     if song.fm_chip == "ym2612" and song.fm_patches:
         lines.append("  (carrier TL is relative; the key-on level rides the volume column)")
-    elif song.fm_chip in ("opl", "opl2", "opl3") and song.fm_patches:
+    elif families & {"opl", "opl2", "opl3", "opll"} and song.fm_patches:
+        # In a combined module this says what the OPL columns do; the arcade
+        # family beside them keeps its carrier levels relative instead.
         lines.append("  (carrier TL rides the volume column; a modulator level "
                      "the log moved mid-note travels as an operator macro; "
                      "a kit column shares one voice)")
@@ -6580,7 +6686,15 @@ def format_report(song: Song) -> str:
                 f"chip fx     {lfo_n} writes (0xBD depth and rhythm bits)")
         else:
             lines.append(f"LFO fx      {lfo_n} chip writes (17/18/1E/1F)")
-    if song.fm_chip == "ym2203":
+    if len(families) > 1:
+        # Two families share the module, so count every pitch column at its own
+        # base instead of assuming the FM block starts at channel 0. The PSG,
+        # SCC and sample-chip notes carry their own markers.
+        fm_ons = sum(
+            1 for e in song.events
+            if e.on and not e.pcm and not e.dac and not e.tone_chip
+        )
+    elif song.fm_chip == "ym2203":
         fm_ons = sum(
             1 for e in song.events
             if e.on and not e.pcm and e.ch % 6 < 3
@@ -6607,9 +6721,9 @@ def format_report(song: Song) -> str:
             if e.on and not e.pcm and not e.dac and e.ch < 8
         )
     pcm_ons = sum(1 for e in song.events if e.on and e.pcm)
-    kit = (f"  (+{song.drum_notes} kit hits)" if song.fm_chip in ("opl", "opl2",
-                                                                    "opl3")
-           and song.drum_notes else "")
+    kit = (f"  (+{song.drum_notes} kit hits)"
+           if families & {"opl", "opl2", "opl3", "opll"} and song.drum_notes
+           else "")
     lines.append(f"FM notes    {fm_ons}{kit}")
     if song.psg_ids:
         lines.append(
