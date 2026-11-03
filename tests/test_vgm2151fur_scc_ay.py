@@ -8,7 +8,7 @@ import unittest
 from pathlib import Path
 
 from vgm2151fur.analyze import _fold_saw, _saw_anchors, _unit_saw, analyze
-from vgm2151fur.ay8910 import ay_note, ay_rate, collect_ay8910
+from vgm2151fur.ay8910 import FX_NOISE, ay_note, ay_rate, collect_ay8910
 from vgm2151fur.furio import CHIP_CHANNELS, iter_blocks, parse_fur
 from vgm2151fur.furwrite import (
     CHIP_AY8910, CHIP_K051649, CHIP_K052539, INS_AY, INS_SCC, write_fur,
@@ -271,6 +271,23 @@ class TestAyCollect(unittest.TestCase):
         self.assertEqual(hit.vol, 15)
         self.assertIn((800, 14), hit.vol_pts)
 
+    def test_level_jump_up_is_a_new_hit(self):
+        # A snare roll keeps the gate open and jumps the level back up from
+        # the decayed value. Each jump is a hit, not one long volume macro.
+        writes = [
+            ChipWrite(0, "ay8910", 0, 7, 0xF6),
+            ChipWrite(0, "ay8910", 0, 0, 254),
+            ChipWrite(0, "ay8910", 0, 1, 0),
+            ChipWrite(100, "ay8910", 0, 8, 0x0D),
+            ChipWrite(1500, "ay8910", 0, 8, 0x07),
+            ChipWrite(2500, "ay8910", 0, 8, 0x0F),
+            ChipWrite(8000, "ay8910", 0, 8, 0x00),
+        ]
+        hits, _offs, _warn = collect_ay8910(_vgm(writes, ay8910_clock=1789773))
+        self.assertEqual([(h.sample_time, h.vol) for h in hits],
+                         [(100, 13), (2500, 15)])
+        self.assertEqual(hits[0].off_sample, 2500)
+
     def test_gate_opening_trick_is_absorbed(self):
         # A loud level written only to open the gate, then the real quiet
         # level within a frame: the note opens at the quiet level.
@@ -284,6 +301,23 @@ class TestAyCollect(unittest.TestCase):
         ]
         hits, _offs, _warn = collect_ay8910(_vgm(writes, ay8910_clock=1789773))
         self.assertEqual(hits[0].vol, 4)
+
+    def test_noise_enable_carries_the_period_written_while_off(self):
+        # A snare often sets the noise period and then turns the mixer's noise
+        # bit on. The period write lands while noise is off, so the mixer turn
+        # must carry the current value or the first tick uses the old hit's.
+        writes = [
+            ChipWrite(0, "ay8910", 0, 7, 0xFE),   # tone A on, noise A off
+            ChipWrite(0, "ay8910", 0, 0, 254),
+            ChipWrite(0, "ay8910", 0, 1, 0),
+            ChipWrite(100, "ay8910", 0, 8, 12),
+            ChipWrite(101, "ay8910", 0, 6, 13),   # noise period while off
+            ChipWrite(110, "ay8910", 0, 7, 0xF6),  # noise A on
+            ChipWrite(8000, "ay8910", 0, 8, 0),
+        ]
+        hits, _offs, _warn = collect_ay8910(_vgm(writes, ay8910_clock=1789773))
+        self.assertEqual(len(hits), 1)
+        self.assertIn((110, FX_NOISE, 31 - 13), hits[0].fx_pts)
 
     def test_noise_note(self):
         vgm = _vgm(self._writes(mixer=0xF7, noise=8), ay8910_clock=1789773)

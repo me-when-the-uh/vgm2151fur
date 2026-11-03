@@ -112,6 +112,9 @@ noise disabled = off). An envelope-enable volume write (bit 4) re-arms the
 generator, which is how MSX drivers retrigger drums; that becomes a new note
 even when the voice never went quiet. A write that clears the envelope bit
 also emits a mode effect, or the register would keep using the generator.
+A level jump of four or more while the gate stays open is a new hit too: a
+snare roll jumps straight from the decayed level back up without closing the
+gate, and treating it as a volume macro lost every hit after the first one.
 
 Before the first `$07` write the mixer defaults to **tone-only** (`$38`,
 `ay8910.REG_MIXER_DEFAULT`). A zeroed mixer enables noise on all three voices at

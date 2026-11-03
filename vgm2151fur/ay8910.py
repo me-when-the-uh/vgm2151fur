@@ -45,9 +45,14 @@ AY_MIN_NOTE = 100
 # A loud gate level followed by the real level this soon is one note.
 AY_GATE_PAIR = 1000
 # ...but only when the drop is large enough to be a gate-opening trick.  A
-# percussion attack decays by a step or two per frame, so absorbing the first
-# frame would throw away the peak (and make the transient too quiet).
-AY_GATE_DROP = 3
+# percussion attack decays by a step or two per frame (three or four on a
+# roll), so absorbing the first frame would throw away the peak and make the
+# transient too quiet.
+AY_GATE_DROP = 6
+# A level jump this large while the gate stays open is a retriggered drum
+# (a snare roll writes the next hit straight from the decayed level back up).
+# Without it the whole roll stayed one note with a volume macro.
+AY_RETRIGGER_RISE = 4
 
 REG_TONE_LO = (0, 2, 4)
 REG_TONE_HI = (1, 3, 5)
@@ -307,6 +312,16 @@ def collect_ay8910(
                 update_gate(st, cid, voice, w.sample, retrigger=True)
                 continue
             level = val & 0x0F
+            if not hit.env:
+                prev = hit.vol_pts[-1][1] if hit.vol_pts else hit.vol
+                if level - prev >= AY_RETRIGGER_RISE:
+                    # The driver keeps the gate open and jumps the level back
+                    # up for the next hit. Close this one silently and let the
+                    # new level open a fresh note, so the roll reaches the
+                    # pattern instead of living only in the volume macro.
+                    close_hit(st, cid, voice, w.sample, emit_off=False)
+                    open_hit(st, cid, voice, w.sample)
+                    continue
             if (w.sample - hit.sample_time <= AY_GATE_PAIR
                     and hit.vol - level >= AY_GATE_DROP):
                 # Loud gate then the real quiet level: keep the quiet level
@@ -345,6 +360,15 @@ def collect_ay8910(
                         w.sample, FX_MODE,
                         ay_mode(tone, noise, bool(reg[REG_VOL[voice]] & 0x10)) - 1,
                     ))
+                    if noise and not hit.noise:
+                        # The driver may have set the noise period while the
+                        # mixer still had noise off (common on a snare whose
+                        # tone and noise turn on together). Carry the value
+                        # over so the first tick does not use the previous
+                        # hit's period.
+                        hit.fx_pts.append((
+                            w.sample, FX_NOISE, 31 - (reg[REG_NOISE] & 0x1F),
+                        ))
                     hit.tone, hit.noise = tone, noise
             for voice in range(AY_VOICES):
                 update_gate(st, cid, voice, w.sample)

@@ -7,9 +7,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from vgm2151fur.analyze import (
-    _SSG_VOLUME_TRIM, analyze, furnace_note_name,
-)
+from vgm2151fur.analyze import analyze, furnace_note_name
 from vgm2151fur.ay8910 import ay_rate, collect_ay8910
 from vgm2151fur.diag import export_fur, opn_pitch_stream, pitch_runs
 from vgm2151fur.furio import CHIP_CHANNELS, iter_blocks, parse_fur
@@ -760,7 +758,7 @@ class TestYm2203Furnace(unittest.TestCase):
                 reg.setdefault(w.reg, set()).add(w.val)
         self.assertIn(0x1C, reg.get(0, set()))
         self.assertIn(0x01, reg.get(1, set()))
-        self.assertIn(0x0F - _SSG_VOLUME_TRIM, reg.get(8, set()))
+        self.assertIn(0x0F, reg.get(8, set()))
 
 
 class TestYm2203OctaveConvention(unittest.TestCase):

@@ -908,7 +908,6 @@ def _tone_steps(
 _NOTE_STEP_SEMITONES = 0.75
 _NOTE_HOLD_SAMPLES = 735  # one 60 Hz frame; SCC merge gap and minimum hold
 _AY_MERGE_GAP = 16  # low/high byte pair, and a second write in the same tick
-_SSG_VOLUME_TRIM = 1  # AY step; the YM2203 SSG is hotter than VGMPlay's split
 _AY_NOTE_HOLD = 1470  # two frames: a one-frame AY step is the pitch macro
 
 
@@ -1137,8 +1136,24 @@ def _absorb_detune(event: NoteEvent, pitch: tuple[int, ...], speed: int) -> tupl
 
 def _macro_if_moving(
     pts: list[tuple[int, int]], start: int, ticks: int, tick_samples: float,
+    *, merge_gap: int = 0,
 ) -> tuple[tuple[int, ...], int, int]:
-    """A per-tick macro, or nothing when the register never moves."""
+    """A per-tick macro, or nothing when the register never moves.
+
+    ``merge_gap`` folds a register burst into one update, keeping the first
+    write's time and the last write's value. A driver often puts the real
+    noise period or envelope byte a sample or two after the gate; without
+    this the first tick would play the stale value from the previous hit,
+    which is especially audible on a snare transient.
+    """
+    if merge_gap:
+        merged: list[tuple[int, int]] = []
+        for t, v in pts:
+            if merged and t - merged[-1][0] <= merge_gap:
+                merged[-1] = (merged[-1][0], v)
+            else:
+                merged.append((t, v))
+        pts = merged
     if len(pts) < 2 or all(v == pts[0][1] for _t, v in pts):
         return (), 1, 255
     return _macro_series(_tick_values(pts, start, ticks, tick_samples))
@@ -1360,11 +1375,11 @@ def _bind_tone_instruments(
         if e.tone_fx_pts:
             noise, noise_speed, noise_loop = _macro_if_moving(
                 [(t, val) for t, cmd, val in e.tone_fx_pts if cmd == FX_NOISE],
-                e.sample, ticks, tick_samples,
+                e.sample, ticks, tick_samples, merge_gap=_AY_MERGE_GAP,
             )
             mode, mode_speed, mode_loop = _macro_if_moving(
                 [(t, (val + 1) & 7) for t, cmd, val in e.tone_fx_pts if cmd == FX_MODE],
-                e.sample, ticks, tick_samples,
+                e.sample, ticks, tick_samples, merge_gap=_AY_MERGE_GAP,
             )
             env_shape, env_shape_speed, env_shape_loop = _macro_if_moving(
                 [(t, (val >> 4) & 0x0F) for t, cmd, val in e.tone_fx_pts if cmd == FX_ENV_SET],
@@ -1383,6 +1398,7 @@ def _bind_tone_instruments(
                     period_pts.append((t, lo | (hi << 8)))
             env_period, env_period_speed, env_period_loop = _macro_if_moving(
                 period_pts, e.sample, ticks, tick_samples,
+                merge_gap=_AY_MERGE_GAP,
             )
         if e.tone_chip == 5 and not noise:
             # Every PCE instrument carries the noise mode explicitly: 1 for a
@@ -1904,8 +1920,7 @@ def _emit_ay_notes(
             bound = nxt or gate_end
             note, e5 = ay_note(clock, period, divider)
             steps = _tone_steps(intra, sst, 0, _AY_MERGE_GAP)
-            trim = _SSG_VOLUME_TRIM if divider >= 16 else 0
-            vol = max(0, _value_at(h.vol_pts, sst, h.vol) - trim)
+            vol = _value_at(h.vol_pts, sst, h.vol)
             if env_open:
                 # The envelope generator drives the level; the register's low
                 # nibble is ignored. Writing that nibble (usually 0) as the
@@ -1913,13 +1928,17 @@ def _emit_ay_notes(
                 # is 15 whenever a volume macro carries the level.
                 vol = 15
             vol_pts = tuple(
-                (t, max(0, v - trim), None)
+                (t, v, None)
                 for t, v in h.vol_pts if sst < t < bound
             )
             prev_st = segs[i - 1][0] if i else -1
             latest: dict[int, int] = {}
             for t, fx, val in buckets[i]:
-                if t > sst:
+                # A source register burst often lands a sample or two after
+                # the gate. It belongs to this note's opening state, not the
+                # next tick, or a snare would start on the previous hit's
+                # noise period.
+                if t > sst + _AY_MERGE_GAP:
                     continue
                 if fx == FX_ENV_SET and i > 0 and t <= prev_st:
                     continue
