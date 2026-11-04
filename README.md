@@ -6,13 +6,12 @@ Supported chips:
 - Yamaha YM2203 (OPN)
 - Yamaha YM2612 (OPN2), including channel-3 special/CSM frequency layouts
 - Yamaha YM2610 / YM2610B (OPNB)
-- Yamaha YM2608 (OPNA): FM, SSG, channel-3 Ext, the rhythm kit and delta-T ADPCM
-- Yamaha YM2413 (OPLL): presets, the user bank and the drum kit
-- Konami VRC7: the same OPLL core with six channels and its own preset ROM
-  (flagged by bit 31 of the YM2413 clock field)
+- Yamaha YM2608 (OPNA)
+- Yamaha YM2413 (OPLL)
+- Konami VRC7 (same OPLL core with its own preset ROM)
 - Yamaha YM3526 (OPL), YM3812 (OPL2) and YMF262 (OPL3), including rhythm mode
   as its own system and OPL3 four-operator voices
-- Yamaha Y8950: OPL FM plus its delta-T ADPCM voice
+- Yamaha Y8950 (OPL with delta-T ADPCM voice)
 - Yamaha YMF278B (OPL4): OPL3 FM plus 24 wave channels. ROM wave samples are
   extracted into the module from a YRW801 image (`VGM2151FUR_YRW801`)
 - Yamaha YM2149 / General Instrument AY-3-8910 (PSG), including volume-register
@@ -27,13 +26,8 @@ Supported chips:
 - Namco C140 and C219
 - Namco C352 (requires a development build of Furnace from a compatible fork. A build with C352 support (built from https://github.com/me-when-the-uh/furnace-ports) is located in `./furnace-c352` - use at your own risk, since it's always a good idea to build from source instead of relying on someone else's builds)
 - Ricoh RF5C68 (FM Towns) and RF5C164 (Sega CD)
-- NES APU (Ricoh 2A03): two pulses, triangle, noise, and the DPCM channel
-  (1-bit samples and direct `$4011` PCM). A Famicom AY is written as a
-  Sunsoft 5B and its notes are pitched at the chip's half clock
-- Hudson HuC6280 (PC Engine / TurboGrafx-16): six wavetable voices with
-  per-wave instruments, periodic noise on voices 4/5 (noise-transient plus
-  tone-tail percussion), and direct-D/A PCM through the DAC stream
-  (8-bit sample bodies)
+- NES APU (Ricoh 2A03, A Famicom AY is written as a Sunsoft 5B and its notes are pitched at the chip's half clock)
+- Hudson HuC6280 (PC Engine / TurboGrafx-16) - six wavetable voices with per-wave instruments, periodic noise on voices 4/5 (noise-transient plus tone-tail percussion), and direct-D/A PCM through the DAC stream (8-bit sample bodies)
 
 A log that mixes several chip families is written as one module when the
 combination is supported. `docs/merged-logs.md` lists the rules.
