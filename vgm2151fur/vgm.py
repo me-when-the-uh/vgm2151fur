@@ -335,6 +335,10 @@ class RomSlice:
     data: bytes
     kind: str = "k007232"  # "k007232" | "msm6295" | "segapcm" | "c140" |
     #                      "c352" | "k053260"
+    # Stream position of a RAM-image dump (0xC0-0xDF). A driver can reload the
+    # same NES DPCM window several times while the song plays, so the samples
+    # are only valid from this point on. ROM dumps leave it at 0.
+    time: int = 0
 
 
 @dataclass
@@ -1201,7 +1205,9 @@ def load_vgm(path: Path | str) -> VgmFile:
                         "rf5c68" if typ == RF5C68_RAM_TYPE else
                         "rf5c164" if typ == RF5C164_RAM_TYPE else "nes_dpcm"
                     )
-                    vgm.roms.append(RomSlice(chip_id, 0, start, payload[2:], kind))
+                    vgm.roms.append(RomSlice(
+                        chip_id, 0, start, payload[2:], kind, time=sample,
+                    ))
             else:
                 kind = {
                     K007232_ROM_TYPE: "k007232",

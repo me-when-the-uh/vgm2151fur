@@ -1115,6 +1115,12 @@ def _absorb_detune(event: NoteEvent, pitch: tuple[int, ...], speed: int) -> tupl
             i += 1
         if i == len(pitch):
             return ()
+        # Only a change within the first tick is the note settling. A note
+        # that holds its pitch and then moves once (a delayed slide or a
+        # portamento to the next note) is real motion: folding it into E5
+        # would retune the whole note, which was audible on the NES triangle.
+        if i > 1:
+            return pitch
         # A zero prefix and then one held offset is the note settling on its
         # pitch. A value that comes back (vibrato) stays a macro.
         if any(v != pitch[i] for v in pitch[i:]):
@@ -7010,6 +7016,14 @@ def analyze(
             )
             events.append(ev)
             nes_dpcm_events.append((ev, hit.sample_index))
+            if hit.end_time:
+                # The driver clears $4015 to stop the sample early (a drum
+                # that is cut before its body ends). Without an explicit off
+                # the tracker would play the whole body.
+                events.append(NoteEvent(
+                    sample=hit.end_time, ch=ch, on=False, note=180, ins=-1,
+                    vol=-1, e5=0x80, pan=0, pcm=True,
+                ))
         nes_pcm_events: list[tuple[NoteEvent, int]] = []
         for hit in nes_pcm_hits:
             ch = nes_base + 4
@@ -7021,6 +7035,11 @@ def analyze(
             )
             events.append(ev)
             nes_pcm_events.append((ev, hit.sample_index))
+            if hit.end_time:
+                events.append(NoteEvent(
+                    sample=hit.end_time, ch=ch, on=False, note=180, ins=-1,
+                    vol=-1, e5=0x80, pan=0, pcm=True,
+                ))
     else:
         nes_base = None
         nes_tone_events = []

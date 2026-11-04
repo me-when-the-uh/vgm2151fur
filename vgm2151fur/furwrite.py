@@ -2531,6 +2531,18 @@ def _build_patterns(song: Song, n_ch: int, pat_len_max: int, fx_cols: int,
 
     # Chip-wide effects are placed after the notes: the LFO speed/pulse has
     # to ride the tick of the key-on it belongs to (see _place_chip_fx).
+    # The tick delay a tone note on a row will use. A row's ED applies to
+    # every event on it, so an effect that lands later in the row than the
+    # note cannot stay there without pushing the note late.
+    note_delay: dict[tuple[int, int], int] = {}
+    for ev_ch, rows in tone_rows.items():
+        for row, group in rows.items():
+            for ev, delay in group:
+                shifted = note_row_shift.get(id(ev))
+                dest, dest_delay = shifted if shifted is not None else (row, delay)
+                key = (ev_ch, dest)
+                prev = note_delay.get(key)
+                note_delay[key] = dest_delay if prev is None else min(prev, dest_delay)
     for sample, ch, cmd, val in getattr(song, "channel_fx", ()) or ():
         ch += ch_offset
         if ch < 0 or ch >= n_ch:
@@ -2548,12 +2560,32 @@ def _build_patterns(song: Song, n_ch: int, pat_len_max: int, fx_cols: int,
             row, delay = loop_start(row, delay, sample)
         if row < 0 or row >= total_rows:
             continue
+        # The note on this row starts at its own tick; this effect happens
+        # after it, so put it at the next row rather than delay the note.
+        note_tick = note_delay.get((ch, row))
+        if note_tick is not None and delay > note_tick and row + 1 < total_rows:
+            row, delay = row + 1, 0
         cell = grid[ch].get(row)
         if cell is None:
             cell = _blank_row()
             grid[ch][row] = cell
+        # Two different values of one effect inside a row (a duty change
+        # shortly after the note opened) cannot share the cell: keep the
+        # first and move the later one to the next row.
+        if any(
+            c == cmd and v != val and c != EMPTY
+            for c, v in (cell.fx or ())
+        ):
+            nrow = row + 1
+            if nrow >= total_rows:
+                continue
+            row, delay = nrow, 0
+            cell = grid[ch].get(row)
+            if cell is None:
+                cell = _blank_row()
+                grid[ch][row] = cell
         _add_fx(cell, cmd, val, fx_cols, stats)
-        if delay:
+        if delay and _cell_ed(cell) == 0:
             _add_fx(cell, 0xED, delay, fx_cols, stats)
 
     # E5 is channel state. Collect it per row and replay in row order, back

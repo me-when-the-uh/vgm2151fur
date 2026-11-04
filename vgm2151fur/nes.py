@@ -359,19 +359,20 @@ def collect_nes_tones(
     return hits, offs, warnings
 
 
-def _dpcm_ram(vgm: VgmFile) -> tuple[bytearray, bytearray]:
-    """64 KB CPU-address image of the dumped DPCM RAM (0xAA = silence)."""
-    buf = bytearray(b"\xAA" * 0x10000)
-    covered = bytearray(0x10000)
-    for s in vgm.roms:
-        if s.kind != "nes_dpcm":
-            continue
-        start = s.start & 0xFFFF
-        for i, b in enumerate(s.data):
-            addr = (start + i) & 0xFFFF
-            buf[addr] = b
-            covered[addr] = 1
-    return buf, covered
+def _dpcm_dumps(vgm: VgmFile) -> list[tuple[int, int, bytes]]:
+    """(stream time, address, data) for every DPCM RAM dump, in order.
+
+    A driver may reload the same 4 KB window while the song plays, so the
+    image is only valid from the block's position in the stream. The old code
+    applied every block up front, which left each hit playing whatever the
+    last block happened to contain.
+    """
+    out = [
+        (getattr(s, "time", 0), s.start & 0xFFFF, s.data)
+        for s in vgm.roms if s.kind == "nes_dpcm"
+    ]
+    out.sort(key=lambda d: d[0])
+    return out
 
 
 def _apply_dpcm_bank(
@@ -399,7 +400,23 @@ def collect_nes_dpcm(
     if not writes:
         return [], [], warnings
     clock = clock or vgm.nes_clock or NES_DEFAULT_CLOCK
-    ram, covered = _dpcm_ram(vgm)
+    # 64 KB CPU-address image of the dumped DPCM RAM (0xAA = silence). RAM
+    # dumps and 0x68 bank copies are replayed in stream order, so a hit reads
+    # the bank that was loaded when the driver triggered it.
+    ram = bytearray(b"\xAA" * 0x10000)
+    covered = bytearray(0x10000)
+    dumps = _dpcm_dumps(vgm)
+    dump_cursor = [0]
+
+    def apply_dumps(upto: int) -> None:
+        while dump_cursor[0] < len(dumps) and dumps[dump_cursor[0]][0] <= upto:
+            _t, start, data = dumps[dump_cursor[0]]
+            dump_cursor[0] += 1
+            for i, b in enumerate(data):
+                addr = (start + i) & 0xFFFF
+                ram[addr] = b
+                covered[addr] = 1
+
     bank_writes = sorted(
         (r for r in getattr(vgm, "pcm_ram_writes", ())
          if r.type == 7),          # NES DPCM database
@@ -416,7 +433,7 @@ def collect_nes_dpcm(
     armed = False
     hits: list[NesDpcmHit] = []
     samples: list[NesDpcmSample] = []
-    by_key: dict[tuple[int, int, bool], int] = {}
+    by_key: dict[tuple[int, int, bool, bytes], int] = {}
     undumped = 0
     starts = 0
 
@@ -424,6 +441,7 @@ def collect_nes_dpcm(
         reg = w.reg & 0x7F
         val = w.val & 0xFF
         t = w.sample
+        apply_dumps(t)
         _apply_dpcm_bank(ram, covered, vgm, bank_writes, t, bank_cursor)
         if reg == 0x10:
             rate = val & 0x0F
@@ -446,7 +464,9 @@ def collect_nes_dpcm(
                 if covered_bytes == 0:
                     undumped += 1
                 body = bytes(ram[(addr + i) & 0xFFFF] for i in range(length))
-                key = (addr, length, loop_bit)
+                # The same address/length can hold different data after a
+                # bank reload, so the body is part of the identity.
+                key = (addr, length, loop_bit, body)
                 idx = by_key.get(key)
                 if idx is None:
                     idx = len(samples)
