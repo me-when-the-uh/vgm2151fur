@@ -191,6 +191,88 @@ class TestOpl4Wave(unittest.TestCase):
         samples, _warn = collect_opl4_wave(v, rom=_rom(16, sample))
         self.assertEqual(samples[0].hits[0].vol_pts, [(500, 16)])
 
+    def test_attack_level_and_pan_after_key_on_are_folded(self):
+        # spc2vgm keys a wave voice at TL=0x7F/pan 8, then writes the real
+        # level and pan one tick later. At row resolution that is still the
+        # attack; treating it as a step left the note silent.
+        sample = bytes(range(1, 21))
+        writes = [
+            ChipWrite(100, "ymf278b", 0, _wave_reg(0, 0), 16),
+            ChipWrite(100, "ymf278b", 0, _wave_reg(0, 1), 0x00),
+            ChipWrite(100, "ymf278b", 0, _wave_reg(0, 2), 0x20),
+            ChipWrite(100, "ymf278b", 0, _wave_reg(0, 3), 0xFE),  # TL 0x7F
+            ChipWrite(100, "ymf278b", 0, _wave_reg(0, 4), 0x88),  # pan 8
+            ChipWrite(140, "ymf278b", 0, _wave_reg(0, 3), 0x42),  # TL 0x21
+            ChipWrite(140, "ymf278b", 0, _wave_reg(0, 4), 0x82),  # pan 2
+            ChipWrite(9000, "ymf278b", 0, _wave_reg(0, 4), 0x02),
+        ]
+        v = _vgm(writes, roms=[
+            RomSlice(0, 0, 0, _rom(16, sample), "ymf278b_rom"),
+        ])
+        samples, _warn = collect_opl4_wave(v, rom=_rom(16, sample))
+        hit = samples[0].hits[0]
+        self.assertEqual((hit.level, hit.pan), (0x21, 2))
+        self.assertEqual(hit.vol_pts, [])
+        self.assertEqual(hit.pan_pts, [])
+        song = analyze(v)
+        ev = next(e for e in song.events if e.on and e.ch == 18)
+        self.assertEqual(ev.vol, 0x7F - 0x21)
+        self.assertEqual(ev.pan, opl4_pan_fx(2))
+
+    def test_late_pan_write_is_a_pan_point(self):
+        sample = bytes(range(1, 21))
+        writes = _wave_note(100, wave=16, off=9000)
+        writes.insert(5, ChipWrite(4000, "ymf278b", 0, _wave_reg(0, 4), 0x82))
+        v = _vgm(writes, roms=[
+            RomSlice(0, 0, 0, _rom(16, sample), "ymf278b_rom"),
+        ])
+        samples, _warn = collect_opl4_wave(v, rom=_rom(16, sample))
+        hit = samples[0].hits[0]
+        self.assertEqual(hit.pan_pts, [(4000, 2)])
+        song = analyze(v)
+        ev = next(e for e in song.events if e.on and e.ch == 18)
+        self.assertIn((4000, ev.vol, opl4_pan_fx(2)), ev.vol_pts)
+
+    def test_held_fnum_write_is_a_pitch_step(self):
+        sample = bytes(range(1, 21))
+        writes = _wave_note(100, wave=16, off=9000)
+        # Octave 2 -> 3 doubles the step: one octave, 768 1/64-semitone units.
+        writes.insert(5, ChipWrite(
+            4000, "ymf278b", 0, _wave_reg(0, 2),
+            (3 << 4) | ((0x200 >> 7) & 7),
+        ))
+        v = _vgm(writes, roms=[
+            RomSlice(0, 0, 0, _rom(16, sample), "ymf278b_rom"),
+        ])
+        samples, _warn = collect_opl4_wave(v, rom=_rom(16, sample))
+        hit = samples[0].hits[0]
+        self.assertEqual(hit.pitch_pts, [(4000, opl4_step(3, 0x200))])
+        song = analyze(v)
+        ev = next(e for e in song.events if e.on and e.ch == 18)
+        self.assertEqual(ev.pitch_steps, ((4000, 768),))
+
+    def test_trailing_silence_step_is_not_a_volume_zero_row(self):
+        # spc2vgm silences a slot with TL=0x7F just before its key-off. The
+        # key-off stops the note, so the trailing zero is inaudible in the
+        # source; writing it as a pattern step only adds volume-00 rows.
+        sample = bytes(range(1, 21))
+        writes = _wave_note(100, wave=16, off=9000)
+        writes.insert(5, ChipWrite(4000, "ymf278b", 0, _wave_reg(0, 3), 0xFE))
+        v = _vgm(writes, roms=[
+            RomSlice(0, 0, 0, _rom(16, sample), "ymf278b_rom"),
+        ])
+        song = analyze(v)
+        ev = next(e for e in song.events if e.on and e.ch == 18)
+        self.assertFalse(any(value == 0 for _t, value, _pan in ev.vol_pts))
+        # A later rise must keep the silent step: it is real, not a tail.
+        writes.insert(6, ChipWrite(6000, "ymf278b", 0, _wave_reg(0, 3), 0x42))
+        v = _vgm(writes, roms=[
+            RomSlice(0, 0, 0, _rom(16, sample), "ymf278b_rom"),
+        ])
+        song = analyze(v)
+        ev = next(e for e in song.events if e.on and e.ch == 18)
+        self.assertTrue(any(value == 0 for _t, value, _pan in ev.vol_pts))
+
     def test_pan_inverts_furnace_conversion(self):
         # opl.cpp:2267 turns 08xy into the slot nibble as
         # ``8 ^ min(convertPanSplitToLinearLR(x, y, 15) + 1, 15)``.

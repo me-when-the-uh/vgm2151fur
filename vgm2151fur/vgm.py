@@ -67,6 +67,10 @@ CMD_SN76489 = 0x50
 # 0xB4 is the NES APU (2A03): register, data.  Reg 0x00-0x17 map $4000-$4017;
 # bit 7 of the register selects the second APU instance.
 CMD_NES = 0xB4
+# 0xB9 is the HuC6280 PSG (PC Engine/TurboGrafx-16): register, data.  The
+# register is a channel-select latch at 0x00 followed by per-channel writes;
+# bit 7 of the register selects the second chip instance.
+CMD_HUC6280 = 0xB9
 CMD_DAC_WRITE = 0x2A
 CMD_DAC_ENABLE = 0x2B
 # 0x55 is the first YM2203's register port; 0xA5 is the second instance in a
@@ -93,8 +97,10 @@ CMD_K053260 = 0xBA
 CMD_DATA_BLOCK = 0x67
 CMD_END = 0x66
 CMD_STREAM_SETUP = 0x90
-# Stream-control chip type (0x90 tt), not the extra-header id. OKIM6258 is 0x17.
+# Stream-control chip type (0x90 tt), not the extra-header id. OKIM6258 is 0x17
+# and the HuC6280 is 0x1B (libvgm's device index).
 STREAM_OKIM6258 = 0x17
+STREAM_C6280 = 0x1B
 # The YM2612 DAC stream driver, the other type this tool reconstructs. Its data
 # bank is the type-0x00 PCM database and its register is $2A.
 DAC_STREAM_YM2612 = 0x02
@@ -108,6 +114,9 @@ NES_DPCM_RAM_TYPE = 0xC2
 # Type 0x07 is the NES APU DPCM *database*: a flat bank the 0x68 RAM-write
 # command copies into $C000/$D000 while the song plays.
 NES_DPCM_BANK_TYPE = 0x07
+# Type 0x05 is the HuC6280 PCM database.  A DAC stream (0x91 bank id 5) plays
+# 8-bit DDA levels out of the concatenation of these blocks.
+HUC6280_PCM_TYPE = 0x05
 RF5C68_RAM_TYPE = 0xC0  # RF5C68 sample-RAM write (16-bit start + data)
 RF5C164_RAM_TYPE = 0xC1  # RF5C164 sample-RAM write (16-bit start + data)
 Y8950_DELTAT_ROM_TYPE = 0x88  # Y8950 delta-T (ADPCM-B) ROM
@@ -129,6 +138,7 @@ EXTRA_YM2610 = 0x08
 EXTRA_SEGAPCM = 0x04
 EXTRA_AY8910 = 0x12
 EXTRA_K051649 = 0x19
+EXTRA_HUC6280 = 0x1B
 EXTRA_C140 = 0x1C
 EXTRA_K053260 = 0x1D
 EXTRA_C352 = 0x27
@@ -190,13 +200,20 @@ YM2413_CLOCK_OFF = 0x10
 # channels, its own preset ROM); the low 30 bits stay the clock.
 YM2413_VRC7_BIT = 0x80000000
 YM2610_DEFAULT_CLOCK = 8000000
-# NES APU header 0x80 (VGM 1.51+).  Bit 30 marks a second APU, bit 31 an FDS
-# channel.  The clock is the CPU clock: COLOR_NTSC / 2 on an NTSC console.
-NES_CLOCK_OFF = 0x80
+# NES APU header 0x84 (VGM 1.51+).  0x80 is the Game Boy DMG clock, inserted
+# ahead of the NES when the header grew; the NES field moved to 0x84.  Bit 30
+# marks a second APU, bit 31 an FDS channel.  The clock is the CPU clock:
+# COLOR_NTSC / 2 on an NTSC console.  (This was 0x80 and worked only because
+# the NTSC default fallback happened to match the files.)
+NES_CLOCK_OFF = 0x84
 NES_DUAL_BIT = 0x40000000
 NES_FDS_BIT = 0x80000000
 NES_DEFAULT_CLOCK = 1789773  # COLOR_NTSC / 2
 EXTRA_NES = 0x14             # extra-header clock-list chip id
+# HuC6280 (PC Engine) header 0xA4 (VGM 1.61+).  The clock is the PSG clock
+# (COLOR_NTSC on NTSC hardware); the CPU/PSG core divides it internally.
+HUC6280_CLOCK_OFF = 0xA4
+HUC6280_DEFAULT_CLOCK = 3579545  # COLOR_NTSC, the PSG clock
 # The OPL family joined the header in 1.51: YM3812 at 0x50, YM3526 at 0x54 and
 # YMF262 at 0x5C. Bit 30 of the YM3812 field is the dual-chip flag that lets
 # command 0xAA address the second one (the Sound Blaster Pro pair); rips also
@@ -390,6 +407,8 @@ class DacStreamPlay:
     step: int = 1
     step_base: int = 0
     bank: int = 0
+    # 0x95 plays a whole data block by id; -1 for a 0x93 offset play.
+    block: int = -1
     # The 0x94 stop (or the next 0x93 start) that ends this play.  0 = the
     # stream ran to its declared length.
     stop_sample: int = 0
@@ -461,6 +480,16 @@ class VgmFile:
     # 0x68 commands copy windows of it into the $C000/$D000 RAM as they play.
     nes_dpcm_bank: bytearray = field(default_factory=bytearray)
     pcm_ram_writes: list[PcmRamWrite] = field(default_factory=list)
+    # HuC6280 (PC Engine) header 0xA4 (VGM 1.61+).  Writes arrive on command
+    # 0xB9; the clock is the PSG clock.  Bit 7 of the register selects a
+    # second chip instance.
+    huc6280_clock: int = 0
+    huc6280_dual: bool = False
+    # HuC6280 PCM database (data-block type 0x05), concatenated in file order.
+    # A DAC stream with bank id 5 plays 8-bit DDA levels out of this bank;
+    # 0x95 block ids index the individual blocks in `huc6280_pcm_blocks`.
+    huc6280_pcm: bytearray = field(default_factory=bytearray)
+    huc6280_pcm_blocks: list[bytes] = field(default_factory=list)
     # Genesis SN76489 header 0x0C.  The data bytes arrive as 0x50 writes;
     # they are a serial register stream, not address/data pairs.
     sn76489_clock: int = 0
@@ -923,13 +952,20 @@ def load_vgm(path: Path | str) -> VgmFile:
     ym2413_dual = bool(ym2413_raw & YM2608_DUAL_BIT)
     ym2413_vrc7 = bool(ym2413_raw & YM2413_VRC7_BIT)
     ym2413_clock = _sane_clock(ym2413_raw)
-    # NES APU clock 0x80 (1.51+), falling back to extra-header id 0x14.
+    # NES APU clock 0x84 (1.51+), falling back to extra-header id 0x14.
     nes_raw = _header_raw(buf, NES_CLOCK_OFF) if ver >= 0x151 else 0
     nes_clock = _sane_clock(nes_raw)
     if not nes_clock:
         nes_clock = _sane_clock(clocks.get(EXTRA_NES, 0))
     nes_dual = bool(nes_raw & NES_DUAL_BIT)
     nes_fds = bool(nes_raw & NES_FDS_BIT)
+    # HuC6280 (PC Engine) clock 0xA4 (1.61+).  The field carries the PSG clock
+    # directly.  The extra-header id is libvgm's device index, 0x1B.
+    huc_raw = _header_raw(buf, HUC6280_CLOCK_OFF) if ver >= 0x161 else 0
+    huc6280_clock = _sane_clock(huc_raw)
+    if not huc6280_clock:
+        huc6280_clock = _sane_clock(clocks.get(EXTRA_HUC6280, 0))
+    huc6280_dual = bool(huc_raw & 0x80000000)
     # OPL family. The three chips share the header's 1.51 block and each of
     # their clock fields carries a second-instance bit; only the YM3812 has a
     # command for the pair (0xAA), and bit 31 there pans them hard.
@@ -1049,6 +1085,8 @@ def load_vgm(path: Path | str) -> VgmFile:
         nes_clock=nes_clock,
         nes_dual=nes_dual,
         nes_fds=nes_fds,
+        huc6280_clock=huc6280_clock,
+        huc6280_dual=huc6280_dual,
         opl_clock=opl_clock,
         opl2_clock=opl2_clock,
         opl2_dual=opl2_dual,
@@ -1140,6 +1178,12 @@ def load_vgm(path: Path | str) -> VgmFile:
             elif typ == 0x04:
                 # OKIM6258 ADPCM bank. 0x95 block ids index these in order.
                 vgm.adpcm_blocks.append(bytes(payload))
+            elif typ == HUC6280_PCM_TYPE:
+                # HuC6280 PCM database.  A DAC stream (bank 5) plays 8-bit
+                # DDA levels out of the concatenation; 0x95 block ids index
+                # the individual blocks.
+                vgm.huc6280_pcm.extend(payload)
+                vgm.huc6280_pcm_blocks.append(bytes(payload))
             elif typ == 0x44:
                 saw_adpcm_compressed = True
             elif typ in (RF5C68_RAM_TYPE, RF5C164_RAM_TYPE, NES_DPCM_RAM_TYPE):
@@ -1236,6 +1280,31 @@ def load_vgm(path: Path | str) -> VgmFile:
                 )
                 vgm.msm6258_plays.append(play)
                 active_adpcm[stream] = play
+            elif st is not None and st["type"] == STREAM_C6280:
+                # 0x95 on a HuC6280 stream plays one whole type-0x05 block.
+                prev = active_stream.pop(stream, None)
+                if prev is not None:
+                    prev.stop_sample = sample
+                play = DacStreamPlay(
+                    sample=sample,
+                    chip_type=st["type"],
+                    chip_id=st["chip_id"],
+                    stream=stream,
+                    port=st["port"],
+                    reg=st["reg"],
+                    offset=0,
+                    length=0,
+                    mode=3,
+                    rate=st["rate"] or vgm.dac_stream_rates.get(stream, 0),
+                    loop=bool(flags & 0x80),
+                    reverse=bool(flags & 0x10),
+                    step=st["step"],
+                    step_base=st["base"],
+                    bank=st["bank"],
+                    block=block,
+                )
+                vgm.dac_stream_plays.append(play)
+                active_stream[stream] = play
             else:
                 rate = vgm.dac_stream_rates.get(stream, VGM_RATE)
                 vgm.dac_block_plays.append((sample, block, rate))
@@ -1531,6 +1600,16 @@ def load_vgm(path: Path | str) -> VgmFile:
             ))
             pos += 3
             continue
+        if cmd == CMD_HUC6280 and pos + 3 <= n:
+            # 0xB9: register, data.  Bit 7 of the register selects a second
+            # chip instance.  The register file is a channel-select latch at
+            # 0x00 followed by per-channel writes.
+            rr = buf[pos + 1]
+            vgm.writes.append(ChipWrite(
+                sample, "huc6280", (rr >> 7) & 1, rr & 0x7F, buf[pos + 2],
+            ))
+            pos += 3
+            continue
         if cmd in (CMD_RF5C68, CMD_RF5C164) and pos + 3 <= n:
             # 0xB0/0xB1: (register, data). One shared register file; the clock
             # tells the two chips apart. Register 0x07 selects the RAM bank.
@@ -1642,6 +1721,10 @@ def load_vgm(path: Path | str) -> VgmFile:
         vgm.warnings.append("AY-3-8910 clock is missing or out of range; using 1789772")
     if any(w.chip == "k051649" for w in vgm.writes) and not vgm.k051649_clock:
         vgm.warnings.append("K051649 clock is missing or out of range; using 1789772")
+    if any(w.chip == "huc6280" for w in vgm.writes) and not vgm.huc6280_clock:
+        vgm.warnings.append(
+            f"HuC6280 clock is missing or out of range; using {HUC6280_DEFAULT_CLOCK}"
+        )
     if any(w.chip == "k053260" for w in vgm.writes) and not vgm.k053260_clock:
         vgm.warnings.append(
             "K053260 clock is missing or out of range; using 3579545"
@@ -1768,7 +1851,10 @@ def load_vgm(path: Path | str) -> VgmFile:
             "modern 0x95 DAC stream control is parsed for the audit but not "
             "converted as source PCM"
         )
-    if vgm.dac_stream_plays and not vgm.dac_data:
+    if (
+        any(p.chip_type != STREAM_C6280 for p in vgm.dac_stream_plays)
+        and not vgm.dac_data
+    ):
         vgm.warnings.append(
             "DAC stream start commands present but no PCM data block; "
             "the stream cannot be reconstructed"

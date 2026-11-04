@@ -46,6 +46,12 @@ OPL4_ROM_SAMPLES = 384  # sample IDs below this read the YRW801 ROM
 OPL4_RAM_BASE = 0x200000  # RAM window in the wave address space
 OPL4_DESCRIPTOR = 12
 OPL4_DEFAULT_CLOCK = 33868800
+# Some drivers (spc2vgm is one) key a wave voice with TL = 0x7F (silent) and
+# pan 8, then write the real level, pan and sometimes the first pitch step one
+# to two milliseconds later.  At a module's row resolution that is still the
+# attack, so those writes belong to the hit's initial state instead of
+# becoming a step on the next row.  A real mid-note move comes much later.
+OPL4_ATTACK_GAP = 128
 SMP_DEPTH_8BIT = 8
 SMP_DEPTH_16BIT = 16
 
@@ -144,6 +150,8 @@ class Opl4WaveHit:
     pan: int
     end_time: int = 0
     vol_pts: list[tuple[int, int]] = field(default_factory=list)
+    pan_pts: list[tuple[int, int]] = field(default_factory=list)
+    pitch_pts: list[tuple[int, int]] = field(default_factory=list)
 
 
 @dataclass
@@ -243,6 +251,42 @@ def collect_opl4_wave(
     # note becomes a volume step instead of being lost.
     active: list[Opl4WaveHit | None] = [None] * OPL4_WAVE_SLOTS
 
+    def record_step(slot: int, t: int) -> None:
+        """Keep a held slot's f-num/octave change as a pitch point."""
+        hit = active[slot]
+        if hit is None:
+            return
+        st = slots[slot]
+        step = opl4_step(st.octave, st.fnum)
+        last = hit.pitch_pts[-1][1] if hit.pitch_pts else hit.step
+        if step == last:
+            return
+        if t - hit.sample_time <= OPL4_ATTACK_GAP:
+            hit.step = step
+            return
+        if hit.pitch_pts and hit.pitch_pts[-1][0] == t:
+            hit.pitch_pts[-1] = (t, step)
+        else:
+            hit.pitch_pts.append((t, step))
+
+    def record_pan(slot: int, t: int, pan: int) -> None:
+        """Keep a held slot's pan change as a point, or fold the attack."""
+        hit = active[slot]
+        if hit is None or pan == hit.pan:
+            return
+        if t - hit.sample_time <= OPL4_ATTACK_GAP and hit.pan == 8:
+            # Only a muted key-on is the two-stage attack; a pan move on an
+            # already audible note is a real mid-note point.
+            hit.pan = pan
+            return
+        last = hit.pan_pts[-1][1] if hit.pan_pts else hit.pan
+        if pan == last:
+            return
+        if hit.pan_pts and hit.pan_pts[-1][0] == t:
+            hit.pan_pts[-1] = (t, pan)
+        else:
+            hit.pan_pts.append((t, pan))
+
     for w in vgm.writes:
         if w.chip != "ymf278b" or (w.reg >> 8) != 2:
             continue
@@ -257,26 +301,34 @@ def collect_opl4_wave(
         elif sub == 1:
             st.wave = (st.wave & 0xFF) | ((w.val & 0x01) << 8)
             st.fnum = (st.fnum & 0x380) | (w.val >> 1)
+            record_step(slot, w.sample)
         elif sub == 2:
             st.fnum = (st.fnum & 0x07F) | ((w.val & 0x07) << 7)
             octave = (w.val >> 4) & 0x0F
             st.octave = octave - 16 if octave & 0x08 else octave
+            record_step(slot, w.sample)
         elif sub == 3:
             level = (w.val >> 1) & 0x7F
             hit = active[slot]
             if st.key and hit is not None:
-                if w.sample == hit.sample_time:
-                    # Same write group as the key-on: the note attacks at
-                    # this level, so it belongs in the instrument column
-                    # rather than in a step on the note row.
-                    hit.level = level
-                else:
-                    last = hit.vol_pts[-1][1] if hit.vol_pts else hit.level
-                    if level != last:
+                last = hit.vol_pts[-1][1] if hit.vol_pts else hit.level
+                if level != last:
+                    if (
+                        w.sample - hit.sample_time <= OPL4_ATTACK_GAP
+                        and hit.level == 0x7F
+                    ):
+                        # Keyed muted, then the real attack follows a tick
+                        # later: that is the note's opening level. An audible
+                        # key-on keeps its level; a later write is a real
+                        # decay step, not a replacement attack.
+                        hit.level = level
+                    elif hit.vol_pts and hit.vol_pts[-1][0] == w.sample:
+                        hit.vol_pts[-1] = (w.sample, level)
+                    else:
                         hit.vol_pts.append((w.sample, level))
             st.tl = level
         elif sub == 4:
-            st.pan = w.val & 0x0F
+            pan = w.val & 0x0F
             key = bool(w.val & 0x80)
             if key and not st.key:
                 hit = Opl4WaveHit(
@@ -285,7 +337,7 @@ def collect_opl4_wave(
                     wave=st.wave,
                     step=opl4_step(st.octave, st.fnum),
                     level=st.tl,
-                    pan=st.pan,
+                    pan=pan,
                 )
                 hits.append(hit)
                 active[slot] = hit
@@ -296,6 +348,9 @@ def collect_opl4_wave(
                 if hit is not None and not hit.end_time:
                     hit.end_time = w.sample
                 active[slot] = None
+            elif st.key:
+                record_pan(slot, w.sample, pan)
+            st.pan = pan
             st.key = key
 
     if not hits:

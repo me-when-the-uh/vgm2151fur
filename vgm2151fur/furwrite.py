@@ -131,6 +131,9 @@ CHIP_OPLL_DRUMS = 0xA7
 # ROM.  DIV_SYSTEM_NES: five channels (two pulses, triangle, noise, DPCM).
 CHIP_VRC7 = 0x9D
 CHIP_NES = 0x06
+# DIV_SYSTEM_PCE: six wavetable voices (two pulses, triangle, noise, DPCM on
+# the NES sit at 0x06).
+CHIP_PCE = 0x05
 OPLL_CHANNELS = 9
 OPLL_DRUMS_CHANNELS = 11
 OPLL_DRUMS_MELODIC = 6
@@ -234,6 +237,9 @@ INS_C352 = 4
 INS_AY = 6
 INS_STD = 0
 INS_SCC = 18
+# DIV_INS_PCE: the HuC6280's 32x5-bit wavetable, through the same wave synth
+# as the SCC. Its direct-D/A bodies use DIV_INS_AMIGA (INS_C352 above).
+INS_PCE = 5
 # DIV_INS_NES: the 2A03 pulse/triangle/noise and DPCM instrument.  The DPCM
 # sample rides the same `amiga` sample feature (1-bit DPCM or 8-bit PCM).
 INS_NES = 34
@@ -715,6 +721,43 @@ def _write_ins_scc(b: Buf, name: str, ins) -> None:
     b.end_block(size_off, start)
 
 
+def _write_ins_pce(b: Buf, name: str, ins) -> None:
+    """DIV_INS_PCE: the note starts on wavetable `ins.wave`.
+
+    The wave-synth feature is identical to the SCC's; only the instrument type
+    byte differs. `ins.waves`/`ins.pitch` carry per-tick wave and pitch motion
+    as `std.wave`/`std.pitch`.
+    """
+    size_off, start = b.begin_block(b"INS2")
+    b.u16(FUR_VERSION)
+    b.u16(INS_PCE)
+    b.raw(b"NA")
+    na_size = len(b.b)
+    b.u16(0)
+    na_start = len(b.b)
+    b.strz(name)
+    b.b[na_size:na_size + 2] = int(len(b.b) - na_start).to_bytes(2, "little")
+    b.raw(b"WS")
+    ws_size = len(b.b)
+    b.u16(0)
+    ws_start = len(b.b)
+    b.u32(ins.wave)  # wave1
+    b.u32(ins.wave)  # wave2, only used by the dual-wave effects
+    b.u8(1)  # rateDivider
+    b.u8(0)  # effect: none
+    b.u8(1)  # enabled
+    b.u8(0)  # global: restart the wave on every note
+    b.u8(0)  # speed
+    b.u8(0)  # param1
+    b.u8(0)  # param2
+    b.u8(0)  # param3
+    b.u8(0)  # param4
+    b.b[ws_size:ws_size + 2] = int(len(b.b) - ws_start).to_bytes(2, "little")
+    _write_tone_macros(b, ins, wave=True)
+    b.raw(b"EN")
+    b.end_block(size_off, start)
+
+
 def _write_tone_macros(b: Buf, ins, *, wave: bool, reset: bool = False) -> None:
     """MA feature for an SCC/AY instrument.
 
@@ -874,14 +917,18 @@ def _write_sample_dpcm(
     b.end_block(size_off, start)
 
 
-def _write_wave(b: Buf, name: str, data: bytes) -> int:
-    """DivWavetable::putWaveData: the 32-byte waveform an SCC instrument plays."""
+def _write_wave(b: Buf, name: str, data: bytes, maximum: int = 255) -> int:
+    """DivWavetable::putWaveData: the waveform an SCC/PCE instrument plays.
+
+    ``maximum`` is the wavetable's height: 255 for the SCC's 8-bit wave, 31 for
+    the PCE's 5-bit one.
+    """
     ptr = len(b)
     size_off, start = b.begin_block(b"WAVE")
     b.strz(name)
     b.u32(len(data))
     b.u32(0)  # min
-    b.u32(255)  # max
+    b.u32(maximum)  # max
     for val in data:
         b.u32(val)
     b.end_block(size_off, start)
@@ -1132,6 +1179,21 @@ def k051649_flag_text(clock: int) -> str:
     if module_clock(clock) != FURNACE_CLOCK_DEFAULT:
         return f"customClock={clock}"
     return ""
+
+
+def pce_flag_text(clock: int) -> str:
+    """PC Engine clock, or "" for Furnace's COLOR_NTSC*2 default.
+
+    The VGM header stores the PSG clock (COLOR_NTSC).  Furnace's PCE runs its
+    pitch table from twice that with a divider of 64, so the module clock is
+    the doubled value; the analyzer labels notes at the PSG clock with a
+    divider of 32, which is the same table.
+    """
+    chip_clock = 2 * (clock or 3579545)
+    default = 2 * (315_000_000.0 / 88.0)
+    if abs(chip_clock - default) <= 1:
+        return ""
+    return f"customClock={chip_clock}"
 
 
 def k053260_flag_text(clock: int) -> str:
@@ -2668,6 +2730,17 @@ def _build_patterns(song: Song, n_ch: int, pat_len_max: int, fx_cols: int,
             ev_ch = ev.ch + ch_offset
             if not (ev.on and ev.vol_pts) or ev_ch < 0 or ev_ch >= n_ch:
                 continue
+            own_row = placed_note_row(ev)
+            if own_row < 0:
+                continue
+            # A step may not spill into the next note on this channel. The
+            # source's final TL=0x7F (silence) lands just before its key-off,
+            # and row rounding used to push it past the following key-on, where
+            # it muted a note that had just started.
+            next_row = next(
+                (r for r in note_rows.get(ev_ch, ()) if r > own_row),
+                total_rows,
+            )
             last_pan = None if ev.no_pan else ev.pan
             note_vol_done = False
             for sample, value, pan in ev.vol_pts:
@@ -2676,7 +2749,12 @@ def _build_patterns(song: Song, n_ch: int, pat_len_max: int, fx_cols: int,
                 row, delay = song.place(sample, stats)
                 if not ev.vol_slide:
                     delay = 0
-                if row < 0 or row >= total_rows:
+                if row < 0 or row >= total_rows or row >= next_row:
+                    continue
+                if ev.pcm and row <= own_row:
+                    # The note row already carries the attack level (or the
+                    # first real level after a muted key-on). A later step
+                    # rounded onto the same row cannot be heard separately.
                     continue
                 cell = grid[ev_ch].get(row)
                 if cell is None:
@@ -3181,6 +3259,14 @@ def _append_system_names(
         ch0 += span
 
 
+# The chip names an FM write arrives under. A log whose stream only touches a
+# wavetable/PSG chip must not gain the analyzer's legacy YM2151 placeholder.
+_FM_CHIP_NAMES = {
+    "ym2151", "ym2203", "ym2612", "ym2610", "ym2608",
+    "opll", "opl", "opl2", "opl3", "y8950", "ymf278b",
+}
+
+
 def write_fur(
     song: Song, *, include_pcm: bool = True, include_fm: bool = True,
     stats: dict | None = None, compress: bool = False,
@@ -3224,14 +3310,30 @@ def write_fur(
     # A YM2612 system stays when the log had the chip, even with no FM notes.
     # A YM2203 system likewise owns its three SSG voices.  A YM2610 system
     # owns FM, SSG and the two ADPCM engines, so either half keeps it.
+    # `systems` still carries the analyzer's legacy YM2151 placeholder so the
+    # channel layout (tone chips start at 8) and `ch_offset` stay in step; an
+    # SPC/PSG-only log must not actually write that empty OPM device, though -
+    # it rescales the whole mix in VGM players and leaves eight silent columns.
+    fm_source = getattr(song, "has_fm_source", True)
+    # A wavetable/PSG chip (PCE, SCC, AY, NES) with no FM write owns the
+    # melody, so the empty YM2151 placeholder must not be written.  A
+    # sample-chip-only log keeps the legacy YM2151 as its base system (the
+    # writer's `ch_offset` would otherwise renumber every sample column).
+    has_tone_chip = bool(
+        getattr(song, "scc_ids", ()) or getattr(song, "ay_ids", ())
+        or getattr(song, "nes_ids", ()) or getattr(song, "huc6280_ids", ())
+        or getattr(song, "psg_ids", ())
+    )
     if ym2610 or ym2608:
         fm_present = (include_fm or include_pcm) and bool(ym_ids)
     elif opl:
         fm_present = include_fm and (bool(opl_ids) or bool(ym_ids))
     elif opll:
         fm_present = include_fm and bool(opll_ids)
+    elif ym_chip:
+        fm_present = include_fm and bool(ym_ids)
     else:
-        fm_present = include_fm and (bool(ym_ids) if ym_chip else True)
+        fm_present = include_fm and (fm_source or not has_tone_chip)
     fm_ins = song.fm_patches if (fm_present and include_fm) else []
     
     pcm_smps = [s for s in song.pcm_samples if s.length >= 8] if include_pcm else []
@@ -3330,16 +3432,24 @@ def write_fur(
     nes_specs = list(getattr(song, "nes_ins", ()) or ())
     nes_dpcm_smps = list(getattr(song, "nes_dpcm_samples", ()) or ())
     nes_pcm_smps = list(getattr(song, "nes_pcm_samples", ()) or ())
+    huc6280_ids = list(getattr(song, "huc6280_ids", ()) or ())
+    huc6280_waves = list(getattr(song, "huc6280_waves", ()) or ())
+    huc6280_specs = list(getattr(song, "huc6280_ins", ()) or ())
+    huc6280_pcm_smps = list(getattr(song, "huc6280_pcm_samples", ()) or ())
     scc_chip = CHIP_K052539 if song.vgm.k051649_plus else CHIP_K051649
     n_scc = 5 * len(scc_ids)
     n_ay = 3 * len(ay_ids)
     n_psg = 4 * len(psg_ids)
     n_nes = 5 * len(nes_ids)
+    n_huc6280 = 6 * len(huc6280_ids)
     n_nes_dpcm_ins = len(nes_dpcm_smps)
     n_nes_pcm_ins = len(nes_pcm_smps)
+    n_huc6280_pcm_ins = len(huc6280_pcm_smps)
     # NES DPCM (1-bit) and direct-DAC (8-bit) bodies follow the SSG PCM group.
     nes_dpcm_smp_base = ssg_pcm_smp_base + len(ssg_pcm_smps)
     nes_pcm_smp_base = nes_dpcm_smp_base + len(nes_dpcm_smps)
+    # HuC6280 direct-D/A bodies follow the NES sample group.
+    huc6280_pcm_smp_base = nes_pcm_smp_base + len(nes_pcm_smps)
     # K007232 appears only when the source carried usable samples for it, and
     # never beside another sample chip.
     want_k007 = bool(pcm_smps)
@@ -3373,7 +3483,7 @@ def write_fur(
         + 4 * len(oki_ids) + len(adpcm_ids)
         + (16 if spcm_smps else 0) + n_rf5c
         + 24 * len(c140_ids) + 32 * len(c352_ids)
-        + 4 * len(k053260_ids) + n_scc + n_ay + n_nes
+        + 4 * len(k053260_ids) + n_scc + n_ay + n_nes + n_huc6280
     )
     if n_ch == 0:
         raise ValueError("write_fur: need include_fm and/or include_pcm")
@@ -3393,8 +3503,9 @@ def write_fur(
         + n_ym2610_a_ins + n_ym2610_b_ins
         + n_ym2608_rhythm_ins + n_ym2608_b_ins
         + n_y8950_b_ins + n_opl4_wave_ins + n_ssg_pcm_ins
-        + n_nes_dpcm_ins + n_nes_pcm_ins
+        + n_nes_dpcm_ins + n_nes_pcm_ins + n_huc6280_pcm_ins
         + len(scc_specs) + len(ay_specs) + len(psg_specs) + len(nes_specs)
+        + len(huc6280_specs)
     )
     n_smp = (
         len(pcm_smps) + len(oki_smps) + len(adpcm_smps)
@@ -3403,9 +3514,9 @@ def write_fur(
         + len(k053260_smps) + len(dac_smps)
         + len(ym2610_a_smps) + len(ym2610_b_smps) + len(ym2608_b_smps)
         + len(y8950_b_smps) + len(opl4_wave_smps) + len(ssg_pcm_smps)
-        + len(nes_dpcm_smps) + len(nes_pcm_smps)
+        + len(nes_dpcm_smps) + len(nes_pcm_smps) + len(huc6280_pcm_smps)
     )
-    n_wav = len(scc_waves)
+    n_wav = len(scc_waves) + len(huc6280_waves)
 
     # Analysis numbers sample-chip channels after the FM block. With no FM
     # they shift down to stay inside n_ch.
@@ -3488,6 +3599,11 @@ def write_fur(
         for voice, label in enumerate(nes_labels):
             names_long.append(f"{label} ({cid + 1})")
             names_short.append(f"N{cid + 1}-{voice + 1}")
+    pce_labels = ("Wave 1", "Wave 2", "Wave 3", "Wave 4", "Wave 5", "Wave 6")
+    for cid in huc6280_ids:
+        for voice, label in enumerate(pce_labels):
+            names_long.append(f"{label} ({cid + 1})")
+            names_short.append(f"P{cid + 1}-{voice + 1}")
 
     label_parts: list[str] = []
     if fm_present:
@@ -3547,6 +3663,8 @@ def write_fur(
         label_parts.append("AY-8910")
     if nes_ids:
         label_parts.append("NES APU")
+    if huc6280_ids:
+        label_parts.append("PC Engine")
     chip_label = " + ".join(label_parts) or "empty"
 
     comment = (
@@ -3799,6 +3917,9 @@ def write_fur(
         flag_texts.append(
             "" if abs(clock - 1789773) <= 2 else f"customClock={clock}"
         )
+    for cid in huc6280_ids:
+        chips.append(CHIP_PCE)
+        flag_texts.append(pce_flag_text(song.vgm.huc6280_clock))
     n_chips = len(chips)
 
     info_size_off, info_start = b.begin_block(b"INFO")
@@ -4085,6 +4206,12 @@ def write_fur(
         _write_ins_pcm(
             b, f"NES PCM {i:02d}", nes_pcm_smp_base + i, INS_C352,
         )
+    for i, smp in enumerate(huc6280_pcm_smps):
+        ins_ptrs.append(len(b))
+        # Note 108 (C-4) plays the 8-bit DDA body at its stored rate.
+        _write_ins_pcm(
+            b, f"HuC6280 PCM {i:02d}", huc6280_pcm_smp_base + i, INS_C352,
+        )
     for i, spec in enumerate(scc_specs):
         ins_ptrs.append(len(b))
         wave = scc_waves[spec.wave] if spec.wave < len(scc_waves) else b""
@@ -4103,6 +4230,18 @@ def write_fur(
     for spec in nes_specs:
         ins_ptrs.append(len(b))
         _write_ins_nes(b, "NES", spec)
+    for i, spec in enumerate(huc6280_specs):
+        ins_ptrs.append(len(b))
+        wave = (
+            huc6280_waves[spec.wave]
+            if spec.wave < len(huc6280_waves) else b""
+        )
+        name = f"PCE {i:02d} {_wave_label(wave)}"
+        if spec.waves:
+            name += "+morph"
+        if spec.pitch:
+            name += "+pitch"
+        _write_ins_pce(b, name, spec)
 
     smp_ptrs: list[int] = []
     for i, smp in enumerate(pcm_smps):
@@ -4264,6 +4403,12 @@ def write_fur(
         smp_ptrs.append(len(b))
         # 8-bit signed bodies; note 108 plays them at their write rate.
         _write_sample_s8(b, smp.name, smp.data, smp.rate)
+    for smp in huc6280_pcm_smps:
+        smp_ptrs.append(len(b))
+        # 8-bit bodies converted from the 5-bit DDA stream; note 108 plays
+        # them at their byte rate.
+        loop = (0, len(smp.data)) if smp.loop else (None, None)
+        _write_sample_s8(b, smp.name, smp.data, smp.rate, loop=loop)
 
     pat_ptrs: list[int] = []
     for ch, idx, rows in patterns:
@@ -4276,6 +4421,11 @@ def write_fur(
         # 128 as the center, exactly the byte + 128 the SCC platform subtracts.
         data = bytes((val + 128) & 0xFF for val in wave)
         wave_ptrs.append(_write_wave(b, f"scc_wave_{_wave_label(wave)}", data))
+    for wave in huc6280_waves:
+        # 5-bit samples (0-31); the PCE wavetable height is 31.
+        wave_ptrs.append(_write_wave(
+            b, f"pce_wave_{_wave_label(wave)}", bytes(wave), maximum=31,
+        ))
 
     for i, p in enumerate(ins_ptrs):
         b.patch_u32(ins_ptr_off + 4 * i, p)

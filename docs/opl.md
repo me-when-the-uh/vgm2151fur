@@ -364,6 +364,24 @@ falling) becomes an explicit note-off row. Both are carried per hit, so a drum
 sample stops when the log stops it and a fade is no longer frozen at its
 attack level.
 
+Some drivers (spc2vgm is one) key a voice at `TL=0x7F` and pan 8, then write
+the real level and pan one tick later. At row resolution that is still the
+attack, so a write inside `OPL4_ATTACK_GAP` (128 samples) replaces the hit's
+opening TL when the key-on level is silent, and the opening pan when the key-on
+pan is 8. Without this every such note started at volume 0 and was muted.
+An audible key-on keeps its own level; a later TL is a real decay step.
+
+Pan and f-num writes on a held slot are kept too. A pan change becomes a
+`08xy` point next to the volume stream (pan 8 has no effect form and rides as a
+volume-0 point), and an f-num/octave change becomes a pitch bend: 1/64-semitone
+row steps emitted as `E8xx`/`E9xx` plus `E5xx`, the same encoding ADPCM-B uses.
+Before this a held OPL4 sample only ever played its key-on pitch.
+
+A trailing `TL=0x7F` (silence) is dropped when no later write raises the level.
+The following key-off already stops the note; keeping the step only produced a
+volume-00 row that the source player never sounded, and row rounding could push
+it past the next key-on and mute a fresh note.
+
 The hardware pan table is 0 = centre, 1-7 = right (left falls), 8 = both off,
 9-15 = left (right falls). Furnace's PCM path derives the slot nibble from the
 `08xy` effect as `8 ^ min(convertPanSplitToLinearLR(x, y, 15) + 1, 15)`

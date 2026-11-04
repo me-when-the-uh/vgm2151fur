@@ -130,18 +130,40 @@ def collect_sn76489(
             glitches += 1
         active[voice] = None
 
+    def noise_period() -> int:
+        return max(0, min(PSG_MAX_PERIOD, freq[2]))
+
+    def set_noise_period(hit: PsgHit, t: int) -> None:
+        period = noise_period()
+        if hit.period == period:
+            return
+        if t == hit.sample_time:
+            hit.period = period
+        elif not hit.pitch_pts or hit.pitch_pts[-1][1] != period:
+            hit.pitch_pts.append((t, period))
+
     def open_hit(voice: int, t: int) -> None:
         active[voice] = PsgHit(
             sample_time=t,
             voice=voice,
-            period=freq[voice] if voice < 3 else 0,
+            period=(
+                freq[voice] if voice < 3
+                else noise_period() if (noise_mode & 3) == 3
+                else 0
+            ),
             vol=15 - vol[voice],
             noise=voice == 3,
             noise_mode=noise_mode if voice == 3 else 0,
         )
 
     def evaluate_tone(voice: int, t: int) -> None:
-        on = freq_high[voice] and vol[voice] < 15
+        if voice == 2 and active[3] is not None and (noise_mode & 3) == 3:
+            # Noise mode 3 borrows tone generator 3's period. Track that
+            # register so the noise note follows it too.
+            set_noise_period(active[3], t)
+        # Period 0 is the usual silence gate on this chip (the tone generator
+        # cannot divide by it). It must close the note, not become a new one.
+        on = freq_high[voice] and vol[voice] < 15 and freq[voice] > 0
         hit = active[voice]
         if on and hit is None:
             open_hit(voice, t)
@@ -188,6 +210,8 @@ def collect_sn76489(
                 hit.noise_mode = noise_mode
             else:
                 hit.mode_pts.append((t, noise_mode))
+        if (noise_mode & 3) == 3:
+            set_noise_period(hit, t)
         level = 15 - vol[3]
         if hit.vol != level:
             if t == hit.sample_time:
