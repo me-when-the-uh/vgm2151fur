@@ -8,7 +8,9 @@ import unittest
 from pathlib import Path
 
 from vgm2151fur.analyze import _fold_saw, _saw_anchors, _unit_saw, analyze
-from vgm2151fur.ay8910 import FX_NOISE, ay_note, ay_rate, collect_ay8910
+from vgm2151fur.ay8910 import (
+    FX_MODE, FX_NOISE, ay_note, ay_rate, collect_ay8910,
+)
 from vgm2151fur.furio import CHIP_CHANNELS, iter_blocks, parse_fur
 from vgm2151fur.furwrite import (
     CHIP_AY8910, CHIP_K051649, CHIP_K052539, INS_AY, INS_SCC, write_fur,
@@ -329,6 +331,55 @@ class TestAyCollect(unittest.TestCase):
         self.assertEqual(fx[0x20], 1)   # mode: noise only (value = mode - 1)
         self.assertEqual(fx[0x21], 31 - 8)
 
+    def test_noise_attack_on_a_sounding_tone_is_a_new_hit(self):
+        # A drum holds the volume open from its noise attack into the tonal
+        # body. Adding noise to the sounding tone is the next attack, not a
+        # tail on the previous body's instrument.
+        writes = [
+            ChipWrite(0, "ay8910", 0, 7, 0xFE),   # tone on, noise off
+            ChipWrite(0, "ay8910", 0, 0, 254),
+            ChipWrite(0, "ay8910", 0, 1, 0),
+            ChipWrite(100, "ay8910", 0, 8, 15),   # body
+            ChipWrite(5000, "ay8910", 0, 0, 30),  # attack pitch
+            ChipWrite(5000, "ay8910", 0, 1, 0),
+            ChipWrite(5000, "ay8910", 0, 6, 31),
+            ChipWrite(5000, "ay8910", 0, 7, 0xF6),  # tone + noise
+            ChipWrite(6000, "ay8910", 0, 7, 0xFE),  # next body: tone only
+            ChipWrite(6000, "ay8910", 0, 8, 0x10),  # envelope retrigger
+            ChipWrite(6000, "ay8910", 0, 11, 66),
+            ChipWrite(6000, "ay8910", 0, 12, 0),
+            ChipWrite(6000, "ay8910", 0, 13, 9),
+            ChipWrite(20000, "ay8910", 0, 8, 0),
+        ]
+        hits, _offs, _warn = collect_ay8910(_vgm(writes, ay8910_clock=1789773))
+        self.assertEqual([h.sample_time for h in hits], [100, 5000, 6000])
+        first = hits[0]
+        # The attack's mixer/noise writes belong to the new hit, not to the
+        # tail of the tone body.
+        self.assertFalse(any(
+            cmd in (FX_MODE, FX_NOISE) and t > first.sample_time
+            for t, cmd, _val in first.fx_pts
+        ))
+        self.assertEqual(hits[1].period, 30)
+        self.assertIn((5000, FX_MODE, 2), hits[1].fx_pts)   # tone + noise
+        self.assertIn((5000, FX_NOISE, 0), hits[1].fx_pts)
+        self.assertFalse(hits[2].noise)
+        self.assertTrue(hits[2].env)
+
+    def test_tone_to_noise_handover_stays_one_note(self):
+        # The glide test's transition: tone off as noise comes on is a mode
+        # change on the same sound, not a new percussion attack.
+        writes = [
+            ChipWrite(0, "ay8910", 0, 7, 0xFE),
+            ChipWrite(0, "ay8910", 0, 0, 1024 & 0xFF),
+            ChipWrite(0, "ay8910", 0, 1, 1024 >> 8),
+            ChipWrite(100, "ay8910", 0, 8, 12),
+            ChipWrite(2300, "ay8910", 0, 7, 0xF7),  # tone off, noise on
+            ChipWrite(3000, "ay8910", 0, 8, 0),
+        ]
+        hits, _offs, _warn = collect_ay8910(_vgm(writes, ay8910_clock=1789772))
+        self.assertEqual(len(hits), 1)
+
     def test_envelope_note(self):
         vgm = _vgm(
             self._writes(volume=0x12, env_shape=9), ay8910_clock=1789773
@@ -445,6 +496,139 @@ class TestFurEmission(unittest.TestCase):
         self.assertIn(0x22, cmds)
         self.assertIn(0x23, cmds)
         self.assertIn(0x24, cmds)
+
+    def test_ay_mode_macro_uses_the_pre_193_encoding(self):
+        # Furnace adds one to every DIV_INS_AY wave-macro value when loading
+        # a file older than version 193 (instrument.cpp). The instrument's
+        # mode macro must therefore store mode bits minus one, exactly like
+        # the 20xx row effect. Storing raw bits made tone+env load as
+        # noise+env, so PSG percussion bodies became noise.
+        writes = [
+            ChipWrite(0, "ay8910", 0, 7, 0xF6),   # tone + noise
+            ChipWrite(0, "ay8910", 0, 0, 254),
+            ChipWrite(0, "ay8910", 0, 1, 0),
+            ChipWrite(0, "ay8910", 0, 11, 66),
+            ChipWrite(0, "ay8910", 0, 12, 0),
+            ChipWrite(0, "ay8910", 0, 13, 9),
+            ChipWrite(100, "ay8910", 0, 8, 0x12),
+            # Mid-note mode change: tone+noise+env (7) becomes tone+env (5).
+            ChipWrite(5000, "ay8910", 0, 7, 0xFE),
+            ChipWrite(15000, "ay8910", 0, 8, 0),
+        ]
+        song = analyze(_vgm(writes, ay8910_clock=1789773))
+        data = write_fur(song, include_pcm=True, include_fm=False)
+        ins = next(
+            block for _off, mag, _size, block in iter_blocks(data)
+            if mag == b"INS2"
+        )
+        mode = _ins_macros(ins)[3]
+        self.assertEqual(mode[:2], [6, 6])   # 7 -> 6
+        self.assertEqual(mode[-1], 4)        # 5 -> 4
+        # The row effect keeps the same encoding (value = bits - 1).
+        mod = parse_fur(data)
+        fx = [fx for rows in mod.patterns.values() for row in rows for fx in row.fx]
+        self.assertIn((0x20, 6), fx)
+
+    def test_short_ay_attack_survives_a_row_collision(self):
+        # A drum is a 5 ms noise attack followed by a tonal body. Both hits
+        # can round onto one row; overwriting the attack changes the timbre.
+        # The short note moves one row back and the body keeps its timing.
+        at = 10000
+        writes = [
+            ChipWrite(0, "ay8910", 0, 7, 0xFE),
+            ChipWrite(0, "ay8910", 0, 0, 254),
+            ChipWrite(0, "ay8910", 0, 1, 0),
+            ChipWrite(0, "ay8910", 0, 6, 8),
+            ChipWrite(at, "ay8910", 0, 8, 15),
+            ChipWrite(at, "ay8910", 0, 7, 0xF6),          # noise attack
+            ChipWrite(at + 200, "ay8910", 0, 0, 40),
+            ChipWrite(at + 200, "ay8910", 0, 1, 0),
+            ChipWrite(at + 200, "ay8910", 0, 7, 0xFE),    # body: tone only
+            ChipWrite(at + 200, "ay8910", 0, 8, 0x10),    # envelope retrigger
+            ChipWrite(at + 200, "ay8910", 0, 11, 66),
+            ChipWrite(at + 200, "ay8910", 0, 12, 0),
+            ChipWrite(at + 200, "ay8910", 0, 13, 9),
+            ChipWrite(40000, "ay8910", 0, 8, 0),
+        ]
+        song = analyze(_vgm(writes, ay8910_clock=1789773))
+        stats: dict[str, int] = {}
+        data = write_fur(
+            song, include_pcm=True, include_fm=False, stats=stats,
+        )
+        mod = parse_fur(data)
+        rows = [
+            oi * 256 + ri
+            for oi, pidx in enumerate(mod.orders[0])
+            for ri, row in enumerate(mod.patterns.get((0, pidx), []))
+            if 0 <= row.note < 180
+        ]
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[1], rows[0] + 1)
+        self.assertEqual(stats.get("note_shifted"), 1)
+        self.assertNotIn("note_collision", stats)
+
+    def test_condensed_rows_keep_both_notes(self):
+        # At x4 a row is long enough to catch two consecutive tone notes. The
+        # later note moves to the next row when the previous row already holds
+        # a note, so neither is overwritten.
+        at = 10000
+        writes = [
+            ChipWrite(0, "ay8910", 0, 7, 0xFE),
+            ChipWrite(0, "ay8910", 0, 0, 254),
+            ChipWrite(0, "ay8910", 0, 1, 0),
+            ChipWrite(at, "ay8910", 0, 8, 15),
+            ChipWrite(at + 300, "ay8910", 0, 0, 200),
+            ChipWrite(at + 300, "ay8910", 0, 1, 0),
+            ChipWrite(at + 300, "ay8910", 0, 8, 15),
+            ChipWrite(40000, "ay8910", 0, 8, 0),
+        ]
+        song = analyze(_vgm(writes, ay8910_clock=1789773), condense=4.0)
+        stats: dict[str, int] = {}
+        data = write_fur(
+            song, include_pcm=True, include_fm=False, stats=stats,
+        )
+        mod = parse_fur(data)
+        rows = [
+            oi * 256 + ri
+            for oi, pidx in enumerate(mod.orders[0])
+            for ri, row in enumerate(mod.patterns.get((0, pidx), []))
+            if 0 <= row.note < 180
+        ]
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(len(set(rows)), 2)
+        self.assertGreaterEqual(stats.get("note_shifted", 0), 1)
+
+
+def _ins_macros(block: bytes) -> dict[int, list[int]]:
+    """Decode an INS2 block's MA feature into ``{macro code: values}``."""
+    pos = block.index(b"MA")
+    size = struct.unpack_from("<H", block, pos + 2)[0]
+    cursor = pos + 4
+    # The 2-byte header field holds Furnace's macro header size (8); it is
+    # not a byte count to skip. The macros start right after it.
+    struct.unpack_from("<H", block, cursor)[0]
+    cursor += 2
+    end = pos + 4 + size
+    out: dict[int, list[int]] = {}
+    while cursor < end and block[cursor] != 0xFF:
+        code, length, _loop, _rel, _mode, word, _delay, _speed = (
+            struct.unpack_from("<BBBBBBBB", block, cursor)
+        )
+        cursor += 8
+        width = word >> 6
+        values: list[int] = []
+        for _ in range(length):
+            if width == 2:
+                values.append(struct.unpack_from("<h", block, cursor)[0])
+                cursor += 2
+            elif width == 3:
+                values.append(struct.unpack_from("<i", block, cursor)[0])
+                cursor += 4
+            else:
+                values.append(block[cursor])
+                cursor += 1
+        out[code] = values
+    return out
 
 
 def _wave_values(block: bytes) -> list[int]:

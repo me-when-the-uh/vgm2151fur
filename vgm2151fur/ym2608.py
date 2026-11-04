@@ -70,6 +70,11 @@ RHYTHM_VOICES = (
     ("RM", "Rim"),
 )
 
+# A driver may key a drum while its level byte still holds the previous (often
+# muted) value and write the real level a little later. A level write this soon
+# after the key is the hit's own level, not a step on the sounding voice.
+RHYTHM_LEVEL_FOLD = 512
+
 # Where each voice lives in the rhythm ROM. The engine reads one nibble per
 # chipClock/432 tick, so the range alone says how long a hit can still be
 # heard - without any sample data in the module.
@@ -135,11 +140,12 @@ class YM2608State(YM2610State):
     def rhythm_level(self, voice: int) -> int:
         """The 0-31 column value that reproduces ``$18+voice``.
 
-        The level field is a loudness, and the global ``$11`` scales every
-        voice; folding it in (as the YM2610 ADPCM-A path does) leaves one
-        value per note that carries the driver's whole mix balance.
+        Only the per-voice field is returned. ``$11`` is the kit's global
+        level, and the platform exposes it as an ``1Fxx`` effect; folding it
+        into every hit clamps quiet kits to column 0 and hides the level the
+        driver actually wrote.
         """
-        return self.adpcm_a_level(voice)
+        return self.a_vol[voice] & 0x1F
 
     def rhythm_pan(self, voice: int) -> int:
         return pan_byte(self.a_pan[voice])
@@ -232,7 +238,7 @@ def collect_ym2608_rhythm(vgm) -> tuple[list[RhythmHit], list[str]]:
                     continue
                 vol = st.rhythm_level(voice)
                 dt = w.sample - hit.sample_time
-                if 0 <= dt <= 64:
+                if 0 <= dt <= RHYTHM_LEVEL_FOLD:
                     hit.vol = vol
                 elif _voice_playing(clock, hit, w.sample):
                     last = hit.vol_pts[-1][1] if hit.vol_pts else hit.vol
@@ -248,7 +254,7 @@ def collect_ym2608_rhythm(vgm) -> tuple[list[RhythmHit], list[str]]:
         vol = st.rhythm_level(voice)
         pan = st.rhythm_pan(voice)
         dt = w.sample - hit.sample_time
-        if 0 <= dt <= 64:
+        if 0 <= dt <= RHYTHM_LEVEL_FOLD:
             hit.vol = vol
             hit.pan = pan
         elif _voice_playing(clock, hit, w.sample):

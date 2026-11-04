@@ -335,6 +335,10 @@ class RomSlice:
     data: bytes
     kind: str = "k007232"  # "k007232" | "msm6295" | "segapcm" | "c140" |
     #                      "c352" | "k053260"
+    # Stream position of a RAM-image dump (0xC0-0xDF). A driver can reload the
+    # same NES DPCM window several times while the song plays, so the samples
+    # are only valid from this point on. ROM dumps leave it at 0.
+    time: int = 0
 
 
 @dataclass
@@ -493,6 +497,10 @@ class VgmFile:
     # Genesis SN76489 header 0x0C.  The data bytes arrive as 0x50 writes;
     # they are a serial register stream, not address/data pairs.
     sn76489_clock: int = 0
+    # A Game Gear rip writes command 0x4F (stereo mask) besides the serial
+    # data bytes. A mask other than 0xFF means the left/right enables are in
+    # use, so the module needs the Game Gear variant.
+    sn76489_stereo: bool = False
     # VGM 1.50 YM2612 PCM: data block type 0x00 is the sample bank, and
     # 0xE0 sets the read pointer.  0x80-0x8F play one byte (plus a 0-15
     # sample wait).  0x2A is a direct DAC byte.  Events keep stream order:
@@ -1197,7 +1205,9 @@ def load_vgm(path: Path | str) -> VgmFile:
                         "rf5c68" if typ == RF5C68_RAM_TYPE else
                         "rf5c164" if typ == RF5C164_RAM_TYPE else "nes_dpcm"
                     )
-                    vgm.roms.append(RomSlice(chip_id, 0, start, payload[2:], kind))
+                    vgm.roms.append(RomSlice(
+                        chip_id, 0, start, payload[2:], kind, time=sample,
+                    ))
             else:
                 kind = {
                     K007232_ROM_TYPE: "k007232",
@@ -1421,9 +1431,19 @@ def load_vgm(path: Path | str) -> VgmFile:
             vgm.writes.append(ChipWrite(sample, "ym2612", 0, 0x2B, buf[pos + 1]))
             pos += 2
             continue
+        if cmd == 0x4F and pos + 2 <= n:
+            # Game Gear stereo: four left and four right enable bits.  Keep it
+            # on the same chip stream with reg 1 so the collector sees it in
+            # order with the tone/volume bytes.
+            value = buf[pos + 1]
+            vgm.writes.append(ChipWrite(sample, "sn76489", 0, 1, value))
+            if value != 0xFF:
+                vgm.sn76489_stereo = True
+            pos += 2
+            continue
         if cmd == CMD_SN76489 and pos + 2 <= n:
             # One SN76489 serial data byte.  The latch/register/channel is
-            # encoded inside the byte; reg is unused.
+            # encoded inside the byte; reg 0.
             vgm.writes.append(ChipWrite(sample, "sn76489", 0, 0, buf[pos + 1]))
             pos += 2
             continue

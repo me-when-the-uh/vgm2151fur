@@ -792,10 +792,17 @@ def _write_tone_macros(b: Buf, ins, *, wave: bool, reset: bool = False) -> None:
             width=2 if max(ins.waves) > 127 else 1,
         )
     if ins.mode:
-        # Raw mode bits (tone 1, noise 2, envelope 4). The pattern effect
-        # 20xx stores the same bits minus one; the macro does not.
+        # AY mode bits (tone 1, noise 2, envelope 4). Before file version
+        # 193 Furnace bumps every DIV_INS_AY wave-macro value by one while
+        # loading (instrument.cpp), the same way 20xx carries the bits minus
+        # one. Store the effect encoding for that format or the reloaded mode
+        # is one step off: tone+env (5) would become noise+env (6) and a drum
+        # body would play as noise.
+        mode = ins.mode
+        if FUR_VERSION < 193:
+            mode = tuple((value - 1) & 0xFF for value in mode)
         _write_macro(
-            b, 3, ins.mode, speed=ins.mode_speed, loop=ins.mode_loop,
+            b, 3, mode, speed=ins.mode_speed, loop=ins.mode_loop,
         )
     if ins.pitch:
         _write_macro(
@@ -2459,8 +2466,83 @@ def _build_patterns(song: Song, n_ch: int, pat_len_max: int, fx_cols: int,
             return loop_row, 0
         return row, delay
 
+    row_samples = float(getattr(song, "samples_per_row", 0) or 0)
+    # A condensed row can catch two tone notes at once. Pin the earlier one to
+    # the end of the previous row instead of letting the later note overwrite
+    # it. Only a note that ends before the next one starts and has no row
+    # volume steps of its own moves; its opening effects move with it. The
+    # previous row's note-off is redundant because the moved key-on cuts that
+    # note, so the off is skipped below.
+    note_row_shift: dict[int, tuple[int, int]] = {}
+    fx_row_shift: dict[tuple[int, int], tuple[int, int]] = {}
+    shifted_rows: set[tuple[int, int]] = set()
+    tone_rows: dict[int, dict[int, list[tuple[object, int]]]] = {}
+    for ev in song.events:
+        if not (ev.on and ev.tone_chip):
+            continue
+        ev_ch = ev.ch + ch_offset
+        if ev_ch < 0 or ev_ch >= n_ch:
+            continue
+        if content_cut is not None and ev.sample >= content_cut:
+            continue
+        row, delay = loop_clip(*song.place(ev.sample, stats), ev.sample)
+        row, delay = loop_start(row, delay, ev.sample)
+        if 0 <= row < total_rows:
+            tone_rows.setdefault(ev_ch, {}).setdefault(row, []).append((ev, delay))
+    used_rows = {
+        (ch, row) for ch, rows in tone_rows.items() for row in rows
+    }
+    shift_delay = min(255, max(1, song.speed - 1))
+    for ev_ch, rows in tone_rows.items():
+        for row in sorted(rows):
+            group = rows[row]
+            if len(group) < 2:
+                continue
+            group.sort(key=lambda item: item[0].sample)
+            for (prev, _pdelay), (ev, _edelay) in zip(group, group[1:]):
+                if (
+                    getattr(prev, "tone_chip", 0) not in (1, 2, 3, 4, 5)
+                    or prev.vol_pts
+                    or not prev.end
+                    or prev.end > ev.sample
+                    or (row_samples and prev.end - prev.sample >= row_samples)
+                ):
+                    continue
+                dest = row - 1
+                if dest >= 0 and (ev_ch, dest) not in used_rows:
+                    note_row_shift[id(prev)] = (dest, shift_delay)
+                    fx_row_shift[(ev_ch, prev.sample)] = (dest, shift_delay)
+                    shifted_rows.add((ev_ch, dest))
+                    used_rows.add((ev_ch, dest))
+                    _bump(stats, "note_shifted")
+                    continue
+                if len(group) != 2:
+                    continue
+                # The row before holds the previous note. Move the later note
+                # to the next row instead so both still play; the earlier note
+                # is short enough to finish before it.
+                dest = row + 1
+                if dest >= total_rows or (ev_ch, dest) in used_rows:
+                    continue
+                note_row_shift[id(ev)] = (dest, 0)
+                fx_row_shift[(ev_ch, ev.sample)] = (dest, 0)
+                used_rows.add((ev_ch, dest))
+                _bump(stats, "note_shifted")
+
     # Chip-wide effects are placed after the notes: the LFO speed/pulse has
     # to ride the tick of the key-on it belongs to (see _place_chip_fx).
+    # The tick delay a tone note on a row will use. A row's ED applies to
+    # every event on it, so an effect that lands later in the row than the
+    # note cannot stay there without pushing the note late.
+    note_delay: dict[tuple[int, int], int] = {}
+    for ev_ch, rows in tone_rows.items():
+        for row, group in rows.items():
+            for ev, delay in group:
+                shifted = note_row_shift.get(id(ev))
+                dest, dest_delay = shifted if shifted is not None else (row, delay)
+                key = (ev_ch, dest)
+                prev = note_delay.get(key)
+                note_delay[key] = dest_delay if prev is None else min(prev, dest_delay)
     for sample, ch, cmd, val in getattr(song, "channel_fx", ()) or ():
         ch += ch_offset
         if ch < 0 or ch >= n_ch:
@@ -2470,16 +2552,40 @@ def _build_patterns(song: Song, n_ch: int, pat_len_max: int, fx_cols: int,
         # Same placement as the note on this sample, including its ED delay.
         # row_of() rounds to the nearest row and would land an effect on a
         # different row from the note whenever speed is more than 1.
-        row, delay = loop_clip(*song.place(sample, stats), sample)
-        row, delay = loop_start(row, delay, sample)
+        shifted = fx_row_shift.get((ch, sample))
+        if shifted is not None:
+            row, delay = shifted
+        else:
+            row, delay = loop_clip(*song.place(sample, stats), sample)
+            row, delay = loop_start(row, delay, sample)
         if row < 0 or row >= total_rows:
             continue
+        # The note on this row starts at its own tick; this effect happens
+        # after it, so put it at the next row rather than delay the note.
+        note_tick = note_delay.get((ch, row))
+        if note_tick is not None and delay > note_tick and row + 1 < total_rows:
+            row, delay = row + 1, 0
         cell = grid[ch].get(row)
         if cell is None:
             cell = _blank_row()
             grid[ch][row] = cell
+        # Two different values of one effect inside a row (a duty change
+        # shortly after the note opened) cannot share the cell: keep the
+        # first and move the later one to the next row.
+        if any(
+            c == cmd and v != val and c != EMPTY
+            for c, v in (cell.fx or ())
+        ):
+            nrow = row + 1
+            if nrow >= total_rows:
+                continue
+            row, delay = nrow, 0
+            cell = grid[ch].get(row)
+            if cell is None:
+                cell = _blank_row()
+                grid[ch][row] = cell
         _add_fx(cell, cmd, val, fx_cols, stats)
-        if delay:
+        if delay and _cell_ed(cell) == 0:
             _add_fx(cell, 0xED, delay, fx_cols, stats)
 
     # E5 is channel state. Collect it per row and replay in row order, back
@@ -2502,6 +2608,10 @@ def _build_patterns(song: Song, n_ch: int, pat_len_max: int, fx_cols: int,
     pcm_pos = _assign_pcm_rows(
         song, total_rows, last_sample, stats, content_end, content_cut,
     )
+    # The tone note that currently owns each (channel, row), so a short
+    # percussive attack can be kept when the following hit rounds onto the
+    # same row.
+    note_ev: dict[tuple[int, int], object] = {}
     for ev in song.events:
         ev_ch = ev.ch + ch_offset
         if ev_ch < 0 or ev_ch >= n_ch:
@@ -2523,6 +2633,10 @@ def _build_patterns(song: Song, n_ch: int, pat_len_max: int, fx_cols: int,
             row, delay = song.place(ev.sample, stats)
         row, delay = loop_clip(row, delay, ev.sample)
         row, delay = loop_start(row, delay, ev.sample)
+        if ev.on:
+            shifted = note_row_shift.get(id(ev))
+            if shifted is not None:
+                row, delay = shifted
         if row < 0 or row >= total_rows:
             continue
         cell = grid[ev_ch].get(row)
@@ -2537,6 +2651,11 @@ def _build_patterns(song: Song, n_ch: int, pat_len_max: int, fx_cols: int,
                 cell.note = NOTE_OFF
                 if delay:
                     _add_fx(cell, 0xED, delay, fx_cols, stats)
+                continue
+            if (ev_ch, row) in shifted_rows and cell.note >= 0 and cell.note != NOTE_OFF:
+                # The note that moved into this row already cuts the previous
+                # note at its key-on; this off would cut the moved note.
+                _bump(stats, "off_swallowed")
                 continue
             # A note-off on the note's own row is a cut (ECxx). An off at or
             # before that row is the previous note releasing, and the new
@@ -2556,7 +2675,31 @@ def _build_patterns(song: Song, n_ch: int, pat_len_max: int, fx_cols: int,
                 _bump(stats, "off_swallowed")
             continue
         if 0 <= cell.note < 180:
-            _bump(stats, "note_collision")
+            prev = note_ev.get((ev_ch, row))
+            # A 5 ms noise attack and the tonal body that follows it can round
+            # onto the same row. Dropping the attack changes the drum's
+            # timbre, so move the short note one row back when that row is
+            # free; the body keeps its own timing and cuts the attack.
+            if (
+                prev is not None
+                and getattr(prev, "tone_chip", 0) == 2  # AY/SSG percussion
+                and not prev.vol_pts
+                and prev.end
+                and prev.end <= ev.sample
+                and (not row_samples or prev.end - prev.sample < row_samples)
+                and row > 0
+                and row - 1 not in grid[ev_ch]
+            ):
+                grid[ev_ch][row - 1] = cell
+                note_ev[(ev_ch, row - 1)] = prev
+                note_ev.pop((ev_ch, row), None)
+                if (ev_ch, row) in note_e5:
+                    note_e5[(ev_ch, row - 1)] = note_e5.pop((ev_ch, row))
+                cell = _blank_row()
+                grid[ev_ch][row] = cell
+                _bump(stats, "note_shifted")
+            else:
+                _bump(stats, "note_collision")
         cell.note = ev.note if ev.note != 180 else NOTE_OFF
         if ev.ins >= 0:
             cell.ins = ev.ins
@@ -2578,6 +2721,7 @@ def _build_patterns(song: Song, n_ch: int, pat_len_max: int, fx_cols: int,
         if delay:
             _add_fx(cell, 0xED, delay, fx_cols, stats)
         note_e5[(ev_ch, row)] = ev.e5
+        note_ev[(ev_ch, row)] = ev
         # PCM pan 0x00 is both channels off. Omitting it leaves Furnace's
         # default (both full). FM pan 0 still means "no 08xx on this row".
         if ev.quad is not None:
@@ -2676,6 +2820,9 @@ def _build_patterns(song: Song, n_ch: int, pat_len_max: int, fx_cols: int,
         for ch in range(n_ch)
     }
     def placed_note_row(ev) -> int:
+        shifted = note_row_shift.get(id(ev))
+        if shifted is not None:
+            return shifted[0]
         if ev.pcm:
             assigned = pcm_pos.get(id(ev))
             if assigned is None:
@@ -3853,10 +4000,14 @@ def write_fur(
     for _cid in psg_ids:
         chips.append(CHIP_SMS)
         psg_clock = song.vgm.sn76489_clock or 3579545
+        # Game Gear selects Furnace's stereo SMPSG core (chipType 3). The
+        # plain SMS core is mono, so its 08xy panning would be ignored.
+        flags = "chipType=3" if getattr(song, "psg_stereo", False) else ""
         if abs(psg_clock - 3579545) <= 2:
-            flag_texts.append("clockSel=0")
+            clock_flag = "clockSel=0"
         else:
-            flag_texts.append(f"customClock={psg_clock}")
+            clock_flag = f"customClock={psg_clock}"
+        flag_texts.append(flags + ("\n" if flags else "") + clock_flag)
     if n_k007:
         chips.append(CHIP_K007232)
         flags = "stereo=true"

@@ -7,7 +7,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from vgm2151fur.analyze import analyze
+from vgm2151fur.analyze import NoteEvent, _absorb_detune, analyze
 from vgm2151fur.furio import iter_blocks, parse_fur
 from vgm2151fur.furwrite import (
     CHIP_NES, CHIP_VRC7, INS_NES, SMP_DEPTH_DPCM, write_fur,
@@ -114,6 +114,39 @@ class TestDpcmBank(unittest.TestCase):
         # $4013 = 0 is the minimum DMC length: one byte.
         self.assertEqual(samples[0].data, b"\xAA")
         self.assertEqual(len(hits), 1)
+        self.assertEqual(warn, [])
+
+    def test_dpcm_ram_reload_follows_stream_time(self):
+        # Gimmick! re-dumps $C000/$D000 while the song plays. A hit must read
+        # the window that was loaded at that point, not the last one in the
+        # file (which made most DPCM notes play the wrong sample).
+        def dump_block(data, addr=0xC000):
+            payload = addr.to_bytes(2, "little") + data
+            return (
+                bytes([0x67, 0x66, 0xC2])
+                + len(payload).to_bytes(4, "little") + payload
+            )
+
+        cmds = bytearray([
+            0xB4, 0x10, 0x0E, 0xB4, 0x12, 0x00,
+            0xB4, 0x13, 0x00, 0xB4, 0x15, 0x1F,   # hit 1 at t=0
+            0x61, 0x10, 0x00,                     # wait 16 samples
+        ])
+        cmds += dump_block(bytes([0x55]) * 64)    # reload at t=16
+        cmds += bytes([
+            0xB4, 0x15, 0x0F,                     # stop
+            0xB4, 0x13, 0x00, 0xB4, 0x15, 0x1F,   # hit 2 at t=16
+        ])
+        raw = _raw_vgm(
+            bytes(cmds), [(0xC2, 0xC000, bytes([0xAA]) * 64)],
+        )
+        p = TMP / "dpcm_reload.vgm"
+        p.write_bytes(raw)
+        v = load_vgm(p)
+        self.assertEqual([r.time for r in v.roms], [0, 16])
+        samples, hits, warn = collect_nes_dpcm(v)
+        self.assertEqual([h.sample_time for h in hits], [0, 16])
+        self.assertEqual([s.data for s in samples], [b"\xAA", b"\x55"])
         self.assertEqual(warn, [])
 
     def test_trigger_without_data_warns(self):
@@ -239,6 +272,63 @@ class TestNesTones(unittest.TestCase):
         hits, _offs, _warn = collect_nes_tones(_vgm(writes))
         self.assertEqual(len(hits), 1)
 
+    def test_pulse_volume_reattack_starts_a_new_note(self):
+        writes = [
+            _nes(0, 0x15, 0x0F),
+            _nes(1000, 0x02, 0x80), _nes(1000, 0x03, 0x08),
+            _nes(1000, 0x00, 0xB9),
+            _nes(5000, 0x00, 0xB2),   # gate the level down
+            _nes(6000, 0x00, 0xB9),   # re-attack at the same pitch
+            _nes(9000, 0x00, 0xB0),
+        ]
+        hits, _offs, _warn = collect_nes_tones(_vgm(writes))
+        self.assertEqual([h.sample_time for h in hits], [1000, 6000])
+        self.assertEqual(hits[1].vol, 9)
+
+    def test_pulse_swell_from_a_sounding_level_stays_one_note(self):
+        writes = [
+            _nes(0, 0x15, 0x0F),
+            _nes(1000, 0x02, 0x80), _nes(1000, 0x03, 0x08),
+            _nes(1000, 0x00, 0xB6),   # volume 6
+            _nes(2000, 0x00, 0xBA),   # swell to 10, same pitch
+            _nes(9000, 0x00, 0xB0),
+        ]
+        hits, _offs, _warn = collect_nes_tones(_vgm(writes))
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0].vol_pts, [(2000, 10)])
+
+    def test_pulse_held_pitch_step_is_a_new_note(self):
+        # Gimmick! changes the period by under a semitone between sustained
+        # notes. Keeping that as a pitch macro made one instrument play
+        # several source notes.
+        writes = [
+            _nes(0, 0x15, 0x0F),
+            _nes(1000, 0x02, 0x50), _nes(1000, 0x03, 0x08),
+            _nes(1000, 0x00, 0xB9),
+            _nes(8000, 0x02, 0x54),
+            _nes(20000, 0x00, 0xB0),
+        ]
+        hits, _offs, _warn = collect_nes_tones(_vgm(writes))
+        self.assertEqual([h.period for h in hits], [0x50, 0x54])
+
+    def test_pulse_vibrato_does_not_split(self):
+        writes = [
+            _nes(0, 0x15, 0x0F),
+            _nes(1000, 0x02, 0x50), _nes(1000, 0x03, 0x08),
+            _nes(1000, 0x00, 0xB9),
+        ]
+        t = 2000
+        for per in (0x54, 0x50, 0x54, 0x50, 0x54, 0x50):
+            writes.append(_nes(t, 0x02, per))
+            t += 700
+        writes.append(_nes(t, 0x00, 0xB0))
+        hits, _offs, _warn = collect_nes_tones(_vgm(writes))
+        self.assertEqual(len(hits), 1)
+        self.assertTrue(hits[0].pitch_pts)
+        # The return to the base pitch must still be a pitch point, or the
+        # macro would hold the bend.
+        self.assertIn((2700, 0x50), hits[0].pitch_pts)
+
     def test_note_mapping_round_trips(self):
         for period in (0, 1, 0x100, 0x400, 0x7FF):
             note, e5 = nes_note(1789773, period)
@@ -246,6 +336,75 @@ class TestNesTones(unittest.TestCase):
             self.assertLessEqual(note, 179)
             self.assertGreaterEqual(e5, 0)
             self.assertLessEqual(e5, 0xFF)
+
+
+class TestNesPitchMotion(unittest.TestCase):
+    def _event(self, e5=119):
+        return NoteEvent(
+            sample=0, ch=13, on=True, note=112, ins=0, vol=15, e5=e5, pan=0,
+        )
+
+    def test_delayed_pitch_change_stays_a_bend(self):
+        # Gimmick!'s triangle holds one period and then moves once near the
+        # end of the note. Folding that into E5 retunes the whole note.
+        ev = self._event()
+        pitch = _absorb_detune(ev, (0, 0, 0, 60, 60), 1)
+        self.assertEqual(pitch, (0, 0, 0, 60, 60))
+        self.assertEqual((ev.note, ev.e5), (112, 119))
+
+    def test_pitch_that_settles_on_the_first_tick_is_the_note(self):
+        ev = self._event()
+        pitch = _absorb_detune(ev, (0, 60, 60), 1)
+        self.assertEqual(pitch, ())
+        self.assertEqual(ev.e5, 119 + 60)
+
+    def test_mid_row_channel_effect_does_not_delay_the_note(self):
+        # Gimmick!'s intro opens pulse 2 on row 0 and changes duty later in
+        # the same row. The row's ED must not push the note to that later
+        # tick; the duty change moves to the next row instead.
+        writes = [
+            _nes(0, 0x15, 0x0F),
+            _nes(44, 0x00, 0xB9),
+            _nes(44, 0x02, 0x1D),
+            _nes(44, 0x03, 0x09),
+            _nes(753, 0x00, 0x39),    # duty 2 -> 0, still inside row 0
+            _nes(2000, 0x00, 0x30),
+        ]
+        song = analyze(_vgm(writes, nes_clock=1789773))
+        # Force the grid the source uses: 9 ticks of 91.7 samples per row.
+        song.hz = 44100.0 / 91.7
+        song.speed = 9
+        song.t0 = 0
+        mod = parse_fur(write_fur(song, include_pcm=True))
+        # Pulse 1 is channel 0 in a NES-only module.
+        row0 = mod.patterns[(0, 0)][0]
+        row1 = mod.patterns[(0, 0)][1]
+        self.assertGreaterEqual(row0.note, 0)
+        self.assertNotIn(
+            0xED, [c for c, _v in (row0.fx or ())],
+            "a mid-row duty change must not delay the note",
+        )
+        self.assertIn((0x12, 2), row0.fx or ())
+        self.assertIn((0x12, 0), row1.fx or ())
+
+    def test_triangle_note_keeps_its_starting_pitch(self):
+        writes = [
+            _nes(1000, 0x15, 0x0F),
+            _nes(1000, 0x08, 0xFF),
+            _nes(1000, 0x0A, 169),
+            _nes(1000, 0x0B, 0x00),
+            _nes(40000, 0x0A, 160),   # one step down, long after the start
+            _nes(80000, 0x08, 0x00),
+        ]
+        song = analyze(_vgm(writes, nes_clock=1789773))
+        tri = next(
+            e for e in song.events
+            if e.on and e.tone_chip == 4 and e.note < 150
+        )
+        self.assertEqual((tri.note, tri.e5), nes_note(1789773, 169))
+        self.assertEqual(tri.tone_pitch_pts, ((40000, 160),))
+        self.assertTrue(song.nes_ins)
+        self.assertTrue(song.nes_ins[0].pitch)
 
 
 class TestNesDpcm(unittest.TestCase):
@@ -298,6 +457,37 @@ class TestNesDpcm(unittest.TestCase):
         )
         self.assertEqual(len(hits), 1)
         self.assertTrue(any("does not dump" in w for w in warn))
+
+    def test_dpcm_stop_becomes_a_note_off(self):
+        # The driver clears $4015 bit 4 to cut a drum short before its body
+        # ends. That must become a PCM note-off, or the tracker plays the
+        # whole sample.
+        data = bytes(0x1000)
+        writes = [
+            _nes(1000, 0x10, 0x0E),
+            _nes(1000, 0x12, 0x11),
+            _nes(1000, 0x13, 0x01),
+            _nes(1000, 0x15, 0x1F),
+            _nes(5000, 0x15, 0x0F),
+        ]
+        song = analyze(_vgm(
+            writes,
+            [RomSlice(0, len(data), 0xC000, data, "nes_dpcm")],
+            nes_clock=1789773,
+        ))
+        ons = [e for e in song.events if e.on and e.pcm]
+        offs = [e for e in song.events if not e.on and e.pcm]
+        self.assertEqual(len(ons), 1)
+        self.assertEqual(ons[0].end, 5000)
+        self.assertEqual([e.sample for e in offs], [5000])
+        mod = parse_fur(write_fur(song, include_pcm=True))
+        notes = [
+            row.note
+            for oi in mod.orders[4]
+            for row in mod.patterns.get((4, oi), [])
+            if row.note >= 0
+        ]
+        self.assertIn(180, notes)   # NOTE_OFF
 
     def test_4011_spam_becomes_pcm(self):
         # Two hundred 7-bit writes at 4-sample spacing = one 11025 Hz body.

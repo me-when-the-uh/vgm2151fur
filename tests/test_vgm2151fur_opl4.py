@@ -143,6 +143,34 @@ class TestOpl4Wave(unittest.TestCase):
             opl4_rate(CLOCK, step), CLOCK * step / (768.0 * 65536.0),
         )
 
+    def test_zero_loop_address_loops_the_whole_body(self):
+        # spc2vgm stores a single-cycle waveform with loop address 0. The
+        # hardware wraps to the body start; treating 0 as "no loop" made the
+        # sine play once and stop.
+        sample = bytes(range(16))  # 8 frames of 16-bit data
+        rom = bytearray(0x1000 + len(sample) + 16)
+        rom[16 * 12:16 * 12 + 12] = _descriptor(2, 0x1000, 0, 8)
+        rom[0x1000:0x1000 + len(sample)] = sample
+        v = _vgm(_wave_note(100, wave=16),
+                 roms=[RomSlice(0, 0, 0, bytes(rom), "ymf278b_rom")])
+        samples, _warn = collect_opl4_wave(v, rom=bytes(rom))
+        smp = samples[0]
+        self.assertEqual((smp.loop_start, smp.loop_end), (0, 8))
+
+    def test_negative_octave_shifts_right(self):
+        # The wave part's 4-bit octave is signed; -6..-7 need a right shift.
+        self.assertEqual(opl4_step(-4, 0x200), (0x200 + 1024) << 1)
+        self.assertEqual(opl4_step(-6, 0x200), (0x200 + 1024) >> 1)
+        self.assertEqual(opl4_step(-7, 0x200), (0x200 + 1024) >> 2)
+        self.assertEqual(opl4_step(-8, 0x200), 0)
+
+    def test_negative_octave_note_collects(self):
+        sample = bytes(range(1, 21))
+        v = _vgm(_wave_note(100, wave=16, slot=0, octave=-6),
+                 roms=[RomSlice(0, 0, 0, _rom(16, sample), "ymf278b_rom")])
+        samples, _warn = collect_opl4_wave(v, rom=_rom(16, sample))
+        self.assertEqual(samples[0].hits[0].step, opl4_step(-6, 0x200))
+
     def test_missing_rom_warns(self):
         v = _vgm(_wave_note(100))
         samples, warn = collect_opl4_wave(v, rom=b"")

@@ -38,6 +38,11 @@ class PsgHit:
     off_sample: int = 0
     noise: bool = False
     noise_mode: int = 0
+    # Game Gear 08xy pan value (0xF0 left, 0x0F right, 0xFF both). Zero when
+    # the source did not declare stereo.
+    pan: int = 0
+    opened_pan: int = 0
+    pan_pts: list[tuple[int, int]] = field(default_factory=list)
     pitch_pts: list[tuple[int, int]] = field(default_factory=list)
     vol_pts: list[tuple[int, int]] = field(default_factory=list)
     mode_pts: list[tuple[int, int]] = field(default_factory=list)
@@ -102,6 +107,8 @@ def collect_sn76489(
     if not writes:
         return [], [], warnings
     clock = clock or vgm.sn76489_clock or PSG_DEFAULT_CLOCK
+    stereo = bool(getattr(vgm, "sn76489_stereo", False))
+    stereo_mask = 0xFF
     freq = [0, 0, 0]
     freq_high = [False, False, False]
     vol = [15, 15, 15, 15]
@@ -112,6 +119,14 @@ def collect_sn76489(
     hits: list[PsgHit] = []
     offs: list[PsgOff] = []
     glitches = 0
+
+    def pan_for(voice: int) -> int:
+        """The 08xy value for one voice under the current Game Gear mask."""
+        if not stereo:
+            return 0
+        left = 0xF0 if stereo_mask & (0x10 << voice) else 0
+        right = 0x0F if stereo_mask & (0x01 << voice) else 0
+        return left | right
 
     def close(voice: int, t: int, *, emit_off: bool = True) -> None:
         nonlocal glitches
@@ -143,6 +158,13 @@ def collect_sn76489(
             hit.pitch_pts.append((t, period))
 
     def open_hit(voice: int, t: int) -> None:
+        pan = pan_for(voice)
+        level = 15 - vol[voice]
+        if stereo and pan == 0:
+            # Both Game Gear sides are off for this voice. The SMS panning
+            # command cannot say "both off" (zero is read as centre), so the
+            # level column carries the silence.
+            level = 0
         active[voice] = PsgHit(
             sample_time=t,
             voice=voice,
@@ -151,9 +173,11 @@ def collect_sn76489(
                 else noise_period() if (noise_mode & 3) == 3
                 else 0
             ),
-            vol=15 - vol[voice],
+            vol=level,
             noise=voice == 3,
             noise_mode=noise_mode if voice == 3 else 0,
+            pan=pan,
+            opened_pan=pan,
         )
 
     def evaluate_tone(voice: int, t: int) -> None:
@@ -222,6 +246,35 @@ def collect_sn76489(
     for w in writes:
         b = w.val & 0xFF
         t = w.sample
+        if w.reg == 1:
+            # Game Gear stereo mask. A change during a held note is a pan
+            # point; a mask that turns both sides off also mutes that voice
+            # through the level column (the SMS 08xy zero reads as centre).
+            if b != stereo_mask:
+                stereo_mask = b
+                for voice, hit in enumerate(active):
+                    if hit is None:
+                        continue
+                    new_pan = pan_for(voice)
+                    old_pan = hit.pan
+                    if new_pan == old_pan:
+                        continue
+                    if t == hit.sample_time:
+                        hit.pan = new_pan
+                        hit.opened_pan = new_pan
+                        if new_pan == 0:
+                            hit.vol = 0
+                        elif old_pan == 0:
+                            hit.vol = 15 - vol[voice]
+                        continue
+                    if new_pan:
+                        hit.pan_pts.append((t, new_pan))
+                    if new_pan == 0:
+                        hit.vol_pts.append((t, 0))
+                    elif old_pan == 0:
+                        hit.vol_pts.append((t, 15 - vol[voice]))
+                    hit.pan = new_pan
+            continue
         if b & 0x80:
             latch_ch = (b >> 5) & 3
             latch_vol = bool(b & 0x10)

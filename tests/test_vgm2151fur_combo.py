@@ -21,14 +21,16 @@ from pathlib import Path
 from vgm2151fur.analyze import _family_keyons, _family_sounds, analyze, format_report
 from vgm2151fur.audit import compare_dac
 from vgm2151fur.furwrite import (
-    CHIP_OPL2, CHIP_OPL3, CHIP_OPLL_DRUMS, CHIP_SMS, CHIP_YM2151,
-    CHIP_YM2612, CHIP_YM2612_EXT, _append_system_names, _channel_vol_max,
-    write_fur,
+    CHIP_AY8910, CHIP_MSM6295, CHIP_OPL2, CHIP_OPL3, CHIP_OPLL_DRUMS,
+    CHIP_SMS, CHIP_YM2151, CHIP_YM2203, CHIP_YM2612, CHIP_YM2612_EXT,
+    _append_system_names, _channel_vol_max, write_fur,
 )
 from vgm2151fur.furio import CHIP_CHANNELS, iter_blocks, parse_fur
 from vgm2151fur.furnace import export_vgm, find_furnace
 from vgm2151fur.opl import N as OPL_N, OPLState, SLOT_ADDR
-from vgm2151fur.vgm import ChipWrite, DacStreamPlay, VGM_RATE, VgmFile, load_vgm
+from vgm2151fur.vgm import (
+    ChipWrite, DacStreamPlay, RomSlice, VGM_RATE, VgmFile, load_vgm,
+)
 from vgm2151fur.ym2612dac import DAC_RELEASE_SAMPLES, collect_dac
 
 TMP = Path(tempfile.gettempdir()) / "vgm2151fur_combo"
@@ -74,27 +76,27 @@ def _stream(sample: int, offset: int, length: int, *, mode: int = 1,
 # ------------------------------------------------------------- note builders
 
 def opn_note(t: int, ch: int = 0, *, block: int = 4, fnum: int = 0x280,
-             off: int | None = 9000) -> list[ChipWrite]:
-    """One YM2612 voice, keyed with the encoding its $28 uses."""
+             off: int | None = 9000, kind: str = "ym2612") -> list[ChipWrite]:
+    """One YM2612/YM2203 voice, keyed with the encoding its $28 uses."""
     port, slot = divmod(ch, 3)
     base = 0x100 * port
     out: list[ChipWrite] = []
     for page in (0x30, 0x40, 0x50, 0x60, 0x70, 0x80, 0x90):
         for op in range(4):
             val = 0x01 if page == 0x30 else (0x1F if page == 0x70 else 0)
-            out.append(ChipWrite(t, "ym2612", 0, base | page | (op << 2) | slot,
-                                val))
+            out.append(ChipWrite(t, kind, 0, base | page | (op << 2) | slot,
+                               val))
     key = ch if ch < 3 else ch + 1
     out += [
-        ChipWrite(t, "ym2612", 0, base | 0xB0 | slot, 0x07),
-        ChipWrite(t, "ym2612", 0, base | 0xB4 | slot, 0xC0),
-        ChipWrite(t + 1, "ym2612", 0, base | 0xA4 | slot,
+        ChipWrite(t, kind, 0, base | 0xB0 | slot, 0x07),
+        ChipWrite(t, kind, 0, base | 0xB4 | slot, 0xC0),
+        ChipWrite(t + 1, kind, 0, base | 0xA4 | slot,
                   (block << 3) | ((fnum >> 8) & 7)),
-        ChipWrite(t + 1, "ym2612", 0, base | 0xA0 | slot, fnum & 0xFF),
-        ChipWrite(t + 2, "ym2612", 0, 0x28, (0xF << 4) | key),
+        ChipWrite(t + 1, kind, 0, base | 0xA0 | slot, fnum & 0xFF),
+        ChipWrite(t + 2, kind, 0, 0x28, (0xF << 4) | key),
     ]
     if off is not None:
-        out.append(ChipWrite(off, "ym2612", 0, 0x28, key))
+        out.append(ChipWrite(off, kind, 0, 0x28, key))
     return out
 
 
@@ -394,6 +396,61 @@ class TestFamilySound(unittest.TestCase):
                  dac_events=[(10, 1, 0)])
         self.assertFalse(_family_sounds(v, {"ym2612"}))
 
+    def test_stray_opna_setup_does_not_outrank_the_ym2203(self):
+        # A malformed log can carry a YM2608 init block (and its SSG period
+        # left at 1) without an OPNA clock. It must not win the system over a
+        # YM2203 that actually keys notes.
+        writes = [
+            ChipWrite(0, "ym2608", 0, 0x10, 0x18),
+            ChipWrite(0, "ym2608_ssg", 0, 1, 2),
+            ChipWrite(0, "ym2608_ssg", 0, 0, 1),
+            ChipWrite(100, "ym2203", 0, 0x28, 0xF0),
+            ChipWrite(200, "ym2203", 0, 0x28, 0x00),
+        ]
+        v = _vgm(writes, ym2203_clock=3993600, ym2608_clock=0)
+        self.assertTrue(_family_sounds(v, {"ym2608", "ym2608_ssg"}))
+        song = analyze(v)
+        self.assertEqual(song.fm_chip, "ym2203")
+
+
+class TestStandaloneSmsPsg(unittest.TestCase):
+    """A Master System / Game Gear log is the SN76489 on its own."""
+
+    def test_standalone_sn76489_gets_an_sms_system(self):
+        v = _vgm(psg_tone(100, voice=0), sn76489_clock=3579545)
+        song = analyze(v)
+        self.assertEqual(song.psg_ids, [0])
+        self.assertEqual(song.psg_count, 1)
+        data = write_fur(song, include_pcm=True)
+        mod = parse_fur(data)
+        self.assertEqual(mod.chips, [CHIP_SMS])
+        self.assertEqual(mod.n_ch, 4)
+        # The plain SMS core is mono; no Game Gear chipType.
+        self.assertNotIn(b"chipType=3", data)
+
+    def test_game_gear_stereo_mask_pans_the_voice(self):
+        # 0xF0 is the all-left mask; voice 2 is left-only, right off.
+        writes = [ChipWrite(0, "sn76489", 0, 1, 0xF0)]
+        writes += psg_tone(100, voice=2)
+        v = _vgm(writes, sn76489_clock=3579545, sn76489_stereo=True)
+        song = analyze(v)
+        self.assertTrue(song.psg_stereo)
+        note = next(e for e in song.events if e.on and e.tone_chip == 3)
+        self.assertEqual(note.pan, 0xF0)
+        data = write_fur(song, include_pcm=True)
+        self.assertIn(b"chipType=3", data)
+
+    def test_game_gear_stereo_change_while_held_becomes_a_pan_point(self):
+        writes = [ChipWrite(0, "sn76489", 0, 1, 0xF0)]
+        writes += psg_tone(100, voice=0, hold=8000)
+        writes += [ChipWrite(2000, "sn76489", 0, 1, 0x0F)]
+        v = _vgm(writes, sn76489_clock=3579545, sn76489_stereo=True)
+        song = analyze(v)
+        self.assertTrue(any(
+            cmd == 0x08 and val == 0x0F
+            for _t, _ch, cmd, val in song.channel_fx
+        ))
+
 
 class TestComboLayout(unittest.TestCase):
     """The channel bases of a module that keeps more than one family."""
@@ -455,6 +512,80 @@ class TestComboLayout(unittest.TestCase):
         self.assertLess(max(chans), 24)
         dac = [e.ch for e in song.events if e.dac and e.on]
         self.assertEqual(set(dac), {5})
+
+    def test_oki_sample_bodies_do_not_shift_the_ay_channels(self):
+        # The tone base must count MSM6295 *chips* (4 voices), not sample
+        # bodies. A bank with two phrases used to push the AY block 8 columns
+        # too far, past the end of the module, so its notes disappeared.
+        rom = bytearray(0x20800)
+        rom[0x20000:0x20008] = bytes(
+            [0x00, 0x05, 0x00, 0x00, 0x05, 0x07, 0x00, 0x00]
+        )
+        rom[0x20008:0x20010] = bytes(
+            [0x00, 0x06, 0x00, 0x00, 0x07, 0x8F, 0x00, 0x00]
+        )
+        rom[0x20500:0x20508] = b"\x11" * 8
+        rom[0x20600:0x20790] = b"\x22" * 400
+        writes = [
+            ChipWrite(0, "msm6295", 0, 0x0E, 0x81),
+            ChipWrite(10, "msm6295", 0, 0x10, 0x02),
+            ChipWrite(100, "msm6295", 0, 0x00, 0x80),
+            ChipWrite(110, "msm6295", 0, 0x00, 0x10),
+            ChipWrite(200, "msm6295", 0, 0x00, 0x81),
+            ChipWrite(210, "msm6295", 0, 0x00, 0x80),
+            ChipWrite(2000, "msm6295", 0, 0x00, 0x40),
+            ChipWrite(100, "ay8910", 0, 7, 0x38),
+            ChipWrite(100, "ay8910", 0, 0, 0x00),
+            ChipWrite(100, "ay8910", 0, 1, 0x01),
+            ChipWrite(100, "ay8910", 0, 8, 0x0F),
+        ]
+        v = _vgm(writes, msm6295_clock=2_000_000, ay8910_clock=1789772,
+                 total_samples=3000)
+        v.roms = [RomSlice(0, len(rom), 0, bytes(rom), "msm6295")]
+        v.msm6295_pin7 = True
+        song = analyze(v)
+        self.assertEqual(len(song.oki_samples), 2)
+        ay = next(e for e in song.events if e.on and e.tone_chip == 2)
+        # 8 placeholder columns + 4 MSM6295 voices, then the AY block.
+        self.assertEqual(ay.ch, 12)
+        mod = parse_fur(write_fur(song, include_pcm=True))
+        self.assertEqual(mod.chips, [CHIP_MSM6295, CHIP_AY8910])
+        self.assertEqual(mod.n_ch, 7)
+        notes = [
+            row.note
+            for oi in mod.orders[4]
+            for row in mod.patterns.get((4, oi), [])
+            if 0 <= row.note < 180
+        ]
+        self.assertTrue(notes, "the AY channel lost its notes")
+
+    def test_ym2203_and_its_ssg_beside_an_opl2(self):
+        # A merged Hoot/Sound Canvas log can carry an OPL2 melody and a
+        # YM2203 (FM + SSG). Both are Furnace systems, so neither side is
+        # dropped for having fewer key-ons.
+        writes: list = []
+        for ch in range(3):
+            writes += opn_note(1000 + ch * PULSE, ch, kind="ym2203")
+        writes += [
+            ChipWrite(1300, "ym2203_ssg", 0, 7, 0x38),
+            ChipWrite(1300, "ym2203_ssg", 0, 0, 0x00),
+            ChipWrite(1300, "ym2203_ssg", 0, 1, 0x01),
+            ChipWrite(1300, "ym2203_ssg", 0, 8, 0x0F),
+        ]
+        for ch in range(3):
+            writes += opl_note(1500 + ch * PULSE, ch)
+        v = _vgm(writes, ym2203_clock=3993600, opl2_clock=3579545,
+                 total_samples=200000)
+        song = analyze(v)
+        self.assertEqual([s.kind for s in song.fm_systems], ["ym2203", "opl2"])
+        self.assertEqual(song.fm_chip, "ym2203")
+        chans = sorted({e.ch for e in song.events if e.on and not e.pcm})
+        self.assertEqual([c for c in chans if c < 6], [0, 1, 2, 3])
+        self.assertTrue(any(c >= 6 for c in chans), chans)
+        data = write_fur(song, include_pcm=True)
+        mod = parse_fur(data)
+        self.assertEqual(mod.chips, [CHIP_YM2203, CHIP_OPL2])
+        self.assertEqual(mod.n_ch, 15)
 
     def test_three_systems_stack_in_order(self):
         writes: list = []

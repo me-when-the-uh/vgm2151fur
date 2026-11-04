@@ -68,21 +68,59 @@ def _pan_byte(raw: int) -> int:
 
 
 def _pan_timeline(vgm: VgmFile) -> list[tuple[int, int]]:
-    """(sample, raw 0xB6 pan bits) for the first YM2612."""
+    """(sample, raw 0xB6 pan bits) for the first YM2612's channel 6.
+
+    Channel 6 lives on the second register port, so its pan is ``$1B6``.
+    Port-0 ``$B6`` is channel 3's pan and says nothing about the DAC.
+    """
     out: list[tuple[int, int]] = []
     for w in vgm.writes:
         if (
             w.chip == "ym2612" and w.chip_id == 0
-            and not (w.reg & 0x100) and (w.reg & 0xFF) == 0xB6
+            and (w.reg & 0x100) and (w.reg & 0xFF) == 0xB6
         ):
             out.append((w.sample, w.val & 0xC0))
     return out
 
 
-def _pan_at(timeline: list[tuple[int, int]], t: int) -> int:
+# How close a 0xB6 write must be to a DAC play to count as that hit's pan.
+# The hardware DAC is mono: the register only pans FM6, and drivers that pan
+# DAC drums write it right at the hit. A value left over from an FM6 voice
+# should not hard-pan the drums. This is decided once per log: a driver that
+# never keys FM6 has no other owner for the register, while one that does may
+# leave an FM6 pan behind.
+DAC_PAN_WINDOW = 128
+
+
+def _fm6_is_used(vgm: VgmFile) -> bool:
+    """Whether channel 6 is keyed as an FM voice while the DAC is off.
+
+    A log that never touches FM6 has no other owner for the 0xB6 register, so
+    a pan write belongs to the DAC drums. When the driver also plays FM6, its
+    pan value is just channel state and must not pan the DAC.
+    """
+    enabled = False
+    for w in vgm.writes:
+        if w.chip != "ym2612" or w.chip_id != 0 or (w.reg & 0x100):
+            continue
+        r = w.reg & 0xFF
+        if r == 0x2B:
+            enabled = bool(w.val & 0x80)
+        elif (r == 0x28 and (w.val & 7) == 6 and (w.val & 0xF0)
+              and not enabled):
+            return True
+    return False
+
+
+def _pan_at(timeline: list[tuple[int, int]] | None, t: int) -> int:
+    """Pan byte for a DAC play at `t`, or -1 when the DAC is not panned."""
+    if not timeline:
+        return -1
     i = bisect.bisect_right(timeline, (t, 0xFFFF)) - 1
     raw = timeline[i][1] if i >= 0 else 0xC0
     return _pan_byte(raw)
+
+
 
 
 def _dac_enable_timeline(vgm: VgmFile) -> list[tuple[int, bool]]:
@@ -185,7 +223,7 @@ def _collect_slices(
 
     stats: dict = {}
     warnings: list[str] = []
-    pan_timeline = _pan_timeline(vgm)
+    pan_timeline = None if _fm6_is_used(vgm) else _pan_timeline(vgm)
     enable_tl = _dac_enable_timeline(vgm)
     words = _byte_events(vgm, stats, enable_tl)
     samples: list[DacSample] = []
@@ -654,7 +692,7 @@ def _collect_packed(
         return [], [], [], {}
     stats: dict = {}
     warnings: list[str] = []
-    pan_timeline = _pan_timeline(vgm)
+    pan_timeline = None if _fm6_is_used(vgm) else _pan_timeline(vgm)
     enable_tl = _dac_enable_timeline(vgm)
     words = _packed_words(vgm, stats, enable_tl)
     chunks = _stream_chunks(vgm, stats)
@@ -933,7 +971,7 @@ def _collect_timeline(
     bank = _signed_bank(bytes(vgm.dac_data))
     if not bank:
         return [], [], warnings, {}
-    pan_timeline = _pan_timeline(vgm)
+    pan_timeline = None if _fm6_is_used(vgm) else _pan_timeline(vgm)
     samples: list[DacSample] = []
     plays: list[DacPlay] = []
     start = 0

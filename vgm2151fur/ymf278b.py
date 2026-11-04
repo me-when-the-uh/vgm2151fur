@@ -132,7 +132,13 @@ def opl4_step(octave: int, fnum: int) -> int:
     """The 16.16 sample increment for an octave/f-num pair (ymf278.cpp)."""
     if octave == -8:
         return 0
-    return (fnum + 1024) << (5 + octave) & 0xFFFFFFFF
+    step = fnum + 1024
+    shift = 5 + octave
+    # Octave -7..-6 shifts right; the reference core does the same. Python
+    # raises on a negative left shift instead of wrapping like C.
+    if shift < 0:
+        return step >> -shift
+    return (step << shift) & 0xFFFFFFFF
 
 
 def opl4_rate(clock: int, step: int) -> float:
@@ -395,7 +401,10 @@ def collect_opl4_wave(
                 frames = loop
                 loop_start = None
             else:
-                loop_start = loop if 0 < loop < frames else None
+                # Loop address 0 is the start of the body, not "no loop".
+                # spc2vgm uses it for single-cycle waveforms (Super Bomberman
+                # 5's short sine bodies), which must repeat for the note.
+                loop_start = loop if loop < frames else None
             data = _body(mem, offset, frames, bits)
             sample = Opl4WaveSample(
                 wave=wave, data=data, loop_start=loop_start,

@@ -217,6 +217,12 @@ from vgm2151fur.ym2612dac import (
 )
 
 
+# A driver may key an OPN voice while its carriers are still muted and write
+# the patch's real TL a few samples later. A level write this close to the
+# key-on is the note's starting level, not a mid-note step.
+OPN_TL_FOLD = 512
+
+
 # Official YM2151 KC note nibble → semitone from C of this octave.
 # Valid codes: C#=0, D=1, D#=2, E=4, F=5, F#=6, G=8, G#=9, A=10, A#=12, B=13,
 # C(next octave)=14.  3/7/11/15 are unused and alias 4/8/12/14.
@@ -768,6 +774,9 @@ class Song:
     psg_ids: list[int] = field(default_factory=list)
     psg_ins: list[ToneIns] = field(default_factory=list)
     psg_count: int = 0
+    # The source wrote Game Gear stereo masks; the SMS system is the Game Gear
+    # variant and the pattern carries 08xy per note.
+    psg_stereo: bool = False
     dac_samples: list[DacSample] = field(default_factory=list)
     dac_count: int = 0
     dac_stats: dict = field(default_factory=dict)
@@ -1112,6 +1121,12 @@ def _absorb_detune(event: NoteEvent, pitch: tuple[int, ...], speed: int) -> tupl
             i += 1
         if i == len(pitch):
             return ()
+        # Only a change within the first tick is the note settling. A note
+        # that holds its pitch and then moves once (a delayed slide or a
+        # portamento to the next note) is real motion: folding it into E5
+        # would retune the whole note, which was audible on the NES triangle.
+        if i > 1:
+            return pitch
         # A zero prefix and then one held offset is the note settling on its
         # pitch. A value that comes back (vibrato) stays a macro.
         if any(v != pitch[i] for v in pitch[i:]):
@@ -3900,6 +3915,28 @@ def analyze(
             arcade_pick = "ym2203"
     if arcade_pick is None and "ym2151" in arcade_live:
         arcade_pick = "ym2151"
+    # A leftover init block can make a chip look live without a single note
+    # (a YM2608 SSG period left at 1, or its rhythm latch at time zero). If
+    # that chip wins only by family precedence while another live family
+    # actually keys notes, the one with notes is the music.
+    if arcade_pick is not None:
+        family_chips = {
+            "ym2608": {"ym2608", "ym2608_ssg"},
+            "ym2610": {"ym2610", "ym2610_ssg"},
+            "ym2612": {"ym2612"},
+            "ym2203": {"ym2203", "ym2203_ssg"},
+            "ym2151": {"ym2151"},
+        }
+        keyons = {
+            name: _family_keyons(vgm, family_chips[name])
+            for name in arcade_live
+        }
+        if not keyons.get(arcade_pick):
+            sounding = {name: n for name, n in keyons.items() if n}
+            if sounding:
+                arcade_pick = max(
+                    sounding, key=lambda name: (sounding[name], name == "ym2203"),
+                )
     if arcade_pick is None and not (opl_live or opll_live):
         # Nothing anywhere plays a note. Keep the chip the log declares so an
         # init-only or silent rip still gets its system and its reset effects.
@@ -3910,9 +3947,12 @@ def analyze(
         )
     # The YM2151 has no sample engine, Ext split or CSM timer to argue with an
     # OPL family: Furnace hosts both, so a log that scores the OPM beside an
-    # OPL gets two systems instead of losing one. The same holds for the
-    # YM2413's kit and user bank, which own no arcade channel block.
-    share_fm = bool(arcade_pick in ("ym2151", "ym2612") and (opl_live or opll_live))
+    # OPL gets two systems instead of losing one. The YM2203 and YM2612 own no
+    # sample engine either (the YM2203's SSG is just three more columns), and
+    # the YM2413's kit and user bank own no arcade channel block.
+    share_fm = bool(
+        arcade_pick in ("ym2151", "ym2612", "ym2203") and (opl_live or opll_live)
+    )
     keep_arcade = arcade_pick is not None and (
         not prefer_opl or is_combo or share_fm
     )
@@ -4251,7 +4291,16 @@ def analyze(
 
     # A Genesis log carries the SN76489 beside the YM2612.  The module uses a
     # second (SMS) system for it, so its four channels follow every FM instance.
-    psg_ids = [0] if (has_sn76489 and is_opn2) else []
+    # A Genesis log carries the SN76489 beside the YM2612. A Master System or
+    # Game Gear rip is the chip on its own, with no FM family at all; it must
+    # still get its SMS system (and its four columns).
+    psg_ids = [0] if (
+        has_sn76489 and (
+            is_opn2
+            or not (arcade_present or has_opl or has_opll or has_opl4 or has_y8950)
+        )
+    ) else []
+    psg_stereo = bool(psg_ids and getattr(vgm, "sn76489_stereo", False))
     psg_base = fm_end if psg_ids else None
     psg_clock = vgm.sn76489_clock or PSG_DEFAULT_CLOCK
     if psg_ids:
@@ -4666,7 +4715,6 @@ def analyze(
 
         ext_active_freqs: dict[int, tuple] = {}
         ext_patch_cache: dict[int, dict[tuple, int]] = {}
-        ext_ready: set[int] = set()
         # Per-column level bookkeeping for the Ext layout. The instrument a
         # column plays is shared and TL-blind, so each note's level has to ride
         # its own volume: `ext_tl_notes` remembers (event, instrument, operator,
@@ -4707,10 +4755,6 @@ def analyze(
                 if ym2203_ext and ch == 2:
                     prev = st.op_mask[ch]
                     if mask:
-                        if cid not in ext_ready:
-                            if mask != 0x0F:
-                                continue
-                            ext_ready.add(cid)
                         freqs = tuple(st.frequency_op(ch, h) for h in range(4))
                         active = ext_active_freqs.get(cid)
                         for c in range(4):
@@ -5054,7 +5098,17 @@ def analyze(
                     ev.fm_pitch_pts = tuple(distinct)
             tl = opn_tl_pts.pop(key, [])
             if tl:
-                ev.tl_pts = tuple(tl)
+                # A driver keys the voice while its carriers still hold the
+                # previous (often muted) level and writes the real TL a few
+                # samples later. That first louder write is the note's start
+                # level; leaving it as a step put the note at volume 0.
+                keyon_tl = 127 - max(0, ev.vol)
+                if (0 <= tl[0][0] - ev.sample <= OPN_TL_FOLD
+                        and tl[0][1] < keyon_tl):
+                    ev.vol = max(0, min(127, 127 - tl[0][1]))
+                    tl = tl[1:]
+                if tl:
+                    ev.tl_pts = tuple(tl)
             if off:
                 ev.end = sample
                 events.append(NoteEvent(
@@ -5329,9 +5383,13 @@ def analyze(
                     if cur != opn_tl_last.get(key, 0x7F):
                         opn_tl_pts[key].append((w.sample, cur))
                         opn_tl_last[key] = cur
-            if 0xB4 <= r <= 0xB6:
+            if (0xB4 <= r <= 0xB6
+                    and not (ch == 5 and st.dac_enabled)):
                 # Per-channel pan / PMS / AMS: snapshot at key-on, and write
                 # a channel effect when the driver moves it during a note.
+                # While the DAC owns channel 6, 0xB6 is FM6 channel state; the
+                # DAC's own pan (if the log has one) travels with its notes,
+                # so a bare register write must not pan the drums.
                 new_b4 = st.pan_pms_ams[ch]
                 if new_b4 != b4:
                     target = (
@@ -5609,7 +5667,17 @@ def analyze(
                     ev.fm_pitch_pts = tuple(distinct)
             tl = opn_tl_pts.pop(key, [])
             if tl:
-                ev.tl_pts = tuple(tl)
+                # A driver keys the voice while its carriers still hold the
+                # previous (often muted) level and writes the real TL a few
+                # samples later. That first louder write is the note's start
+                # level; leaving it as a step put the note at volume 0.
+                keyon_tl = 127 - max(0, ev.vol)
+                if (0 <= tl[0][0] - ev.sample <= OPN_TL_FOLD
+                        and tl[0][1] < keyon_tl):
+                    ev.vol = max(0, min(127, 127 - tl[0][1]))
+                    tl = tl[1:]
+                if tl:
+                    ev.tl_pts = tuple(tl)
             if off:
                 ev.end = sample
                 events.append(NoteEvent(
@@ -5896,6 +5964,20 @@ def analyze(
                     pcm=True,
                 ))
 
+        # $11 is the kit's global level, and the platform exposes it as an
+        # 1Fxx effect. Keeping it on a rhythm column reproduces the driver's
+        # mix balance; folding it into each hit would clamp a quiet kit to
+        # column 0 and hide the per-voice level.
+        if rhythm_hits:
+            for w in vgm.writes:
+                if (w.chip != "ym2608" or (w.reg & 0x100)
+                        or (w.reg & 0xFF) != 0x11):
+                    continue
+                if w.chip_id not in ym_base:
+                    continue
+                target = ym_base[w.chip_id] + ym2608_fm_count + 3
+                channel_fx.append((w.sample, target, 0x1F, w.val & 0x3F))
+
         for i, smp in enumerate(ym2608_b_samples):
             for h in smp.hits:
                 ym2608_b_count += 1
@@ -6035,6 +6117,10 @@ def analyze(
             else:
                 note, e5 = psg_note(h.period)
                 pitch = tuple(h.pitch_pts)
+            if psg_stereo:
+                for t, pan in h.pan_pts:
+                    if pan:
+                        channel_fx.append((t, ch, 0x08, pan))
             psg_events.append(NoteEvent(
                 sample=h.sample_time,
                 ch=ch,
@@ -6043,7 +6129,7 @@ def analyze(
                 ins=-1,
                 vol=max(0, min(15, h.vol)),
                 e5=e5,
-                pan=0,
+                pan=h.opened_pan,
                 end=h.off_sample,
                 vol_pts=tuple(
                     (t, max(0, min(15, v)), None) for t, v in h.vol_pts
@@ -6678,12 +6764,14 @@ def analyze(
     # SCC and AY are pitched chips and convert even under --melody-only. Their
     # channels follow the FM block and every sample chip.
     tone_base = (
-        fm_end + (2 if audible else 0) + 4 * len(oki_samples) + n_adpcm_ch
+        fm_end + (2 if audible else 0)
+        + 4 * len({s.chip_id for s in oki_samples}) + n_adpcm_ch
         + (16 if spcm_audible else 0)
         + RF5C_VOICES * (1 if rf5c68_audible else 0)
         + RF5C_VOICES * (1 if rf5c164_audible else 0)
-        + 24 * len(c140_audible)
-        + 32 * len(c352_audible) + 4 * len(k053260_audible)
+        + 24 * len({h.chip_id for s in c140_audible for h in s.hits})
+        + 32 * len({h.chip_id for s in c352_audible for h in s.hits})
+        + 4 * len({h.chip_id for s in k053260_audible for h in s.hits})
     )
     # Count the final DAC maps once, below; the collector's list is transient.
     n_ym2610_a_ins = (len(ym2610_a_samples) + YM2610_MAP_SLOTS - 1) // YM2610_MAP_SLOTS
@@ -6977,6 +7065,14 @@ def analyze(
             )
             events.append(ev)
             nes_dpcm_events.append((ev, hit.sample_index))
+            if hit.end_time:
+                # The driver clears $4015 to stop the sample early (a drum
+                # that is cut before its body ends). Without an explicit off
+                # the tracker would play the whole body.
+                events.append(NoteEvent(
+                    sample=hit.end_time, ch=ch, on=False, note=180, ins=-1,
+                    vol=-1, e5=0x80, pan=0, pcm=True,
+                ))
         nes_pcm_events: list[tuple[NoteEvent, int]] = []
         for hit in nes_pcm_hits:
             ch = nes_base + 4
@@ -6988,6 +7084,11 @@ def analyze(
             )
             events.append(ev)
             nes_pcm_events.append((ev, hit.sample_index))
+            if hit.end_time:
+                events.append(NoteEvent(
+                    sample=hit.end_time, ch=ch, on=False, note=180, ins=-1,
+                    vol=-1, e5=0x80, pan=0, pcm=True,
+                ))
     else:
         nes_base = None
         nes_tone_events = []
@@ -7465,6 +7566,7 @@ def analyze(
             _rebase_non_fm_ins(events, dac_base, dac_base + n_dac_ins)
             tone_ins_base += n_dac_ins
         for placed, sample_idx, pan in dac_notes:
+            no_pan = pan < 0
             events.append(NoteEvent(
                 sample=placed,
                 ch=dac_ch,
@@ -7473,10 +7575,13 @@ def analyze(
                 ins=dac_base + sample_idx // 120,
                 vol=127,
                 e5=0x80,
-                pan=pan,
+                pan=0 if no_pan else pan,
+                no_pan=no_pan,
                 dac=True,
             ))
         for placed, pan in dac_pan_events:
+            if pan < 0:
+                continue
             channel_fx.append((placed, dac_ch, 0x08, pan))
         events.sort(key=lambda e: (e.sample, e.ch, 0 if e.on else 1))
         dac_count = len(dac_notes)
@@ -7640,7 +7745,9 @@ def analyze(
             warnings.append("no YM2610 FM key-ons found")
         elif is_opna:
             warnings.append("no YM2608 FM key-ons found")
-        else:
+        elif not has_sample_ins:
+            # A PSG-only (SMS/GG) or AY/SCC/NES module needs no FM key-ons;
+            # the legacy YM2151 placeholder is only a channel-numbering base.
             warnings.append(
                 "no YM2203 key-ons found" if is_opn
                 else "no YM2151 key-ons found"
@@ -7823,6 +7930,7 @@ def analyze(
         psg_ids=psg_ids,
         psg_ins=psg_ins,
         psg_count=psg_count,
+        psg_stereo=psg_stereo,
         dac_samples=dac_samples,
         dac_count=dac_count,
         dac_stats=dac_stats,

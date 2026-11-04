@@ -288,9 +288,17 @@ class YM2610State:
         return min(self.ops[ch][i].tl for i in carriers)
 
     def adpcm_a_level(self, ch: int) -> int:
-        """Effective 5-bit level with the master attenuation folded in."""
-        atten = 0x1F - (self.a_vol[ch] & 0x1F)
-        atten += (0x3F - (self.a_master & 0x3F)) * 0x1F // 0x3F
+        """Effective 0-31 column level with the master attenuation folded in.
+
+        The chip adds the channel's 5-bit attenuation to the 6-bit total-level
+        attenuation (0-63) before applying its volume curve. The module column
+        has only 31 steps, so the combined attenuation is clamped into that
+        range.
+        """
+        atten = (
+            (0x1F - (self.a_vol[ch] & 0x1F))
+            + (0x3F - (self.a_master & 0x3F))
+        )
         return max(0, 0x1F - min(0x1F, atten))
 
 
