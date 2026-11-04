@@ -411,6 +411,45 @@ class TestFamilySound(unittest.TestCase):
         self.assertEqual(song.fm_chip, "ym2203")
 
 
+class TestStandaloneSmsPsg(unittest.TestCase):
+    """A Master System / Game Gear log is the SN76489 on its own."""
+
+    def test_standalone_sn76489_gets_an_sms_system(self):
+        v = _vgm(psg_tone(100, voice=0), sn76489_clock=3579545)
+        song = analyze(v)
+        self.assertEqual(song.psg_ids, [0])
+        self.assertEqual(song.psg_count, 1)
+        data = write_fur(song, include_pcm=True)
+        mod = parse_fur(data)
+        self.assertEqual(mod.chips, [CHIP_SMS])
+        self.assertEqual(mod.n_ch, 4)
+        # The plain SMS core is mono; no Game Gear chipType.
+        self.assertNotIn(b"chipType=3", data)
+
+    def test_game_gear_stereo_mask_pans_the_voice(self):
+        # 0xF0 is the all-left mask; voice 2 is left-only, right off.
+        writes = [ChipWrite(0, "sn76489", 0, 1, 0xF0)]
+        writes += psg_tone(100, voice=2)
+        v = _vgm(writes, sn76489_clock=3579545, sn76489_stereo=True)
+        song = analyze(v)
+        self.assertTrue(song.psg_stereo)
+        note = next(e for e in song.events if e.on and e.tone_chip == 3)
+        self.assertEqual(note.pan, 0xF0)
+        data = write_fur(song, include_pcm=True)
+        self.assertIn(b"chipType=3", data)
+
+    def test_game_gear_stereo_change_while_held_becomes_a_pan_point(self):
+        writes = [ChipWrite(0, "sn76489", 0, 1, 0xF0)]
+        writes += psg_tone(100, voice=0, hold=8000)
+        writes += [ChipWrite(2000, "sn76489", 0, 1, 0x0F)]
+        v = _vgm(writes, sn76489_clock=3579545, sn76489_stereo=True)
+        song = analyze(v)
+        self.assertTrue(any(
+            cmd == 0x08 and val == 0x0F
+            for _t, _ch, cmd, val in song.channel_fx
+        ))
+
+
 class TestComboLayout(unittest.TestCase):
     """The channel bases of a module that keeps more than one family."""
 

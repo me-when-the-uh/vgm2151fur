@@ -206,6 +206,17 @@ class TestGenesisPsgDac(unittest.TestCase):
         self.assertEqual(vgm.dac_events[0], (0, 0, 0))
         self.assertEqual([e for e in vgm.dac_events if e[1] == 1], [(0, 1, 0)])
 
+    def test_game_gear_stereo_command_parses(self):
+        body = bytes([0x4F, 0xBB, 0x50, 0x96])
+        p = TMP / "gamegear_stereo.vgm"
+        p.write_bytes(_raw_vgm(body))
+        vgm = load_vgm(p)
+        self.assertTrue(vgm.sn76489_stereo)
+        self.assertEqual(
+            [(w.reg, w.val) for w in vgm.writes if w.chip == "sn76489"],
+            [(1, 0xBB), (0, 0x96)],
+        )
+
     def test_dense_dac_is_signed_once_and_uses_split_pan(self):
         bank = bytes([0x80, 0x90]) + bytes(
             (0x80 + (i % 17) - 8) & 0xFF for i in range(298)

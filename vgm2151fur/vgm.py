@@ -493,6 +493,10 @@ class VgmFile:
     # Genesis SN76489 header 0x0C.  The data bytes arrive as 0x50 writes;
     # they are a serial register stream, not address/data pairs.
     sn76489_clock: int = 0
+    # A Game Gear rip writes command 0x4F (stereo mask) besides the serial
+    # data bytes. A mask other than 0xFF means the left/right enables are in
+    # use, so the module needs the Game Gear variant.
+    sn76489_stereo: bool = False
     # VGM 1.50 YM2612 PCM: data block type 0x00 is the sample bank, and
     # 0xE0 sets the read pointer.  0x80-0x8F play one byte (plus a 0-15
     # sample wait).  0x2A is a direct DAC byte.  Events keep stream order:
@@ -1421,9 +1425,19 @@ def load_vgm(path: Path | str) -> VgmFile:
             vgm.writes.append(ChipWrite(sample, "ym2612", 0, 0x2B, buf[pos + 1]))
             pos += 2
             continue
+        if cmd == 0x4F and pos + 2 <= n:
+            # Game Gear stereo: four left and four right enable bits.  Keep it
+            # on the same chip stream with reg 1 so the collector sees it in
+            # order with the tone/volume bytes.
+            value = buf[pos + 1]
+            vgm.writes.append(ChipWrite(sample, "sn76489", 0, 1, value))
+            if value != 0xFF:
+                vgm.sn76489_stereo = True
+            pos += 2
+            continue
         if cmd == CMD_SN76489 and pos + 2 <= n:
             # One SN76489 serial data byte.  The latch/register/channel is
-            # encoded inside the byte; reg is unused.
+            # encoded inside the byte; reg 0.
             vgm.writes.append(ChipWrite(sample, "sn76489", 0, 0, buf[pos + 1]))
             pos += 2
             continue

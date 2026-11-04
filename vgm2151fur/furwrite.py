@@ -3968,10 +3968,14 @@ def write_fur(
     for _cid in psg_ids:
         chips.append(CHIP_SMS)
         psg_clock = song.vgm.sn76489_clock or 3579545
+        # Game Gear selects Furnace's stereo SMPSG core (chipType 3). The
+        # plain SMS core is mono, so its 08xy panning would be ignored.
+        flags = "chipType=3" if getattr(song, "psg_stereo", False) else ""
         if abs(psg_clock - 3579545) <= 2:
-            flag_texts.append("clockSel=0")
+            clock_flag = "clockSel=0"
         else:
-            flag_texts.append(f"customClock={psg_clock}")
+            clock_flag = f"customClock={psg_clock}"
+        flag_texts.append(flags + ("\n" if flags else "") + clock_flag)
     if n_k007:
         chips.append(CHIP_K007232)
         flags = "stereo=true"

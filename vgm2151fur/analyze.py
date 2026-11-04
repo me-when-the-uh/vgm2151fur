@@ -768,6 +768,9 @@ class Song:
     psg_ids: list[int] = field(default_factory=list)
     psg_ins: list[ToneIns] = field(default_factory=list)
     psg_count: int = 0
+    # The source wrote Game Gear stereo masks; the SMS system is the Game Gear
+    # variant and the pattern carries 08xy per note.
+    psg_stereo: bool = False
     dac_samples: list[DacSample] = field(default_factory=list)
     dac_count: int = 0
     dac_stats: dict = field(default_factory=dict)
@@ -4273,7 +4276,16 @@ def analyze(
 
     # A Genesis log carries the SN76489 beside the YM2612.  The module uses a
     # second (SMS) system for it, so its four channels follow every FM instance.
-    psg_ids = [0] if (has_sn76489 and is_opn2) else []
+    # A Genesis log carries the SN76489 beside the YM2612. A Master System or
+    # Game Gear rip is the chip on its own, with no FM family at all; it must
+    # still get its SMS system (and its four columns).
+    psg_ids = [0] if (
+        has_sn76489 and (
+            is_opn2
+            or not (arcade_present or has_opl or has_opll or has_opl4 or has_y8950)
+        )
+    ) else []
+    psg_stereo = bool(psg_ids and getattr(vgm, "sn76489_stereo", False))
     psg_base = fm_end if psg_ids else None
     psg_clock = vgm.sn76489_clock or PSG_DEFAULT_CLOCK
     if psg_ids:
@@ -6052,6 +6064,10 @@ def analyze(
             else:
                 note, e5 = psg_note(h.period)
                 pitch = tuple(h.pitch_pts)
+            if psg_stereo:
+                for t, pan in h.pan_pts:
+                    if pan:
+                        channel_fx.append((t, ch, 0x08, pan))
             psg_events.append(NoteEvent(
                 sample=h.sample_time,
                 ch=ch,
@@ -6060,7 +6076,7 @@ def analyze(
                 ins=-1,
                 vol=max(0, min(15, h.vol)),
                 e5=e5,
-                pan=0,
+                pan=h.opened_pan,
                 end=h.off_sample,
                 vol_pts=tuple(
                     (t, max(0, min(15, v)), None) for t, v in h.vol_pts
@@ -7657,7 +7673,9 @@ def analyze(
             warnings.append("no YM2610 FM key-ons found")
         elif is_opna:
             warnings.append("no YM2608 FM key-ons found")
-        else:
+        elif not has_sample_ins:
+            # A PSG-only (SMS/GG) or AY/SCC/NES module needs no FM key-ons;
+            # the legacy YM2151 placeholder is only a channel-numbering base.
             warnings.append(
                 "no YM2203 key-ons found" if is_opn
                 else "no YM2151 key-ons found"
@@ -7840,6 +7858,7 @@ def analyze(
         psg_ids=psg_ids,
         psg_ins=psg_ins,
         psg_count=psg_count,
+        psg_stereo=psg_stereo,
         dac_samples=dac_samples,
         dac_count=dac_count,
         dac_stats=dac_stats,
