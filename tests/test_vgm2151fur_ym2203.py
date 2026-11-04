@@ -252,6 +252,20 @@ class TestYm2203ExtColumns(unittest.TestCase):
     def test_ext_layout_is_detected(self):
         self.assertTrue(self.song.ym2203_ext)
 
+    def test_a_partial_key_on_before_the_first_full_chord_is_kept(self):
+        # Grounseed "Betrayal" opens channel 3 with a two-operator mask before
+        # any full 0xF chord. Those are real notes, not operator setup.
+        writes = [
+            ChipWrite(100, "ym2203", 0, 0xAC, 0x15),
+            ChipWrite(100, "ym2203", 0, 0xA8, 0x00),
+            ChipWrite(self.T_ON, "ym2203", 0, 0x28, 0x30 | 2),
+        ]
+        song = analyze(_vgm(writes), pcm=False)
+        ons = sorted(
+            e.ch for e in song.events if e.on and e.sample == self.T_ON
+        )
+        self.assertEqual(ons, [2, 3])   # operators 1 and 2
+
     def test_each_column_keeps_its_own_operator_level(self):
         got = [p.tl & 0x7F for p in self.patch.ops]
         # $42,$46,$4A,$4E are ops[0..3] in register order; only $4A moved.

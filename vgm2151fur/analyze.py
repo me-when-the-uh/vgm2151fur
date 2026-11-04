@@ -4688,7 +4688,6 @@ def analyze(
 
         ext_active_freqs: dict[int, tuple] = {}
         ext_patch_cache: dict[int, dict[tuple, int]] = {}
-        ext_ready: set[int] = set()
         # Per-column level bookkeeping for the Ext layout. The instrument a
         # column plays is shared and TL-blind, so each note's level has to ride
         # its own volume: `ext_tl_notes` remembers (event, instrument, operator,
@@ -4729,10 +4728,6 @@ def analyze(
                 if ym2203_ext and ch == 2:
                     prev = st.op_mask[ch]
                     if mask:
-                        if cid not in ext_ready:
-                            if mask != 0x0F:
-                                continue
-                            ext_ready.add(cid)
                         freqs = tuple(st.frequency_op(ch, h) for h in range(4))
                         active = ext_active_freqs.get(cid)
                         for c in range(4):
