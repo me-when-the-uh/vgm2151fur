@@ -227,7 +227,7 @@ class TestGenesisPsgDac(unittest.TestCase):
                               (0x40, 0x0F), (0x00, 0x00)):
             writes = [
                 ChipWrite(0, "ym2612", 0, 0x22, 0),
-                ChipWrite(0, "ym2612", 0, 0xB6, raw),
+                ChipWrite(0, "ym2612", 0, 0x1B6, raw),
             ]
             src = _vgm(writes, dac_data=bytearray(bank), dac_events=events)
             samples, plays, warn, _stats = collect_dac(src, slices=True)
@@ -572,7 +572,7 @@ class TestYm2612DacSlices(unittest.TestCase):
             (0, bytes([0x91, 0x92, 0x93, 0x94]), 4),
             (4410, bytes([0x95, 0x96, 0x97, 0x98]), 4),
         ])
-        writes = [ChipWrite(2000, "ym2612", 0, 0xB6, 0x40)]
+        writes = [ChipWrite(2000, "ym2612", 0, 0x1B6, 0x40)]
         src = _vgm(
             writes, dac_data=bank, dac_events=events, total_samples=9000,
         )
@@ -585,7 +585,7 @@ class TestYm2612DacSlices(unittest.TestCase):
             (0, bytes([0x91, 0x92, 0x93, 0x94]), 4),
             (100, bytes([0x95, 0x96, 0x97, 0x98]), 4),
         ])
-        writes = [ChipWrite(50, "ym2612", 0, 0xB6, 0x40)]
+        writes = [ChipWrite(50, "ym2612", 0, 0x1B6, 0x40)]
         src = _vgm(
             writes, dac_data=bank, dac_events=events, total_samples=1000,
         )
@@ -789,9 +789,9 @@ class TestYm2612DacSlices(unittest.TestCase):
         bank = bytes((0x80 + (i % 31) - 15) & 0xFF for i in range(220500))
         bank, events = self._runs([(0, bank, 4)])
         writes = self._marker() + [
-            ChipWrite(0, "ym2612", 0, 0xB6, 0xC0),
-            ChipWrite(5 * 44100, "ym2612", 0, 0xB6, 0x80),
-            ChipWrite(10 * 44100, "ym2612", 0, 0xB6, 0x40),
+            ChipWrite(0, "ym2612", 0, 0x1B6, 0xC0),
+            ChipWrite(5 * 44100, "ym2612", 0, 0x1B6, 0x80),
+            ChipWrite(10 * 44100, "ym2612", 0, 0x1B6, 0x40),
         ]
         src = _vgm(
             writes, dac_data=bank, dac_events=events,
@@ -820,6 +820,28 @@ class TestYm2612DacSlices(unittest.TestCase):
         self.assertTrue(notes)
         self.assertTrue(any((8, 0xFF) in r.fx or (8, 0xF0) in r.fx
                             or (8, 0x0F) in r.fx for r in notes))
+
+    def test_port0_b6_is_channel_three_not_the_dac_pan(self):
+        # $B6 on port 0 panning channel 3 used to be read as the DAC's pan.
+        # The DAC is FM6, whose pan lives on port 1 ($1B6).
+        bank, events = self._runs([(0, bytes([0x80, 0x90, 0xA0, 0xB0]), 4)])
+        writes = self._marker() + [
+            ChipWrite(0, "ym2612", 0, 0xB6, 0x40),
+        ]
+        src = _vgm(
+            writes, dac_data=bank, dac_events=events, total_samples=1000,
+        )
+        _samples, plays, _warn, _stats = collect_dac(src)
+        self.assertEqual(plays[0].pan, -1)
+
+        writes = self._marker() + [
+            ChipWrite(0, "ym2612", 0, 0x1B6, 0x40),
+        ]
+        src = _vgm(
+            writes, dac_data=bank, dac_events=events, total_samples=1000,
+        )
+        _samples, plays, _warn, _stats = collect_dac(src)
+        self.assertEqual(plays[0].pan, 0x0F)
 
 
 class TestYm2612Pitch(unittest.TestCase):

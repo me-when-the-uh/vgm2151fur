@@ -5383,9 +5383,13 @@ def analyze(
                     if cur != opn_tl_last.get(key, 0x7F):
                         opn_tl_pts[key].append((w.sample, cur))
                         opn_tl_last[key] = cur
-            if 0xB4 <= r <= 0xB6:
+            if (0xB4 <= r <= 0xB6
+                    and not (ch == 5 and st.dac_enabled)):
                 # Per-channel pan / PMS / AMS: snapshot at key-on, and write
                 # a channel effect when the driver moves it during a note.
+                # While the DAC owns channel 6, 0xB6 is FM6 channel state; the
+                # DAC's own pan (if the log has one) travels with its notes,
+                # so a bare register write must not pan the drums.
                 new_b4 = st.pan_pms_ams[ch]
                 if new_b4 != b4:
                     target = (
@@ -7562,6 +7566,7 @@ def analyze(
             _rebase_non_fm_ins(events, dac_base, dac_base + n_dac_ins)
             tone_ins_base += n_dac_ins
         for placed, sample_idx, pan in dac_notes:
+            no_pan = pan < 0
             events.append(NoteEvent(
                 sample=placed,
                 ch=dac_ch,
@@ -7570,10 +7575,13 @@ def analyze(
                 ins=dac_base + sample_idx // 120,
                 vol=127,
                 e5=0x80,
-                pan=pan,
+                pan=0 if no_pan else pan,
+                no_pan=no_pan,
                 dac=True,
             ))
         for placed, pan in dac_pan_events:
+            if pan < 0:
+                continue
             channel_fx.append((placed, dac_ch, 0x08, pan))
         events.sort(key=lambda e: (e.sample, e.ch, 0 if e.on else 1))
         dac_count = len(dac_notes)
