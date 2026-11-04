@@ -352,7 +352,9 @@ Playback rate is `clock * step / (768 * 65536)` with
 sample body into a `.fur` sample (signed 16-bit), one `DIV_INS_MULTIPCM`
 instrument per body, and writes the pattern note as the pitch ratio to the
 body's most common step. The body's own C-4 rate is that step's rate. A
-descriptor whose loop point sits before the last two frames loops there. A loop
+descriptor whose loop point sits before the last two frames loops there; loop
+address 0 is the body start (spc2vgm uses it for single-cycle sine bodies), not
+"no loop". A loop
 point in the last two frames is the descriptor's padding: the reference modules
 trim the body to the loop point and play it once. A body of exactly `0x10000`
 frames wraps the slot's 16-bit position counter, so its loop address cannot
