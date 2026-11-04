@@ -143,6 +143,20 @@ class TestOpl4Wave(unittest.TestCase):
             opl4_rate(CLOCK, step), CLOCK * step / (768.0 * 65536.0),
         )
 
+    def test_negative_octave_shifts_right(self):
+        # The wave part's 4-bit octave is signed; -6..-7 need a right shift.
+        self.assertEqual(opl4_step(-4, 0x200), (0x200 + 1024) << 1)
+        self.assertEqual(opl4_step(-6, 0x200), (0x200 + 1024) >> 1)
+        self.assertEqual(opl4_step(-7, 0x200), (0x200 + 1024) >> 2)
+        self.assertEqual(opl4_step(-8, 0x200), 0)
+
+    def test_negative_octave_note_collects(self):
+        sample = bytes(range(1, 21))
+        v = _vgm(_wave_note(100, wave=16, slot=0, octave=-6),
+                 roms=[RomSlice(0, 0, 0, _rom(16, sample), "ymf278b_rom")])
+        samples, _warn = collect_opl4_wave(v, rom=_rom(16, sample))
+        self.assertEqual(samples[0].hits[0].step, opl4_step(-6, 0x200))
+
     def test_missing_rom_warns(self):
         v = _vgm(_wave_note(100))
         samples, warn = collect_opl4_wave(v, rom=b"")

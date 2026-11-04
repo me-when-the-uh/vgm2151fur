@@ -132,7 +132,13 @@ def opl4_step(octave: int, fnum: int) -> int:
     """The 16.16 sample increment for an octave/f-num pair (ymf278.cpp)."""
     if octave == -8:
         return 0
-    return (fnum + 1024) << (5 + octave) & 0xFFFFFFFF
+    step = fnum + 1024
+    shift = 5 + octave
+    # Octave -7..-6 shifts right; the reference core does the same. Python
+    # raises on a negative left shift instead of wrapping like C.
+    if shift < 0:
+        return step >> -shift
+    return (step << shift) & 0xFFFFFFFF
 
 
 def opl4_rate(clock: int, step: int) -> float:
