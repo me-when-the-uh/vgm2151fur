@@ -792,10 +792,17 @@ def _write_tone_macros(b: Buf, ins, *, wave: bool, reset: bool = False) -> None:
             width=2 if max(ins.waves) > 127 else 1,
         )
     if ins.mode:
-        # Raw mode bits (tone 1, noise 2, envelope 4). The pattern effect
-        # 20xx stores the same bits minus one; the macro does not.
+        # AY mode bits (tone 1, noise 2, envelope 4). Before file version
+        # 193 Furnace bumps every DIV_INS_AY wave-macro value by one while
+        # loading (instrument.cpp), the same way 20xx carries the bits minus
+        # one. Store the effect encoding for that format or the reloaded mode
+        # is one step off: tone+env (5) would become noise+env (6) and a drum
+        # body would play as noise.
+        mode = ins.mode
+        if FUR_VERSION < 193:
+            mode = tuple((value - 1) & 0xFF for value in mode)
         _write_macro(
-            b, 3, ins.mode, speed=ins.mode_speed, loop=ins.mode_loop,
+            b, 3, mode, speed=ins.mode_speed, loop=ins.mode_loop,
         )
     if ins.pitch:
         _write_macro(
@@ -2502,6 +2509,11 @@ def _build_patterns(song: Song, n_ch: int, pat_len_max: int, fx_cols: int,
     pcm_pos = _assign_pcm_rows(
         song, total_rows, last_sample, stats, content_end, content_cut,
     )
+    # The tone note that currently owns each (channel, row), so a short
+    # percussive attack can be kept when the following hit rounds onto the
+    # same row.
+    note_ev: dict[tuple[int, int], object] = {}
+    row_samples = float(getattr(song, "samples_per_row", 0) or 0)
     for ev in song.events:
         ev_ch = ev.ch + ch_offset
         if ev_ch < 0 or ev_ch >= n_ch:
@@ -2556,7 +2568,31 @@ def _build_patterns(song: Song, n_ch: int, pat_len_max: int, fx_cols: int,
                 _bump(stats, "off_swallowed")
             continue
         if 0 <= cell.note < 180:
-            _bump(stats, "note_collision")
+            prev = note_ev.get((ev_ch, row))
+            # A 5 ms noise attack and the tonal body that follows it can round
+            # onto the same row. Dropping the attack changes the drum's
+            # timbre, so move the short note one row back when that row is
+            # free; the body keeps its own timing and cuts the attack.
+            if (
+                prev is not None
+                and getattr(prev, "tone_chip", 0) == 2  # AY/SSG percussion
+                and not prev.vol_pts
+                and prev.end
+                and prev.end <= ev.sample
+                and (not row_samples or prev.end - prev.sample < row_samples)
+                and row > 0
+                and row - 1 not in grid[ev_ch]
+            ):
+                grid[ev_ch][row - 1] = cell
+                note_ev[(ev_ch, row - 1)] = prev
+                note_ev.pop((ev_ch, row), None)
+                if (ev_ch, row) in note_e5:
+                    note_e5[(ev_ch, row - 1)] = note_e5.pop((ev_ch, row))
+                cell = _blank_row()
+                grid[ev_ch][row] = cell
+                _bump(stats, "note_shifted")
+            else:
+                _bump(stats, "note_collision")
         cell.note = ev.note if ev.note != 180 else NOTE_OFF
         if ev.ins >= 0:
             cell.ins = ev.ins
@@ -2578,6 +2614,7 @@ def _build_patterns(song: Song, n_ch: int, pat_len_max: int, fx_cols: int,
         if delay:
             _add_fx(cell, 0xED, delay, fx_cols, stats)
         note_e5[(ev_ch, row)] = ev.e5
+        note_ev[(ev_ch, row)] = ev
         # PCM pan 0x00 is both channels off. Omitting it leaves Furnace's
         # default (both full). FM pan 0 still means "no 08xx on this row".
         if ev.quad is not None:

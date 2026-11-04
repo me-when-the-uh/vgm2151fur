@@ -446,6 +446,108 @@ class TestFurEmission(unittest.TestCase):
         self.assertIn(0x23, cmds)
         self.assertIn(0x24, cmds)
 
+    def test_ay_mode_macro_uses_the_pre_193_encoding(self):
+        # Furnace adds one to every DIV_INS_AY wave-macro value when loading
+        # a file older than version 193 (instrument.cpp). The instrument's
+        # mode macro must therefore store mode bits minus one, exactly like
+        # the 20xx row effect. Storing raw bits made tone+env load as
+        # noise+env, so PSG percussion bodies became noise.
+        writes = [
+            ChipWrite(0, "ay8910", 0, 7, 0xFE),
+            ChipWrite(0, "ay8910", 0, 0, 254),
+            ChipWrite(0, "ay8910", 0, 1, 0),
+            ChipWrite(0, "ay8910", 0, 11, 66),
+            ChipWrite(0, "ay8910", 0, 12, 0),
+            ChipWrite(0, "ay8910", 0, 13, 9),
+            ChipWrite(100, "ay8910", 0, 8, 0x12),
+            # Mid-note mode change: tone+env (5) becomes tone+noise+env (7).
+            ChipWrite(5000, "ay8910", 0, 7, 0xF6),
+            ChipWrite(15000, "ay8910", 0, 8, 0),
+        ]
+        song = analyze(_vgm(writes, ay8910_clock=1789773))
+        data = write_fur(song, include_pcm=True, include_fm=False)
+        ins = next(
+            block for _off, mag, _size, block in iter_blocks(data)
+            if mag == b"INS2"
+        )
+        mode = _ins_macros(ins)[3]
+        self.assertEqual(mode[:2], [4, 4])   # 5 -> 4
+        self.assertEqual(mode[-1], 6)        # 7 -> 6
+        # The row effect keeps the same encoding (value = bits - 1).
+        mod = parse_fur(data)
+        fx = [fx for rows in mod.patterns.values() for row in rows for fx in row.fx]
+        self.assertIn((0x20, 4), fx)
+
+    def test_short_ay_attack_survives_a_row_collision(self):
+        # A drum is a 5 ms noise attack followed by a tonal body. Both hits
+        # can round onto one row; overwriting the attack changes the timbre.
+        # The short note moves one row back and the body keeps its timing.
+        at = 10000
+        writes = [
+            ChipWrite(0, "ay8910", 0, 7, 0xFE),
+            ChipWrite(0, "ay8910", 0, 0, 254),
+            ChipWrite(0, "ay8910", 0, 1, 0),
+            ChipWrite(0, "ay8910", 0, 6, 8),
+            ChipWrite(at, "ay8910", 0, 8, 15),
+            ChipWrite(at, "ay8910", 0, 7, 0xF6),          # noise attack
+            ChipWrite(at + 200, "ay8910", 0, 0, 40),
+            ChipWrite(at + 200, "ay8910", 0, 1, 0),
+            ChipWrite(at + 200, "ay8910", 0, 7, 0xFE),    # body: tone only
+            ChipWrite(at + 200, "ay8910", 0, 8, 0x10),    # envelope retrigger
+            ChipWrite(at + 200, "ay8910", 0, 11, 66),
+            ChipWrite(at + 200, "ay8910", 0, 12, 0),
+            ChipWrite(at + 200, "ay8910", 0, 13, 9),
+            ChipWrite(40000, "ay8910", 0, 8, 0),
+        ]
+        song = analyze(_vgm(writes, ay8910_clock=1789773))
+        stats: dict[str, int] = {}
+        data = write_fur(
+            song, include_pcm=True, include_fm=False, stats=stats,
+        )
+        mod = parse_fur(data)
+        rows = [
+            oi * 256 + ri
+            for oi, pidx in enumerate(mod.orders[0])
+            for ri, row in enumerate(mod.patterns.get((0, pidx), []))
+            if 0 <= row.note < 180
+        ]
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[1], rows[0] + 1)
+        self.assertEqual(stats.get("note_shifted"), 1)
+        self.assertNotIn("note_collision", stats)
+
+
+def _ins_macros(block: bytes) -> dict[int, list[int]]:
+    """Decode an INS2 block's MA feature into ``{macro code: values}``."""
+    pos = block.index(b"MA")
+    size = struct.unpack_from("<H", block, pos + 2)[0]
+    cursor = pos + 4
+    # The 2-byte header field holds Furnace's macro header size (8); it is
+    # not a byte count to skip. The macros start right after it.
+    struct.unpack_from("<H", block, cursor)[0]
+    cursor += 2
+    end = pos + 4 + size
+    out: dict[int, list[int]] = {}
+    while cursor < end and block[cursor] != 0xFF:
+        code, length, _loop, _rel, _mode, word, _delay, _speed = (
+            struct.unpack_from("<BBBBBBBB", block, cursor)
+        )
+        cursor += 8
+        width = word >> 6
+        values: list[int] = []
+        for _ in range(length):
+            if width == 2:
+                values.append(struct.unpack_from("<h", block, cursor)[0])
+                cursor += 2
+            elif width == 3:
+                values.append(struct.unpack_from("<i", block, cursor)[0])
+                cursor += 4
+            else:
+                values.append(block[cursor])
+                cursor += 1
+        out[code] = values
+    return out
+
 
 def _wave_values(block: bytes) -> list[int]:
     name_end = block.index(0)

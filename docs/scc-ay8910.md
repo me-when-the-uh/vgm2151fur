@@ -151,6 +151,12 @@ without the macro a drum hit reusing the previous shape kept the stale
 envelope state, which cost about 20 % of the AY layer's energy and the
 character of every drum attack.
 
+The instrument's channel-mode macro is written with the same bits-minus-one
+encoding as `20xy`. Files older than version 193 make Furnace add one to every
+AY wave-macro value while loading (`instrument.cpp`); storing the raw bits
+there turned tone+envelope (5) into noise+envelope (6), and every PSG drum body
+played as noise instead of a pitched tone.
+
 Channel mode (tone/noise/envelope), noise frequency and the hardware envelope
 (period and shape) are pattern effects, one per change:
 
@@ -225,7 +231,11 @@ no lattice.
 Condensing lengthens the tick with the row. The macros are built from the
 final tick rate, so each macro step is one tick of the module that was
 written. A factor that stacks two notes on one cell shows up as
-`note_collision` and the lossless pick leaves it.
+`note_collision` and the lossless pick leaves it. The exception is a short AY
+attack that ends before the next hit: its body often rounds onto the same row,
+so the attack moves one row back (the next note cuts it) and both play. A
+drum's ~5 ms noise attack plus its tonal body is the common case; dropping the
+attack changed the percussion timbre.
 
 ## Validation
 
