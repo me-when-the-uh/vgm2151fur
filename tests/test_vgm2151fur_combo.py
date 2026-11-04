@@ -394,6 +394,22 @@ class TestFamilySound(unittest.TestCase):
                  dac_events=[(10, 1, 0)])
         self.assertFalse(_family_sounds(v, {"ym2612"}))
 
+    def test_stray_opna_setup_does_not_outrank_the_ym2203(self):
+        # A malformed log can carry a YM2608 init block (and its SSG period
+        # left at 1) without an OPNA clock. It must not win the system over a
+        # YM2203 that actually keys notes.
+        writes = [
+            ChipWrite(0, "ym2608", 0, 0x10, 0x18),
+            ChipWrite(0, "ym2608_ssg", 0, 1, 2),
+            ChipWrite(0, "ym2608_ssg", 0, 0, 1),
+            ChipWrite(100, "ym2203", 0, 0x28, 0xF0),
+            ChipWrite(200, "ym2203", 0, 0x28, 0x00),
+        ]
+        v = _vgm(writes, ym2203_clock=3993600, ym2608_clock=0)
+        self.assertTrue(_family_sounds(v, {"ym2608", "ym2608_ssg"}))
+        song = analyze(v)
+        self.assertEqual(song.fm_chip, "ym2203")
+
 
 class TestComboLayout(unittest.TestCase):
     """The channel bases of a module that keeps more than one family."""

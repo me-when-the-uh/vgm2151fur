@@ -3900,6 +3900,28 @@ def analyze(
             arcade_pick = "ym2203"
     if arcade_pick is None and "ym2151" in arcade_live:
         arcade_pick = "ym2151"
+    # A leftover init block can make a chip look live without a single note
+    # (a YM2608 SSG period left at 1, or its rhythm latch at time zero). If
+    # that chip wins only by family precedence while another live family
+    # actually keys notes, the one with notes is the music.
+    if arcade_pick is not None:
+        family_chips = {
+            "ym2608": {"ym2608", "ym2608_ssg"},
+            "ym2610": {"ym2610", "ym2610_ssg"},
+            "ym2612": {"ym2612"},
+            "ym2203": {"ym2203", "ym2203_ssg"},
+            "ym2151": {"ym2151"},
+        }
+        keyons = {
+            name: _family_keyons(vgm, family_chips[name])
+            for name in arcade_live
+        }
+        if not keyons.get(arcade_pick):
+            sounding = {name: n for name, n in keyons.items() if n}
+            if sounding:
+                arcade_pick = max(
+                    sounding, key=lambda name: (sounding[name], name == "ym2203"),
+                )
     if arcade_pick is None and not (opl_live or opll_live):
         # Nothing anywhere plays a note. Keep the chip the log declares so an
         # init-only or silent rip still gets its system and its reset effects.
