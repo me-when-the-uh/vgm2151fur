@@ -272,6 +272,63 @@ class TestNesTones(unittest.TestCase):
         hits, _offs, _warn = collect_nes_tones(_vgm(writes))
         self.assertEqual(len(hits), 1)
 
+    def test_pulse_volume_reattack_starts_a_new_note(self):
+        writes = [
+            _nes(0, 0x15, 0x0F),
+            _nes(1000, 0x02, 0x80), _nes(1000, 0x03, 0x08),
+            _nes(1000, 0x00, 0xB9),
+            _nes(5000, 0x00, 0xB2),   # gate the level down
+            _nes(6000, 0x00, 0xB9),   # re-attack at the same pitch
+            _nes(9000, 0x00, 0xB0),
+        ]
+        hits, _offs, _warn = collect_nes_tones(_vgm(writes))
+        self.assertEqual([h.sample_time for h in hits], [1000, 6000])
+        self.assertEqual(hits[1].vol, 9)
+
+    def test_pulse_swell_from_a_sounding_level_stays_one_note(self):
+        writes = [
+            _nes(0, 0x15, 0x0F),
+            _nes(1000, 0x02, 0x80), _nes(1000, 0x03, 0x08),
+            _nes(1000, 0x00, 0xB6),   # volume 6
+            _nes(2000, 0x00, 0xBA),   # swell to 10, same pitch
+            _nes(9000, 0x00, 0xB0),
+        ]
+        hits, _offs, _warn = collect_nes_tones(_vgm(writes))
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0].vol_pts, [(2000, 10)])
+
+    def test_pulse_held_pitch_step_is_a_new_note(self):
+        # Gimmick! changes the period by under a semitone between sustained
+        # notes. Keeping that as a pitch macro made one instrument play
+        # several source notes.
+        writes = [
+            _nes(0, 0x15, 0x0F),
+            _nes(1000, 0x02, 0x50), _nes(1000, 0x03, 0x08),
+            _nes(1000, 0x00, 0xB9),
+            _nes(8000, 0x02, 0x54),
+            _nes(20000, 0x00, 0xB0),
+        ]
+        hits, _offs, _warn = collect_nes_tones(_vgm(writes))
+        self.assertEqual([h.period for h in hits], [0x50, 0x54])
+
+    def test_pulse_vibrato_does_not_split(self):
+        writes = [
+            _nes(0, 0x15, 0x0F),
+            _nes(1000, 0x02, 0x50), _nes(1000, 0x03, 0x08),
+            _nes(1000, 0x00, 0xB9),
+        ]
+        t = 2000
+        for per in (0x54, 0x50, 0x54, 0x50, 0x54, 0x50):
+            writes.append(_nes(t, 0x02, per))
+            t += 700
+        writes.append(_nes(t, 0x00, 0xB0))
+        hits, _offs, _warn = collect_nes_tones(_vgm(writes))
+        self.assertEqual(len(hits), 1)
+        self.assertTrue(hits[0].pitch_pts)
+        # The return to the base pitch must still be a pitch point, or the
+        # macro would hold the bend.
+        self.assertIn((2700, 0x50), hits[0].pitch_pts)
+
     def test_note_mapping_round_trips(self):
         for period in (0, 1, 0x100, 0x400, 0x7FF):
             note, e5 = nes_note(1789773, period)

@@ -39,6 +39,20 @@ NES_MAX_PERIOD = 0x7FF
 NES_MIN_NOTE = 100
 # A period change this large is a new note rather than a bend.
 NES_NOTE_JUMP_ST = 1.0
+# NES drivers re-strike a note by writing a new volume without clearing the
+# gate. A jump this large while a note is open is a new hit, not a volume
+# step: folding it into the note's instrument would make one macro play
+# several source notes. A rise from a very low level to an attack level is
+# the same even when the driver leaves the period alone.
+NES_RETRIGGER_RISE = 4
+NES_RETRIGGER_LOW = 3
+# A period write this close to the volume jump belongs to the same hit.
+NES_RETRIGGER_WINDOW = 128
+# A pulse period that has been held for a while and then steps by this much
+# (1/64 semitones) is the next note, not a bend. Vibrato rewrites the period
+# every frame, so it never looks like a held step.
+NES_STEP_ST = 32
+NES_STEP_HOLD = 1500
 
 # NTSC DMC output-bit periods in CPU cycles, indexed by ``$4010 & 0x0F``.
 DPCM_PERIODS = (
@@ -189,6 +203,15 @@ def collect_nes_tones(
     hits: list[NesHit] = []
     offs: list[NesOff] = []
     glitches = 0
+    # Volume jumps that may be a re-attack, and the last small period change
+    # that may belong to the same hit.
+    rise_t = [-1, -1, -1, -1]
+    period_change_t = [-1, -1, -1, -1]
+    last_period_t = [-1, -1, -1, -1]
+    # Last period value acted on. A write of the same value is not a change,
+    # while a return to the note's base pitch still is (and must reach the
+    # pitch macro).
+    prev_period = [0, 0, 0]
 
     def close(voice: int, t: int, *, emit_off: bool = True) -> None:
         nonlocal glitches
@@ -207,6 +230,9 @@ def collect_nes_tones(
         active[voice] = None
 
     def open_hit(voice: int, t: int) -> None:
+        last_period_t[voice] = t
+        if voice != 3:
+            prev_period[voice] = period[voice]
         if voice == 3:
             active[voice] = NesHit(
                 sample_time=t, voice=3, period=noise_period,
@@ -251,7 +277,8 @@ def collect_nes_tones(
                 elif not hit.duty_pts or hit.duty_pts[-1][1] != noise_mode:
                     hit.duty_pts.append((t, noise_mode))
         elif voice == 2:
-            if period[2] != hit.period:
+            if period[2] != prev_period[2]:
+                prev_period[2] = period[2]
                 if t == hit.sample_time:
                     hit.period = period[2]
                 elif abs(_period_delta(hit.period, period[2])) >= int(
@@ -267,16 +294,35 @@ def collect_nes_tones(
                 elif not hit.linear_pts or hit.linear_pts[-1][1] != linear:
                     hit.linear_pts.append((t, linear))
         else:
-            if period[voice] != hit.period:
+            if period[voice] != prev_period[voice]:
+                prev_period[voice] = period[voice]
+                change = _period_delta(hit.period, period[voice])
                 if t == hit.sample_time:
                     hit.period = period[voice]
-                elif abs(_period_delta(hit.period, period[voice])) >= int(
-                        NES_NOTE_JUMP_ST * 64):
+                    last_period_t[voice] = t
+                elif abs(change) >= int(NES_NOTE_JUMP_ST * 64):
                     close(voice, t, emit_off=False)
                     open_hit(voice, t)
                     return
-                elif not hit.pitch_pts or hit.pitch_pts[-1][1] != period[voice]:
-                    hit.pitch_pts.append((t, period[voice]))
+                elif (abs(change) >= NES_STEP_ST
+                      and t - last_period_t[voice] >= NES_STEP_HOLD):
+                    # A held pitch step is the next note in a melody, not a
+                    # bend. Keeping it in the pitch macro made one instrument
+                    # play several source notes.
+                    close(voice, t, emit_off=False)
+                    open_hit(voice, t)
+                    return
+                elif (rise_t[voice] >= 0
+                      and t - rise_t[voice] <= NES_RETRIGGER_WINDOW):
+                    # The volume just jumped and the pitch moved: a new hit.
+                    close(voice, t, emit_off=False)
+                    open_hit(voice, t)
+                    return
+                else:
+                    if not hit.pitch_pts or hit.pitch_pts[-1][1] != period[voice]:
+                        period_change_t[voice] = t
+                        hit.pitch_pts.append((t, period[voice]))
+                    last_period_t[voice] = t
             if duty[voice] != hit.duty:
                 if t == hit.sample_time:
                     hit.duty = duty[voice]
@@ -305,9 +351,25 @@ def collect_nes_tones(
         t = w.sample
         if reg == 0x00 or reg == 0x04:
             voice = 0 if reg == 0x00 else 1
+            before = vol[voice]
             vol[voice] = val & 0x0F
             env_mode[voice] = (val >> 4) & 3
             duty[voice] = (val >> 6) & 3
+            if (active[voice] is not None
+                    and t > active[voice].sample_time
+                    and vol[voice] - before >= NES_RETRIGGER_RISE):
+                # A re-attack: the driver raised the level from (near) silence
+                # without clearing the gate, or moved the pitch at the same
+                # time. Start a new note instead of turning several source
+                # notes into one long volume/pitch macro.
+                rise_t[voice] = t
+                recent = (
+                    period_change_t[voice] >= 0
+                    and t - period_change_t[voice] <= NES_RETRIGGER_WINDOW
+                )
+                if before <= NES_RETRIGGER_LOW or recent:
+                    close(voice, t, emit_off=False)
+                    open_hit(voice, t)
             evaluate(voice, t)
         elif reg == 0x02 or reg == 0x06:
             voice = 0 if reg == 0x02 else 1
