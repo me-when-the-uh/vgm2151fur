@@ -2466,6 +2466,69 @@ def _build_patterns(song: Song, n_ch: int, pat_len_max: int, fx_cols: int,
             return loop_row, 0
         return row, delay
 
+    row_samples = float(getattr(song, "samples_per_row", 0) or 0)
+    # A condensed row can catch two tone notes at once. Pin the earlier one to
+    # the end of the previous row instead of letting the later note overwrite
+    # it. Only a note that ends before the next one starts and has no row
+    # volume steps of its own moves; its opening effects move with it. The
+    # previous row's note-off is redundant because the moved key-on cuts that
+    # note, so the off is skipped below.
+    note_row_shift: dict[int, tuple[int, int]] = {}
+    fx_row_shift: dict[tuple[int, int], tuple[int, int]] = {}
+    shifted_rows: set[tuple[int, int]] = set()
+    tone_rows: dict[int, dict[int, list[tuple[object, int]]]] = {}
+    for ev in song.events:
+        if not (ev.on and ev.tone_chip):
+            continue
+        ev_ch = ev.ch + ch_offset
+        if ev_ch < 0 or ev_ch >= n_ch:
+            continue
+        if content_cut is not None and ev.sample >= content_cut:
+            continue
+        row, delay = loop_clip(*song.place(ev.sample, stats), ev.sample)
+        row, delay = loop_start(row, delay, ev.sample)
+        if 0 <= row < total_rows:
+            tone_rows.setdefault(ev_ch, {}).setdefault(row, []).append((ev, delay))
+    used_rows = {
+        (ch, row) for ch, rows in tone_rows.items() for row in rows
+    }
+    shift_delay = min(255, max(1, song.speed - 1))
+    for ev_ch, rows in tone_rows.items():
+        for row in sorted(rows):
+            group = rows[row]
+            if len(group) < 2:
+                continue
+            group.sort(key=lambda item: item[0].sample)
+            for (prev, _pdelay), (ev, _edelay) in zip(group, group[1:]):
+                if (
+                    getattr(prev, "tone_chip", 0) not in (1, 2, 3, 4, 5)
+                    or prev.vol_pts
+                    or not prev.end
+                    or prev.end > ev.sample
+                    or (row_samples and prev.end - prev.sample >= row_samples)
+                ):
+                    continue
+                dest = row - 1
+                if dest >= 0 and (ev_ch, dest) not in used_rows:
+                    note_row_shift[id(prev)] = (dest, shift_delay)
+                    fx_row_shift[(ev_ch, prev.sample)] = (dest, shift_delay)
+                    shifted_rows.add((ev_ch, dest))
+                    used_rows.add((ev_ch, dest))
+                    _bump(stats, "note_shifted")
+                    continue
+                if len(group) != 2:
+                    continue
+                # The row before holds the previous note. Move the later note
+                # to the next row instead so both still play; the earlier note
+                # is short enough to finish before it.
+                dest = row + 1
+                if dest >= total_rows or (ev_ch, dest) in used_rows:
+                    continue
+                note_row_shift[id(ev)] = (dest, 0)
+                fx_row_shift[(ev_ch, ev.sample)] = (dest, 0)
+                used_rows.add((ev_ch, dest))
+                _bump(stats, "note_shifted")
+
     # Chip-wide effects are placed after the notes: the LFO speed/pulse has
     # to ride the tick of the key-on it belongs to (see _place_chip_fx).
     for sample, ch, cmd, val in getattr(song, "channel_fx", ()) or ():
@@ -2477,8 +2540,12 @@ def _build_patterns(song: Song, n_ch: int, pat_len_max: int, fx_cols: int,
         # Same placement as the note on this sample, including its ED delay.
         # row_of() rounds to the nearest row and would land an effect on a
         # different row from the note whenever speed is more than 1.
-        row, delay = loop_clip(*song.place(sample, stats), sample)
-        row, delay = loop_start(row, delay, sample)
+        shifted = fx_row_shift.get((ch, sample))
+        if shifted is not None:
+            row, delay = shifted
+        else:
+            row, delay = loop_clip(*song.place(sample, stats), sample)
+            row, delay = loop_start(row, delay, sample)
         if row < 0 or row >= total_rows:
             continue
         cell = grid[ch].get(row)
@@ -2513,7 +2580,6 @@ def _build_patterns(song: Song, n_ch: int, pat_len_max: int, fx_cols: int,
     # percussive attack can be kept when the following hit rounds onto the
     # same row.
     note_ev: dict[tuple[int, int], object] = {}
-    row_samples = float(getattr(song, "samples_per_row", 0) or 0)
     for ev in song.events:
         ev_ch = ev.ch + ch_offset
         if ev_ch < 0 or ev_ch >= n_ch:
@@ -2535,6 +2601,10 @@ def _build_patterns(song: Song, n_ch: int, pat_len_max: int, fx_cols: int,
             row, delay = song.place(ev.sample, stats)
         row, delay = loop_clip(row, delay, ev.sample)
         row, delay = loop_start(row, delay, ev.sample)
+        if ev.on:
+            shifted = note_row_shift.get(id(ev))
+            if shifted is not None:
+                row, delay = shifted
         if row < 0 or row >= total_rows:
             continue
         cell = grid[ev_ch].get(row)
@@ -2549,6 +2619,11 @@ def _build_patterns(song: Song, n_ch: int, pat_len_max: int, fx_cols: int,
                 cell.note = NOTE_OFF
                 if delay:
                     _add_fx(cell, 0xED, delay, fx_cols, stats)
+                continue
+            if (ev_ch, row) in shifted_rows and cell.note >= 0 and cell.note != NOTE_OFF:
+                # The note that moved into this row already cuts the previous
+                # note at its key-on; this off would cut the moved note.
+                _bump(stats, "off_swallowed")
                 continue
             # A note-off on the note's own row is a cut (ECxx). An off at or
             # before that row is the previous note releasing, and the new
@@ -2713,6 +2788,9 @@ def _build_patterns(song: Song, n_ch: int, pat_len_max: int, fx_cols: int,
         for ch in range(n_ch)
     }
     def placed_note_row(ev) -> int:
+        shifted = note_row_shift.get(id(ev))
+        if shifted is not None:
+            return shifted[0]
         if ev.pcm:
             assigned = pcm_pos.get(id(ev))
             if assigned is None:

@@ -242,7 +242,10 @@ written. A factor that stacks two notes on one cell shows up as
 attack that ends before the next hit: its body often rounds onto the same row,
 so the attack moves one row back (the next note cuts it) and both play. A
 drum's ~5 ms noise attack plus its tonal body is the common case; dropping the
-attack changed the percussion timbre.
+attack changed the percussion timbre. When the previous row already holds a
+note, the later note moves one row forward instead, so a condensed variant
+does not lose either note. A note-off sitting on the target row is redundant
+(the moved key-on cuts that note) and is dropped.
 
 ## Validation
 

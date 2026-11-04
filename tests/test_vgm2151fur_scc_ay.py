@@ -567,6 +567,37 @@ class TestFurEmission(unittest.TestCase):
         self.assertEqual(stats.get("note_shifted"), 1)
         self.assertNotIn("note_collision", stats)
 
+    def test_condensed_rows_keep_both_notes(self):
+        # At x4 a row is long enough to catch two consecutive tone notes. The
+        # later note moves to the next row when the previous row already holds
+        # a note, so neither is overwritten.
+        at = 10000
+        writes = [
+            ChipWrite(0, "ay8910", 0, 7, 0xFE),
+            ChipWrite(0, "ay8910", 0, 0, 254),
+            ChipWrite(0, "ay8910", 0, 1, 0),
+            ChipWrite(at, "ay8910", 0, 8, 15),
+            ChipWrite(at + 300, "ay8910", 0, 0, 200),
+            ChipWrite(at + 300, "ay8910", 0, 1, 0),
+            ChipWrite(at + 300, "ay8910", 0, 8, 15),
+            ChipWrite(40000, "ay8910", 0, 8, 0),
+        ]
+        song = analyze(_vgm(writes, ay8910_clock=1789773), condense=4.0)
+        stats: dict[str, int] = {}
+        data = write_fur(
+            song, include_pcm=True, include_fm=False, stats=stats,
+        )
+        mod = parse_fur(data)
+        rows = [
+            oi * 256 + ri
+            for oi, pidx in enumerate(mod.orders[0])
+            for ri, row in enumerate(mod.patterns.get((0, pidx), []))
+            if 0 <= row.note < 180
+        ]
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(len(set(rows)), 2)
+        self.assertGreaterEqual(stats.get("note_shifted", 0), 1)
+
 
 def _ins_macros(block: bytes) -> dict[int, list[int]]:
     """Decode an INS2 block's MA feature into ``{macro code: values}``."""
