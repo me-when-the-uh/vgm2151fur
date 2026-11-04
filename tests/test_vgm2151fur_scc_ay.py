@@ -8,7 +8,9 @@ import unittest
 from pathlib import Path
 
 from vgm2151fur.analyze import _fold_saw, _saw_anchors, _unit_saw, analyze
-from vgm2151fur.ay8910 import FX_NOISE, ay_note, ay_rate, collect_ay8910
+from vgm2151fur.ay8910 import (
+    FX_MODE, FX_NOISE, ay_note, ay_rate, collect_ay8910,
+)
 from vgm2151fur.furio import CHIP_CHANNELS, iter_blocks, parse_fur
 from vgm2151fur.furwrite import (
     CHIP_AY8910, CHIP_K051649, CHIP_K052539, INS_AY, INS_SCC, write_fur,
@@ -329,6 +331,55 @@ class TestAyCollect(unittest.TestCase):
         self.assertEqual(fx[0x20], 1)   # mode: noise only (value = mode - 1)
         self.assertEqual(fx[0x21], 31 - 8)
 
+    def test_noise_attack_on_a_sounding_tone_is_a_new_hit(self):
+        # A drum holds the volume open from its noise attack into the tonal
+        # body. Adding noise to the sounding tone is the next attack, not a
+        # tail on the previous body's instrument.
+        writes = [
+            ChipWrite(0, "ay8910", 0, 7, 0xFE),   # tone on, noise off
+            ChipWrite(0, "ay8910", 0, 0, 254),
+            ChipWrite(0, "ay8910", 0, 1, 0),
+            ChipWrite(100, "ay8910", 0, 8, 15),   # body
+            ChipWrite(5000, "ay8910", 0, 0, 30),  # attack pitch
+            ChipWrite(5000, "ay8910", 0, 1, 0),
+            ChipWrite(5000, "ay8910", 0, 6, 31),
+            ChipWrite(5000, "ay8910", 0, 7, 0xF6),  # tone + noise
+            ChipWrite(6000, "ay8910", 0, 7, 0xFE),  # next body: tone only
+            ChipWrite(6000, "ay8910", 0, 8, 0x10),  # envelope retrigger
+            ChipWrite(6000, "ay8910", 0, 11, 66),
+            ChipWrite(6000, "ay8910", 0, 12, 0),
+            ChipWrite(6000, "ay8910", 0, 13, 9),
+            ChipWrite(20000, "ay8910", 0, 8, 0),
+        ]
+        hits, _offs, _warn = collect_ay8910(_vgm(writes, ay8910_clock=1789773))
+        self.assertEqual([h.sample_time for h in hits], [100, 5000, 6000])
+        first = hits[0]
+        # The attack's mixer/noise writes belong to the new hit, not to the
+        # tail of the tone body.
+        self.assertFalse(any(
+            cmd in (FX_MODE, FX_NOISE) and t > first.sample_time
+            for t, cmd, _val in first.fx_pts
+        ))
+        self.assertEqual(hits[1].period, 30)
+        self.assertIn((5000, FX_MODE, 2), hits[1].fx_pts)   # tone + noise
+        self.assertIn((5000, FX_NOISE, 0), hits[1].fx_pts)
+        self.assertFalse(hits[2].noise)
+        self.assertTrue(hits[2].env)
+
+    def test_tone_to_noise_handover_stays_one_note(self):
+        # The glide test's transition: tone off as noise comes on is a mode
+        # change on the same sound, not a new percussion attack.
+        writes = [
+            ChipWrite(0, "ay8910", 0, 7, 0xFE),
+            ChipWrite(0, "ay8910", 0, 0, 1024 & 0xFF),
+            ChipWrite(0, "ay8910", 0, 1, 1024 >> 8),
+            ChipWrite(100, "ay8910", 0, 8, 12),
+            ChipWrite(2300, "ay8910", 0, 7, 0xF7),  # tone off, noise on
+            ChipWrite(3000, "ay8910", 0, 8, 0),
+        ]
+        hits, _offs, _warn = collect_ay8910(_vgm(writes, ay8910_clock=1789772))
+        self.assertEqual(len(hits), 1)
+
     def test_envelope_note(self):
         vgm = _vgm(
             self._writes(volume=0x12, env_shape=9), ay8910_clock=1789773
@@ -453,15 +504,15 @@ class TestFurEmission(unittest.TestCase):
         # the 20xx row effect. Storing raw bits made tone+env load as
         # noise+env, so PSG percussion bodies became noise.
         writes = [
-            ChipWrite(0, "ay8910", 0, 7, 0xFE),
+            ChipWrite(0, "ay8910", 0, 7, 0xF6),   # tone + noise
             ChipWrite(0, "ay8910", 0, 0, 254),
             ChipWrite(0, "ay8910", 0, 1, 0),
             ChipWrite(0, "ay8910", 0, 11, 66),
             ChipWrite(0, "ay8910", 0, 12, 0),
             ChipWrite(0, "ay8910", 0, 13, 9),
             ChipWrite(100, "ay8910", 0, 8, 0x12),
-            # Mid-note mode change: tone+env (5) becomes tone+noise+env (7).
-            ChipWrite(5000, "ay8910", 0, 7, 0xF6),
+            # Mid-note mode change: tone+noise+env (7) becomes tone+env (5).
+            ChipWrite(5000, "ay8910", 0, 7, 0xFE),
             ChipWrite(15000, "ay8910", 0, 8, 0),
         ]
         song = analyze(_vgm(writes, ay8910_clock=1789773))
@@ -471,12 +522,12 @@ class TestFurEmission(unittest.TestCase):
             if mag == b"INS2"
         )
         mode = _ins_macros(ins)[3]
-        self.assertEqual(mode[:2], [4, 4])   # 5 -> 4
-        self.assertEqual(mode[-1], 6)        # 7 -> 6
+        self.assertEqual(mode[:2], [6, 6])   # 7 -> 6
+        self.assertEqual(mode[-1], 4)        # 5 -> 4
         # The row effect keeps the same encoding (value = bits - 1).
         mod = parse_fur(data)
         fx = [fx for rows in mod.patterns.values() for row in rows for fx in row.fx]
-        self.assertIn((0x20, 4), fx)
+        self.assertIn((0x20, 6), fx)
 
     def test_short_ay_attack_survives_a_row_collision(self):
         # A drum is a 5 ms noise attack followed by a tonal body. Both hits

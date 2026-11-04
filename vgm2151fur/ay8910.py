@@ -355,21 +355,34 @@ def collect_ay8910(
                     continue
                 tone = _tone_on(reg, voice)
                 noise = _noise_on(reg, voice)
-                if (tone, noise) != (hit.tone, hit.noise):
+                if (tone, noise) == (hit.tone, hit.noise):
+                    continue
+                if noise and not hit.noise and tone:
+                    # The mixer adding noise to a voice that is still
+                    # sounding (both tone bits on) is a new percussion hit.
+                    # Drivers hold the volume open through a drum's noise
+                    # attack and its tonal body, so without this the attack is
+                    # glued to the end of the previous body's instrument macro
+                    # and never gets its own row. A tone-to-noise handover
+                    # (tone off as noise comes on) stays one note: that is a
+                    # mode change on the same sound, not a new attack. The
+                    # period and noise-period writes just before this mixer
+                    # write belong to the new hit.
+                    update_gate(st, cid, voice, w.sample, retrigger=True)
+                    continue
+                hit.fx_pts.append((
+                    w.sample, FX_MODE,
+                    ay_mode(tone, noise, bool(reg[REG_VOL[voice]] & 0x10)) - 1,
+                ))
+                if noise and not hit.noise:
+                    # A tone-to-noise handover stays on the same note, but
+                    # the driver may have set the noise period while noise
+                    # was off. Carry it over so the first tick does not use
+                    # the previous hit's period.
                     hit.fx_pts.append((
-                        w.sample, FX_MODE,
-                        ay_mode(tone, noise, bool(reg[REG_VOL[voice]] & 0x10)) - 1,
+                        w.sample, FX_NOISE, 31 - (reg[REG_NOISE] & 0x1F),
                     ))
-                    if noise and not hit.noise:
-                        # The driver may have set the noise period while the
-                        # mixer still had noise off (common on a snare whose
-                        # tone and noise turn on together). Carry the value
-                        # over so the first tick does not use the previous
-                        # hit's period.
-                        hit.fx_pts.append((
-                            w.sample, FX_NOISE, 31 - (reg[REG_NOISE] & 0x1F),
-                        ))
-                    hit.tone, hit.noise = tone, noise
+                hit.tone, hit.noise = tone, noise
             for voice in range(AY_VOICES):
                 update_gate(st, cid, voice, w.sample)
             continue

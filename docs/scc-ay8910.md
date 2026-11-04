@@ -167,6 +167,13 @@ Channel mode (tone/noise/envelope), noise frequency and the hardware envelope
 | `22xy` | envelope shape `x`, enable this channel when `y` is non-zero |
 | `23xx` / `24xx` | envelope period low / high |
 
+Adding noise to a voice that is still sounding (the tone bit stays on) is a
+new percussion hit. Drivers hold the volume open from a drum's noise attack
+into its tonal body, so without this split the attack is buried at the end of
+the previous body's instrument macro and never reaches its own row. A
+tone-to-noise handover where the tone bit drops stays one note: that is a mode
+change on the same sound, not a new attack.
+
 A pure-noise AY voice has no audible pitch, and its period writes stay off
 the pattern. A tone voice keeps every period written while the tone bit was
 set, including a glide that finishes with the tone bit off. A step held for
