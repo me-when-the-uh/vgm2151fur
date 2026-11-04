@@ -279,17 +279,17 @@ class TestYm2608State(unittest.TestCase):
         st.write(0xB4, (1 << 7) | (1 << 6))
         self.assertEqual(st.pan_byte(0), st.pan_byte_ch(0))
 
-    def test_rhythm_level_folds_the_global(self):
-        """$11 scales every voice, so the column carries both together."""
+    def test_rhythm_level_keeps_the_global_separate(self):
+        """$11 travels as an 1Fxx effect; the column is the voice's level."""
         st = YM2608State()
         st.write(0x18, (3 << 6) | 31)
         st.write(0x11, 0x3F)
-        self.assertEqual(st.rhythm_level(0), 31)      # master at full, unchanged
+        self.assertEqual(st.rhythm_level(0), 31)
         st.write(0x11, 49)
-        folded = st.rhythm_level(0)
-        self.assertLess(folded, 31)
-        # Exactly the YM2610's ADPCM-A fold: same decoder, same arithmetic.
-        self.assertEqual(folded, st.adpcm_a_level(0))
+        self.assertEqual(st.rhythm_level(0), 31)
+        # The ADPCM-A helper still folds the master, since that engine has no
+        # per-chip effect in the module.
+        self.assertLess(st.adpcm_a_level(0), 31)
 
 
 class TestDeltaTCutting(unittest.TestCase):
@@ -362,13 +362,25 @@ class TestRhythmCollector(unittest.TestCase):
         writes = [
             _rhythm_level(1, 30),
             _rhythm_key(100, 0x02),
-            _rhythm_level(1, 8, t=400),           # still inside the voice's body
+            _rhythm_level(1, 8, t=800),           # still inside the voice's body
         ]
         hits, _w = collect_ym2608_rhythm(_vgm(writes))
         self.assertEqual(hits[0].vol, 30)
-        self.assertEqual(hits[0].vol_pts, [(400, 8)])
+        self.assertEqual(hits[0].vol_pts, [(800, 8)])
 
-    def test_global_level_moves_every_sounding_voice(self):
+    def test_level_just_after_the_gate_belongs_to_the_hit(self):
+        # The real level can follow the key by a few hundred samples; it is
+        # still the hit's own level, not a step on the sounding voice.
+        writes = [
+            _rhythm_level(1, 0),
+            _rhythm_key(100, 0x02),
+            _rhythm_level(1, 24, t=410),
+        ]
+        hits, _w = collect_ym2608_rhythm(_vgm(writes))
+        self.assertEqual(hits[0].vol, 24)
+        self.assertFalse(hits[0].vol_pts)
+
+    def test_global_level_is_not_folded_into_the_hits(self):
         writes = [
             _rhythm_level(0, 31), _rhythm_level(3, 31),
             ChipWrite(90, "ym2608", 0, 0x11, 0x3F),
@@ -378,7 +390,8 @@ class TestRhythmCollector(unittest.TestCase):
         hits, _w = collect_ym2608_rhythm(_vgm(writes))
         self.assertEqual(len(hits), 2)
         for h in hits:
-            self.assertTrue(h.vol_pts, h.voice)
+            self.assertEqual(h.vol, 31)
+            self.assertFalse(h.vol_pts)
 
     def test_pan_comes_from_the_level_byte(self):
         writes = [
@@ -484,25 +497,24 @@ class TestYm2608Analyze(unittest.TestCase):
         self.assertEqual(chs(lambda e: e.ch >= 15), [15])      # delta-T
         self.assertEqual(CHIP_CHANNELS[CHIP_YM2608], 16)
 
-    def test_rhythm_note_carries_the_folded_level(self):
+    def test_rhythm_note_carries_the_voice_level(self):
         song = analyze(self._base())
         hit = next(e for e in song.events if e.on and e.ch == 9)
-        self.assertEqual(hit.vol, 26)          # master at full: unchanged
+        self.assertEqual(hit.vol, 26)          # the voice's own $18 field
         self.assertEqual(hit.pan, 0xFF)
         self.assertLessEqual(hit.vol, 31)      # the column's ceiling
 
-    def test_global_level_fold_lowers_the_column(self):
+    def test_global_level_is_emitted_as_an_1f_effect(self):
         writes = _fm_note(0) + [
             ChipWrite(80, "ym2608", 0, 0x11, 32),      # pull the kit down
             _rhythm_level(0, 26), _rhythm_key(400, 0x01),
         ]
         song = analyze(_vgm(writes))
         hit = next(e for e in song.events if e.on and e.ch == 9)
-        st = YM2608State()
-        st.write(0x11, 32)
-        st.write(0x18, (3 << 6) | 26)
-        self.assertEqual(hit.vol, st.rhythm_level(0))
-        self.assertLess(hit.vol, 26)
+        self.assertEqual(hit.vol, 26)
+        # The kit's global level stays a chip effect instead of being folded
+        # into every hit (which clamped quiet kits to column 0).
+        self.assertIn((80, 9, 0x1F, 32), song.channel_fx)
 
     def test_second_block_is_the_next_three_channels(self):
         song = analyze(_vgm(_fm_note(4) + _fm_note(0)))

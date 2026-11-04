@@ -217,6 +217,12 @@ from vgm2151fur.ym2612dac import (
 )
 
 
+# A driver may key an OPN voice while its carriers are still muted and write
+# the patch's real TL a few samples later. A level write this close to the
+# key-on is the note's starting level, not a mid-note step.
+OPN_TL_FOLD = 512
+
+
 # Official YM2151 KC note nibble → semitone from C of this octave.
 # Valid codes: C#=0, D=1, D#=2, E=4, F=5, F#=6, G=8, G#=9, A=10, A#=12, B=13,
 # C(next octave)=14.  3/7/11/15 are unused and alias 4/8/12/14.
@@ -3941,9 +3947,12 @@ def analyze(
         )
     # The YM2151 has no sample engine, Ext split or CSM timer to argue with an
     # OPL family: Furnace hosts both, so a log that scores the OPM beside an
-    # OPL gets two systems instead of losing one. The same holds for the
-    # YM2413's kit and user bank, which own no arcade channel block.
-    share_fm = bool(arcade_pick in ("ym2151", "ym2612") and (opl_live or opll_live))
+    # OPL gets two systems instead of losing one. The YM2203 and YM2612 own no
+    # sample engine either (the YM2203's SSG is just three more columns), and
+    # the YM2413's kit and user bank own no arcade channel block.
+    share_fm = bool(
+        arcade_pick in ("ym2151", "ym2612", "ym2203") and (opl_live or opll_live)
+    )
     keep_arcade = arcade_pick is not None and (
         not prefer_opl or is_combo or share_fm
     )
@@ -5089,7 +5098,17 @@ def analyze(
                     ev.fm_pitch_pts = tuple(distinct)
             tl = opn_tl_pts.pop(key, [])
             if tl:
-                ev.tl_pts = tuple(tl)
+                # A driver keys the voice while its carriers still hold the
+                # previous (often muted) level and writes the real TL a few
+                # samples later. That first louder write is the note's start
+                # level; leaving it as a step put the note at volume 0.
+                keyon_tl = 127 - max(0, ev.vol)
+                if (0 <= tl[0][0] - ev.sample <= OPN_TL_FOLD
+                        and tl[0][1] < keyon_tl):
+                    ev.vol = max(0, min(127, 127 - tl[0][1]))
+                    tl = tl[1:]
+                if tl:
+                    ev.tl_pts = tuple(tl)
             if off:
                 ev.end = sample
                 events.append(NoteEvent(
@@ -5644,7 +5663,17 @@ def analyze(
                     ev.fm_pitch_pts = tuple(distinct)
             tl = opn_tl_pts.pop(key, [])
             if tl:
-                ev.tl_pts = tuple(tl)
+                # A driver keys the voice while its carriers still hold the
+                # previous (often muted) level and writes the real TL a few
+                # samples later. That first louder write is the note's start
+                # level; leaving it as a step put the note at volume 0.
+                keyon_tl = 127 - max(0, ev.vol)
+                if (0 <= tl[0][0] - ev.sample <= OPN_TL_FOLD
+                        and tl[0][1] < keyon_tl):
+                    ev.vol = max(0, min(127, 127 - tl[0][1]))
+                    tl = tl[1:]
+                if tl:
+                    ev.tl_pts = tuple(tl)
             if off:
                 ev.end = sample
                 events.append(NoteEvent(
@@ -5930,6 +5959,20 @@ def analyze(
                     pan=0,
                     pcm=True,
                 ))
+
+        # $11 is the kit's global level, and the platform exposes it as an
+        # 1Fxx effect. Keeping it on a rhythm column reproduces the driver's
+        # mix balance; folding it into each hit would clamp a quiet kit to
+        # column 0 and hide the per-voice level.
+        if rhythm_hits:
+            for w in vgm.writes:
+                if (w.chip != "ym2608" or (w.reg & 0x100)
+                        or (w.reg & 0xFF) != 0x11):
+                    continue
+                if w.chip_id not in ym_base:
+                    continue
+                target = ym_base[w.chip_id] + ym2608_fm_count + 3
+                channel_fx.append((w.sample, target, 0x1F, w.val & 0x3F))
 
         for i, smp in enumerate(ym2608_b_samples):
             for h in smp.hits:

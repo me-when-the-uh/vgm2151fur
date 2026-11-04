@@ -22,8 +22,8 @@ from vgm2151fur.analyze import _family_keyons, _family_sounds, analyze, format_r
 from vgm2151fur.audit import compare_dac
 from vgm2151fur.furwrite import (
     CHIP_OPL2, CHIP_OPL3, CHIP_OPLL_DRUMS, CHIP_SMS, CHIP_YM2151,
-    CHIP_YM2612, CHIP_YM2612_EXT, _append_system_names, _channel_vol_max,
-    write_fur,
+    CHIP_YM2203, CHIP_YM2612, CHIP_YM2612_EXT, _append_system_names,
+    _channel_vol_max, write_fur,
 )
 from vgm2151fur.furio import CHIP_CHANNELS, iter_blocks, parse_fur
 from vgm2151fur.furnace import export_vgm, find_furnace
@@ -74,27 +74,27 @@ def _stream(sample: int, offset: int, length: int, *, mode: int = 1,
 # ------------------------------------------------------------- note builders
 
 def opn_note(t: int, ch: int = 0, *, block: int = 4, fnum: int = 0x280,
-             off: int | None = 9000) -> list[ChipWrite]:
-    """One YM2612 voice, keyed with the encoding its $28 uses."""
+             off: int | None = 9000, kind: str = "ym2612") -> list[ChipWrite]:
+    """One YM2612/YM2203 voice, keyed with the encoding its $28 uses."""
     port, slot = divmod(ch, 3)
     base = 0x100 * port
     out: list[ChipWrite] = []
     for page in (0x30, 0x40, 0x50, 0x60, 0x70, 0x80, 0x90):
         for op in range(4):
             val = 0x01 if page == 0x30 else (0x1F if page == 0x70 else 0)
-            out.append(ChipWrite(t, "ym2612", 0, base | page | (op << 2) | slot,
-                                val))
+            out.append(ChipWrite(t, kind, 0, base | page | (op << 2) | slot,
+                               val))
     key = ch if ch < 3 else ch + 1
     out += [
-        ChipWrite(t, "ym2612", 0, base | 0xB0 | slot, 0x07),
-        ChipWrite(t, "ym2612", 0, base | 0xB4 | slot, 0xC0),
-        ChipWrite(t + 1, "ym2612", 0, base | 0xA4 | slot,
+        ChipWrite(t, kind, 0, base | 0xB0 | slot, 0x07),
+        ChipWrite(t, kind, 0, base | 0xB4 | slot, 0xC0),
+        ChipWrite(t + 1, kind, 0, base | 0xA4 | slot,
                   (block << 3) | ((fnum >> 8) & 7)),
-        ChipWrite(t + 1, "ym2612", 0, base | 0xA0 | slot, fnum & 0xFF),
-        ChipWrite(t + 2, "ym2612", 0, 0x28, (0xF << 4) | key),
+        ChipWrite(t + 1, kind, 0, base | 0xA0 | slot, fnum & 0xFF),
+        ChipWrite(t + 2, kind, 0, 0x28, (0xF << 4) | key),
     ]
     if off is not None:
-        out.append(ChipWrite(off, "ym2612", 0, 0x28, key))
+        out.append(ChipWrite(off, kind, 0, 0x28, key))
     return out
 
 
@@ -510,6 +510,34 @@ class TestComboLayout(unittest.TestCase):
         self.assertLess(max(chans), 24)
         dac = [e.ch for e in song.events if e.dac and e.on]
         self.assertEqual(set(dac), {5})
+
+    def test_ym2203_and_its_ssg_beside_an_opl2(self):
+        # A merged Hoot/Sound Canvas log can carry an OPL2 melody and a
+        # YM2203 (FM + SSG). Both are Furnace systems, so neither side is
+        # dropped for having fewer key-ons.
+        writes: list = []
+        for ch in range(3):
+            writes += opn_note(1000 + ch * PULSE, ch, kind="ym2203")
+        writes += [
+            ChipWrite(1300, "ym2203_ssg", 0, 7, 0x38),
+            ChipWrite(1300, "ym2203_ssg", 0, 0, 0x00),
+            ChipWrite(1300, "ym2203_ssg", 0, 1, 0x01),
+            ChipWrite(1300, "ym2203_ssg", 0, 8, 0x0F),
+        ]
+        for ch in range(3):
+            writes += opl_note(1500 + ch * PULSE, ch)
+        v = _vgm(writes, ym2203_clock=3993600, opl2_clock=3579545,
+                 total_samples=200000)
+        song = analyze(v)
+        self.assertEqual([s.kind for s in song.fm_systems], ["ym2203", "opl2"])
+        self.assertEqual(song.fm_chip, "ym2203")
+        chans = sorted({e.ch for e in song.events if e.on and not e.pcm})
+        self.assertEqual([c for c in chans if c < 6], [0, 1, 2, 3])
+        self.assertTrue(any(c >= 6 for c in chans), chans)
+        data = write_fur(song, include_pcm=True)
+        mod = parse_fur(data)
+        self.assertEqual(mod.chips, [CHIP_YM2203, CHIP_OPL2])
+        self.assertEqual(mod.n_ch, 15)
 
     def test_three_systems_stack_in_order(self):
         writes: list = []

@@ -1105,7 +1105,7 @@ class TestOplRealRips(unittest.TestCase):
 
 
 class TestMixedFamilySelection(unittest.TestCase):
-    """A mixed OPL + arcade log converts the family that plays it."""
+    """A mixed OPL + arcade log keeps both systems when Furnace can host them."""
 
     @staticmethod
     def _mixed(opl_notes: int, ym_notes: int):
@@ -1121,21 +1121,26 @@ class TestMixedFamilySelection(unittest.TestCase):
         writes.sort(key=lambda w: w.sample)
         return _vgm(writes, total_samples=200000, ym2203_clock=3579545)
 
-    def test_the_dominant_family_is_selected(self):
+    def test_opn_and_opl_are_both_kept(self):
+        # Furnace hosts a YM2203 beside an OPL family as two systems. The
+        # earlier key-on dominance test dropped the smaller side, which lost
+        # the YM2203's FM and SSG parts entirely on merged rips.
         song = analyze(self._mixed(8, 2))
-        self.assertEqual(song.fm_chip, KIND_OPL2)
+        self.assertEqual(song.fm_chip, "ym2203")
+        self.assertEqual(song.ym2203_ids, [0])
         self.assertEqual(song.opl_ids, [0])
-        self.assertEqual(song.ym2203_ids, [])
-        self.assertTrue(any("OPL has more key-ons (8)" in w for w in song.warnings),
-                        song.warnings)
+        self.assertEqual([s.kind for s in song.fm_systems], ["ym2203", "opl2"])
+        self.assertTrue(
+            any("each keeps its own system" in w for w in song.warnings),
+            song.warnings,
+        )
 
-    def test_a_dominant_opn_log_drops_the_opl_side(self):
+    def test_opn_and_opl_keep_both_systems_when_opn_is_denser(self):
         song = analyze(self._mixed(2, 8))
         self.assertEqual(song.fm_chip, "ym2203")
         self.assertEqual(song.ym2203_ids, [0])
-        self.assertEqual(song.opl_ids, [])
-        self.assertTrue(any("YM2203 has more key-ons (8)" in w for w in song.warnings),
-                        song.warnings)
+        self.assertEqual(song.opl_ids, [0])
+        self.assertEqual([s.kind for s in song.fm_systems], ["ym2203", "opl2"])
 
     def test_two_opl_kinds_pick_the_denser_side(self):
         writes: list[ChipWrite] = []
