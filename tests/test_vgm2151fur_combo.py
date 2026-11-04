@@ -21,14 +21,16 @@ from pathlib import Path
 from vgm2151fur.analyze import _family_keyons, _family_sounds, analyze, format_report
 from vgm2151fur.audit import compare_dac
 from vgm2151fur.furwrite import (
-    CHIP_OPL2, CHIP_OPL3, CHIP_OPLL_DRUMS, CHIP_SMS, CHIP_YM2151,
-    CHIP_YM2203, CHIP_YM2612, CHIP_YM2612_EXT, _append_system_names,
-    _channel_vol_max, write_fur,
+    CHIP_AY8910, CHIP_MSM6295, CHIP_OPL2, CHIP_OPL3, CHIP_OPLL_DRUMS,
+    CHIP_SMS, CHIP_YM2151, CHIP_YM2203, CHIP_YM2612, CHIP_YM2612_EXT,
+    _append_system_names, _channel_vol_max, write_fur,
 )
 from vgm2151fur.furio import CHIP_CHANNELS, iter_blocks, parse_fur
 from vgm2151fur.furnace import export_vgm, find_furnace
 from vgm2151fur.opl import N as OPL_N, OPLState, SLOT_ADDR
-from vgm2151fur.vgm import ChipWrite, DacStreamPlay, VGM_RATE, VgmFile, load_vgm
+from vgm2151fur.vgm import (
+    ChipWrite, DacStreamPlay, RomSlice, VGM_RATE, VgmFile, load_vgm,
+)
 from vgm2151fur.ym2612dac import DAC_RELEASE_SAMPLES, collect_dac
 
 TMP = Path(tempfile.gettempdir()) / "vgm2151fur_combo"
@@ -510,6 +512,52 @@ class TestComboLayout(unittest.TestCase):
         self.assertLess(max(chans), 24)
         dac = [e.ch for e in song.events if e.dac and e.on]
         self.assertEqual(set(dac), {5})
+
+    def test_oki_sample_bodies_do_not_shift_the_ay_channels(self):
+        # The tone base must count MSM6295 *chips* (4 voices), not sample
+        # bodies. A bank with two phrases used to push the AY block 8 columns
+        # too far, past the end of the module, so its notes disappeared.
+        rom = bytearray(0x20800)
+        rom[0x20000:0x20008] = bytes(
+            [0x00, 0x05, 0x00, 0x00, 0x05, 0x07, 0x00, 0x00]
+        )
+        rom[0x20008:0x20010] = bytes(
+            [0x00, 0x06, 0x00, 0x00, 0x07, 0x8F, 0x00, 0x00]
+        )
+        rom[0x20500:0x20508] = b"\x11" * 8
+        rom[0x20600:0x20790] = b"\x22" * 400
+        writes = [
+            ChipWrite(0, "msm6295", 0, 0x0E, 0x81),
+            ChipWrite(10, "msm6295", 0, 0x10, 0x02),
+            ChipWrite(100, "msm6295", 0, 0x00, 0x80),
+            ChipWrite(110, "msm6295", 0, 0x00, 0x10),
+            ChipWrite(200, "msm6295", 0, 0x00, 0x81),
+            ChipWrite(210, "msm6295", 0, 0x00, 0x80),
+            ChipWrite(2000, "msm6295", 0, 0x00, 0x40),
+            ChipWrite(100, "ay8910", 0, 7, 0x38),
+            ChipWrite(100, "ay8910", 0, 0, 0x00),
+            ChipWrite(100, "ay8910", 0, 1, 0x01),
+            ChipWrite(100, "ay8910", 0, 8, 0x0F),
+        ]
+        v = _vgm(writes, msm6295_clock=2_000_000, ay8910_clock=1789772,
+                 total_samples=3000)
+        v.roms = [RomSlice(0, len(rom), 0, bytes(rom), "msm6295")]
+        v.msm6295_pin7 = True
+        song = analyze(v)
+        self.assertEqual(len(song.oki_samples), 2)
+        ay = next(e for e in song.events if e.on and e.tone_chip == 2)
+        # 8 placeholder columns + 4 MSM6295 voices, then the AY block.
+        self.assertEqual(ay.ch, 12)
+        mod = parse_fur(write_fur(song, include_pcm=True))
+        self.assertEqual(mod.chips, [CHIP_MSM6295, CHIP_AY8910])
+        self.assertEqual(mod.n_ch, 7)
+        notes = [
+            row.note
+            for oi in mod.orders[4]
+            for row in mod.patterns.get((4, oi), [])
+            if 0 <= row.note < 180
+        ]
+        self.assertTrue(notes, "the AY channel lost its notes")
 
     def test_ym2203_and_its_ssg_beside_an_opl2(self):
         # A merged Hoot/Sound Canvas log can carry an OPL2 melody and a

@@ -6760,12 +6760,14 @@ def analyze(
     # SCC and AY are pitched chips and convert even under --melody-only. Their
     # channels follow the FM block and every sample chip.
     tone_base = (
-        fm_end + (2 if audible else 0) + 4 * len(oki_samples) + n_adpcm_ch
+        fm_end + (2 if audible else 0)
+        + 4 * len({s.chip_id for s in oki_samples}) + n_adpcm_ch
         + (16 if spcm_audible else 0)
         + RF5C_VOICES * (1 if rf5c68_audible else 0)
         + RF5C_VOICES * (1 if rf5c164_audible else 0)
-        + 24 * len(c140_audible)
-        + 32 * len(c352_audible) + 4 * len(k053260_audible)
+        + 24 * len({h.chip_id for s in c140_audible for h in s.hits})
+        + 32 * len({h.chip_id for s in c352_audible for h in s.hits})
+        + 4 * len({h.chip_id for s in k053260_audible for h in s.hits})
     )
     # Count the final DAC maps once, below; the collector's list is transient.
     n_ym2610_a_ins = (len(ym2610_a_samples) + YM2610_MAP_SLOTS - 1) // YM2610_MAP_SLOTS
