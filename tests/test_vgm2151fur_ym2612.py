@@ -29,7 +29,13 @@ from vgm2151fur.ym2612 import (
     ym2612_note_fnum,
     ym2612_pitch_units,
 )
-from vgm2151fur.ym2612dac import DAC_RELEASE_SAMPLES, collect_dac
+from vgm2151fur.ym2612dac import (
+    DAC_RELEASE_SAMPLES,
+    DacSample,
+    _cluster_similar_samples,
+    _merge_one_shot_samples,
+    collect_dac,
+)
 
 TMP = Path(tempfile.gettempdir()) / "vgm2151fur_ym2612"
 TMP.mkdir(exist_ok=True)
@@ -1497,6 +1503,43 @@ class TestYm2612DacSourceSamples(unittest.TestCase):
         self.assertEqual(len(song.dac_samples), 2)
         self.assertEqual(song.dac_count, 3)
 
+    def test_similar_bodies_move_the_note_by_their_offset(self):
+        # The same bank audio reached from a different row position has a
+        # few frames of extra leading fill. One body serves both, and the
+        # shorter play's note moves so the shared main waveform stays put.
+        common = bytes((i * 7) % 251 for i in range(400))
+        long = DacSample(
+            0, 20 + len(common), b"\x00" * 20 + common, 44100, 0,
+        )
+        short = DacSample(
+            0, 5 + len(common), b"\x09" * 5 + common, 44100, 0,
+        )
+        notes = [(1000, 0, 255), (5000, 1, 255)]
+        samples, moved, offs = _cluster_similar_samples(
+            [long, short], notes, [(1, 9000)], {},
+        )
+        self.assertEqual(samples, [long, short])
+        self.assertEqual({idx for _t, idx, _p in moved}, {0})
+        self.assertEqual(moved[0], (1000, 0, 255))
+        # b[i] == a[i + 15], so the note starts 15 frames earlier at 44.1k.
+        self.assertEqual(moved[1], (4985, 0, 255))
+        self.assertEqual(offs, [(1, 8985)])
+
+    def test_unique_contiguous_samples_become_one_body(self):
+        first = DacSample(0, 4, b"\x01\x02\x03\x04", 1000, 0)
+        second = DacSample(0, 4, b"\x05\x06\x07\x08", 1000, 0)
+        notes = [(0, 0, 255), (176, 1, 255)]
+        samples, merged, offs = _merge_one_shot_samples(
+            [first, second], notes, [(0, 176), (1, 352)], {},
+        )
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0][0], 0)
+        self.assertEqual(merged[0][2], 255)
+        self.assertEqual(samples[merged[0][1]].data,
+                         b"\x01\x02\x03\x04\x05\x06\x07\x08")
+        # The intermediate note's cut is gone; the chain's own end stays.
+        self.assertEqual(offs, [(0, 176)])
+
     def test_over_budget_tail_is_one_final_sample(self):
         # When the chunk fallback still needs more than the budget, the whole
         # remaining sequence goes into the last sample instead of vanishing.
@@ -1566,6 +1609,17 @@ class TestYm2612DacAlienSoldier(unittest.TestCase):
         self.assertFalse(any(
             "dropped to stay inside" in w for w in song.warnings
         ))
+
+    def test_similar_and_one_shot_bank_bodies_share_storage(self):
+        song = analyze(load_vgm(ALIEN))
+        self.assertLessEqual(len(song.dac_samples), 100)
+        self.assertLess(song.dac_stats["dac_sample_bytes"], 250000)
+        self.assertGreater(song.dac_stats.get("dac_similar_samples", 0), 20)
+        self.assertGreater(
+            song.dac_stats.get("dac_similar_shifted_notes", 0), 0,
+        )
+        self.assertGreater(song.dac_stats.get("dac_oneshot_samples", 0), 0)
+        self.assertFalse(song.dac_stats.get("dac_release_trimmed"))
 
 
 @unittest.skipUnless(ROBOT.is_file(), "RobotBattle2 rip missing")

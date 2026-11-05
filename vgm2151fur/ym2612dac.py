@@ -29,6 +29,18 @@ DAC_CHUNK_SECONDS = 0.25
 # Furnace clamps a sample-playback rate to this value.
 DAC_RATE_MAX = 192000
 DAC_RATE_MIN = 1
+# Bank samples whose bodies are the same audio at a small frame offset share
+# one module sample. Rate and length are compared loosely, but the interior of
+# the body must match almost exactly; only the leading/trailing fill may move.
+DAC_SIMILAR_RATE = 32
+DAC_SIMILAR_SHIFT = 16
+DAC_SIMILAR_EDGE = 128
+DAC_SIMILAR_MIN_MATCH = 0.90
+DAC_SIMILAR_INTERIOR = 0.999
+DAC_SIMILAR_MIN_LEN = 32
+# A unique sample that starts this soon after the previous unique sample is
+# part of the same contiguous one-shot phrase.
+DAC_ONESHOT_GAP = 64
 
 
 @dataclass(frozen=True)
@@ -1331,6 +1343,298 @@ def _held_byte(
     return smp.data[frame]
 
 
+def _body_overlap(a: bytes, b: bytes, shift: int):
+    """Overlap of two bodies when ``b[i]`` aligns with ``a[i + shift]``."""
+    if shift >= 0:
+        n = min(len(a) - shift, len(b))
+        if n <= 0:
+            return None
+        return n, shift, 0
+    n = min(len(a), len(b) + shift)
+    if n <= 0:
+        return None
+    return n, 0, -shift
+
+
+def _sampled_mismatch(a: bytes, b: bytes, shift: int, limit: int = 128) -> float:
+    ov = _body_overlap(a, b, shift)
+    if ov is None:
+        return 1.0
+    n, sa, sb = ov
+    step = max(1, n // limit)
+    count = len(range(0, n, step))
+    mism = sum(
+        1 for i in range(0, n, step) if a[i + sa] != b[i + sb]
+    )
+    return mism / max(1, count)
+
+
+def _full_mismatch(a: bytes, b: bytes, shift: int) -> tuple[int, list[int]]:
+    ov = _body_overlap(a, b, shift)
+    if ov is None:
+        return 0, []
+    n, sa, sb = ov
+    return n, [
+        i for i in range(n) if a[i + sa] != b[i + sb]
+    ]
+
+
+def _similar_alignment(a: bytes, b: bytes) -> tuple[int, float, float] | None:
+    """Best body offset if two bank samples are the same audio.
+
+    The leading and trailing fill can move by a few frames when a driver
+    reaches the same bank body from a different row position.  The interior
+    of the bodies must agree almost exactly; returning the offset lets the
+    writer move that play's note so its main body still lands on time.
+    """
+    if len(a) < DAC_SIMILAR_MIN_LEN or len(b) < DAC_SIMILAR_MIN_LEN:
+        return None
+    best_sample = min(
+        (_sampled_mismatch(a, b, sh), abs(sh), sh)
+        for sh in range(-DAC_SIMILAR_SHIFT, DAC_SIMILAR_SHIFT + 1)
+    )
+    if best_sample[0] > 0.5:
+        # Even the best coarse alignment is clearly a different body.
+        return None
+    best: tuple[tuple[float, float, int, int], int, float, float] | None = None
+    center = best_sample[2]
+    for sh in range(center - 3, center + 4):
+        if abs(sh) > DAC_SIMILAR_SHIFT:
+            continue
+        n, mism = _full_mismatch(a, b, sh)
+        if n < max(8, len(a) // 4):
+            continue
+        edge = min(DAC_SIMILAR_EDGE, max(4, n // 8))
+        interior_n = n - 2 * edge
+        interior_mis = sum(1 for i in mism if edge <= i < n - edge)
+        overall = 1.0 - len(mism) / n
+        interior = (
+            1.0 - interior_mis / interior_n if interior_n > 0 else overall
+        )
+        if overall < DAC_SIMILAR_MIN_MATCH:
+            continue
+        if interior < DAC_SIMILAR_INTERIOR:
+            continue
+        cand = (interior, overall, -len(mism), -abs(sh))
+        if best is None or cand > best[0]:
+            best = (cand, sh, overall, interior)
+    if best is None:
+        return None
+    return best[1], best[2], best[3]
+
+
+def _similar_candidates(a: DacSample, b: DacSample) -> bool:
+    if abs(a.c4_rate - b.c4_rate) > DAC_SIMILAR_RATE:
+        return False
+    small = min(len(a.data), len(b.data))
+    if small < DAC_SIMILAR_MIN_LEN:
+        return False
+    tolerance = min(256, max(16, small // 16))
+    return abs(len(a.data) - len(b.data)) <= tolerance
+
+
+def _merge_one_shot_samples(
+    samples: list[DacSample],
+    notes: list[tuple[int, int, int]],
+    off_items: list[tuple[int, int]],
+    stats: dict,
+) -> tuple[list[DacSample], list[tuple[int, int, int]], list[tuple[int, int]]]:
+    """Join unique samples that play back-to-back into one body.
+
+    A sample used exactly once cannot be needed again, so a sequence of such
+    notes on the same channel, pan and rate is stored as one body and played
+    by the first note.  The next note's onset truncates the previous body, so
+    overlapping tails stay exact.
+    """
+    if len(notes) < 2:
+        return samples, notes, off_items
+    uses: dict[int, int] = {}
+    for _t, idx, _pan in notes:
+        uses[idx] = uses.get(idx, 0) + 1
+    off_by_note: dict[int, list[int]] = {}
+    for ni, t in off_items:
+        off_by_note.setdefault(ni, []).append(t)
+
+    ordered = sorted(
+        range(len(notes)), key=lambda i: (notes[i][0], i),
+    )
+    runs: list[list[int]] = []
+    current: list[int] = []
+    for ni in ordered:
+        t, idx, pan = notes[ni]
+        if uses.get(idx) != 1:
+            if len(current) > 1:
+                runs.append(current)
+            current = []
+            continue
+        if current:
+            pt, pidx, ppan = notes[current[-1]]
+            prev = samples[pidx]
+            end = pt + len(prev.data) * VGM_RATE / prev.c4_rate
+            cut = off_by_note.get(current[-1])
+            if cut:
+                end = min(end, min(cut))
+            if (
+                pan == ppan
+                and samples[idx].c4_rate == prev.c4_rate
+                and t >= pt
+                and t <= end + DAC_ONESHOT_GAP
+            ):
+                current.append(ni)
+                continue
+            if len(current) > 1:
+                runs.append(current)
+        current = [ni]
+    if len(current) > 1:
+        runs.append(current)
+    if not runs:
+        return samples, notes, off_items
+
+    removed: set[int] = set()
+    for run in runs:
+        first_ni = run[0]
+        start, first_idx, pan = notes[first_ni]
+        rate = samples[first_idx].c4_rate
+        body = bytearray(samples[first_idx].data)
+        held = body[-1] if body else 0x80
+        for ni in run[1:]:
+            t, idx, _pan = notes[ni]
+            target = int(round((t - start) * rate / VGM_RATE))
+            if target < len(body):
+                del body[target:]
+            elif target > len(body):
+                body.extend(bytes([held]) * (target - len(body)))
+            payload = samples[idx].data
+            body.extend(payload)
+            if payload:
+                held = payload[-1]
+            removed.add(ni)
+        new_idx = len(samples)
+        samples.append(DacSample(-1, len(body), bytes(body), rate, start))
+        notes[first_ni] = (start, new_idx, pan)
+        stats["dac_oneshot_chains"] = (
+            stats.get("dac_oneshot_chains", 0) + 1
+        )
+        stats["dac_oneshot_notes"] = (
+            stats.get("dac_oneshot_notes", 0) + len(run) - 1
+        )
+        stats["dac_oneshot_samples"] = (
+            stats.get("dac_oneshot_samples", 0) + len(run) - 1
+        )
+    if not removed:
+        return samples, notes, off_items
+
+    remap_note: dict[int, int] = {}
+    new_notes: list[tuple[int, int, int]] = []
+    for i, note in enumerate(notes):
+        if i in removed:
+            continue
+        remap_note[i] = len(new_notes)
+        new_notes.append(note)
+    new_offs = [
+        (remap_note[ni], t) for ni, t in off_items if ni in remap_note
+    ]
+    return samples, new_notes, new_offs
+
+
+def _cluster_similar_samples(
+    samples: list[DacSample],
+    notes: list[tuple[int, int, int]],
+    off_items: list[tuple[int, int]],
+    stats: dict,
+) -> tuple[list[DacSample], list[tuple[int, int, int]], list[tuple[int, int]]]:
+    """Share one body between bank samples that differ only by a start offset.
+
+    The representative is the longest member.  A play that used a shorter
+    body starts at its own note time, so the note moves by the body offset to
+    keep the shared main waveform on the same spot on the timeline.
+    """
+    count = len(samples)
+    if count < 2:
+        return samples, notes, off_items
+    groups: list[list[int]] = []
+    for i, smp in enumerate(samples):
+        placed = False
+        for group in groups:
+            rep = group[0]
+            if not _similar_candidates(samples[rep], smp):
+                continue
+            if _similar_alignment(samples[rep].data, smp.data) is not None:
+                group.append(i)
+                placed = True
+                break
+        if not placed:
+            groups.append([i])
+
+    remap = list(range(count))
+    shifts = [0] * count
+    merged_groups = 0
+    for group in groups:
+        if len(group) < 2:
+            continue
+        rep = max(group, key=lambda i: len(samples[i].data))
+        members = []
+        for i in group:
+            if i == rep:
+                members.append(i)
+                continue
+            if not _similar_candidates(samples[rep], samples[i]):
+                continue
+            hit = _similar_alignment(samples[rep].data, samples[i].data)
+            if hit is None:
+                continue
+            shifts[i] = hit[0]
+            members.append(i)
+        if len(members) < 2:
+            continue
+        merged_groups += 1
+        for i in members:
+            remap[i] = rep
+        stats["dac_similar_samples"] = (
+            stats.get("dac_similar_samples", 0) + len(members) - 1
+        )
+    if not merged_groups:
+        return samples, notes, off_items
+    stats["dac_similar_groups"] = merged_groups
+
+    note_dt: list[int] = [0] * len(notes)
+    new_notes: list[tuple[int, int, int]] = []
+    for i, (t, idx, pan) in enumerate(notes):
+        target = remap[idx]
+        sh = shifts[idx]
+        if sh:
+            dt = -sh * VGM_RATE / samples[target].c4_rate
+            note_dt[i] = int(round(dt))
+            t = max(0, t + note_dt[i])
+            stats["dac_similar_shifted_notes"] = (
+                stats.get("dac_similar_shifted_notes", 0) + 1
+            )
+        new_notes.append((t, target, pan))
+    new_notes.sort(key=lambda n: n[0])
+    new_offs = [
+        (ni, max(0, t + note_dt[ni])) for ni, t in off_items
+    ]
+    return samples, new_notes, new_offs
+
+
+def _compact_samples(
+    samples: list[DacSample],
+    notes: list[tuple[int, int, int]],
+) -> tuple[list[DacSample], list[tuple[int, int, int]]]:
+    """Drop bodies no note references and renumber the sample map."""
+    used = {idx for _t, idx, _pan in notes}
+    remap: dict[int, int] = {}
+    compact: list[DacSample] = []
+    for i, smp in enumerate(samples):
+        if i not in used:
+            continue
+        remap[i] = len(compact)
+        compact.append(smp)
+    return compact, [
+        (t, remap[idx], pan) for t, idx, pan in notes
+    ]
+
+
 def group_dac_plays(
     samples: list[DacSample],
     plays: list[DacPlay],
@@ -1382,7 +1686,7 @@ def group_dac_plays(
     out: list[DacSample] = []
     by_key: dict[tuple[bytes, int], int] = {}
     notes: list[tuple[int, int, int]] = []
-    offs: list[tuple[int, int]] = []
+    off_items: list[tuple[int, int]] = []
     pan_events: list[tuple[int, int]] = []
     previous_sample: int | None = None
     previous_time = 0
@@ -1405,7 +1709,7 @@ def group_dac_plays(
         if total_samples and next_time <= span_end + tolerance:
             # The next note already cuts this one on time.
             return
-        offs.append((int(round(span_end)), 0))
+        off_items.append((len(notes) - 1, int(round(span_end))))
         stats["dac_cut_offs"] = stats.get("dac_cut_offs", 0) + 1
 
     for row in sorted(groups):
@@ -1552,6 +1856,21 @@ def group_dac_plays(
         previous_sample = idx
         previous_time = note_time
         stats["dac_groups"] = stats.get("dac_groups", 0) + 1
+
+    # Bank source bodies are whole audio regions, so two bodies that differ
+    # only by a small start offset and a one-shot sequence that never repeats
+    # can share storage.  The chunk path must not do this: those bodies are
+    # adjacent time slices of one stream.
+    if plays and all(p.source for p in plays):
+        out, notes, off_items = _merge_one_shot_samples(
+            out, notes, off_items, stats,
+        )
+        out, notes = _compact_samples(out, notes)
+        out, notes, off_items = _cluster_similar_samples(
+            out, notes, off_items, stats,
+        )
+        out, notes = _compact_samples(out, notes)
+    offs = [(t, 0) for _ni, t in off_items]
 
     warnings: list[str] = []
     trimmed = 0
