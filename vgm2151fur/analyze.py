@@ -7514,7 +7514,13 @@ def analyze(
                 on=True,
                 note=note,
                 ins=-1,
-                vol=h.vol,
+                # The column is the note's maximum. A hardware envelope is
+                # restored by the instrument's hardware sequence (see
+                # _write_ins_gb), so it starts at the source's initial volume
+                # without the column capping it. The wave voice's column is
+                # NR32 (0/5/10/15) and soft-envelope notes carry their onset
+                # volume in the volume macro.
+                vol=(15 if h.voice != 2 and not h.soft_env else h.vol),
                 e5=e5,
                 pan=ev_pan,
                 end=h.off_sample,

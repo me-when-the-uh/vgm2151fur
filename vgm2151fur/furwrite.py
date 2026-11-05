@@ -903,8 +903,25 @@ def _write_ins_gb(b: Buf, name: str, ins) -> None:
         | (int(getattr(ins, "gb_env_vol", 0)) & 15)
     )
     b.u8(int(getattr(ins, "gb_sound_len", 63)) & 0xFF)
-    b.u8(1 if getattr(ins, "gb_soft_env", False) else 0)
-    b.u8(0)  # no hardware envelope sequence
+    soft = bool(getattr(ins, "gb_soft_env", False))
+    wave = bool(getattr(ins, "gb_wave", False))
+    b.u8(1 if soft else 0)
+    if soft or wave:
+        b.u8(0)  # no hardware envelope sequence
+    else:
+        # The pattern volume column is the maximum, so the note starts at 15.
+        # This sequence rewrites the hardware envelope to the source's initial
+        # volume (and length/direction) before the key-on write, so the column
+        # does not raise every drum to full level.
+        b.u8(1)
+        env_data = (
+            ((int(getattr(ins, "gb_sound_len", 63)) & 0xFF) << 8)
+            | ((int(getattr(ins, "gb_env_vol", 0)) & 15) << 4)
+            | ((int(getattr(ins, "gb_env_dir", 0)) & 1) << 3)
+            | (int(getattr(ins, "gb_env_len", 0)) & 7)
+        )
+        b.u8(0)  # DIV_GB_HWCMD_ENVELOPE
+        b.u16(env_data)
     b.b[gb_size:gb_size + 2] = int(len(b.b) - gb_start).to_bytes(2, "little")
     if getattr(ins, "gb_wave", False):
         b.raw(b"WS")

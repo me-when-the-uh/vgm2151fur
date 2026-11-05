@@ -65,6 +65,15 @@ nibble (which is the level the source audibly continues from) and carries the
 new period/direction. Keeping the original instrument would decay at the old
 rate and leave the note too loud for too long.
 
+The pattern volume column is the loudest level the note can reach, so a
+hardware-envelope pulse/noise note carries column 15. The instrument's
+*hardware sequence* then rewrites NRx2 to the source's initial volume,
+direction, period and length before the key-on write. Without that sequence
+the column would raise every drum to full level (or, if the column held the
+initial volume, a rising envelope would be capped). The wave voice's column
+is its NR32 level, and software-envelope notes carry their onset volume in
+the volume macro.
+
 Drivers often write NRx2 and NR51 at, or a sample or two after, the trigger.
 Those writes are folded into the note's opening envelope and pan (a tiny
 16-sample window). A frame-sized window would instead swallow the *next*

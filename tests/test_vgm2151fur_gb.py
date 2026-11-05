@@ -353,6 +353,47 @@ class TestGbWave(unittest.TestCase):
             (hits[0].env_vol, hits[0].env_dir, hits[0].env_len), (9, 0, 1),
         )
 
+    def test_hardware_envelope_column_is_max_with_hwseq(self):
+        # The pattern column is the ceiling (15); the instrument's hardware
+        # sequence restores the source's initial envelope so the note is not
+        # raised to full level.
+        writes = _noise_note(1000, 0x21, 0x16)
+        song = analyze(_vgm(writes))
+        ev = next(
+            e for e in song.events
+            if e.tone_chip == 6 and e.on and not e.tone_gb_wave
+            and not e.gb_soft_env
+        )
+        self.assertEqual(ev.vol, 15)
+        data = write_fur(song, include_pcm=True)
+        features = [
+            block for _o, mag, _s, block in iter_blocks(data) if mag == b"INS2"
+        ]
+        found = None
+        for block in features:
+            p = 4
+            if block[p:p + 2] == b"NA":
+                ln = struct.unpack_from("<H", block, p + 2)[0]
+                p += 4 + ln
+            while p + 4 <= len(block):
+                code = block[p:p + 2]
+                ln = struct.unpack_from("<H", block, p + 2)[0]
+                if code == b"GB":
+                    payload = block[p + 4:p + 4 + ln]
+                    found = payload
+                    break
+                if code == b"EN":
+                    break
+                p += 4 + ln
+            if found is not None:
+                break
+        self.assertIsNotNone(found)
+        self.assertEqual(found[3], 1)          # one hardware-sequence entry
+        cmd = found[4]
+        value = struct.unpack_from("<H", found, 5)[0]
+        self.assertEqual(cmd, 0)               # DIV_GB_HWCMD_ENVELOPE
+        self.assertEqual(value, (64 << 8) | (2 << 4) | (0 << 3) | 1)
+
     def test_wave_images_become_wavetables(self):
         wave_a = bytes(range(0x10, 0x20))
         wave_b = bytes(range(0x90, 0xA0))
