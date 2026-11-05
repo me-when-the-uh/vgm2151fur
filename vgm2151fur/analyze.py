@@ -4777,7 +4777,11 @@ def analyze(
                 # write). Otherwise the note stays at its key-on snapshot.
                 merged: list[tuple[int, int, int]] = []
                 for p in pts:
-                    if merged and p[0] - merged[-1][0] <= 16:
+                    # 64 samples (~1.5 ms) joins a partial f-num write:
+                    # drivers write the block/high byte and the low byte at
+                    # different samples, and the half-updated value would
+                    # otherwise become a short, wrong pitch step.
+                    if merged and p[0] - merged[-1][0] <= 64:
                         merged[-1] = p
                     else:
                         merged.append(p)
@@ -4865,12 +4869,13 @@ def analyze(
                             bit = 1 << c
                             if not (mask & bit):
                                 continue
+                            # A key-on is a 0->1 transition. A bit that stays
+                            # set is a still-held operator: the driver often
+                            # rewrites $28 while releasing other operators and
+                            # loads the next note's frequency into this one, so
+                            # a frequency change alone is not a retrigger.
                             fresh = not (prev & bit) or active is None
-                            changed = (
-                                active is not None
-                                and freqs[EXT_FREQ_OP[c]] != active[EXT_FREQ_OP[c]]
-                            )
-                            if not (fresh or changed):
+                            if not fresh:
                                 continue
                             close_opn_note((cid, ch, c), w.sample, off=False)
                             ins = intern_ext_patch(cid)
@@ -5175,7 +5180,11 @@ def analyze(
             if pts:
                 merged: list[tuple[int, int, int]] = []
                 for p in pts:
-                    if merged and p[0] - merged[-1][0] <= 16:
+                    # 64 samples (~1.5 ms) joins a partial f-num write:
+                    # drivers write the block/high byte and the low byte at
+                    # different samples, and the half-updated value would
+                    # otherwise become a short, wrong pitch step.
+                    if merged and p[0] - merged[-1][0] <= 64:
                         merged[-1] = p
                     else:
                         merged.append(p)
@@ -5335,12 +5344,13 @@ def analyze(
                             bit = 1 << c
                             if not (mask & bit):
                                 continue
+                            # A key-on is a 0->1 transition. A bit that stays
+                            # set is a still-held operator: the driver often
+                            # rewrites $28 while releasing other operators and
+                            # loads the next note's frequency into this one, so
+                            # a frequency change alone is not a retrigger.
                             fresh = not (prev & bit) or active is None
-                            changed = (
-                                active is not None
-                                and freqs[EXT_FREQ_OP[c]] != active[EXT_FREQ_OP[c]]
-                            )
-                            if not (fresh or changed):
+                            if not fresh:
                                 continue
                             close_opn_note((cid, ch, c), w.sample, off=False)
                             ins = intern_ext_patch(cid)
@@ -5747,7 +5757,11 @@ def analyze(
             if pts:
                 merged: list[tuple[int, int, int]] = []
                 for p in pts:
-                    if merged and p[0] - merged[-1][0] <= 16:
+                    # 64 samples (~1.5 ms) joins a partial f-num write:
+                    # drivers write the block/high byte and the low byte at
+                    # different samples, and the half-updated value would
+                    # otherwise become a short, wrong pitch step.
+                    if merged and p[0] - merged[-1][0] <= 64:
                         merged[-1] = p
                     else:
                         merged.append(p)

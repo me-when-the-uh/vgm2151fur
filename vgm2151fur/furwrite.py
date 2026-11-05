@@ -1601,13 +1601,13 @@ def _emit_steps(
     # One row can carry one transpose and one fine-tune step.  If the driver
     # wrote several f-nums inside one row, the last one is the row's pitch;
     # the intermediate values are shorter than a row and cannot be heard.
-    by_row: dict[int, int] = {}
+    by_row: dict[int, tuple[int, int]] = {}
     for t, delta in ev.pitch_steps:
-        row = song.place(t, stats)[0]
+        row, delay = song.place(t, stats)
         if row <= note_row:
             row = note_row + 1
         if 0 <= row < total_rows:
-            by_row[row] = delta
+            by_row[row] = (delta, delay)
     e5w = ev.e5
     xpose = 0
 
@@ -1638,13 +1638,18 @@ def _emit_steps(
     for idx, row in enumerate(targets):
         if row >= limit_row:
             break
-        delta = by_row[row]
+        delta, delay = by_row[row]
         next_row = targets[idx + 1] if idx + 1 < len(targets) else total_rows
         next_row = min(next_row, limit_row)
         cell = grid[ch].get(row)
         if cell is not None and 0 <= cell.note < 180:
             # A later note owns this row and carries its own pitch.
             continue
+        # A pitch step written inside a row must land on the driver's tick,
+        # not at the row start: at fast tempos the row is several
+        # milliseconds long and the difference is an audible early bend.
+        if delay > 0 and not any(c == 0xED for c, _v in (cell_at(row).fx or ())):
+            _add_fx(cell_at(row), 0xED, delay, fx_cols, stats)
         # E8xx/E9xx reach +-15 semitones, and a larger jump is split over
         # rows. Never borrow a row a later step owns. Its effect must land
         # there.

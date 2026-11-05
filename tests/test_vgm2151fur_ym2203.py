@@ -266,6 +266,68 @@ class TestYm2203ExtColumns(unittest.TestCase):
         )
         self.assertEqual(ons, [2, 3])   # operators 1 and 2
 
+    def _ext_chord(self):
+        """A four-operator channel-3 chord with a simple patch."""
+        w = []
+        for op in range(4):
+            w.append(ChipWrite(100, "ym2203", 0, 0x30 + op * 4, 0x01))
+            w.append(ChipWrite(101, "ym2203", 0, 0x50 + op * 4, 0x1F))
+            w.append(ChipWrite(102, "ym2203", 0, 0x60 + op * 4, 0x00))
+            w.append(ChipWrite(103, "ym2203", 0, 0x70 + op * 4, 0x1F))
+            w.append(ChipWrite(104, "ym2203", 0, 0x80 + op * 4, 0x1F))
+        w.append(ChipWrite(106, "ym2203", 0, 0xB2, 0x07))
+        w.append(ChipWrite(106, "ym2203", 0, 0x27, 0x40))   # 3-slot mode
+        w.append(ChipWrite(107, "ym2203", 0, 0xA6, (4 << 3) | 2))
+        w.append(ChipWrite(107, "ym2203", 0, 0xA2, 0x34))
+        w.append(ChipWrite(107, "ym2203", 0, 0xAC, (4 << 3) | 1))
+        w.append(ChipWrite(107, "ym2203", 0, 0xA8, 0x18))
+        w.append(ChipWrite(self.T_ON, "ym2203", 0, 0x28, 0xF2))
+        return w
+
+    def test_held_operator_is_not_retriggered_by_a_frequency_change(self):
+        # Betrayal releases operators by clearing their $28 mask bits while
+        # loading the next note's f-num into the same registers. The set bits
+        # are still-held operators, not new notes.
+        t = 230_000
+        ws = self._ext_chord() + [
+            ChipWrite(t, "ym2203", 0, 0xA6, (4 << 3) | 2),
+            ChipWrite(t, "ym2203", 0, 0xA2, 0x78),
+            ChipWrite(t, "ym2203", 0, 0xAC, (4 << 3) | 1),
+            ChipWrite(t, "ym2203", 0, 0xA8, 0x78),
+            ChipWrite(t, "ym2203", 0, 0x28, 0xD2),   # clear operator 2
+            ChipWrite(t, "ym2203", 0, 0x28, 0x92),   # clear operator 3
+            ChipWrite(t, "ym2203", 0, 0x28, 0x12),   # clear operator 4
+        ]
+        song = analyze(_vgm(ws), pcm=False)
+        retriggers = [e.ch for e in song.events
+                      if e.on and e.sample == t]
+        self.assertEqual(retriggers, [], "a release mask re-keyed a held column")
+        ends = {e.ch: e.end for e in song.events
+                if e.on and e.sample == self.T_ON}
+        self.assertEqual(ends[3], t)   # column 1 released
+        self.assertEqual(ends[4], t)   # column 2 released
+        self.assertEqual(ends[5], t)   # column 3 released
+        self.assertFalse(ends.get(2), "column 0 is still held")
+
+    def test_split_fnum_write_does_not_make_a_pitch_step(self):
+        # The block/high byte and the low byte of one f-num are often written
+        # a millisecond apart. The half-updated value is not a pitch step.
+        t = 230_000
+        ws = self._ext_chord() + [
+            ChipWrite(t, "ym2203", 0, 0xAC, (4 << 3) | 4),  # high byte
+            ChipWrite(t + 44, "ym2203", 0, 0xA8, 0x78),     # low byte
+        ]
+        song = analyze(_vgm(ws), pcm=False)
+        ev = next(e for e in song.events if e.on and e.ch == 4)
+        self.assertFalse(
+            any(p[0] == t for p in ev.fm_pitch_pts),
+            ev.fm_pitch_pts,
+        )
+        self.assertTrue(
+            any(p == (t + 44, 4, 0x478) for p in ev.fm_pitch_pts),
+            ev.fm_pitch_pts,
+        )
+
     def test_each_column_keeps_its_own_operator_level(self):
         got = [p.tl & 0x7F for p in self.patch.ops]
         # $42,$46,$4A,$4E are ops[0..3] in register order; only $4A moved.
@@ -391,7 +453,7 @@ class TestYm2203Analyze(unittest.TestCase):
             ChipWrite(30000, "ym2203", 0, 0xA4, (4 << 3) | ((1250 >> 8) & 7)),
             ChipWrite(30000, "ym2203", 0, 0xA0, 1250 & 0xFF),
         ]
-        song = analyze(_vgm(ws, ym2203_clock=CLOCK))
+        song = analyze(_vgm(ws, ym2203_clock=CLOCK), speed=2)
         ev = next(e for e in song.events if e.on)
         self.assertGreaterEqual(len(ev.fm_pitch_pts), 2)
         self.assertTrue(ev.pitch_steps)
@@ -403,6 +465,10 @@ class TestYm2203Analyze(unittest.TestCase):
             for row in rows for cmd, value in (row.fx or ())
         ]
         self.assertTrue(any(cmd in (0xE5, 0xE8, 0xE9) for cmd, _v in fx), fx)
+        # The step lands on the driver's tick of the row, not at its start.
+        _row, delay = song.place(30000, {})
+        self.assertGreater(delay, 0, "pick a step inside a row for this test")
+        self.assertIn((0xED, delay), fx)
 
     def test_long_pitch_sweep_becomes_pitch_macro(self):
         ws = _fm_note(4, 1204, off=60000)
