@@ -80,6 +80,12 @@ GB core inverts every nibble when it loads a wavetable (the DAC is inverted),
 so the writer stores the complement to make the exported wave RAM match the
 source bytes.
 
+A wave trigger counts even when NR32 (output level) is still 0: some drivers
+start the voice muted and raise the level a few samples later. NR32 changes
+while the voice is open become volume-column steps, including the mute gaps.
+A frequency write just after the trigger is the note's base pitch rather than
+a bend, because those same drivers set NRx3/NRx4 right after the trigger.
+
 ## Stereo
 
 NR51's per-channel L/R enables map to Furnace's `08xy` (binary left/right);

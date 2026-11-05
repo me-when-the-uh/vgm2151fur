@@ -247,6 +247,53 @@ class TestGbWave(unittest.TestCase):
     def _wave_cmds(sample, image: bytes):
         return [_gb(sample, 0x20 + i, b) for i, b in enumerate(image)]
 
+    def test_wave_trigger_while_muted_starts_at_the_level_rise(self):
+        # Kirby's Dream Land 2 starts the wave voice with NR32 = 0 and raises
+        # the output level a few samples later. The rise starts the note.
+        img = bytes(range(0x10, 0x20))
+        writes = [_gb(0, 0x20 + i, b) for i, b in enumerate(img)]
+        writes += [
+            _gb(0, 0x0A, 0x80), _gb(0, 0x0C, 0x00),
+            _gb(0, 0x0D, 0x00), _gb(0, 0x0E, 0x80),
+        ]
+        writes += [_gb(100, 0x0C, 0x40)]
+        hits, _o, _w, _warn = collect_gb(_vgm(writes))
+        wave = [h for h in hits if h.voice == 2]
+        self.assertEqual(len(wave), 1)
+        self.assertEqual(wave[0].sample_time, 100)
+        self.assertEqual(wave[0].vol, 10)
+
+    def test_wave_mute_is_a_note_off(self):
+        # NR32 = 0 gates the voice; the next level starts a new note instead
+        # of one long note with silent volume steps.
+        img = bytes(range(0x10, 0x20))
+        writes = [_gb(0, 0x20 + i, b) for i, b in enumerate(img)]
+        writes += [
+            _gb(0, 0x0A, 0x80), _gb(0, 0x0C, 0x40),
+            _gb(0, 0x0D, 0x00), _gb(0, 0x0E, 0x80),
+            _gb(500, 0x0C, 0x00), _gb(900, 0x0C, 0x40),
+        ]
+        hits, offs, _w, _warn = collect_gb(_vgm(writes))
+        wave = [h for h in hits if h.voice == 2]
+        self.assertEqual(len(wave), 2)
+        self.assertEqual(wave[0].off_sample, 500)
+        self.assertEqual(wave[1].sample_time, 900)
+        self.assertIn((500, 2), [(o.sample_time, o.voice) for o in offs])
+
+    def test_wave_pitch_set_after_muted_trigger_is_the_base(self):
+        img = bytes(range(0x10, 0x20))
+        writes = [_gb(0, 0x20 + i, b) for i, b in enumerate(img)]
+        writes += [
+            _gb(0, 0x0A, 0x80), _gb(0, 0x0C, 0x00),
+            _gb(0, 0x0D, 0x00), _gb(0, 0x0E, 0x80),
+            _gb(100, 0x0C, 0x40),
+            _gb(200, 0x0D, 0x51), _gb(200, 0x0E, 0x04),
+        ]
+        hits, _o, _w, _warn = collect_gb(_vgm(writes))
+        wave = [h for h in hits if h.voice == 2][0]
+        self.assertEqual(wave.period, 0x451)
+        self.assertEqual(wave.pitch_pts, [])
+
     def test_wave_images_become_wavetables(self):
         wave_a = bytes(range(0x10, 0x20))
         wave_b = bytes(range(0x90, 0xA0))

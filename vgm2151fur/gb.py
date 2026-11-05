@@ -39,6 +39,9 @@ GB_PITCH_DIVIDER = 16
 GB_MAX_PERIOD = 0x7FF
 # Shorter than this is a click/housekeeping gate, not a note.
 GB_MIN_NOTE = 100
+# A pitch write this soon after the trigger is the note's real base, not a
+# bend (drivers often set the frequency just after starting the voice).
+GB_REFIT_SAMPLES = 735
 # Two mid-note NRx2 writes mean the driver is doing a software volume ramp.
 GB_SOFT_ENV_WRITES = 2
 
@@ -262,6 +265,7 @@ def collect_gb(
     noise_period = 0
     noise_width = 0
     wave_on = False
+    wave_started = False
     wave_vol = 0
     sweep = 0
     pan = [0xFF, 0xFF, 0xFF, 0xFF]
@@ -315,7 +319,10 @@ def collect_gb(
         stays audible.
         """
         if voice == 2:
-            return wave_on and wave_volume(wave_vol) > 0
+            # A wave trigger with NR32 = 0 is muted; the note starts when the
+            # output level rises (see the NR32 branch). A trigger while the
+            # level is up starts a normal note.
+            return wave_on and current_wave >= 0 and wave_volume(wave_vol) > 0
         e = env[voice]
         if (e & 0xF8) == 0:
             return False
@@ -418,6 +425,12 @@ def collect_gb(
         if period[voice] == prev_period[voice]:
             return
         prev_period[voice] = period[voice]
+        # A pitch write just after the trigger is the note's real base, not a
+        # bend. This matters for a voice started muted whose frequency is set
+        # a few samples before the output level rises (Kirby DL2 wave).
+        if t - hit.sample_time <= GB_REFIT_SAMPLES and not hit.pitch_pts:
+            hit.period = period[voice]
+            return
         # A frequency write without a trigger keeps the hardware envelope
         # running. It is a pitch bend, not a new note: splitting here (an
         # arpeggio, for instance) would restart the envelope at the note's
@@ -484,6 +497,8 @@ def collect_gb(
             period[voice] = (period[voice] & 0xFF) | ((val & 7) << 8)
             length_en[voice] = bool(val & 0x40)
             if val & 0x80:
+                if voice == 2:
+                    wave_started = True
                 trigger(voice, t)
             else:
                 record_pitch(voice, t)
@@ -492,17 +507,32 @@ def collect_gb(
             wave_on = bool(val & 0x80)
             length_val[2] = val & 0x3F
             if was_on and not wave_on:
+                wave_started = False
                 close(2, t)
         elif reg == REG_W_LEN:
             length_val[2] = val
             length_en[2] = bool(val & 0x40)
         elif reg == REG_W_VOL:
             wave_vol = val
+            v = wave_volume(val)
             hit = active[2]
             if hit is not None and t > hit.sample_time:
-                v = wave_volume(val)
-                if v != hit.vol:
-                    hit.vol_pts.append((t, v))
+                if v == 0:
+                    # NR32 = 0 mutes the voice. Treat it as a note-off so the
+                    # next output level starts a fresh note instead of one
+                    # enormous note carrying silent volume steps and a long
+                    # pitch macro.
+                    close(2, t)
+                else:
+                    last = hit.vol_pts[-1][1] if hit.vol_pts else hit.vol
+                    if v != last:
+                        hit.vol_pts.append((t, v))
+            elif v > 0 and wave_started and wave_on and current_wave >= 0:
+                # The voice was triggered while muted (Kirby's Dream Land 2
+                # sets NR32 = 0, triggers, then raises NR32 a few samples
+                # later). The level rising starts the note; the pitch write
+                # that follows is folded in as the note's base.
+                open_hit(2, t)
         elif reg == REG_N_LEN:
             length_val[3] = val & 0x3F
             length_en[3] = bool(val & 0x40)
