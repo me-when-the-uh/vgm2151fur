@@ -111,13 +111,24 @@ def gb_period_delta(base: int, new: int) -> int:
 def gb_noise_note(nr43: int) -> int:
     """Furnace's noise column for an NR43 value.
 
-    The platform's noise table only covers shift 0-15 with dividers 4-7 (plus
-    the shift-0 row).  A value outside it picks the closest representable
-    frequency; those are the inaudible top of the range.
+    The platform's noise table is a lookup indexed by ``note - 60``; the note
+    name is not a 12-TET pitch.  Each chromatic step moves the hardware rate by
+    two to four semitones (and the last few steps by up to an octave), so the
+    converter selects the table entry whose period matches NR43 instead of
+    transposing by note.
+
+    The table also starts with a duplicate of the fastest rate (period 0.5) at
+    C-0, and only covers shift 0-15 with dividers 4-7 (plus the shift-0 row).
+    Furnace renders the entries faster than period 8 as a near-DC rumble, not
+    noise, so the top of the range is folded onto C-5 (period 8), the fastest
+    rate that still reads as noise.  This is what makes the noise note appear
+    at C-5 rather than C-0.  Slower values keep their relative pitch below it.
     """
     value = nr43 & 0xF7
     try:
-        pos = _NOISE_TABLE.index(value)
+        # Skip the leading duplicate so NR43=0 uses the real end-of-table
+        # entry rather than the C-0 alias.
+        pos = _NOISE_TABLE.index(value, 1)
     except ValueError:
         want = _noise_period(value)
         pos = min(
@@ -127,7 +138,9 @@ def gb_noise_note(nr43: int) -> int:
                 - math.log2(max(1e-9, want))
             ),
         )
-    return 60 + pos
+    if pos == 0:
+        pos = len(_NOISE_TABLE) - 1
+    return 60 + min(pos, 60)
 
 
 def _noise_period(nr43: int) -> float:

@@ -36,10 +36,19 @@ becomes a pitch macro (this is how the drivers build arpeggios). Splitting
 those would restart the envelope and hold notes the source lets decay.
 
 Noise has no period register: `gb_noise_note` inverts Furnace's `noiseTable`.
-The table covers shift 0-15 with dividers 4-7 plus the shift-0 row; an NR43
-outside it picks the nearest representable hardware period (usually a
-different encoding of the same inaudible high frequency). The LFSR width bit
-becomes the `12xx` duty effect.
+The note number is a table index, not a 12-TET pitch: each chromatic step moves
+the hardware rate by two to four semitones (and the last few steps by up to an
+octave). The table covers shift 0-15 with dividers 4-7 plus the shift-0 row; an
+NR43 outside it picks the nearest representable hardware period.
+
+The table's C-0 entry is a duplicate of the fastest rate (period 0.5), but
+Furnace renders the entries faster than period 8 as a near-DC rumble rather
+than noise. The converter therefore folds that top of the range onto **C-5**
+(period 8), the fastest rate that still sounds like noise, and keeps slower
+values on lower notes with their relative pitch. This is why the noise column
+shows C-5 instead of C-0. The LFSR width bit becomes the `12xx` duty effect.
+An exported VGM therefore writes the folded (slower) NR43 for those top notes,
+trading bit-exactness for an audible Furnace render.
 
 ## Envelopes and "zombie mode"
 

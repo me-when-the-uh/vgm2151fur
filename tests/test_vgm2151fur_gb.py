@@ -255,6 +255,17 @@ class TestGbNotes(unittest.TestCase):
             gb_noise_note(0x01) - 60,
         )
 
+    def test_fast_noise_notes_fold_to_c5(self):
+        # The platform's C-0 entry is the fastest rate (period 0.5), but
+        # Furnace renders it as a near-DC rumble.  The converter keeps the
+        # top of the noise range at C-5 (period 8), the fastest rate that
+        # still sounds like noise.
+        for nr43 in (0x00, 0x04, 0x08, 0x18, 0x22):
+            self.assertEqual(gb_noise_note(nr43), 120, hex(nr43))
+        # Slower rates keep their relative pitch below C-5.
+        self.assertEqual(gb_noise_note(0x5E), 102)   # shift 5 / divider 6
+        self.assertLess(gb_noise_note(0x5E), 120)
+
     def test_pan_from_nr51(self):
         writes = [_gb(900, 0x15, 0x10)]  # ch1 left only, before the note
         writes += _note(1000, 0xF0)
