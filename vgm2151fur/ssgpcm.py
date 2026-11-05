@@ -90,6 +90,12 @@ STREAM_CHIP = {
 # same voice so the source audio is kept instead of disappearing; a short
 # DAC-stream play is dropped outright.
 PCM_MIN_FRAMES = 128
+# Only bodies longer than this are candidates for the DC drop/trim; short
+# percussion hits must keep their exact shape.
+SSG_PCM_DC_MIN_LEN = 2048
+# Pointers this close into the same bank range are the same sample with a
+# few-frame start shift, not distinct bodies.
+SSG_PCM_OFFSET_TOLERANCE = 4
 
 
 @dataclass
@@ -335,14 +341,19 @@ def _body_frames(seg: list[tuple[int, int]], rate: int) -> int:
     return max(1, int(round(span * rate / VGM_RATE)) + 1)
 
 
-def _dc_fraction(data: bytes) -> float:
-    """Fraction of the body at its most common level (the DC offset)."""
+def _longest_run(data: bytes) -> int:
+    """Longest consecutive run of one level."""
     if not data:
-        return 1.0
-    counts = [0] * 256
-    for b in data:
-        counts[b] += 1
-    return max(counts) / len(data)
+        return 0
+    best = cur = 1
+    for i in range(1, len(data)):
+        if data[i] == data[i - 1]:
+            cur += 1
+            if cur > best:
+                best = cur
+        else:
+            cur = 1
+    return best
 
 
 def _trim_dc(data: bytes) -> bytes:
@@ -350,14 +361,15 @@ def _trim_dc(data: bytes) -> bytes:
 
     A stream play can declare a long length whose tail is just the held AY
     level: a short transient followed by a flat line.  If more than 80% of
-    the body sits at one level, it is a DC offset rather than audio and the
-    whole body is dropped.  Otherwise trim a trailing constant run when it is
-    at least half the body and at least 64 frames, and reject a body that is
-    one level throughout or a bare step between two levels.
+    the body is one consecutive run at a single level, it is a DC offset
+    rather than audio and the whole body is dropped.  Otherwise trim a
+    trailing constant run when it is at least half the body and at least 64
+    frames, and reject a body that is one level throughout or a bare step
+    between two levels.
     """
-    if len(data) < 2:
+    if len(data) <= SSG_PCM_DC_MIN_LEN:
         return data
-    if _dc_fraction(data) > 0.80:
+    if _longest_run(data) > len(data) * 0.80:
         return b""
     last = data[-1]
     start = len(data) - 1
@@ -366,7 +378,7 @@ def _trim_dc(data: bytes) -> bytes:
     if start == 0:
         return data[:1]  # one constant level throughout
     run = len(data) - start
-    if run >= 64 and run * 2 >= len(data):
+    if run >= 64 and run * 2 >= len(data) - 2:
         trimmed = data[:start + 1]
         if len(set(trimmed)) < 2:
             return trimmed[:1]
@@ -491,33 +503,58 @@ def collect_ssg_pcm(
     # once and let each play's stop cut it, the same rule the banked YM2612
     # DAC path uses.  Trim a held DC tail first: a long declared play is often
     # a short transient followed by the register's constant level.
+    #
+    # A driver can also latch a pointer a few bytes into the same sample.
+    # Cluster offsets within SSG_PCM_OFFSET_TOLERANCE so those become one
+    # body with a few-frame start shift instead of adjacent duplicates.  Use
+    # one median stream rate per chip; the log's integer rates differ by a
+    # hertz or two and would otherwise resample the same source into distinct
+    # arrays.
     stream_groups: dict[
         tuple[int, int], list[tuple[int, int, list[tuple[int, int]]]]
     ] = {}
+    stream_rates: dict[int, list[int]] = {}
     for cid, voice, rate, points, offset in streamed:
         if len(points) < 2 or _body_frames(points, rate) < PCM_MIN_FRAMES:
             continue
         stream_groups.setdefault((cid, offset), []).append(
             (voice, rate, points)
         )
-    for (cid, _offset), takes in stream_groups.items():
-        rates = sorted(rate for _v, rate, _p in takes)
+        stream_rates.setdefault(cid, []).append(rate)
+    for cid in sorted(stream_rates):
+        offsets = sorted(off for c, off in stream_groups if c == cid)
+        clusters: list[list[int]] = []
+        current: list[int] = []
+        for off in offsets:
+            if current and off - current[-1] <= SSG_PCM_OFFSET_TOLERANCE:
+                current.append(off)
+            else:
+                if current:
+                    clusters.append(current)
+                current = [off]
+        if current:
+            clusters.append(current)
+        rates = sorted(stream_rates[cid])
         rate = rates[len(rates) // 2]
-        candidates = []
-        for voice, _take_rate, points in takes:
-            data = _trim_dc(_resample(points, rate))
-            if len(data) >= 2:
-                candidates.append((voice, points, data))
-        if not candidates:
-            continue
-        voice, seg, data = max(candidates, key=lambda c: len(c[2]))
-        plays = [
-            (hit_voice, pts[0][0], pts[-1][0])
-            for hit_voice, _rate, pts in takes
-        ]
-        all_segments.append((
-            cid, voice, rate, data, seg[0][0], seg[-1][0], plays,
-        ))
+        for cluster in clusters:
+            takes = [
+                take for off in cluster for take in stream_groups[(cid, off)]
+            ]
+            candidates = []
+            for voice, _take_rate, points in takes:
+                data = _trim_dc(_resample(points, rate))
+                if len(data) >= 2:
+                    candidates.append((voice, points, data))
+            if not candidates:
+                continue
+            voice, seg, data = max(candidates, key=lambda c: len(c[2]))
+            plays = [
+                (hit_voice, pts[0][0], pts[-1][0])
+                for hit_voice, _rate, pts in takes
+            ]
+            all_segments.append((
+                cid, voice, rate, data, seg[0][0], seg[-1][0], plays,
+            ))
 
     samples: list[SsgPcmSample] = []
     hits: list[SsgPcmHit] = []

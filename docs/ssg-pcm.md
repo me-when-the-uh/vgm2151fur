@@ -61,17 +61,25 @@ Plays that start at the **same bank offset** read the same source from the
 start, so a short play is a prefix of the longest one.  The collector stores
 the longest body once and gives each play its own hit; the hit's `end_time`
 becomes the note-off that cuts the longer body at the shorter play's stop.
-This is the same rule the banked YM2612 DAC path uses.  On the Rusty title
-rip it cuts 104 bodies to 57 without changing the 758 hits.
+This is the same rule the banked YM2612 DAC path uses.  Offsets within
+`SSG_PCM_OFFSET_TOLERANCE` bytes are the same sample with a few-frame start
+shift, so they join the same cluster; one median stream rate per chip keeps
+the log's ±1 Hz rate jitter from resampling the same source into separate
+arrays.  On the Rusty title rip this cuts 104 bodies to 34 without changing
+the 758 hits.
 
 Before a body is stored, `_trim_dc` drops a mostly-constant tail: a stream
 play often declares a long length whose remainder is just the held register
-level, so the body is a short peak followed by a flat DC line.  If more than
-80% of the body sits at one level, the body is a DC offset rather than audio
-and is dropped.  Otherwise a trailing constant run of at least 64 frames and
-at least half the body is trimmed to one frame, and a body that is one level
-throughout (or only a step between two levels) is dropped.  This keeps the
-transient instead of spending a sample slot on the DC offset.
+level, so the body is a short peak followed by a flat DC line.  The rule only
+applies to bodies longer than 2,048 frames; shorter percussion hits keep
+their exact shape.  For a longer body, if more than 80% of it is one
+**consecutive** run at a single level, the body is a DC offset rather than
+audio and is dropped; a waveform that merely spends most of its time at one
+level but keeps returning to other values is kept.  Otherwise a trailing
+constant run of at least 64 frames and at least half the body is trimmed to
+one frame, and a body that is one level throughout (or only a step between
+two levels) is dropped.  This keeps the transient instead of spending a
+sample slot on the DC offset.
 
 The DAC-mode condition is what separates the two uses of one channel: in
 `02 Blood Soon Castle [Intro]` the voice plays a normal tone with a slow

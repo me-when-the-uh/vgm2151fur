@@ -219,6 +219,33 @@ class TestSsgPcmDacStream(unittest.TestCase):
         )
         self.assertEqual({h.sample_index for h in hits}, {0})
 
+    def test_near_offsets_share_a_body(self):
+        # A pointer a few bytes into the same sample is a start shift, not a
+        # second body.
+        body = bytes([(i // 4) % 16 for i in range(3000)])
+        vgm = self._stream(body, length=2000, sample=1000)
+        vgm.dac_stream_plays.append(DacStreamPlay(
+            sample=10000, chip_type=0x06, chip_id=0, stream=0,
+            port=0, reg=10, offset=4, length=2000, mode=1,
+            rate=15964, loop=False, reverse=False, step=1,
+            step_base=0, bank=0,
+        ))
+        samples, hits, _warn = collect_ssg_pcm(vgm, chip="ym2203_ssg")
+        self.assertEqual(len(samples), 1)
+        self.assertEqual(len(hits), 2)
+
+    def test_distant_offsets_stay_separate(self):
+        body = bytes([(i // 4) % 16 for i in range(3000)])
+        vgm = self._stream(body, length=1000, sample=1000)
+        vgm.dac_stream_plays.append(DacStreamPlay(
+            sample=10000, chip_type=0x06, chip_id=0, stream=0,
+            port=0, reg=10, offset=8, length=1000, mode=1,
+            rate=15964, loop=False, reverse=False, step=1,
+            step_base=0, bank=0,
+        ))
+        samples, _hits, _warn = collect_ssg_pcm(vgm, chip="ym2203_ssg")
+        self.assertEqual(len(samples), 2)
+
     def test_stream_levels_round_trip(self):
         body = bytes([0, 15] * 600)
         vgm = self._stream(body)
@@ -251,12 +278,20 @@ class TestSsgPcmDacStream(unittest.TestCase):
 
     def test_dc_tail_is_trimmed(self):
         # 50% DC: keep the body but drop the trailing flat half.
+        body = bytes([15] * 1500 + [0] * 1500)
+        vgm = self._stream(body, length=len(body), rate=15964)
+        samples, hits, _warn = collect_ssg_pcm(vgm, chip="ym2203_ssg")
+        self.assertEqual(len(hits), 1)
+        self.assertGreater(len(samples[0].data), 1400)
+        self.assertLess(len(samples[0].data), 1700)
+
+    def test_short_body_is_left_alone(self):
+        # 2,048 frames or fewer keep their exact shape even with a DC tail.
         body = bytes([15] * 1000 + [0] * 1000)
         vgm = self._stream(body, length=len(body), rate=15964)
         samples, hits, _warn = collect_ssg_pcm(vgm, chip="ym2203_ssg")
         self.assertEqual(len(hits), 1)
-        self.assertGreater(len(samples[0].data), 900)
-        self.assertLess(len(samples[0].data), 1300)
+        self.assertGreater(len(samples[0].data), 1900)
 
     def test_pure_dc_stream_is_dropped(self):
         body = bytes([15] * 3000)
@@ -371,13 +406,13 @@ class TestSsgPcmRealRips(unittest.TestCase):
     @unittest.skipUnless(
         Path(r"D:\Downloads\rforce.vgm").is_file(), "rforce.vgm missing"
     )
-    def test_rforce_drops_the_dc_voice(self):
-        # Voice 0's body is ~96% one level (a flat DC offset); it is dropped
-        # instead of spending a sample slot on the flat line.
+    def test_rforce_all_three_voices(self):
+        # Voice 0 is 96% one level overall, but its longest consecutive run
+        # is only 31%, so it is a real waveform and is kept.
         vgm = load_vgm(Path(r"D:\Downloads\rforce.vgm"))
         samples, hits, _warn = collect_ssg_pcm(vgm, chip="ym2203_ssg")
-        self.assertEqual(len(samples), 2)
-        self.assertEqual(sorted(s.voice for s in samples), [1, 2])
+        self.assertEqual(len(samples), 3)
+        self.assertEqual(sorted(s.voice for s in samples), [0, 1, 2])
 
     @unittest.skipUnless(
         Path(r"F:\NASbackup\JamesAlan\_devspace\grbsd\SELECT-ay.vgm").is_file(),
