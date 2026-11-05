@@ -335,6 +335,45 @@ def _body_frames(seg: list[tuple[int, int]], rate: int) -> int:
     return max(1, int(round(span * rate / VGM_RATE)) + 1)
 
 
+def _dc_fraction(data: bytes) -> float:
+    """Fraction of the body at its most common level (the DC offset)."""
+    if not data:
+        return 1.0
+    counts = [0] * 256
+    for b in data:
+        counts[b] += 1
+    return max(counts) / len(data)
+
+
+def _trim_dc(data: bytes) -> bytes:
+    """Drop DC-heavy bodies and trim a mostly-constant tail.
+
+    A stream play can declare a long length whose tail is just the held AY
+    level: a short transient followed by a flat line.  If more than 80% of
+    the body sits at one level, it is a DC offset rather than audio and the
+    whole body is dropped.  Otherwise trim a trailing constant run when it is
+    at least half the body and at least 64 frames, and reject a body that is
+    one level throughout or a bare step between two levels.
+    """
+    if len(data) < 2:
+        return data
+    if _dc_fraction(data) > 0.80:
+        return b""
+    last = data[-1]
+    start = len(data) - 1
+    while start > 0 and data[start - 1] == last:
+        start -= 1
+    if start == 0:
+        return data[:1]  # one constant level throughout
+    run = len(data) - start
+    if run >= 64 and run * 2 >= len(data):
+        trimmed = data[:start + 1]
+        if len(set(trimmed)) < 2:
+            return trimmed[:1]
+        return trimmed
+    return data
+
+
 def _merge_short(
     segments: list[list[tuple[int, int]]], rate: int,
 ) -> list[list[tuple[int, int]]]:
@@ -418,11 +457,11 @@ def collect_ssg_pcm(
                 segments.append((voice, seg))
         return segments
 
-    # (chip, voice, rate, body, hits), where each hit is its own
-    # (voice, start, end).  Direct-write segments have one hit; a bank range
-    # shared by several stream plays gets one body and many hits.
+    # (chip, voice, rate, body data, start, end, hits), where each hit is its
+    # own (voice, start, end).  Direct-write segments have one hit; a bank
+    # range shared by several stream plays gets one body and many hits.
     all_segments: list[tuple[
-        int, int, int, list[tuple[int, int]], list[tuple[int, int, int]],
+        int, int, int, bytes, int, int, list[tuple[int, int, int]],
     ]] = []
     for cid in sorted(per_chip):
         gap = PCM_SPLIT_GAP
@@ -439,15 +478,19 @@ def collect_ssg_pcm(
             by_voice.setdefault(voice, []).append(seg)
         for voice, segs in by_voice.items():
             for seg in _merge_short(segs, rate):
+                data = _trim_dc(_resample(seg, rate))
+                if len(data) < 2:
+                    continue
                 all_segments.append((
-                    cid, voice, rate, seg,
+                    cid, voice, rate, data, seg[0][0], seg[-1][0],
                     [(voice, seg[0][0], seg[-1][0])],
                 ))
 
     # Plays that start at the same bank offset read the same source from the
     # start; a short one is a prefix of the longest.  Store the longest body
     # once and let each play's stop cut it, the same rule the banked YM2612
-    # DAC path uses.  A body under the minimum is still not worth storing.
+    # DAC path uses.  Trim a held DC tail first: a long declared play is often
+    # a short transient followed by the register's constant level.
     stream_groups: dict[
         tuple[int, int], list[tuple[int, int, list[tuple[int, int]]]]
     ] = {}
@@ -460,35 +503,39 @@ def collect_ssg_pcm(
     for (cid, _offset), takes in stream_groups.items():
         rates = sorted(rate for _v, rate, _p in takes)
         rate = rates[len(rates) // 2]
-        voice, _long_rate, seg = max(
-            takes, key=lambda t: _body_frames(t[2], t[1]),
-        )
+        candidates = []
+        for voice, _take_rate, points in takes:
+            data = _trim_dc(_resample(points, rate))
+            if len(data) >= 2:
+                candidates.append((voice, points, data))
+        if not candidates:
+            continue
+        voice, seg, data = max(candidates, key=lambda c: len(c[2]))
         plays = [
-            (voice, pts[0][0], pts[-1][0])
-            for voice, _rate, pts in takes
+            (hit_voice, pts[0][0], pts[-1][0])
+            for hit_voice, _rate, pts in takes
         ]
-        all_segments.append((cid, voice, rate, seg, plays))
+        all_segments.append((
+            cid, voice, rate, data, seg[0][0], seg[-1][0], plays,
+        ))
 
     samples: list[SsgPcmSample] = []
     hits: list[SsgPcmHit] = []
-    for cid, voice, rate, seg, plays in all_segments:
-        data = _resample(seg, rate)
-        if len(data) < 2:
-            continue
+    for cid, voice, rate, data, start, end, plays in all_segments:
         idx = len(samples)
         samples.append(SsgPcmSample(
-            name=f"SSG {cid:02d} {voice + 1} {seg[0][0]:08x}",
+            name=f"SSG {cid:02d} {voice + 1} {start:08x}",
             data=data,
             rate=rate,
-            start=seg[0][0],
-            end=seg[-1][0],
+            start=start,
+            end=end,
             voice=voice,
             chip_id=cid,
         ))
-        for hit_voice, start, end in plays:
+        for hit_voice, hit_start, hit_end in plays:
             hits.append(SsgPcmHit(
-                sample_time=start,
-                end_time=end,
+                sample_time=hit_start,
+                end_time=hit_end,
                 voice=hit_voice,
                 chip_id=cid,
                 sample_index=idx,

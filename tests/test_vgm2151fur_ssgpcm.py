@@ -235,12 +235,34 @@ class TestSsgPcmDacStream(unittest.TestCase):
         self.assertEqual((samples, hits), ([], []))
 
     def test_millisecond_length_mode(self):
-        body = bytes([15] * 3000)
+        body = bytes([(i // 8) % 16 for i in range(3000)])
         # 100 ms at 15964 Hz = 1596 bytes of the bank.
         vgm = self._stream(body, length=100, mode=2)
         samples, hits, _warn = collect_ssg_pcm(vgm, chip="ym2203_ssg")
         self.assertEqual(len(hits), 1)
         self.assertGreater(len(samples[0].data), 1400)
+
+    def test_high_dc_stream_is_dropped(self):
+        # A tiny peak followed by a flat DC tail is not worth a sample slot.
+        body = bytes([15] * 200 + [0] * 4000)
+        vgm = self._stream(body, length=len(body), rate=15964)
+        samples, hits, _warn = collect_ssg_pcm(vgm, chip="ym2203_ssg")
+        self.assertEqual((samples, hits), ([], []))
+
+    def test_dc_tail_is_trimmed(self):
+        # 50% DC: keep the body but drop the trailing flat half.
+        body = bytes([15] * 1000 + [0] * 1000)
+        vgm = self._stream(body, length=len(body), rate=15964)
+        samples, hits, _warn = collect_ssg_pcm(vgm, chip="ym2203_ssg")
+        self.assertEqual(len(hits), 1)
+        self.assertGreater(len(samples[0].data), 900)
+        self.assertLess(len(samples[0].data), 1300)
+
+    def test_pure_dc_stream_is_dropped(self):
+        body = bytes([15] * 3000)
+        vgm = self._stream(body, length=len(body), rate=15964)
+        samples, hits, _warn = collect_ssg_pcm(vgm, chip="ym2203_ssg")
+        self.assertEqual((samples, hits), ([], []))
 
     def test_stop_sample_ends_the_play_early(self):
         body = bytes([(i // 8) % 16 for i in range(3000)])
@@ -349,11 +371,13 @@ class TestSsgPcmRealRips(unittest.TestCase):
     @unittest.skipUnless(
         Path(r"D:\Downloads\rforce.vgm").is_file(), "rforce.vgm missing"
     )
-    def test_rforce_all_three_voices(self):
+    def test_rforce_drops_the_dc_voice(self):
+        # Voice 0's body is ~96% one level (a flat DC offset); it is dropped
+        # instead of spending a sample slot on the flat line.
         vgm = load_vgm(Path(r"D:\Downloads\rforce.vgm"))
         samples, hits, _warn = collect_ssg_pcm(vgm, chip="ym2203_ssg")
-        self.assertEqual(len(samples), 3)
-        self.assertEqual(sorted(s.voice for s in samples), [0, 1, 2])
+        self.assertEqual(len(samples), 2)
+        self.assertEqual(sorted(s.voice for s in samples), [1, 2])
 
     @unittest.skipUnless(
         Path(r"F:\NASbackup\JamesAlan\_devspace\grbsd\SELECT-ay.vgm").is_file(),

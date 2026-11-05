@@ -64,6 +64,15 @@ becomes the note-off that cuts the longer body at the shorter play's stop.
 This is the same rule the banked YM2612 DAC path uses.  On the Rusty title
 rip it cuts 104 bodies to 57 without changing the 758 hits.
 
+Before a body is stored, `_trim_dc` drops a mostly-constant tail: a stream
+play often declares a long length whose remainder is just the held register
+level, so the body is a short peak followed by a flat DC line.  If more than
+80% of the body sits at one level, the body is a DC offset rather than audio
+and is dropped.  Otherwise a trailing constant run of at least 64 frames and
+at least half the body is trimmed to one frame, and a body that is one level
+throughout (or only a step between two levels) is dropped.  This keeps the
+transient instead of spending a sample slot on the DC offset.
+
 The DAC-mode condition is what separates the two uses of one channel: in
 `02 Blood Soon Castle [Intro]` the voice plays a normal tone with a slow
 volume ramp for the first minute, then the mixer turns its tone off and the
