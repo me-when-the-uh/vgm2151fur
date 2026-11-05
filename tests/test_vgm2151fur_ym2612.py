@@ -431,6 +431,23 @@ class TestYm2612DacSlices(unittest.TestCase):
         self.assertEqual(song.dac_samples[0].data[0], 0x30)
         self.assertEqual(song.dac_samples[0].data[-1], 0x00)
 
+    def test_long_phrase_chunks_keep_the_source_rate(self):
+        # A phrase past 0.25 s is split into several sample-map chunks. Each
+        # chunk used to take the phrase's trailing zero as its own tail, so
+        # every chunk stretched to the phrase end and the overlapping group
+        # doubled its playback rate (44.1 kHz became 88.2 kHz).
+        events = [(i, 2, 0x40) for i in range(60000)]
+        events += [(70000 + i, 2, 0x20) for i in range(10000)]
+        src = _vgm(
+            self._marker() + [ChipWrite(0, "ym2612", 0, 0x2B, 0x80)],
+            dac_events=events, total_samples=90000,
+        )
+        samples, plays, _warn, _stats = collect_dac(src)
+        self.assertEqual({s.c4_rate for s in samples}, {44100})
+        ordered = sorted(plays, key=lambda p: p.onset)
+        for a, b in zip(ordered, ordered[1:]):
+            self.assertLessEqual(a.onset + a.span, b.onset + 1, (a, b))
+
     def test_timeline_fallback_is_explicit(self):
         bank = bytes((0x80 + (i % 31) - 15) & 0xFF for i in range(300))
         events = [(0, 0, 0)]

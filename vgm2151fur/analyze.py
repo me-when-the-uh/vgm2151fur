@@ -3154,7 +3154,7 @@ def _collect_opl(
         val = w.val
         addr = (port << 8) | r
 
-        if r == 0xBD and not opl3:
+        if r == 0xBD and port == 0:
             old = st.regs[addr]
             was_rhythm = bool(old & 0x20)
             old_trig = (old & 0x1F) if was_rhythm else 0
@@ -3695,8 +3695,8 @@ def _opl_rhythm_plan(
 
     Returns ``(drums, stats)``: kit latches actually triggered while the mode was
     in force, how long rhythm mode stayed on, and the melodic key-ons that sit on
-    registers a kit takes over. Only OPL3's port-1 ``$1BD`` and the flat
-    ``$BD`` of an OPL or OPL2 are rhythm registers.
+    registers a kit takes over. ``$BD`` is bank 0 on every OPL; the OPL3's
+    ``$1BD`` is the second bank's own register, not a rhythm control.
     """
     # The OPL4's FM half is OPL3-shaped.
     st = OPLState(KIND_OPL3 if kind == "opl4" else kind, False)
@@ -3726,7 +3726,7 @@ def _opl_rhythm_plan(
                 break
             port = ((w.reg >> 8) & 1) if st.opl3 else 0
             r = w.reg & 0xFF
-            if r == 0xBD and (port == (1 if st.opl3 else 0)):
+            if r == 0xBD and port == 0:
                 now = bool(w.val & 0x20)
                 if now != mode:
                     stats["segments"] = stats.get("segments", 0) + 1
@@ -3852,7 +3852,7 @@ def _family_keyons(vgm: VgmFile, chips: set[str]) -> int:
                 prev = rhythm.get(("opll", w.chip_id), 0)
                 count += (sel & ~prev).bit_count()
                 rhythm[("opll", w.chip_id)] = sel
-        elif w.chip in ("opl", "opl2", "opl3", KIND_Y8950):
+        elif w.chip in ("opl", "opl2", "opl3", KIND_Y8950, "ymf278b"):
             r = w.reg & 0xFF
             port = (w.reg >> 8) & 1
             if 0xB0 <= r <= 0xB8:
@@ -3861,7 +3861,7 @@ def _family_keyons(vgm: VgmFile, chips: set[str]) -> int:
                 if on and not opl_on.get(key, False):
                     count += 1
                 opl_on[key] = on
-            elif r == 0xBD and w.chip != "opl3":
+            elif r == 0xBD and port == 0:
                 trig = (w.val & 0x1F) if w.val & 0x20 else 0
                 prev = rhythm.get(w.chip_id, 0)
                 count += (trig & ~prev).bit_count()

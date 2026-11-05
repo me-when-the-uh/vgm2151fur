@@ -510,11 +510,16 @@ def _chunk_words(
                     continue
                 w0 = audio[a0]
                 w1 = audio[a1]
-                chunk_tail = None
-                for j in range(w1 + 1, len(phrase)):
-                    if phrase[j][1] == 0:
-                        chunk_tail = j
-                        break
+                # A chunk may take the zero byte that immediately follows its
+                # last word, but not a zero thousands of words later: that is
+                # the phrase's trailing silence, and appending it stretched
+                # every chunk to the whole phrase (two overlapped chunks then
+                # made group_dac_plays double the rate).
+                chunk_tail = (
+                    w1 + 1
+                    if w1 + 1 < len(phrase) and phrase[w1 + 1][1] == 0
+                    else None
+                )
                 selected = phrase[w0:w1 + 1] + (
                     [phrase[chunk_tail]] if chunk_tail is not None else []
                 )
@@ -840,15 +845,20 @@ def group_dac_plays(
         return int(round(t0 + row * row_samples + delay * tick))
 
     ordered = sorted(plays, key=lambda p: p.onset)
-    next_onset = {
-        id(p): (ordered[i + 1].onset if i + 1 < len(ordered) else total_samples)
-        for i, p in enumerate(ordered)
-    }
-
     groups: dict[int, list[DacPlay]] = {}
     for p in ordered:
         row, _delay = place(p.onset)
         groups.setdefault(row, []).append(p)
+    # The lower-bound rate guard must see the next *note* (the next row), not
+    # the next chunk of the same note. A phrase is split into 0.25 s chunks
+    # that share a row; using a following chunk's onset made the group play at
+    # twice its real rate (a 44.1 kHz chunk stretched to 88.2 kHz).
+    rows = sorted(groups)
+    next_onset: dict[int, int] = {}
+    for i, row in enumerate(rows):
+        nxt = groups[rows[i + 1]][0].onset if i + 1 < len(rows) else total_samples
+        for p in groups[row]:
+            next_onset[id(p)] = nxt
 
     out: list[DacSample] = []
     by_key: dict[tuple[bytes, int], int] = {}

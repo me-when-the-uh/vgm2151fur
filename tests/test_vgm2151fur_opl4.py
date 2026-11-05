@@ -330,10 +330,11 @@ class TestOpl4Writer(unittest.TestCase):
             ChipWrite(3000, "ymf278b", 0, 0xB0, 0x00),
         ]
         if drums:
-            # The OPL3/OPL4 rhythm register is port 1's 0xBD.
+            # The OPL3/OPL4 rhythm register is bank 0's 0xBD (port 1's
+            # 0x1BD is the second bank's own register).
             writes += [
-                ChipWrite(4000, "ymf278b", 0, 0x1BD, 0x20),
-                ChipWrite(4100, "ymf278b", 0, 0x1BD, 0x30),
+                ChipWrite(4000, "ymf278b", 0, 0xBD, 0x20),
+                ChipWrite(4100, "ymf278b", 0, 0xBD, 0x30),
             ]
         writes += _wave_note(1000)
         return analyze(_vgm(writes, roms=[
