@@ -82,8 +82,10 @@ triples start 31 bytes plus 12 per chip before the first ADIR pointer.
   3579545: a 4 MHz OPM plays flat otherwise. Each YM2203 system carries the
   same flag for its own clock (default 3579545). The YM2612 default is the
   Genesis clock truncated to 7670454, so a 7670453 header also gets the flag;
-  this keeps the exported f-num/block identical to the source. An OPL and an
-  OPL2 use the same default as the YM2151; the OPL3's is `COLOR_NTSC * 4`,
+  this keeps the exported f-num/block identical to the source. An 8,000,000 Hz
+  header asks for Furnace's named FM Towns entry (`clockSel=2`) instead. An
+  OPL and an OPL2 use the same default as the YM2151; the OPL3's is
+  `COLOR_NTSC * 4`,
   which a header rounded to 14318180 misses by two hertz - so it keeps the
   flag, while a value that is the default to within about 2 Hz does not:
   identical phase steps either way, and writing the crystal keeps a shared

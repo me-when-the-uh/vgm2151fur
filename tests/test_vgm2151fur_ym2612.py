@@ -39,13 +39,13 @@ ALIEN = Path(r"D:\Downloads\Alien Soldier\07 - Runner AD2025.vgz")
 ROBOT = Path(r"D:\Downloads\RobotBattle2.vgz")
 
 
-def _vgm(writes, *, total_samples=400000, **kw):
+def _vgm(writes, *, total_samples=400000, clock=CLOCK, **kw):
     return VgmFile(
         path=Path("synthetic.vgm"), buf=b"", version=0x161,
         total_samples=total_samples, loop_samples=0, loop_file_pos=None,
         loop_sample=None, ym2151_clock=0, k007232_clock=0, gd3={},
         roms=[], writes=sorted(writes, key=lambda w: w.sample),
-        ym2612_clock=CLOCK, **kw,
+        ym2612_clock=clock, **kw,
     )
 
 
@@ -1191,6 +1191,25 @@ class TestYm2612SpecialCases(unittest.TestCase):
         self.assertEqual(mod.chips, [CHIP_YM2612_EXT])
         self.assertEqual(mod.n_ch, 9)
 
+    def test_partial_key_on_before_the_first_full_chord_is_kept(self):
+        # FM Towns MIDI drivers open channel 3 with a two-operator mask before
+        # the first full chord. Those are real notes, not operator setup.
+        t = 20_000
+        ws = _patch(100, ch=2)
+        ws += [
+            ChipWrite(100, "ym2612", 0, 0x27, 0x40),
+            ChipWrite(100, "ym2612", 0, 0xAD, 0x22),   # group 1 (column 0)
+            ChipWrite(100, "ym2612", 0, 0xA9, 0x6A),
+            ChipWrite(100, "ym2612", 0, 0xAE, 0x22),   # group 2 (column 1)
+            ChipWrite(100, "ym2612", 0, 0xAA, 0x6A),
+            ChipWrite(t, "ym2612", 0, 0x28, 0x32),     # operators 1 and 2
+        ]
+        song = analyze(_vgm(ws))
+        ons = sorted(
+            e.ch for e in song.events if e.on and e.sample == t
+        )
+        self.assertEqual(ons, [2, 3])
+
     def test_normal_channel_notes_feed_all_four_columns(self):
         ws = _patch(100)
         ws += [
@@ -1258,6 +1277,15 @@ class TestYm2612Writer(unittest.TestCase):
         self.assertIn(b"FM 6", data)
         self.assertIn(b"customClock=7670453", data)
         self.assertEqual(_ins_types(data)[0], INS_FM)
+
+    def test_fm_towns_clock_uses_the_named_setting(self):
+        # Furnace's Genesis clock list has a 8 MHz FM Towns entry; a real FM
+        # Towns rip should select it instead of carrying a custom clock.
+        song = self._song(_fm_note(4, 1232))
+        song.vgm.ym2612_clock = 8_000_000
+        data = write_fur(song, include_pcm=False)
+        self.assertIn(b"clockSel=2", data)
+        self.assertNotIn(b"customClock=8000000", data)
 
     def test_opn_operator_fields(self):
         sr = (0x12, 0x13, 0x14, 0x15)
@@ -1557,6 +1585,36 @@ PACK = (
     / "Thunder Force IV (Lightening Force) (Mega Drive, Genesis)"
 )
 HAVE_PACK = PACK.is_dir() and any(PACK.glob("*.vgz"))
+
+
+class TestYm2612FmTownsExt(unittest.TestCase):
+    """FM Towns MIDI rips whose opening channel-3 chord is only partly keyed."""
+
+    RIPS = (
+        (Path(r"F:\NASbackup\JamesAlan\_devspace\grbsd\ripwip\_finished"
+              r"\xenon-fmtowns\done\17 Ranphar 2.vgz"), 593),
+        (Path(r"F:\NASbackup\JamesAlan\_devspace\grbsd\ripwip\_finished"
+              r"\xenon-fmtowns\done\09 Contact.vgz"), 179),
+    )
+
+    def _check(self, path: Path, first_sample: int):
+        if not path.is_file():
+            self.skipTest(f"{path.name} not present")
+        vgm = load_vgm(path)
+        song = analyze(vgm)
+        self.assertTrue(song.ym2612_ext)
+        first = [(e.sample, e.ch) for e in song.events
+                 if e.on and e.ch in (2, 3, 4, 5)][:2]
+        self.assertEqual(first, [(first_sample, 2), (first_sample, 3)])
+        data = write_fur(song, include_pcm=False)
+        self.assertIn(b"clockSel=2", data)
+        self.assertNotIn(b"customClock=8000000", data)
+
+    def test_ranphar_opening_pair_keeps_its_attack(self):
+        self._check(*self.RIPS[0])
+
+    def test_contact_opening_pair_keeps_its_attack(self):
+        self._check(*self.RIPS[1])
 
 
 @unittest.skipUnless(HAVE_FURNACE and HAVE_PACK, "Furnace or the TFIV pack missing")

@@ -4048,6 +4048,13 @@ def write_fur(
             if kind == "ym2612":
                 chips.append(CHIP_YM2612_EXT if system.ext else CHIP_YM2612)
                 fm_clock = song.vgm.ym2612_clock
+                # Furnace's Genesis clock list has a named 8 MHz FM Towns
+                # entry (clockSel=2).  A source from that machine reports
+                # exactly 8 MHz, so ask for the stock setting rather than a
+                # custom clock.
+                if fm_clock == 8_000_000:
+                    flag_texts.append("clockSel=2")
+                    continue
                 # Furnace's Genesis default is COLOR_NTSC*15/7 truncated to
                 # 7670454, while the VGM header normally says 7670453.  Write
                 # the source clock so the exported pitch register matches it.

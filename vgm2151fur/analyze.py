@@ -5096,7 +5096,6 @@ def analyze(
         opn_offs: list[int] = []
         ext_active_freqs: dict[int, tuple] = {}
         ext_patch_cache: dict[int, dict[tuple, int]] = {}
-        ext_ready: set[int] = set()
         # Ext column level bookkeeping, as on the YM2203: each column's volume
         # must carry the levels the driver scripted, relative to the instrument
         # floor `_bind_ext_levels` installs at the end of this collector.
@@ -5325,14 +5324,6 @@ def analyze(
                 if block_port_ext and ch == 2:
                     prev = st.op_mask[ch]
                     if mask:
-                        if cid not in ext_ready:
-                            # Before the first full chord the driver is still
-                            # initializing the operators.  The first full
-                            # chord is the audible one.
-                            if mask != 0x0F:
-                                st.op_mask[ch] = mask
-                                continue
-                            ext_ready.add(cid)
                         freqs = tuple(st.frequency_op(2, g) for g in range(4))
                         active = ext_active_freqs.get(cid)
                         for c in range(4):
