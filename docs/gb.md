@@ -30,9 +30,10 @@ falls back to `4194304`.
 
 Furnace's GB core divides the clock by 16 and writes `2048 - freq` to
 NRx3/NRx4. The analyzer inverts that (`gb_note`) so the exported register
-matches the source exactly. A held period step of half a semitone or more,
-or a jump of a full semitone, starts a new note; faster rewrites (vibrato)
-stay a pitch macro. This mirrors the NES rule.
+matches the source exactly. Only an NRx4/NR44 trigger starts a new note; a
+frequency write without a trigger keeps the hardware envelope running, so it
+becomes a pitch macro (this is how the drivers build arpeggios). Splitting
+those would restart the envelope and hold notes the source lets decay.
 
 Noise has no period register: `gb_noise_note` inverts Furnace's `noiseTable`.
 The table covers shift 0-15 with dividers 4-7 plus the shift-0 row; an NR43
@@ -56,6 +57,13 @@ Two encodings appear in real logs, and the collector detects them per note:
   The writes are replayed through the same state machine as the emulator
   (`_nrx2_step`, the CGB-E single-pass rule) and the resulting volume
   trajectory becomes a volume macro on a `softEnv = true` instrument.
+
+A mid-note NRx2 write that changes the decay period or direction (e.g.
+`0xE7 -> 0x51`, used to speed a fade up) is a hardware-envelope change. The
+collector splits the note there; the new segment starts at the new high
+nibble (which is the level the source audibly continues from) and carries the
+new period/direction. Keeping the original instrument would decay at the old
+rate and leave the note too loud for too long.
 
 The writer tags the chip `chipType=2` (CGB-E) so Furnace's emulator uses the
 same zombie rule the replay follows. A hardware-envelope note keeps the volume

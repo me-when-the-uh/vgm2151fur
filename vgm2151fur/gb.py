@@ -39,10 +39,6 @@ GB_PITCH_DIVIDER = 16
 GB_MAX_PERIOD = 0x7FF
 # Shorter than this is a click/housekeeping gate, not a note.
 GB_MIN_NOTE = 100
-# A period change this large is a new note rather than a bend.
-GB_NOTE_JUMP_ST = 1.0
-GB_STEP_ST = 32          # 1/64 semitones
-GB_STEP_HOLD = 1500      # held this long, a step is the next note
 # Two mid-note NRx2 writes mean the driver is doing a software volume ramp.
 GB_SOFT_ENV_WRITES = 2
 
@@ -276,7 +272,6 @@ def collect_gb(
     hits: list[GbHit] = []
     offs: list[GbOff] = []
     glitches = 0
-    last_period_t = [-1, -1, -1]
     prev_period = [0, 0, 0]
 
     # Wave RAM image.
@@ -341,13 +336,15 @@ def collect_gb(
         if hit is None:
             return
         hit.off_sample = t
+        env_end = t or 10 ** 12
         pts, count = _softenv_volumes(
-            env_writes[voice], hit.sample_time, t or 10 ** 12, hit.env_vol,
+            env_writes[voice], hit.sample_time, env_end, hit.env_vol,
             hit.env_raw,
         )
         # Only a note whose NRx2 period is zero is using the zombie volume
         # bug. A note with a hardware envelope (period > 0) decays on its own;
-        # repeated NRx2 refreshes there must not be replayed as a macro.
+        # mid-note decay-rate changes are handled by splitting the note where
+        # they happen (see the NRx2 branch below).
         if count >= GB_SOFT_ENV_WRITES and hit.env_len == 0:
             hit.soft_env = True
             hit.vol_pts = list(pts)
@@ -372,7 +369,7 @@ def collect_gb(
             glitches += 1
         active[voice] = None
 
-    def open_hit(voice: int, t: int) -> None:
+    def open_hit(voice: int, t: int, vol_override: int | None = None) -> None:
         env_writes[voice] = []
         if voice == 2:
             if not wave_on or current_wave < 0:
@@ -383,27 +380,26 @@ def collect_gb(
                 sound_len=63, pan=pan[2],
             )
             return
-        if not dac_on(voice):
+        if not dac_on(voice) and vol_override is None:
             return
+        start_vol = env[voice] >> 4 if vol_override is None else vol_override
         if voice == 3:
             active[voice] = GbHit(
                 sample_time=t, voice=3, period=noise_period,
-                vol=env[3] >> 4, duty=noise_width,
-                env_vol=env[3] >> 4, env_dir=(env[3] >> 3) & 1,
+                vol=start_vol, duty=noise_width,
+                env_vol=start_vol, env_dir=(env[3] >> 3) & 1,
                 env_len=env[3] & 7, sound_len=final_sound_len(3),
                 pan=pan[3], env_raw=env[3],
             )
-            last_period_t[0] = t
         else:
             active[voice] = GbHit(
                 sample_time=t, voice=voice, period=period[voice],
-                vol=env[voice] >> 4, duty=duty[voice],
-                env_vol=env[voice] >> 4, env_dir=(env[voice] >> 3) & 1,
+                vol=start_vol, duty=duty[voice],
+                env_vol=start_vol, env_dir=(env[voice] >> 3) & 1,
                 env_len=env[voice] & 7, sound_len=final_sound_len(voice),
                 pan=pan[voice], sweep=sweep if voice == 0 else 0,
                 env_raw=env[voice],
             )
-            last_period_t[voice] = t
             prev_period[voice] = period[voice]
 
     def trigger(voice: int, t: int) -> None:
@@ -415,34 +411,21 @@ def collect_gb(
         if audible:
             open_hit(voice, t)
 
-    def record_pitch(voice: int, t: int, *, evaluate: bool) -> None:
+    def record_pitch(voice: int, t: int) -> None:
         hit = active[voice]
         if hit is None or t <= hit.sample_time:
             return
         if period[voice] == prev_period[voice]:
             return
         prev_period[voice] = period[voice]
-        if not evaluate:
-            # The low byte alone is a transient value; wait for the high write
-            # to complete the 11-bit period before deciding anything.
-            if not hit.pitch_pts or hit.pitch_pts[-1][0] != t:
-                hit.pitch_pts.append((t, period[voice]))
-            else:
-                hit.pitch_pts[-1] = (t, period[voice])
-            return
-        change = gb_period_delta(hit.period, period[voice])
-        if abs(change) >= int(GB_NOTE_JUMP_ST * 64):
-            close(voice, t, emit_off=False)
-            open_hit(voice, t)
-        elif abs(change) >= GB_STEP_ST and t - last_period_t[voice] >= GB_STEP_HOLD:
-            close(voice, t, emit_off=False)
-            open_hit(voice, t)
-        else:
-            if hit.pitch_pts and hit.pitch_pts[-1][0] == t:
-                hit.pitch_pts[-1] = (t, period[voice])
-            elif not hit.pitch_pts or hit.pitch_pts[-1][1] != period[voice]:
-                hit.pitch_pts.append((t, period[voice]))
-            last_period_t[voice] = t
+        # A frequency write without a trigger keeps the hardware envelope
+        # running. It is a pitch bend, not a new note: splitting here (an
+        # arpeggio, for instance) would restart the envelope at the note's
+        # initial volume and hold notes the source lets decay.
+        if hit.pitch_pts and hit.pitch_pts[-1][0] == t:
+            hit.pitch_pts[-1] = (t, period[voice])
+        elif not hit.pitch_pts or hit.pitch_pts[-1][1] != period[voice]:
+            hit.pitch_pts.append((t, period[voice]))
 
     for w in writes:
         reg = w.reg & 0x7F
@@ -467,13 +450,35 @@ def collect_gb(
             env[voice] = val
             hit = active[voice]
             if hit is not None and t > hit.sample_time:
-                env_writes[voice].append((t, val))
                 if (val & 0xF8) == 0:
                     close(voice, t)          # DAC off stops the voice
+                    continue
+                # Volume 0 with no attack is the driver's silence/kill write
+                # (0x08); it is a note-off, not a decay-rate change.
+                if (val >> 4) == 0 and not ((val & 8) and (val & 7)):
+                    close(voice, t)
+                    continue
+                if hit.env_len > 0:
+                    # A hardware envelope whose period or direction changes
+                    # mid-note is how drivers speed a decay up or slow it
+                    # down. Split the note at the change; the new segment
+                    # starts at the volume the old envelope had reached.
+                    new_period = val & 7
+                    new_dir = (val >> 3) & 1
+                    if (new_period != hit.env_len
+                            or new_dir != hit.env_dir):
+                        # VGMPlay (and the driver's intent) takes the new
+                        # high nibble as the level from here on, so the split
+                        # segment starts at it rather than the old envelope's
+                        # reached volume.
+                        close(voice, t, emit_off=False)
+                        open_hit(voice, t, vol_override=val >> 4)
+                        continue
+                env_writes[voice].append((t, val))
         elif reg in (REG_P1_LO, REG_P2_LO, REG_W_LO):
             voice = {REG_P1_LO: 0, REG_P2_LO: 1, REG_W_LO: 2}[reg]
             period[voice] = (period[voice] & 0x700) | val
-            record_pitch(voice, t, evaluate=False)
+            record_pitch(voice, t)
         elif reg in (REG_P1_HI, REG_P2_HI, REG_W_HI):
             voice = {REG_P1_HI: 0, REG_P2_HI: 1, REG_W_HI: 2}[reg]
             period[voice] = (period[voice] & 0xFF) | ((val & 7) << 8)
@@ -481,7 +486,7 @@ def collect_gb(
             if val & 0x80:
                 trigger(voice, t)
             else:
-                record_pitch(voice, t, evaluate=True)
+                record_pitch(voice, t)
         elif reg == REG_W_ON:
             was_on = wave_on
             wave_on = bool(val & 0x80)

@@ -1427,36 +1427,43 @@ def _bind_tone_instruments(
                 (t, max(0, v)) for t, v, _ in e.vol_pts
             ]
             series = _tick_values(pts, e.sample, ticks, tick_samples)
-            folded = _fold_saw(series)
-            # Past 255 ticks a non-repeating series is stored as every Nth
-            # value. A one-level saw is played as a slide instead, so the
-            # ramp still moves on every tick.
-            thin = (
-                folded is None
-                and len(series) > MACRO_MAX
-                and _cycle(series) is None
-                and _unit_saw(series)
-            )
-            if folded is not None:
-                vol_vals, vol_speed, vol_loop = folded
-            elif thin:
-                e.vol = series[0]
-                e.vol_slide = _slide_open(series)
-            else:
+            if e.tone_chip == 6:
+                # The GB platform applies a software-envelope volume macro
+                # directly; a generic FA volume slide is not implemented there,
+                # so never fold the trajectory into a slide. _macro_series
+                # drops the trailing hold anyway, keeping decay macros short.
                 vol_vals, vol_speed, vol_loop = _macro_series(series)
-                used = len(scc_ins) + len(ay_ins)
-                # AY volume is the 4-bit register. Step-2 / step-4 rounding
-                # is the SCC list getting long, and it stays on the SCC.
-                if (
-                    e.tone_chip == 1
-                    and vol_vals
-                    and used > 160
-                    and not _unit_saw(vol_vals)
-                ):
-                    step = 2 if used <= 208 else 4
-                    vol_vals = tuple((v // step) * step for v in vol_vals)
-                    if len(set(vol_vals)) <= 1:
-                        vol_vals = ()
+            else:
+                folded = _fold_saw(series)
+                # Past 255 ticks a non-repeating series is stored as every Nth
+                # value. A one-level saw is played as a slide instead, so the
+                # ramp still moves on every tick.
+                thin = (
+                    folded is None
+                    and len(series) > MACRO_MAX
+                    and _cycle(series) is None
+                    and _unit_saw(series)
+                )
+                if folded is not None:
+                    vol_vals, vol_speed, vol_loop = folded
+                elif thin:
+                    e.vol = series[0]
+                    e.vol_slide = _slide_open(series)
+                else:
+                    vol_vals, vol_speed, vol_loop = _macro_series(series)
+                    used = len(scc_ins) + len(ay_ins)
+                    # AY volume is the 4-bit register. Step-2 / step-4 rounding
+                    # is the SCC list getting long, and it stays on the SCC.
+                    if (
+                        e.tone_chip == 1
+                        and vol_vals
+                        and used > 160
+                        and not _unit_saw(vol_vals)
+                    ):
+                        step = 2 if used <= 208 else 4
+                        vol_vals = tuple((v // step) * step for v in vol_vals)
+                        if len(set(vol_vals)) <= 1:
+                            vol_vals = ()
         noise = mode = env_shape = env_period = ()
         noise_speed = mode_speed = env_shape_speed = env_period_speed = 1
         noise_loop = mode_loop = env_shape_loop = env_period_loop = 255

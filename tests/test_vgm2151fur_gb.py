@@ -104,6 +104,16 @@ class TestGbNotes(unittest.TestCase):
         self.assertEqual(gb_period_delta(0x600, 0x600), 0)
         self.assertGreater(gb_period_delta(0x600, 0x700), 0)  # higher pitch
 
+    def test_frequency_write_without_a_trigger_is_a_bend(self):
+        # Arpeggios rewrite NRx3/NRx4 without a trigger, so the hardware
+        # envelope keeps running. Splitting there would restart the envelope
+        # and hold notes the source lets decay.
+        writes = _note(1000, 0x61)
+        writes += [_gb(2000, 0x03, 0x86), _gb(2000, 0x04, 0x06)]
+        hits, _o, _w, _warn = collect_gb(_vgm(writes))
+        self.assertEqual(len(hits), 1)
+        self.assertTrue(hits[0].pitch_pts)
+
     def test_note_off_on_dac_disable(self):
         writes = _note(1000, 0xF0)
         writes += [_gb(9000, 0x02, 0x00)]  # DAC off
@@ -159,6 +169,25 @@ class TestGbNotes(unittest.TestCase):
         self.assertFalse(hits[0].soft_env)
         self.assertEqual((hits[0].env_vol, hits[0].env_dir, hits[0].env_len),
                          (10, 0, 1))
+
+    def test_hardware_envelope_rate_change_splits_note(self):
+        # A mid-note NRx2 rewrite that changes the period speeds up/slows down
+        # the decay. The note splits there and the new segment starts at the
+        # new high nibble (VGMPlay's behavior, and the driver's intent).
+        writes = _noise_note(1000, 0xE7, 0x16)   # vol 14, decay, period 7
+        writes += [_gb(4000, 0x11, 0x51)]        # vol 5, decay, period 1
+        hits, _o, _w, _warn = collect_gb(_vgm(writes))
+        self.assertEqual(len(hits), 2)
+        self.assertEqual((hits[0].env_vol, hits[0].env_len), (14, 7))
+        self.assertEqual(hits[0].off_sample, 4000)
+        self.assertFalse(hits[0].soft_env)
+        self.assertEqual(
+            (hits[1].env_vol, hits[1].env_dir, hits[1].env_len), (5, 0, 1),
+        )
+        # A same-period refresh is not a split.
+        writes = _noise_note(1000, 0xE7, 0x16) + [_gb(4000, 0x11, 0xE7)]
+        hits, _o, _w, _warn = collect_gb(_vgm(writes))
+        self.assertEqual(len(hits), 1)
 
     def test_noise_length_disabled_uses_64(self):
         # Furnace enables the noise length counter when soundLen < 64, so a
