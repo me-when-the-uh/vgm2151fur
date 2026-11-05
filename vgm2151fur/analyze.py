@@ -6180,25 +6180,15 @@ def analyze(
                         pcm=True,
                     ))
 
-    # Collect DAC runs now; group them after the row grid is known.
+    # Collect DAC runs after the row grid is known: the source-sample path
+    # needs the grid to check how many row bodies the module will hold.
     dac_samples: list[DacSample] = []
     dac_plays: list[DacPlay] = []
     dac_count = 0
     dac_ch = -1
     dac_stats: dict = {}
     if pcm and is_opn2:
-        dac_samples, dac_plays, dac_warn, dac_stats = collect_dac(
-            vgm, slices=dac_slices,
-        )
-        warnings.extend(dac_warn)
         dac_ch = ym_base.get(ym2612_ids[0], 0) + (8 if ym2612_ext else 5)
-        if (
-            dac_writes and not dac_plays and not dac_warn
-            and not dac_stats.get("dac_disabled_bytes")
-        ):
-            warnings.append(
-                f"{dac_writes} YM2612 DAC writes but no playable DAC data"
-            )
 
     # Genesis PSG.  The SN76489 has no key-on, so the collector gates on its
     # 4-bit attenuation and keeps mid-note period/volume writes as macros.
@@ -7786,10 +7776,22 @@ def analyze(
 
     # Group DAC runs after the row grid; insert their maps before tone instruments.
     dac_pan_events: list[tuple[int, int]] = []
+    if pcm and is_opn2:
+        dac_samples, dac_plays, dac_warn, dac_stats = collect_dac(
+            vgm, slices=dac_slices, grid=(hz, use_speed, t0),
+        )
+        warnings.extend(dac_warn)
+        if (
+            dac_writes and not dac_plays and not dac_warn
+            and not dac_stats.get("dac_disabled_bytes")
+        ):
+            warnings.append(
+                f"{dac_writes} YM2612 DAC writes but no playable DAC data"
+            )
     if dac_plays and dac_ch >= 0:
         dac_base = len(patch_order)
         (
-            dac_samples, dac_notes, dac_pan_events,
+            dac_samples, dac_notes, dac_offs, dac_pan_events,
             dac_group_warn, dac_group_stats,
         ) = group_dac_plays(
             dac_samples, dac_plays, hz=hz, speed=use_speed, t0=t0,
@@ -7815,9 +7817,28 @@ def analyze(
                 no_pan=no_pan,
                 dac=True,
             ))
-        for placed, pan in dac_pan_events:
-            if pan < 0:
+        for placed, _pan in dac_offs:
+            events.append(NoteEvent(
+                sample=placed,
+                ch=dac_ch,
+                on=False,
+                note=180,
+                ins=-1,
+                vol=-1,
+                e5=0x80,
+                pan=0,
+                dac=True,
+            ))
+        # Source samples can outlive a pan write; those points ride the
+        # channel as 08xx mid-note instead of cutting the sample.
+        for t, pan in dac_stats.get("dac_pan_points", ()):
+            if pan >= 0:
+                dac_pan_events.append((t, pan))
+        seen_pan: set[tuple[int, int]] = set()
+        for placed, pan in sorted(dac_pan_events):
+            if pan < 0 or (placed, pan) in seen_pan:
                 continue
+            seen_pan.add((placed, pan))
             channel_fx.append((placed, dac_ch, 0x08, pan))
         events.sort(key=lambda e: (e.sample, e.ch, 0 if e.on else 1))
         dac_count = len(dac_notes)
@@ -8375,7 +8396,13 @@ def format_report(song: Song) -> str:
         maps = (len(song.dac_samples) + 119) // 120
         source = song.dac_stats.get("dac_source_bytes", 0)
         mode = song.dac_stats.get("dac_mode", "slices")
-        if mode == "chunks":
+        if mode == "source":
+            shape = f"{len(song.dac_samples)} bank samples"
+            extra = (
+                f", {song.dac_stats.get('dac_source_runs', 0)} bank runs"
+                f", {song.dac_stats.get('dac_source_runs_reused', 0)} reused"
+            )
+        elif mode == "chunks":
             shape = f"{len(song.dac_samples)} PCM chunks"
             extra = (
                 f", {song.dac_stats.get('dac_pan_chunks', 0)} pan chunks"
