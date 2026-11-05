@@ -1,0 +1,521 @@
+"""Game Boy DMG (LR35902 APU) register stream -> notes and wavetables.
+
+The DMG has four voices: two pulse channels (channel 1 also has a hardware
+frequency sweep), one 32-nibble wavetable voice, and a noise channel.  Unlike
+the NES, every voice has its own trigger bit (NRx4/NR44 bit 7), so a note
+starts on that write.  The envelope lives in NRx2 for the pulse/noise voices,
+while the wave voice's level is NR32.
+
+Register map (VGM command ``0xB3``, register ``0x00`` = ``FF10``/NR10):
+
+    0x00    NR10 sweep (ch1)        0x01-0x04 NR11-14 pulse 1
+    0x06-0x09 NR21-24 pulse 2       0x0A-0x0E NR30-34 wave
+    0x10-0x13 NR41-44 noise         0x14 NR50 master volume
+    0x15    NR51 stereo output      0x16 NR52 sound on/off
+    0x20-0x2F wave RAM (32 nibbles)
+
+Two envelope encodings appear in real logs.  A driver that writes NRx2 once
+at the note start is using the *hardware* envelope (initial volume, direction
+and period); that maps straight onto Furnace's GB envelope fields.  A driver
+that keeps rewriting NRx2 during the note is using the hardware's "zombie"
+volume bug (Furnace's software envelope): the writes are replayed through the
+same state machine the emulator uses, and the resulting volume trajectory
+becomes a volume macro.
+"""
+
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass, field
+
+from vgm2151fur.pitch import furnace_period_note
+from vgm2151fur.vgm import VgmFile
+
+GB_CHANNELS = 4
+GB_DEFAULT_CLOCK = 4194304
+# Furnace's GB pitch table: clock / 16, an 11-bit period register, and the
+# platform writes ``2048 - freq`` back to NRx3/NRx4.
+GB_PITCH_DIVIDER = 16
+GB_MAX_PERIOD = 0x7FF
+# Shorter than this is a click/housekeeping gate, not a note.
+GB_MIN_NOTE = 100
+# A period change this large is a new note rather than a bend.
+GB_NOTE_JUMP_ST = 1.0
+GB_STEP_ST = 32          # 1/64 semitones
+GB_STEP_HOLD = 1500      # held this long, a step is the next note
+# Two mid-note NRx2 writes mean the driver is doing a software volume ramp.
+GB_SOFT_ENV_WRITES = 2
+
+REG_SWEEP = 0x00
+REG_P1_DUTY = 0x01
+REG_P1_ENV = 0x02
+REG_P1_LO = 0x03
+REG_P1_HI = 0x04
+REG_P2_DUTY = 0x06
+REG_P2_ENV = 0x07
+REG_P2_LO = 0x08
+REG_P2_HI = 0x09
+REG_W_ON = 0x0A
+REG_W_LEN = 0x0B
+REG_W_VOL = 0x0C
+REG_W_LO = 0x0D
+REG_W_HI = 0x0E
+REG_N_LEN = 0x10
+REG_N_ENV = 0x11
+REG_N_FREQ = 0x12
+REG_N_CTL = 0x13
+REG_VOL = 0x14
+REG_PAN = 0x15
+REG_ON = 0x16
+REG_WAVE = 0x20
+
+# Furnace's noiseTable (gb.cpp).  The index is note-60; the value is the NR43
+# register it writes.  Only dividers 4-7 and the shift-0 row are present, which
+# is what the platform can express.
+_NOISE_TABLE: list[int] = [0]
+for _shift in range(15, -1, -1):
+    for _div in range(7, 3, -1):
+        _NOISE_TABLE.append((_shift << 4) | _div)
+_NOISE_TABLE.extend([0x03, 0x02, 0x01, 0x00])
+
+
+def gb_note(clock: int, period: int) -> tuple[int, int]:
+    """11-bit NRx3/NRx4 value -> (Furnace note, E5).
+
+    Furnace writes ``2048 - table_value`` to the register, so the table must
+    produce ``2048 - period``.
+    """
+    period = max(0, min(GB_MAX_PERIOD, period))
+    return furnace_period_note(
+        clock or GB_DEFAULT_CLOCK, GB_PITCH_DIVIDER, 2048 - period,
+        period_offset=0, maximum=GB_MAX_PERIOD,
+    )
+
+
+def gb_period_delta(base: int, new: int) -> int:
+    """1/64-semitone change between two NRx3/NRx4 period values."""
+    pa = 2048 - max(0, min(GB_MAX_PERIOD, base))
+    pb = 2048 - max(0, min(GB_MAX_PERIOD, new))
+    if pa <= 0 or pb <= 0:
+        return 0
+    return int(round(64.0 * 12.0 * math.log2(pa / pb)))
+
+
+def gb_noise_note(nr43: int) -> int:
+    """Furnace's noise column for an NR43 value.
+
+    The platform's noise table only covers shift 0-15 with dividers 4-7 (plus
+    the shift-0 row).  A value outside it picks the closest representable
+    frequency; those are the inaudible top of the range.
+    """
+    value = nr43 & 0xF7
+    try:
+        pos = _NOISE_TABLE.index(value)
+    except ValueError:
+        want = _noise_period(value)
+        pos = min(
+            range(len(_NOISE_TABLE)),
+            key=lambda i: abs(
+                math.log2(max(1e-9, _noise_period(_NOISE_TABLE[i])))
+                - math.log2(max(1e-9, want))
+            ),
+        )
+    return 60 + pos
+
+
+def _noise_period(nr43: int) -> float:
+    shift = (nr43 >> 4) & 0x0F
+    div = nr43 & 7
+    return (div if div else 0.5) * (1 << shift)
+
+
+def wave_volume(nr32: int) -> int:
+    """NR32 output level -> Furnace 0-15 column volume."""
+    return (0, 15, 10, 5)[(nr32 >> 5) & 3]
+
+
+def wave_nibbles(image: bytes | bytearray) -> bytes:
+    """16 wave-RAM bytes -> the 32 nibbles Furnace stores, sample order."""
+    out = bytearray(32)
+    for i in range(16):
+        out[i * 2] = (image[i] >> 4) & 0x0F
+        out[i * 2 + 1] = image[i] & 0x0F
+    return bytes(out)
+
+
+@dataclass
+class GbHit:
+    sample_time: int
+    voice: int                 # 0/1 pulse, 2 wave, 3 noise
+    period: int                # NRx3/NRx4 value, or NR43 for noise
+    vol: int                   # 0-15 at note start
+    duty: int                  # pulse duty 0-3; noise width 0/1
+    wave: int = 0              # wavetable index for voice 2
+    env_vol: int = 0
+    env_dir: int = 0
+    env_len: int = 0
+    sound_len: int = 63        # Furnace field (63 = length disabled)
+    soft_env: bool = False
+    env_raw: int = 0
+    off_sample: int = 0
+    pitch_pts: list[tuple[int, int]] = field(default_factory=list)
+    vol_pts: list[tuple[int, int]] = field(default_factory=list)
+    wave_pts: list[tuple[int, int]] = field(default_factory=list)
+    duty_pts: list[tuple[int, int]] = field(default_factory=list)
+    pan: int = 0xFF
+    pan_pts: list[tuple[int, int]] = field(default_factory=list)
+    sweep: int = 0
+    sweep_pts: list[tuple[int, int]] = field(default_factory=list)
+
+
+@dataclass
+class GbOff:
+    sample_time: int
+    voice: int
+
+
+@dataclass
+class _EnvState:
+    """The emulator's NRx2 "zombie" volume state."""
+
+    volume: int = 0
+    countdown: int = 0
+    clock: bool = False
+    locked: bool = False
+
+
+def _nrx2_step(vol: int, value: int, old_value: int, st: _EnvState) -> int:
+    """One NRx2 write, using the CGB-E (single-pass) rule.
+
+    The converter tags the chip as a CGB-E so Furnace's own emulator uses the
+    same rule.  The full source lives in ``sound/gb/apu.c``.
+    """
+    if st.clock:
+        st.countdown = value & 7
+    should_tick = bool((value & 7) and not (old_value & 7) and not st.locked)
+    should_invert = bool((value & 8) ^ (old_value & 8))
+    if (value & 0xF) == 8 and (old_value & 0xF) == 8 and not st.locked:
+        should_tick = True
+    if should_invert:
+        if value & 8:
+            if not (old_value & 7) and not st.locked:
+                vol ^= 0xF
+            else:
+                vol = (0x0E - vol) & 0xF
+            should_tick = False
+        else:
+            vol = (0x10 - vol) & 0xF
+    if should_tick:
+        vol = (vol + (1 if value & 8 else -1)) & 0xF
+    elif not (value & 7) and st.clock:
+        if not should_invert:
+            if vol == 0xF and (value & 8):
+                st.locked = True
+            elif vol == 0 and not (value & 8):
+                st.locked = True
+        elif vol == 1 and not (value & 8):
+            st.locked = True
+        elif vol == 0x0E and (value & 8):
+            st.locked = True
+        st.clock = False
+    return vol
+
+
+def _softenv_volumes(
+    writes: list[tuple[int, int]], start: int, end: int, env_vol: int,
+    env_raw: int = 0,
+) -> tuple[list[tuple[int, int]], int]:
+    """Replay mid-note NRx2 writes into a coalesced volume timeline.
+
+    ``writes`` is [(sample, value)] for one voice.  ``env_raw`` is the NRx2
+    value in force at the trigger.  Returns the (sample, volume) points
+    strictly inside (start, end) and the write count.
+    """
+    st = _EnvState(volume=env_vol, countdown=env_vol & 7)
+    vol = env_vol
+    old = env_raw
+    points: list[tuple[int, int]] = []
+    count = 0
+    for t, value in writes:
+        if not (start < t < end):
+            continue
+        vol = _nrx2_step(vol, value, old, st)
+        old = value
+        count += 1
+        if points and points[-1][0] == t:
+            points[-1] = (t, vol)
+        else:
+            points.append((t, vol))
+    return points, count
+
+
+def collect_gb(
+    vgm: VgmFile, clock: int | None = None,
+) -> tuple[list[GbHit], list[GbOff], list[bytes], list[str]]:
+    """Pulse, wave and noise notes + the wavetables they use."""
+    warnings: list[str] = []
+    writes = [w for w in vgm.writes if w.chip == "gb" and w.chip_id == 0]
+    if not writes:
+        return [], [], [], warnings
+
+    duty = [0, 0]                       # pulse 1/2 duty
+    length_val = [0, 0, 0, 0]           # raw length counter
+    length_en = [False, False, False, False]
+    env = [0, 0, 0, 0]                  # NRx2 / NR42
+    period = [0, 0, 0]                  # pulse 1/2, wave
+    noise_period = 0
+    noise_width = 0
+    wave_on = False
+    wave_vol = 0
+    sweep = 0
+    pan = [0xFF, 0xFF, 0xFF, 0xFF]
+    enabled = True
+
+    active: list[GbHit | None] = [None] * 4
+    env_writes: list[list[tuple[int, int]]] = [[] for _ in range(4)]
+    hits: list[GbHit] = []
+    offs: list[GbOff] = []
+    glitches = 0
+    last_period_t = [-1, -1, -1]
+    prev_period = [0, 0, 0]
+
+    # Wave RAM image.
+    wave_image = bytearray(16)
+    wave_touched = [False] * 16
+    wave_index_by_key: dict[bytes, int] = {}
+    waves: list[bytes] = []
+    current_wave = -1
+
+    def finalize_wave(t: int) -> None:
+        nonlocal current_wave
+        if not all(wave_touched):
+            return
+        nib = wave_nibbles(wave_image)
+        idx = wave_index_by_key.get(nib)
+        if idx is None:
+            idx = len(waves)
+            wave_index_by_key[nib] = idx
+            waves.append(nib)
+        if idx != current_wave:
+            current_wave = idx
+            hit = active[2]
+            if hit is not None and t > hit.sample_time:
+                if not hit.wave_pts or hit.wave_pts[-1][1] != idx:
+                    hit.wave_pts.append((t, idx))
+        for i in range(16):
+            wave_touched[i] = False
+
+    def dac_on(voice: int) -> bool:
+        if voice == 2:
+            return wave_on
+        return (env[voice] & 0xF8) != 0
+
+    def final_sound_len(voice: int) -> int:
+        # Furnace writes ``63 - soundLen`` and enables counting when <63.
+        if length_en[voice] and length_val[voice] > 0:
+            return 63 - length_val[voice]
+        return 63
+
+    def close(voice: int, t: int, *, emit_off: bool = True) -> None:
+        nonlocal glitches
+        hit = active[voice]
+        if hit is None:
+            return
+        hit.off_sample = t
+        pts, count = _softenv_volumes(
+            env_writes[voice], hit.sample_time, t or 10 ** 12, hit.env_vol,
+            hit.env_raw,
+        )
+        if count >= GB_SOFT_ENV_WRITES:
+            hit.soft_env = True
+            hit.vol_pts = list(pts)
+        env_writes[voice].clear()
+        # A pulse/noise note with volume 0 and no growth is silent. A hardware
+        # attack from 0 (direction up, period > 0) does sound, so keep it.
+        silent = (
+            voice != 2 and hit.vol == 0 and not hit.soft_env
+            and not (hit.env_dir and hit.env_len)
+        )
+        if voice == 2 and hit.vol == 0 and not hit.vol_pts:
+            silent = True
+        if t <= 0:
+            if not silent:
+                hits.append(hit)
+        elif t - hit.sample_time >= GB_MIN_NOTE:
+            if not silent:
+                hits.append(hit)
+                if emit_off:
+                    offs.append(GbOff(t, voice))
+        else:
+            glitches += 1
+        active[voice] = None
+
+    def open_hit(voice: int, t: int) -> None:
+        env_writes[voice] = []
+        if voice == 2:
+            if not wave_on or current_wave < 0:
+                return
+            active[voice] = GbHit(
+                sample_time=t, voice=2, period=period[2],
+                vol=wave_volume(wave_vol), duty=0, wave=current_wave,
+                sound_len=63, pan=pan[2],
+            )
+            return
+        if not dac_on(voice):
+            return
+        if voice == 3:
+            active[voice] = GbHit(
+                sample_time=t, voice=3, period=noise_period,
+                vol=env[3] >> 4, duty=noise_width,
+                env_vol=env[3] >> 4, env_dir=(env[3] >> 3) & 1,
+                env_len=env[3] & 7, sound_len=final_sound_len(3),
+                pan=pan[3], env_raw=env[3],
+            )
+            last_period_t[0] = t
+        else:
+            active[voice] = GbHit(
+                sample_time=t, voice=voice, period=period[voice],
+                vol=env[voice] >> 4, duty=duty[voice],
+                env_vol=env[voice] >> 4, env_dir=(env[voice] >> 3) & 1,
+                env_len=env[voice] & 7, sound_len=final_sound_len(voice),
+                pan=pan[voice], sweep=sweep if voice == 0 else 0,
+                env_raw=env[voice],
+            )
+            last_period_t[voice] = t
+            prev_period[voice] = period[voice]
+
+    def trigger(voice: int, t: int) -> None:
+        close(voice, t, emit_off=False)
+        open_hit(voice, t)
+
+    def record_pitch(voice: int, t: int, *, evaluate: bool) -> None:
+        hit = active[voice]
+        if hit is None or t <= hit.sample_time:
+            return
+        if period[voice] == prev_period[voice]:
+            return
+        prev_period[voice] = period[voice]
+        if not evaluate:
+            # The low byte alone is a transient value; wait for the high write
+            # to complete the 11-bit period before deciding anything.
+            if not hit.pitch_pts or hit.pitch_pts[-1][0] != t:
+                hit.pitch_pts.append((t, period[voice]))
+            else:
+                hit.pitch_pts[-1] = (t, period[voice])
+            return
+        change = gb_period_delta(hit.period, period[voice])
+        if abs(change) >= int(GB_NOTE_JUMP_ST * 64):
+            close(voice, t, emit_off=False)
+            open_hit(voice, t)
+        elif abs(change) >= GB_STEP_ST and t - last_period_t[voice] >= GB_STEP_HOLD:
+            close(voice, t, emit_off=False)
+            open_hit(voice, t)
+        else:
+            if hit.pitch_pts and hit.pitch_pts[-1][0] == t:
+                hit.pitch_pts[-1] = (t, period[voice])
+            elif not hit.pitch_pts or hit.pitch_pts[-1][1] != period[voice]:
+                hit.pitch_pts.append((t, period[voice]))
+            last_period_t[voice] = t
+
+    for w in writes:
+        reg = w.reg & 0x7F
+        val = w.val & 0xFF
+        t = w.sample
+
+        if reg == REG_SWEEP:
+            sweep = val
+            hit = active[0]
+            if hit is not None and t > hit.sample_time:
+                hit.sweep_pts.append((t, val))
+        elif reg in (REG_P1_DUTY, REG_P2_DUTY):
+            voice = 0 if reg == REG_P1_DUTY else 1
+            duty[voice] = (val >> 6) & 3
+            length_val[voice] = val & 0x3F
+            hit = active[voice]
+            if hit is not None and t > hit.sample_time:
+                if not hit.duty_pts or hit.duty_pts[-1][1] != duty[voice]:
+                    hit.duty_pts.append((t, duty[voice]))
+        elif reg in (REG_P1_ENV, REG_P2_ENV, REG_N_ENV):
+            voice = {REG_P1_ENV: 0, REG_P2_ENV: 1, REG_N_ENV: 3}[reg]
+            env[voice] = val
+            hit = active[voice]
+            if hit is not None and t > hit.sample_time:
+                env_writes[voice].append((t, val))
+                if (val & 0xF8) == 0:
+                    close(voice, t)          # DAC off stops the voice
+        elif reg in (REG_P1_LO, REG_P2_LO, REG_W_LO):
+            voice = {REG_P1_LO: 0, REG_P2_LO: 1, REG_W_LO: 2}[reg]
+            period[voice] = (period[voice] & 0x700) | val
+            record_pitch(voice, t, evaluate=False)
+        elif reg in (REG_P1_HI, REG_P2_HI, REG_W_HI):
+            voice = {REG_P1_HI: 0, REG_P2_HI: 1, REG_W_HI: 2}[reg]
+            period[voice] = (period[voice] & 0xFF) | ((val & 7) << 8)
+            length_en[voice] = bool(val & 0x40)
+            if val & 0x80:
+                trigger(voice, t)
+            else:
+                record_pitch(voice, t, evaluate=True)
+        elif reg == REG_W_ON:
+            was_on = wave_on
+            wave_on = bool(val & 0x80)
+            length_val[2] = val & 0x3F
+            if was_on and not wave_on:
+                close(2, t)
+        elif reg == REG_W_LEN:
+            length_val[2] = val
+            length_en[2] = bool(val & 0x40)
+        elif reg == REG_W_VOL:
+            wave_vol = val
+            hit = active[2]
+            if hit is not None and t > hit.sample_time:
+                v = wave_volume(val)
+                if v != hit.vol:
+                    hit.vol_pts.append((t, v))
+        elif reg == REG_N_LEN:
+            length_val[3] = val & 0x3F
+            length_en[3] = bool(val & 0x40)
+        elif reg == REG_N_FREQ:
+            noise_period = val
+            noise_width = (val >> 3) & 1
+            hit = active[3]
+            if hit is not None and t > hit.sample_time:
+                if (val & 0xF7) != (hit.period & 0xF7):
+                    close(3, t, emit_off=False)
+                    open_hit(3, t)
+                elif noise_width != hit.duty:
+                    if not hit.duty_pts or hit.duty_pts[-1][1] != noise_width:
+                        hit.duty_pts.append((t, noise_width))
+        elif reg == REG_N_CTL:
+            length_en[3] = bool(val & 0x40)
+            if val & 0x80:
+                trigger(3, t)
+        elif reg == REG_PAN:
+            for v in range(4):
+                left = (val >> (4 + v)) & 1
+                right = (val >> v) & 1
+                new_pan = (0xF0 if left else 0) | (0x0F if right else 0)
+                if new_pan != pan[v]:
+                    pan[v] = new_pan
+                    hit = active[v]
+                    if hit is not None and t > hit.sample_time:
+                        if not hit.pan_pts or hit.pan_pts[-1][1] != new_pan:
+                            hit.pan_pts.append((t, new_pan))
+        elif reg == REG_ON:
+            on = bool(val & 0x80)
+            if enabled and not on:
+                for v in range(4):
+                    close(v, t)
+            enabled = on
+        elif REG_WAVE <= reg <= REG_WAVE + 15:
+            i = reg - REG_WAVE
+            wave_image[i] = val
+            wave_touched[i] = True
+            finalize_wave(t)
+        # 0x14 master volume: the module mix is normalised separately.
+
+    for voice in range(4):
+        if active[voice] is not None:
+            close(voice, 0, emit_off=False)
+    if glitches:
+        warnings.append(f"Game Boy: ignored {glitches} sub-frame tone gates")
+    return hits, offs, waves, warnings

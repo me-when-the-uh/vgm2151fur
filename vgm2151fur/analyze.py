@@ -131,6 +131,16 @@ from vgm2151fur.nes import (
     collect_nes_tones,
     nes_note,
 )
+from vgm2151fur.gb import (
+    GB_CHANNELS,
+    GB_DEFAULT_CLOCK,
+    GB_PITCH_DIVIDER,
+    GbHit,
+    collect_gb,
+    gb_noise_note,
+    gb_note,
+    gb_period_delta,
+)
 from vgm2151fur.huc6280 import (
     HUC6280_CHANNELS,
     HUC6280_DEFAULT_CLOCK,
@@ -452,6 +462,15 @@ class NoteEvent:
     # Tone chip clock and divider: SCC 16, AY-8910 8, YM2203 SSG 16.
     tone_clock: int = 0
     tone_div: int = 8
+    # Game Boy wavetable voice: the column carries NR32 levels as row steps,
+    # so the binding must not fold them into a volume macro.
+    tone_gb_wave: bool = False
+    # Game Boy DIV_INS_GB envelope fields (pulse/noise only).
+    gb_soft_env: bool = False
+    gb_env_vol: int = 0
+    gb_env_dir: int = 0
+    gb_env_len: int = 0
+    gb_sound_len: int = 63
     # AY only: (sample, effect, value), including the state at the note start.
     tone_fx_pts: tuple[tuple[int, int, int], ...] = ()
     # 0 = volume macro or column, 1 = FA01 from the note, 2 = FA00 on the note.
@@ -518,6 +537,16 @@ class ToneIns:
     env_period: tuple[int, ...] = ()
     env_period_speed: int = 1
     env_period_loop: int = 255
+    # Game Boy: the DIV_INS_GB feature. A hardware-envelope note carries
+    # env_vol/env_dir/env_len; a software ("zombie") envelope sets soft_env
+    # and uses `vol` instead. `gb_wave` marks the wavetable voice, whose
+    # instrument selects `wave` through the wave-synth feature.
+    gb_soft_env: bool = False
+    gb_env_vol: int = 0
+    gb_env_dir: int = 0
+    gb_env_len: int = 0
+    gb_sound_len: int = 63
+    gb_wave: bool = False
 
 
 @dataclass(frozen=True)
@@ -770,6 +799,13 @@ class Song:
     huc6280_pcm_samples: list[Huc6280PcmSample] = field(default_factory=list)
     huc6280_count: int = 0
     huc6280_pcm_count: int = 0
+    # Game Boy DMG: four voices (two pulses, wave, noise). `gb_waves` is the
+    # deduplicated 32-nibble wavetable list, `gb_ins` one instrument per
+    # distinct (wave, envelope, macros) and `gb_count` the note total.
+    gb_ids: list[int] = field(default_factory=list)
+    gb_waves: list[bytes] = field(default_factory=list)
+    gb_ins: list[ToneIns] = field(default_factory=list)
+    gb_count: int = 0
     # Genesis SN76489: four channels (three tone + noise) after the FM block.
     psg_ids: list[int] = field(default_factory=list)
     psg_ins: list[ToneIns] = field(default_factory=list)
@@ -1179,6 +1215,17 @@ def _plain_tone(spec: ToneIns, tone_chip: int) -> ToneIns:
     if tone_chip in (1, 5):
         # SCC and PCE are wavetable chips: the wave is the timbre.
         return ToneIns(wave=spec.wave)
+    if tone_chip == 6:
+        # Game Boy: a wavetable voice keeps its waveform; a pulse/noise voice
+        # keeps the hardware envelope (without the sample-level macros).
+        if getattr(spec, "gb_wave", False):
+            return ToneIns(wave=spec.wave, gb_wave=True)
+        return ToneIns(
+            gb_env_vol=spec.gb_env_vol,
+            gb_env_dir=spec.gb_env_dir,
+            gb_env_len=spec.gb_env_len,
+            gb_sound_len=spec.gb_sound_len,
+        )
     return ToneIns()
 
 
@@ -1214,7 +1261,13 @@ def _take_tone(
         mapping[plain] = idx
         bucket.append(plain)
         return idx, plain
-    return 0, bucket[0] if bucket else plain
+    if not bucket:
+        # The budget is already spent on the earlier families. This family
+        # still needs one instrument for its notes to point at.
+        mapping[plain] = 0
+        bucket.append(plain)
+        return 0, plain
+    return 0, bucket[0]
 
 
 def _bind_tone_instruments(
@@ -1224,12 +1277,14 @@ def _bind_tone_instruments(
     psg_ins: list[ToneIns],
     nes_ins: list[ToneIns],
     huc6280_ins: list[ToneIns],
+    gb_ins: list[ToneIns],
     tone_ins_base: int,
     scc_clock: int,
     ay_clock: int,
     psg_clock: int,
     nes_clock: int,
     huc6280_clock: int,
+    gb_clock: int,
     hz: float,
     total_samples: int,
 ) -> None:
@@ -1247,13 +1302,23 @@ def _bind_tone_instruments(
     psg_map: dict[ToneIns, int] = {}
     nes_map: dict[ToneIns, int] = {}
     huc6280_map: dict[ToneIns, int] = {}
+    gb_map: dict[ToneIns, int] = {}
     ins_cap = max(1, 250 - tone_ins_base)
+    # GB binds last. Reserve a share so a large SCC/AY/PCE list cannot spend
+    # every slot before it; the surplus collapses to plain per-wave/per-env
+    # instruments, which is the documented "fall back to columns" behavior.
+    has_gb = any(e.tone_chip == 6 and e.on for e in events)
+    early_cap = ins_cap
+    if has_gb:
+        families = len({e.tone_chip for e in events if e.on and e.tone_chip})
+        early_cap = max(1, ins_cap - max(8, ins_cap // max(2, families)))
     bound: list[tuple[NoteEvent, int]] = []
     tone_order = [e for e in events if e.on and e.tone_chip == 2]
     tone_order += [e for e in events if e.on and e.tone_chip == 1]
     tone_order += [e for e in events if e.on and e.tone_chip == 3]
     tone_order += [e for e in events if e.on and e.tone_chip == 4]
     tone_order += [e for e in events if e.on and e.tone_chip == 5]
+    tone_order += [e for e in events if e.on and e.tone_chip == 6]
     for e in tone_order:
         end = e.end or track_end
         # 255 macro values times the largest speed byte. Long SSG pads can
@@ -1285,6 +1350,13 @@ def _bind_tone_instruments(
             clock = e.tone_clock or huc6280_clock or HUC6280_DEFAULT_CLOCK
             divider = 32
             maximum = HUC6280_MAX_PERIOD
+        elif e.tone_chip == 6:
+            # Furnace's GB core divides the 4 MHz clock by 16 and writes
+            # ``2048 - freq``; the analyzer already handed us that value as
+            # the note's raw period, so the table inverts it directly.
+            clock = e.tone_clock or gb_clock or GB_DEFAULT_CLOCK
+            divider = GB_PITCH_DIVIDER
+            maximum = 0x7FF
         else:
             # AY and the YM2203's SSG share the instrument path but not the
             # clock or Furnace's divider (8 vs 16).
@@ -1293,7 +1365,7 @@ def _bind_tone_instruments(
             maximum = 0xFFF
         tbl = (
             pitch_table(float(clock), divider, maximum=maximum)
-            if e.tone_chip in (3, 4, 5)
+            if e.tone_chip in (3, 4, 5, 6)
             else pitch_table(module_clock(clock), divider)
         )
         base_off = (e.note << 7) + (e.e5 - E5_CENTER)
@@ -1346,7 +1418,8 @@ def _bind_tone_instruments(
         vol_vals: tuple[int, ...] = ()
         vol_speed, vol_loop = 1, 255
         series: list[int] = []
-        if e.vol_pts and e.tone_chip not in (3, 5):
+        if e.vol_pts and e.tone_chip not in (3, 5) and not (
+                e.tone_chip == 6 and e.tone_gb_wave):
             # PSG volume is the raw 4-bit register and the SMS platform reads
             # it straight from the column; a std.vol macro would scale it.
             # The PCE likewise keeps its balance envelope as 08xy row steps.
@@ -1435,27 +1508,40 @@ def _bind_tone_instruments(
             env_shape_loop=env_shape_loop,
             env_period=env_period, env_period_speed=env_period_speed,
             env_period_loop=env_period_loop,
+            gb_soft_env=bool(getattr(e, "gb_soft_env", False)),
+            gb_env_vol=int(getattr(e, "gb_env_vol", 0)),
+            gb_env_dir=int(getattr(e, "gb_env_dir", 0)),
+            gb_env_len=int(getattr(e, "gb_env_len", 0)),
+            gb_sound_len=int(getattr(e, "gb_sound_len", 63)),
+            gb_wave=bool(e.tone_gb_wave),
         )
         if e.tone_chip == 1:
-            idx, kept = _take_tone(spec, scc_map, scc_ins, len(ay_ins), ins_cap, 1)
+            idx, kept = _take_tone(spec, scc_map, scc_ins, len(ay_ins), early_cap, 1)
         elif e.tone_chip == 3:
             idx, kept = _take_tone(
-                spec, psg_map, psg_ins, len(scc_ins) + len(ay_ins), ins_cap, 3,
+                spec, psg_map, psg_ins, len(scc_ins) + len(ay_ins), early_cap, 3,
             )
         elif e.tone_chip == 4:
             idx, kept = _take_tone(
                 spec, nes_map, nes_ins,
-                len(scc_ins) + len(ay_ins) + len(psg_ins), ins_cap, 4,
+                len(scc_ins) + len(ay_ins) + len(psg_ins), early_cap, 4,
             )
         elif e.tone_chip == 5:
             idx, kept = _take_tone(
                 spec, huc6280_map, huc6280_ins,
                 len(scc_ins) + len(ay_ins) + len(psg_ins) + len(nes_ins),
-                ins_cap, 5,
+                early_cap, 5,
+            )
+        elif e.tone_chip == 6:
+            idx, kept = _take_tone(
+                spec, gb_map, gb_ins,
+                len(scc_ins) + len(ay_ins) + len(psg_ins) + len(nes_ins)
+                + len(huc6280_ins),
+                ins_cap, 6,
             )
         else:
             # AY runs first, so the SCC list is still empty and `others` is 0.
-            idx, kept = _take_tone(spec, ay_map, ay_ins, 0, ins_cap, 2)
+            idx, kept = _take_tone(spec, ay_map, ay_ins, 0, early_cap, 2)
         bound.append((e, idx))
         if e.tone_chip == 4 and kept.pitch:
             # The instrument now carries the pitch trajectory; the row ramp
@@ -1465,9 +1551,10 @@ def _bind_tone_instruments(
             # The PCE column is the control volume; `vol_pts` carry the
             # balance register and any control-volume steps as row effects.
             e.vol = column_vol
-        elif e.tone_chip == 3:
+        elif e.tone_chip == 3 or (e.tone_chip == 6 and e.tone_gb_wave):
             # The SMS column is the raw 4-bit register; keep vol_pts as
             # pattern steps rather than folding them into a volume macro.
+            # The GB wave column is the NR32 level (0/5/10/15), same idea.
             pass
         elif kept.vol:
             # The column that makes the macro the register: SCC vol*macro/15,
@@ -1494,6 +1581,7 @@ def _bind_tone_instruments(
     n_ay = len(ay_ins)
     n_psg = len(psg_ins)
     n_nes = len(nes_ins)
+    n_huc = len(huc6280_ins)
     for event, idx in bound:
         if event.tone_chip == 1:
             event.ins = tone_ins_base + idx
@@ -1503,6 +1591,10 @@ def _bind_tone_instruments(
             event.ins = tone_ins_base + n_scc + n_ay + n_psg + idx
         elif event.tone_chip == 5:
             event.ins = tone_ins_base + n_scc + n_ay + n_psg + n_nes + idx
+        elif event.tone_chip == 6:
+            event.ins = (
+                tone_ins_base + n_scc + n_ay + n_psg + n_nes + n_huc + idx
+            )
         else:
             event.ins = tone_ins_base + n_scc + idx
 
@@ -7326,6 +7418,106 @@ def analyze(
             huc6280_pcm_events.append((ev, hit.sample_index))
         huc6280_pcm_count = len(huc_pcm_hits)
 
+    # Game Boy DMG: two pulse voices, the wavetable voice and noise, in that
+    # order after the PCE block. A note's instrument is a DIV_INS_GB that
+    # carries the hardware envelope (or, when the driver used the zombie
+    # volume bug, a volume macro); the wave voice also selects a 32-nibble
+    # wavetable through the wave-synth feature.
+    gb_ids: list[int] = []
+    gb_waves: list[bytes] = []
+    gb_ins: list[ToneIns] = []
+    gb_count = 0
+    gb_clock = vgm.gb_dmg_clock or GB_DEFAULT_CLOCK
+    gb_hits, gb_offs, gb_wave_list, gb_warn = collect_gb(vgm, gb_clock)
+    warnings.extend(gb_warn)
+    if gb_hits or gb_offs:
+        gb_ids.append(0)
+        gb_base = (
+            tone_base + SCC_VOICES * len(scc_ids) + AY_VOICES * len(ay_ids)
+            + (NES_CHANNELS if nes_ids else 0)
+            + (HUC6280_CHANNELS if huc6280_ids else 0)
+        )
+        gb_waves = list(gb_wave_list)
+        gb_wave_index = {img: i for i, img in enumerate(gb_waves)}
+        for h in gb_hits:
+            ch = gb_base + h.voice
+            if h.voice == 3:
+                note = gb_noise_note(h.period)
+                e5 = 0x80
+                pitch_pts: tuple[tuple[int, int], ...] = ()
+            else:
+                note, e5 = gb_note(gb_clock, h.period)
+                # The binding works in pitch-table units; the GB table holds
+                # ``2048 - register``.
+                pitch_pts = tuple((t, 2048 - p) for t, p in h.pitch_pts)
+            # Duty (pulse) / noise width. Both use the 12xx effect.
+            if h.voice != 2:
+                channel_fx.append((h.sample_time, ch, 0x12, h.duty))
+                for t, d in h.duty_pts:
+                    channel_fx.append((t, ch, 0x12, d))
+            # Ch1 hardware sweep.
+            if h.voice == 0 and (h.sweep & 0x7F):
+                channel_fx.append((
+                    h.sample_time, ch, 0x13,
+                    (((h.sweep >> 4) & 7) << 4) | (h.sweep & 7),
+                ))
+                channel_fx.append((h.sample_time, ch, 0x14, (h.sweep >> 3) & 1))
+                for t, sw in h.sweep_pts:
+                    channel_fx.append((
+                        t, ch, 0x13, (((sw >> 4) & 7) << 4) | (sw & 7),
+                    ))
+                    channel_fx.append((t, ch, 0x14, (sw >> 3) & 1))
+            # Stereo: NR51's per-channel L/R map is Furnace's 08xy.
+            ev_pan = h.pan
+            if ev_pan == 0:
+                # Both off: a real mute, not "leave the previous pan".
+                ev_pan = 0
+            for t, p in h.pan_pts:
+                channel_fx.append((t, ch, 0x08, p))
+            wave_steps: list[tuple[int, int]] = []
+            if h.voice == 2:
+                for t, w in h.wave_pts:
+                    idx = gb_wave_index.get(gb_waves[w]) if w < len(gb_waves) else None
+                    if idx is None:
+                        idx = len(gb_waves)
+                        gb_wave_index[gb_waves[w]] = idx
+                    if wave_steps and wave_steps[-1][1] == idx:
+                        continue
+                    wave_steps.append((t, idx))
+            vol_pts = tuple((t, v, None) for t, v in h.vol_pts)
+            ev = NoteEvent(
+                sample=h.sample_time,
+                ch=ch,
+                on=True,
+                note=note,
+                ins=-1,
+                vol=h.vol,
+                e5=e5,
+                pan=ev_pan,
+                end=h.off_sample,
+                vol_pts=vol_pts,
+                tone_pitch_pts=pitch_pts,
+                tone_wave_pts=tuple(wave_steps),
+                tone_wave=h.wave if h.voice == 2 else -1,
+                tone_clock=gb_clock,
+                tone_div=GB_PITCH_DIVIDER,
+                tone_period_offset=0,
+                tone_chip=6,
+                tone_gb_wave=h.voice == 2,
+                gb_soft_env=h.soft_env,
+                gb_env_vol=h.env_vol,
+                gb_env_dir=h.env_dir,
+                gb_env_len=h.env_len,
+                gb_sound_len=h.sound_len,
+            )
+            events.append(ev)
+            gb_count += 1
+        for off in gb_offs:
+            events.append(NoteEvent(
+                sample=off.sample_time, ch=gb_base + off.voice, on=False,
+                note=180, ins=-1, vol=-1, e5=0x80, pan=0,
+            ))
+
     # The YM2203 SSG rides in the same six-channel system: 0-2 FM, 3-5 PSG. Its
     # notes share the AY instrument list.
     ssg_pcm, ssg_pcm_hits = _ssg_pcm("ym2203_ssg")
@@ -7693,12 +7885,14 @@ def analyze(
     # once per tick, so building it before condense (or before the musical
     # row is chosen) plays the driver's trajectory at the wrong speed.
     _bind_tone_instruments(
-        events, scc_ins, ay_ins, psg_ins, nes_ins, huc6280_ins, tone_ins_base,
+        events, scc_ins, ay_ins, psg_ins, nes_ins, huc6280_ins, gb_ins,
+        tone_ins_base,
         vgm.k051649_clock or SCC_DEFAULT_CLOCK,
         ay_note_clock,
         psg_clock,
         nes_clock,
         huc6280_clock,
+        gb_clock,
         hz, vgm.total_samples,
     )
     # SSG PCM instruments sit immediately before the tone list.
@@ -7891,6 +8085,10 @@ def analyze(
         huc6280_pcm_samples=huc_pcm_samples,
         huc6280_count=huc6280_count,
         huc6280_pcm_count=huc6280_pcm_count,
+        gb_ids=gb_ids,
+        gb_waves=gb_waves,
+        gb_ins=gb_ins,
+        gb_count=gb_count,
         fm_vol_max=_fm_vol_max(fm_systems, is_opll=is_opll, is_opl=is_opl),
         fm_notes=(
             opll_stats.get("notes", 0) if is_opll else
@@ -8185,6 +8383,15 @@ def format_report(song: Song) -> str:
         lines.append(
             f"PCE PCM     {song.huc6280_pcm_count} note(s) in "
             f"{len(song.huc6280_pcm_samples)} 8-bit sample(s)"
+        )
+    if song.gb_ids:
+        sw = sum(1 for i in song.gb_ins if i.gb_soft_env)
+        lines.append(
+            f"GB notes    {song.gb_count}  ({len(song.gb_ids)} chip"
+            f"{'s' if len(song.gb_ids) > 1 else ''}, "
+            f"{len(song.gb_waves)} waveforms, {len(song.gb_ins)} instruments"
+            f"{f', {sw} soft-envelope' if sw else ''}, "
+            f"{song.vgm.gb_dmg_clock or 4194304} Hz)"
         )
     if song.ssg_pcm_samples:
         lines.append(

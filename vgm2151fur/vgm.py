@@ -64,6 +64,10 @@ CMD_YM2608_B_P1 = 0xA7
 CMD_YM2413 = 0x51
 CMD_YM2413_2 = 0xA1
 CMD_SN76489 = 0x50
+# 0xB3 is the Game Boy DMG (LR35902) APU: register, data.  Register 0x00 maps
+# FF10 (NR10), so 0x00-0x16 are the sound registers and 0x20-0x2F the wave RAM.
+# The DMG has a single APU, so there is no instance bit.
+CMD_GB = 0xB3
 # 0xB4 is the NES APU (2A03): register, data.  Reg 0x00-0x17 map $4000-$4017;
 # bit 7 of the register selects the second APU instance.
 CMD_NES = 0xB4
@@ -200,6 +204,11 @@ YM2413_CLOCK_OFF = 0x10
 # channels, its own preset ROM); the low 30 bits stay the clock.
 YM2413_VRC7_BIT = 0x80000000
 YM2610_DEFAULT_CLOCK = 8000000
+# Game Boy DMG header 0x80 (VGM 1.51+).  The clock is the DMG CPU clock, always
+# 4194304 Hz on real hardware.  It sits just before the NES APU field.
+GB_DMG_CLOCK_OFF = 0x80
+GB_DMG_DEFAULT_CLOCK = 4194304
+EXTRA_GB = 0x13            # extra-header clock-list chip id (libvgm DMG)
 # NES APU header 0x84 (VGM 1.51+).  0x80 is the Game Boy DMG clock, inserted
 # ahead of the NES when the header grew; the NES field moved to 0x84.  Bit 30
 # marks a second APU, bit 31 an FDS channel.  The clock is the CPU clock:
@@ -475,7 +484,12 @@ class VgmFile:
     ym2413_clock: int = 0
     ym2413_dual: bool = False
     ym2413_vrc7: bool = False
-    # NES APU (2A03) header 0x80 (VGM 1.51+).  Writes arrive on command 0xB4;
+    # Game Boy DMG header 0x80 (VGM 1.61+).  Writes arrive on command 0xB3;
+    # register 0x00 maps FF10.  Bit 30 of the clock field is a second APU, and
+    # the second instance uses bit 7 of the register byte (Dual Chip Support #2).
+    gb_dmg_clock: int = 0
+    gb_dmg_dual: bool = False
+    # NES APU (2A03) header 0x84 (VGM 1.51+).  Writes arrive on command 0xB4;
     # bit 30 of the clock field is a second APU and bit 31 an FDS channel.
     nes_clock: int = 0
     nes_dual: bool = False
@@ -821,6 +835,11 @@ def chips_in_head(buf: bytes) -> set[str]:
     if version >= 0x150 and _field_in_header(buf, YM2413_CLOCK_OFF, 4):
         if 100_000 <= _header_clock(buf, YM2413_CLOCK_OFF) <= 40_000_000:
             kinds.add("vrc7" if (_header_raw(buf, YM2413_CLOCK_OFF) & YM2413_VRC7_BIT) else "opll")
+    # Game Boy DMG (header 0x80, 1.61+).  The extra-header clock list is not in
+    # this prefix; the census then relies on the parsed writes instead.
+    if version >= 0x161 and _field_in_header(buf, GB_DMG_CLOCK_OFF, 4):
+        if 100_000 <= _header_clock(buf, GB_DMG_CLOCK_OFF) <= 40_000_000:
+            kinds.add("gb")
     # NES APU (header 0x80, 1.51+). The extra-header clock list is not in this
     # prefix, so a file that carries it only there still converts; the census
     # just will not list it.
@@ -960,6 +979,13 @@ def load_vgm(path: Path | str) -> VgmFile:
     ym2413_dual = bool(ym2413_raw & YM2608_DUAL_BIT)
     ym2413_vrc7 = bool(ym2413_raw & YM2413_VRC7_BIT)
     ym2413_clock = _sane_clock(ym2413_raw)
+    # Game Boy DMG clock 0x80 (1.61+), falling back to extra-header id 0x13.
+    # Bit 30 marks a second APU (Dual Chip Support #2).
+    gb_raw = _header_raw(buf, GB_DMG_CLOCK_OFF) if ver >= 0x161 else 0
+    gb_dmg_clock = _sane_clock(gb_raw)
+    if not gb_dmg_clock:
+        gb_dmg_clock = _sane_clock(clocks.get(EXTRA_GB, 0))
+    gb_dmg_dual = bool(gb_raw & 0x40000000)
     # NES APU clock 0x84 (1.51+), falling back to extra-header id 0x14.
     nes_raw = _header_raw(buf, NES_CLOCK_OFF) if ver >= 0x151 else 0
     nes_clock = _sane_clock(nes_raw)
@@ -1093,6 +1119,8 @@ def load_vgm(path: Path | str) -> VgmFile:
         nes_clock=nes_clock,
         nes_dual=nes_dual,
         nes_fds=nes_fds,
+        gb_dmg_clock=gb_dmg_clock,
+        gb_dmg_dual=gb_dmg_dual,
         huc6280_clock=huc6280_clock,
         huc6280_dual=huc6280_dual,
         opl_clock=opl_clock,
@@ -1611,6 +1639,16 @@ def load_vgm(path: Path | str) -> VgmFile:
             vgm.writes.append(ChipWrite(sample, "segapcm", 0, addr & 0x7FF, buf[pos + 3]))
             pos += 4
             continue
+        if cmd == CMD_GB and pos + 3 <= n:
+            # 0xB3: register, data.  Register 0x00 is FF10 (NR10); 0x20-0x2F
+            # is the wave RAM.  Bit 7 of the register selects a second APU
+            # (Dual Chip Support #2), so mask it off like the NES does.
+            rr = buf[pos + 1]
+            vgm.writes.append(ChipWrite(
+                sample, "gb", (rr >> 7) & 1, rr & 0x7F, buf[pos + 2],
+            ))
+            pos += 3
+            continue
         if cmd == CMD_NES and pos + 3 <= n:
             # 0xB4: register, data. Bit 7 of the register selects the second
             # APU instance (0x00-0x17 = $4000-$4017).
@@ -1811,6 +1849,10 @@ def load_vgm(path: Path | str) -> VgmFile:
     if any(w.chip == "opll" for w in vgm.writes) and not vgm.ym2413_clock:
         vgm.warnings.append(
             "YM2413 clock is missing or out of range; using the standard clock"
+        )
+    if any(w.chip == "gb" for w in vgm.writes) and not vgm.gb_dmg_clock:
+        vgm.warnings.append(
+            f"Game Boy DMG clock is missing or out of range; using {GB_DMG_DEFAULT_CLOCK}"
         )
     if any(w.chip == "nes" for w in vgm.writes) and not vgm.nes_clock:
         vgm.warnings.append(

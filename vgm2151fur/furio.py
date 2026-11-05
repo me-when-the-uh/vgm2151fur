@@ -13,7 +13,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from vgm2151fur.furwrite import (
-    CHIP_AY8910, CHIP_C140, CHIP_C352, CHIP_K007232, CHIP_K051649, CHIP_K052539,
+    CHIP_AY8910, CHIP_C140, CHIP_C352, CHIP_GB, CHIP_K007232, CHIP_K051649,
+    CHIP_K052539,
     CHIP_K053260, CHIP_MSM6258, CHIP_MSM6295, CHIP_OPL, CHIP_OPL2,
     CHIP_NES, CHIP_PCE, CHIP_OPLL, CHIP_OPL2_DRUMS, CHIP_OPLL_DRUMS, CHIP_OPL3,
     CHIP_OPL3_DRUMS, CHIP_OPL_DRUMS, CHIP_RF5C68, CHIP_SEGAPCM, CHIP_VRC7,
@@ -59,6 +60,7 @@ CHIP_CHANNELS = {
     CHIP_VRC7: 6,   # Konami VRC7 (OPLL core, six channels)
     CHIP_NES: 5,    # NES APU: two pulses, triangle, noise, DPCM
     CHIP_PCE: 6,    # HuC6280: six wavetable voices
+    CHIP_GB: 4,     # Game Boy DMG: two pulses, wavetable, noise
     CHIP_MSM6295: 4,  # MSM6295
     CHIP_MSM6258: 1,  # MSM6258
     CHIP_K007232: 2,  # K007232
