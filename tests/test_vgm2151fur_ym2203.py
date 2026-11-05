@@ -415,6 +415,47 @@ class TestExtRealRip(unittest.TestCase):
                 f"${reg:02X}: only {reached} of {len(moved)} levels reached")
 
 
+class TestYm2203LongVibrato(unittest.TestCase):
+    """Madou 23: a 43-second note whose driver writes vibrato every tick."""
+
+    SRC = Path(r"F:\NASbackup\JamesAlan\_devspace\grbsd\ripwip\_finished"
+               r"\madou123\done\23 I can't... go on... anymore....vgz")
+
+    def test_vibrato_stays_on_row_steps(self):
+        if not self.SRC.exists():
+            self.skipTest(f"{self.SRC} not present")
+        song = analyze(load_vgm(self.SRC))
+        moving = [e for e in song.events if e.on and e.fm_pitch_pts]
+        self.assertEqual(len(moving), 5)
+        self.assertTrue(all(e.pitch_steps for e in moving))
+        self.assertGreaterEqual(
+            max(len(e.pitch_steps) for e in moving), 1700,
+        )
+        # A long macro at speed 11 was the non-smooth version.
+        for patch in song.fm_patches:
+            if len(set(patch.pitch_macro)) > 1:
+                self.assertEqual(patch.pitch_speed, 1, patch.name)
+
+    @unittest.skipUnless(HAVE_FURNACE, "furnace console build missing")
+    def test_exported_pitch_follows_the_source(self):
+        if not self.SRC.exists():
+            self.skipTest(f"{self.SRC} not present")
+        song = analyze(load_vgm(self.SRC))
+        stem = TMP / "madou_lfo"
+        fur = stem.with_suffix(".fur")
+        fur.write_bytes(write_fur(song, include_pcm=False))
+        back = load_vgm(export_fur(fur, stem.with_suffix(".vgm")))
+        src = load_vgm(self.SRC)
+        for ch in range(9):
+            self.assertEqual(
+                pitch_runs(
+                    src, back, ch, threshold_st=0.25, min_run_ms=60,
+                ),
+                [],
+                f"ch{ch}: pitch diverged",
+            )
+
+
 class TestYm2203Analyze(unittest.TestCase):
     def test_fm_note_and_patch(self):
         song = analyze(_vgm(_fm_note(4, 1232), ym2203_clock=CLOCK))

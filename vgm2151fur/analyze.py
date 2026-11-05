@@ -2163,6 +2163,25 @@ def _steppable_pitch(
     return True
 
 
+def _row_steppable(
+    pts: tuple[tuple[int, int, int], ...],
+    start: int,
+    tick_samples: float,
+    row_ticks: int,
+) -> bool:
+    """True when the trajectory has at most about one write per pattern row.
+
+    A vibrato written once per driver tick at speed 1 can ride the row's E5/E8
+    effects exactly.  A macro would have to thin it to fit 255 entries, which
+    turns a 60 Hz wobble into a slow staircase.
+    """
+    if row_ticks <= 0 or tick_samples <= 0:
+        return False
+    row_len = tick_samples * row_ticks
+    rows = {int((t - start) // row_len) for t, _b, _f in pts}
+    return len(rows) * 5 >= len(pts) * 4
+
+
 def _bind_fm_pitch(
     events: list[NoteEvent],
     patches: dict[tuple, FMPatch],
@@ -2172,6 +2191,7 @@ def _bind_fm_pitch(
     total_samples: int,
     cap: int = 200,
     allow_steps: bool = False,
+    row_ticks: int = 1,
 ) -> tuple[int, int]:
     """Turn YM2203/YM2612 f-num trajectories into instrument pitch macros.
 
@@ -2205,7 +2225,16 @@ def _bind_fm_pitch(
             # A held pitch with a jump or two is a step function. One
             # E5/E8/E9 row effect reproduces it without an instrument copy.
             # Only oscillating motion needs a macro.
-            if allow_steps and (len(pts) <= 4 or _steppable_pitch(pts)):
+            if allow_steps and (
+                len(pts) <= 4
+                or _steppable_pitch(pts)
+                or (
+                    ticks > MACRO_MAX
+                    and _row_steppable(
+                        pts, e.sample, tick_samples, row_ticks,
+                    )
+                )
+            ):
                 deltas = tuple(
                     (t, int(round(opn_pitch_units(b, f) - ref)))
                     for t, b, f in pts[1:]
@@ -7881,6 +7910,7 @@ def analyze(
         cap=max(len(patch_order), 250 - foreign_ins - 24),
         allow_steps=(is_opn or is_opn2 or is_opl or is_opnb
                      or is_opna or is_opll),
+        row_ticks=use_speed,
     )
     # An operator level the driver scripted while its note sounded. The volume
     # column reaches only a KVS operator. The rest travel as instrument macros.
