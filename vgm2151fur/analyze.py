@@ -7444,7 +7444,16 @@ def analyze(
             if h.voice == 3:
                 note = gb_noise_note(h.period)
                 e5 = 0x80
-                pitch_pts: tuple[tuple[int, int], ...] = ()
+                # The binding's noise branch converts these raw note positions
+                # to offsets (it subtracts the note's own position), so store
+                # the ntPos for each NR43, not the already-subtracted offset.
+                offsets: list[tuple[int, int]] = []
+                for t, nr43 in h.pitch_pts:
+                    pos = gb_noise_note(nr43) - 60
+                    if offsets and offsets[-1][1] == pos:
+                        continue
+                    offsets.append((t, pos))
+                pitch_pts: tuple[tuple[int, int], ...] = tuple(offsets)
             else:
                 note, e5 = gb_note(gb_clock, h.period)
                 # The binding works in pitch-table units; the GB table holds
@@ -7504,6 +7513,7 @@ def analyze(
                 tone_period_offset=0,
                 tone_chip=6,
                 tone_gb_wave=h.voice == 2,
+                tone_noise=h.voice == 3,
                 gb_soft_env=h.soft_env,
                 gb_env_vol=h.env_vol,
                 gb_env_dir=h.env_dir,

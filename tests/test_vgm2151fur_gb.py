@@ -46,6 +46,15 @@ def _note(sample, env, env_len=0, duty=2, period=0x600):
     ]
 
 
+def _noise_note(sample, env, nr43, length=0, length_en=False):
+    return [
+        _gb(sample, 0x10, length & 0x3F),
+        _gb(sample, 0x11, env),
+        _gb(sample, 0x12, nr43),
+        _gb(sample, 0x13, (0x40 if length_en else 0) | 0x80),
+    ]
+
+
 class TestGbParsing(unittest.TestCase):
     def test_command_and_clock(self):
         buf = bytearray(0xC0)
@@ -102,6 +111,64 @@ class TestGbNotes(unittest.TestCase):
         self.assertEqual(len(hits), 1)
         self.assertEqual(hits[0].off_sample, 9000)
         self.assertEqual([(o.sample_time, o.voice) for o in offs], [(9000, 0)])
+
+    def test_silent_retrigger_is_a_note_off(self):
+        # The Pokemon Card GB2 driver stops a pulse with NR12 = 0x08 (DAC on,
+        # volume 0) followed by a trigger. That must emit an off, not a silent
+        # replacement note that drops the previous note's end.
+        writes = _note(1000, 0x90)
+        writes += [_gb(9000, 0x02, 0x08), _gb(9000, 0x04, 0x80)]
+        hits, offs, _w, _warn = collect_gb(_vgm(writes))
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0].off_sample, 9000)
+        self.assertEqual([(o.sample_time, o.voice) for o in offs], [(9000, 0)])
+
+    def test_noise_silent_retrigger_is_a_note_off(self):
+        writes = _noise_note(1000, 0xA1, 0x16)
+        writes += [_gb(9000, 0x11, 0x08), _gb(9000, 0x13, 0x80)]
+        hits, offs, _w, _warn = collect_gb(_vgm(writes))
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0].off_sample, 9000)
+        self.assertEqual([(o.sample_time, o.voice) for o in offs], [(9000, 3)])
+
+    def test_noise_nr43_change_stays_one_note(self):
+        # A drum body sweeps NR43 without re-triggering; it must remain one
+        # note so the hardware envelope keeps decaying.
+        writes = _noise_note(1000, 0xA1, 0x16)
+        writes += [_gb(3000, 0x12, 0x15), _gb(5000, 0x12, 0x17)]
+        hits, _o, _w, _warn = collect_gb(_vgm(writes))
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0].period, 0x16)
+        self.assertEqual(hits[0].pitch_pts, [(3000, 0x15), (5000, 0x17)])
+
+    def test_noise_pitch_macro_is_the_table_offset(self):
+        writes = _noise_note(1000, 0xA1, 0x16)
+        writes += [_gb(3000, 0x12, 0x15)]  # one table step higher
+        song = analyze(_vgm(writes))
+        ev = next(e for e in song.events if e.tone_chip == 6 and e.tone_noise)
+        # The binding subtracts the note position, so the event stores ntPos.
+        self.assertEqual(ev.tone_pitch_pts, ((3000, gb_noise_note(0x15) - 60),))
+        ins = song.gb_ins[ev.ins]
+        self.assertLessEqual(max(abs(v) for v in ins.pitch), 2)
+
+    def test_hardware_envelope_not_mistaken_for_zombie(self):
+        # Repeated NRx2 refreshes with a nonzero period must stay hardware.
+        writes = _note(1000, 0xA1)
+        writes += [_gb(2000, 0x02, 0xA1), _gb(3000, 0x02, 0xA1)]
+        hits, _o, _w, _warn = collect_gb(_vgm(writes))
+        self.assertFalse(hits[0].soft_env)
+        self.assertEqual((hits[0].env_vol, hits[0].env_dir, hits[0].env_len),
+                         (10, 0, 1))
+
+    def test_noise_length_disabled_uses_64(self):
+        # Furnace enables the noise length counter when soundLen < 64, so a
+        # source note with length counting off must carry 64, not 63.
+        hits, _o, _w, _warn = collect_gb(_vgm(_noise_note(1000, 0xA1, 0x16)))
+        self.assertEqual(hits[0].sound_len, 64)
+        hits, _o, _w, _warn = collect_gb(
+            _vgm(_noise_note(1000, 0xA1, 0x16, length=36, length_en=True))
+        )
+        self.assertEqual(hits[0].sound_len, 63 - 36)
 
     def test_hardware_envelope(self):
         # One NRx2 write at the trigger: the platform's hardware envelope.

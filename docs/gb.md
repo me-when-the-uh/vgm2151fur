@@ -78,6 +78,27 @@ NR51's per-channel L/R enables map to Furnace's `08xy` (binary left/right);
 the note carries the value in force at its start and mid-note moves become
 pan effects.
 
+## Note-offs
+
+A voice stops when its DAC is cleared (NRx2 = 0x00 for pulse/noise, NR30 bit 7
+for wave) or when the driver re-triggers it with volume 0 (the common
+`NRx2 = 0x08` then `NRx4 = 0x80` idiom). That second form used to become a
+silent replacement note, which left the *previous* note open in the pattern;
+the collector now treats a silent re-trigger as a real note-off and emits an
+off event at that sample. The wave voice's NR30 on/off is its gate.
+
+Noise length counting needs care: Furnace writes NR44's length-enable bit when
+`soundLen < 64` and NR41 = `63 - soundLen`. A source note with length counting
+*disabled* therefore has to carry `soundLen = 64` (not 63); otherwise every
+noise note is cut after 64 ticks even though the source sustains it.
+
+## Noise sweeps
+
+NR43 is the noise timbre/frequency, not a new note. A drum body can rewrite it
+several times while the hardware envelope decays, so mid-note changes become a
+pitch macro (`tone_pitch_pts` in note-table steps) rather than note splits.
+Splitting would restart the envelope on every step and chop the decay.
+
 ## Instrument budget
 
 GB instruments share the module's 255-instrument limit with SCC/AY/PCE. GB

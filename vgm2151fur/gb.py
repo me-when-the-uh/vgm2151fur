@@ -310,11 +310,30 @@ def collect_gb(
             return wave_on
         return (env[voice] & 0xF8) != 0
 
+    def voice_audible(voice: int) -> bool:
+        """Whether a trigger right now would produce sound.
+
+        Drivers stop a pulse/noise voice by writing NRx2 = 0x08 (DAC on, volume
+        0) and re-triggering, or by clearing the DAC. Such a "trigger" is a
+        note-off, not a new note: the previous note must get an explicit off.
+        A hardware attack from 0 (direction up, period > 0) does rise, so it
+        stays audible.
+        """
+        if voice == 2:
+            return wave_on and wave_volume(wave_vol) > 0
+        e = env[voice]
+        if (e & 0xF8) == 0:
+            return False
+        return (e >> 4) > 0 or bool((e & 8) and (e & 7))
+
     def final_sound_len(voice: int) -> int:
-        # Furnace writes ``63 - soundLen`` and enables counting when <63.
+        # Pulses disable length counting at ``soundLen == 63``; the noise
+        # platform tests ``soundLen < 64``, so 64 is its "disabled" value.
+        # Without that, every noise note is cut after 64 length ticks even
+        # when the source never enabled the counter.
         if length_en[voice] and length_val[voice] > 0:
             return 63 - length_val[voice]
-        return 63
+        return 64 if voice == 3 else 63
 
     def close(voice: int, t: int, *, emit_off: bool = True) -> None:
         nonlocal glitches
@@ -326,7 +345,10 @@ def collect_gb(
             env_writes[voice], hit.sample_time, t or 10 ** 12, hit.env_vol,
             hit.env_raw,
         )
-        if count >= GB_SOFT_ENV_WRITES:
+        # Only a note whose NRx2 period is zero is using the zombie volume
+        # bug. A note with a hardware envelope (period > 0) decays on its own;
+        # repeated NRx2 refreshes there must not be replayed as a macro.
+        if count >= GB_SOFT_ENV_WRITES and hit.env_len == 0:
             hit.soft_env = True
             hit.vol_pts = list(pts)
         env_writes[voice].clear()
@@ -385,8 +407,13 @@ def collect_gb(
             prev_period[voice] = period[voice]
 
     def trigger(voice: int, t: int) -> None:
-        close(voice, t, emit_off=False)
-        open_hit(voice, t)
+        audible = voice_audible(voice)
+        # A silent re-trigger (NRx2 = 0x08 or a cleared wave DAC) is how many
+        # drivers stop a voice, so the previous note needs a real off. A real
+        # re-trigger replaces the previous note on the same row.
+        close(voice, t, emit_off=not audible)
+        if audible:
+            open_hit(voice, t)
 
     def record_pitch(voice: int, t: int, *, evaluate: bool) -> None:
         hit = active[voice]
@@ -479,10 +506,20 @@ def collect_gb(
             noise_width = (val >> 3) & 1
             hit = active[3]
             if hit is not None and t > hit.sample_time:
-                if (val & 0xF7) != (hit.period & 0xF7):
-                    close(3, t, emit_off=False)
-                    open_hit(3, t)
-                elif noise_width != hit.duty:
+                # NR43 is the noise timbre/pitch. Changing it mid-note is a
+                # sweep (a drum body), not a new note: keeping it in one note
+                # lets the hardware envelope finish its decay.
+                last = (
+                    hit.pitch_pts[-1][1] if hit.pitch_pts
+                    else (hit.period & 0xF7)
+                )
+                cur = val & 0xF7
+                if cur != last:
+                    if hit.pitch_pts and hit.pitch_pts[-1][0] == t:
+                        hit.pitch_pts[-1] = (t, cur)
+                    else:
+                        hit.pitch_pts.append((t, cur))
+                if noise_width != hit.duty:
                     if not hit.duty_pts or hit.duty_pts[-1][1] != noise_width:
                         hit.duty_pts.append((t, noise_width))
         elif reg == REG_N_CTL:
