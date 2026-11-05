@@ -196,6 +196,29 @@ class TestSsgPcmDacStream(unittest.TestCase):
         self.assertEqual(samples[0].rate, 15964)
         self.assertEqual(samples[0].voice, 2)
 
+    def test_same_offset_plays_share_the_longest_body(self):
+        body = bytes([(i // 8) % 16 for i in range(1200)])
+        vgm = self._stream(body, length=1200, sample=1000)
+        vgm.dac_stream_plays.append(DacStreamPlay(
+            sample=10000, chip_type=0x06, chip_id=0, stream=0,
+            port=0, reg=10, offset=0, length=600, mode=1,
+            rate=15964, loop=False, reverse=False, step=1,
+            step_base=0, bank=0,
+        ))
+        samples, hits, _warn = collect_ssg_pcm(vgm, chip="ym2203_ssg")
+        # Both plays read bank offset 0; the 600-byte play is a prefix of the
+        # 1,200-byte one, so it reuses that body and is cut at its own stop.
+        self.assertEqual(len(samples), 1)
+        self.assertEqual(len(hits), 2)
+        self.assertGreater(len(samples[0].data), 1000)
+        first = min(hits, key=lambda h: h.sample_time)
+        self.assertEqual(first.sample_time, 1000)
+        self.assertLess(
+            first.end_time,
+            1000 + 1200 * 44100 // 15964,
+        )
+        self.assertEqual({h.sample_index for h in hits}, {0})
+
     def test_stream_levels_round_trip(self):
         body = bytes([0, 15] * 600)
         vgm = self._stream(body)

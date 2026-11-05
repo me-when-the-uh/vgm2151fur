@@ -57,6 +57,13 @@ declared stream rate (typically 15.9 kHz) becomes the sample's `c4_rate`
 instead of being inferred from the 44.1 kHz-rounded timestamps.  A looping
 stream is played once (the AY sample instrument is one-shot) and reported.
 
+Plays that start at the **same bank offset** read the same source from the
+start, so a short play is a prefix of the longest one.  The collector stores
+the longest body once and gives each play its own hit; the hit's `end_time`
+becomes the note-off that cuts the longer body at the shorter play's stop.
+This is the same rule the banked YM2612 DAC path uses.  On the Rusty title
+rip it cuts 104 bodies to 57 without changing the 758 hits.
+
 The DAC-mode condition is what separates the two uses of one channel: in
 `02 Blood Soon Castle [Intro]` the voice plays a normal tone with a slow
 volume ramp for the first minute, then the mixer turns its tone off and the
