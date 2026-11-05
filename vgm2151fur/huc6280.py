@@ -52,6 +52,8 @@ HUC6280_MAX_PERIOD = 0xFFF
 # A driver writing the note's own registers a few milliseconds after the gate
 # is still describing this note, not a bend (same rule as SCC/C140).
 HUC6280_REFIT_SAMPLES = 735
+# The LO and HI bytes of one 12-bit frequency update land within a few samples.
+HUC6280_FREQ_PAIR_GAP = 64
 # A whole-waveform rewrite is a burst of byte writes; only the settled image is
 # a step of a morph.
 WAVE_BURST_SAMPLES = 64
@@ -297,7 +299,14 @@ def collect_huc6280(
             # The driver rewrote the note's own pitch inside the frame.
             hit.period = period
             return
-        hit.pitch_pts.append((t, period))
+        # A 12-bit update is a LO/HI pair; the two writes can land a few
+        # samples apart. Keep only the settled value so the transient low byte
+        # never becomes a pitch step (a 730-sample merge would instead eat the
+        # driver's per-frame vibrato).
+        if hit.pitch_pts and t - hit.pitch_pts[-1][0] <= HUC6280_FREQ_PAIR_GAP:
+            hit.pitch_pts[-1] = (t, period)
+        else:
+            hit.pitch_pts.append((t, period))
 
     def update_volume(st: dict, voice: int, t: int) -> None:
         hit = note_live(st, voice)

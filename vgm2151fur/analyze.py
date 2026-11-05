@@ -7347,7 +7347,13 @@ def analyze(
                 channel_fx.append((h.sample_time, voice_ch, 0x11, 0))
             seg_pts = [(h.sample_time, h.period)]
             seg_pts += list(h.pitch_pts)
-            segs = segment_periods(seg_pts, gate_end, huc_clock, 32, 0)
+            # Collapse only the adjacent LO/HI byte pair. A one-frame merge
+            # would swallow the driver's per-frame vibrato and leave a single
+            # arbitrary pitch value (unstable, too-flat notes).
+            segs = segment_periods(
+                seg_pts, gate_end, huc_clock, 32, 0,
+                merge_gap=_AY_MERGE_GAP,
+            )
             for i, (st, period, intra) in enumerate(segs):
                 nxt = segs[i + 1][0] if i + 1 < len(segs) else 0
                 seg_end = nxt or h.off_sample
@@ -7368,6 +7374,7 @@ def analyze(
                 )
                 steps = _tone_steps(
                     intra, st, HUC6280_REFIT_SAMPLES if i == 0 else 0,
+                    merge_gap=_AY_MERGE_GAP,
                 )
                 wave_steps: list[tuple[int, int]] = []
                 for t, img in merge_step_writes(
