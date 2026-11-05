@@ -294,6 +294,37 @@ class TestGbWave(unittest.TestCase):
         self.assertEqual(wave.period, 0x451)
         self.assertEqual(wave.pitch_pts, [])
 
+    def test_partial_wave_update_is_the_current_image(self):
+        # Drivers rewrite only the bytes that changed. A note must use the
+        # current accumulator, not wait until all 16 bytes were touched.
+        img = bytearray(range(0x10, 0x20))
+        writes = [_gb(0, 0x20 + i, b) for i, b in enumerate(img)]
+        writes += [
+            _gb(1000, 0x0A, 0x80), _gb(1000, 0x0C, 0x40),
+            _gb(1000, 0x0D, 0x00), _gb(1000, 0x0E, 0x85),
+        ]
+        img[5] = 0xAB
+        writes += [
+            _gb(2000, 0x25, 0xAB),
+            _gb(2100, 0x0A, 0x00), _gb(2101, 0x0A, 0x80),
+            _gb(2101, 0x0E, 0x85),
+        ]
+        hits, _o, waves, _warn = collect_gb(_vgm(writes))
+        wave = [h for h in hits if h.voice == 2]
+        self.assertEqual(len(wave), 2)
+        self.assertNotEqual(wave[0].wave, wave[1].wave)
+        self.assertEqual(waves[wave[1].wave], wave_nibbles(bytes(img)))
+
+    def test_envelope_written_after_trigger_is_the_note_envelope(self):
+        # Blitz/Kuma noise: NR43, trigger, then NR42. The late NR42 is the
+        # note's envelope, not a mid-note change.
+        writes = _noise_note(1000, 0x11, 0x16)
+        writes.append(_gb(1002, 0x11, 0x91))
+        hits, _o, _w, _warn = collect_gb(_vgm(writes))
+        self.assertEqual(
+            (hits[0].env_vol, hits[0].env_dir, hits[0].env_len), (9, 0, 1),
+        )
+
     def test_wave_images_become_wavetables(self):
         wave_a = bytes(range(0x10, 0x20))
         wave_b = bytes(range(0x90, 0xA0))

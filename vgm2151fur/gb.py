@@ -44,6 +44,9 @@ GB_MIN_NOTE = 100
 GB_REFIT_SAMPLES = 735
 # Two mid-note NRx2 writes mean the driver is doing a software volume ramp.
 GB_SOFT_ENV_WRITES = 2
+# A whole-wave RAM rewrite is a burst of byte writes; writes this close belong
+# to the same morph step.
+GB_WAVE_BURST = 64
 
 REG_SWEEP = 0x00
 REG_P1_DUTY = 0x01
@@ -278,31 +281,32 @@ def collect_gb(
     glitches = 0
     prev_period = [0, 0, 0]
 
-    # Wave RAM image.
+    # Wave RAM image. Drivers rewrite only the bytes that changed, so the
+    # accumulator is the live image and a note takes whatever it holds when it
+    # starts. Treating "all 16 bytes touched since the last image" as a
+    # complete update missed partial rewrites and made notes play a stale wave.
     wave_image = bytearray(16)
-    wave_touched = [False] * 16
     wave_index_by_key: dict[bytes, int] = {}
     waves: list[bytes] = []
-    current_wave = -1
 
-    def finalize_wave(t: int) -> None:
-        nonlocal current_wave
-        if not all(wave_touched):
-            return
+    def wave_now(t: int, record: bool = False) -> int:
         nib = wave_nibbles(wave_image)
         idx = wave_index_by_key.get(nib)
         if idx is None:
             idx = len(waves)
             wave_index_by_key[nib] = idx
             waves.append(nib)
-        if idx != current_wave:
-            current_wave = idx
+        if record:
             hit = active[2]
             if hit is not None and t > hit.sample_time:
-                if not hit.wave_pts or hit.wave_pts[-1][1] != idx:
+                if (hit.wave_pts
+                        and t - hit.wave_pts[-1][0] <= GB_WAVE_BURST):
+                    # A whole-image rewrite is a burst of byte writes; keep the
+                    # first time and the settled image.
+                    hit.wave_pts[-1] = (hit.wave_pts[-1][0], idx)
+                elif not hit.wave_pts or hit.wave_pts[-1][1] != idx:
                     hit.wave_pts.append((t, idx))
-        for i in range(16):
-            wave_touched[i] = False
+        return idx
 
     def dac_on(voice: int) -> bool:
         if voice == 2:
@@ -322,7 +326,7 @@ def collect_gb(
             # A wave trigger with NR32 = 0 is muted; the note starts when the
             # output level rises (see the NR32 branch). A trigger while the
             # level is up starts a normal note.
-            return wave_on and current_wave >= 0 and wave_volume(wave_vol) > 0
+            return wave_on and wave_volume(wave_vol) > 0
         e = env[voice]
         if (e & 0xF8) == 0:
             return False
@@ -379,11 +383,12 @@ def collect_gb(
     def open_hit(voice: int, t: int, vol_override: int | None = None) -> None:
         env_writes[voice] = []
         if voice == 2:
-            if not wave_on or current_wave < 0:
+            if not wave_on:
                 return
+            index = wave_now(t)
             active[voice] = GbHit(
                 sample_time=t, voice=2, period=period[2],
-                vol=wave_volume(wave_vol), duty=0, wave=current_wave,
+                vol=wave_volume(wave_vol), duty=0, wave=index,
                 sound_len=63, pan=pan[2],
             )
             return
@@ -471,6 +476,16 @@ def collect_gb(
                 if (val >> 4) == 0 and not ((val & 8) and (val & 7)):
                     close(voice, t)
                     continue
+                if t - hit.sample_time <= GB_REFIT_SAMPLES:
+                    # Drivers often write NRx2 just after the trigger (e.g.
+                    # Blitz's / Kuma's noise: NR43, trigger, then NR42). That
+                    # write is this note's envelope, not a mid-note change.
+                    hit.env_vol = val >> 4
+                    hit.env_dir = (val >> 3) & 1
+                    hit.env_len = val & 7
+                    hit.env_raw = val
+                    hit.vol = val >> 4
+                    continue
                 if hit.env_len > 0:
                     # A hardware envelope whose period or direction changes
                     # mid-note is how drivers speed a decay up or slow it
@@ -527,7 +542,7 @@ def collect_gb(
                     last = hit.vol_pts[-1][1] if hit.vol_pts else hit.vol
                     if v != last:
                         hit.vol_pts.append((t, v))
-            elif v > 0 and wave_started and wave_on and current_wave >= 0:
+            elif v > 0 and wave_started and wave_on:
                 # The voice was triggered while muted (Kirby's Dream Land 2
                 # sets NR32 = 0, triggers, then raises NR32 a few samples
                 # later). The level rising starts the note; the pitch write
@@ -581,13 +596,34 @@ def collect_gb(
         elif REG_WAVE <= reg <= REG_WAVE + 15:
             i = reg - REG_WAVE
             wave_image[i] = val
-            wave_touched[i] = True
-            finalize_wave(t)
+            wave_now(t, record=True)
         # 0x14 master volume: the module mix is normalised separately.
 
     for voice in range(4):
         if active[voice] is not None:
             close(voice, 0, emit_off=False)
+    # A 16-byte rewrite passes through intermediate images; only the states a
+    # note starts on or settles on are real wavetables. Drop the rest and
+    # remap the indices so the module stays well inside the 256-wavetable cap.
+    used: dict[int, int] = {}
+    for h in hits:
+        if h.voice != 2:
+            continue
+        if h.wave not in used:
+            used[h.wave] = len(used)
+        for _t, idx in h.wave_pts:
+            if idx not in used:
+                used[idx] = len(used)
+    if len(used) != len(waves):
+        pruned = [b""] * len(used)
+        for old, new in used.items():
+            pruned[new] = waves[old]
+        for h in hits:
+            if h.voice != 2:
+                continue
+            h.wave = used[h.wave]
+            h.wave_pts = [(t, used[idx]) for t, idx in h.wave_pts]
+        waves = pruned
     if glitches:
         warnings.append(f"Game Boy: ignored {glitches} sub-frame tone gates")
     return hits, offs, waves, warnings
