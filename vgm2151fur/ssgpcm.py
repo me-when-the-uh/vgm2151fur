@@ -90,6 +90,12 @@ STREAM_CHIP = {
 # same voice so the source audio is kept instead of disappearing; a short
 # DAC-stream play is dropped outright.
 PCM_MIN_FRAMES = 128
+# Only bodies longer than this are candidates for the DC drop/trim; short
+# percussion hits must keep their exact shape.
+SSG_PCM_DC_MIN_LEN = 2048
+# Pointers this close into the same bank range are the same sample with a
+# few-frame start shift, not distinct bodies.
+SSG_PCM_OFFSET_TOLERANCE = 4
 
 
 @dataclass
@@ -205,15 +211,15 @@ def _stream_body(vgm: VgmFile, play) -> bytes:
 
 def _stream_points(
     vgm: VgmFile, chip: str,
-) -> tuple[list[tuple[int, int, int, list[tuple[int, int]]]], int]:
+) -> tuple[list[tuple[int, int, int, list[tuple[int, int]], int]], int]:
     """Expand DAC-stream plays that write an SSG volume register.
 
     Every ``0x93`` start is its own note, at its own rate, bounded by its
-    ``0x94`` stop.  Returns ``[(chip_id, voice, rate, points)]`` and a count
-    of looping streams.  Plays are never merged with each other: the start
-    and stop commands are the note timing.
+    ``0x94`` stop.  Returns ``[(chip_id, voice, rate, points, offset)]`` and a
+    count of looping streams.  The bank offset lets the caller store the
+    longest body once when several plays read the same source range.
     """
-    out: list[tuple[int, int, int, list[tuple[int, int]]]] = []
+    out: list[tuple[int, int, int, list[tuple[int, int]], int]] = []
     loops = 0
     if not vgm.dac_stream_plays or not vgm.dac_data:
         return out, loops
@@ -235,7 +241,7 @@ def _stream_points(
             (int(round(play.sample + i * step)), byte & 0x0F)
             for i, byte in enumerate(body)
         ]
-        out.append((play.chip_id, voice, rate, points))
+        out.append((play.chip_id, voice, rate, points, play.offset))
     return out, loops
 
 
@@ -335,6 +341,51 @@ def _body_frames(seg: list[tuple[int, int]], rate: int) -> int:
     return max(1, int(round(span * rate / VGM_RATE)) + 1)
 
 
+def _longest_run(data: bytes) -> int:
+    """Longest consecutive run of one level."""
+    if not data:
+        return 0
+    best = cur = 1
+    for i in range(1, len(data)):
+        if data[i] == data[i - 1]:
+            cur += 1
+            if cur > best:
+                best = cur
+        else:
+            cur = 1
+    return best
+
+
+def _trim_dc(data: bytes) -> bytes:
+    """Drop DC-heavy bodies and trim a mostly-constant tail.
+
+    A stream play can declare a long length whose tail is just the held AY
+    level: a short transient followed by a flat line.  If more than 80% of
+    the body is one consecutive run at a single level, it is a DC offset
+    rather than audio and the whole body is dropped.  Otherwise trim a
+    trailing constant run when it is at least half the body and at least 64
+    frames, and reject a body that is one level throughout or a bare step
+    between two levels.
+    """
+    if len(data) <= SSG_PCM_DC_MIN_LEN:
+        return data
+    if _longest_run(data) > len(data) * 0.80:
+        return b""
+    last = data[-1]
+    start = len(data) - 1
+    while start > 0 and data[start - 1] == last:
+        start -= 1
+    if start == 0:
+        return data[:1]  # one constant level throughout
+    run = len(data) - start
+    if run >= 64 and run * 2 >= len(data) - 2:
+        trimmed = data[:start + 1]
+        if len(set(trimmed)) < 2:
+            return trimmed[:1]
+        return trimmed
+    return data
+
+
 def _merge_short(
     segments: list[list[tuple[int, int]]], rate: int,
 ) -> list[list[tuple[int, int]]]:
@@ -418,7 +469,12 @@ def collect_ssg_pcm(
                 segments.append((voice, seg))
         return segments
 
-    all_segments: list[tuple[int, int, int, list[tuple[int, int]]]] = []
+    # (chip, voice, rate, body data, start, end, hits), where each hit is its
+    # own (voice, start, end).  Direct-write segments have one hit; a bank
+    # range shared by several stream plays gets one body and many hits.
+    all_segments: list[tuple[
+        int, int, int, bytes, int, int, list[tuple[int, int, int]],
+    ]] = []
     for cid in sorted(per_chip):
         gap = PCM_SPLIT_GAP
         while True:
@@ -434,39 +490,93 @@ def collect_ssg_pcm(
             by_voice.setdefault(voice, []).append(seg)
         for voice, segs in by_voice.items():
             for seg in _merge_short(segs, rate):
-                all_segments.append((cid, voice, rate, seg))
+                data = _trim_dc(_resample(seg, rate))
+                if len(data) < 2:
+                    continue
+                all_segments.append((
+                    cid, voice, rate, data, seg[0][0], seg[-1][0],
+                    [(voice, seg[0][0], seg[-1][0])],
+                ))
 
-    # One note per DAC-stream play, at its declared rate.  These are explicit
-    # triggers, so the note timing survives; a body under the minimum is still
-    # not worth storing.
-    for cid, voice, rate, points in streamed:
+    # Plays that start at the same bank offset read the same source from the
+    # start; a short one is a prefix of the longest.  Store the longest body
+    # once and let each play's stop cut it, the same rule the banked YM2612
+    # DAC path uses.  Trim a held DC tail first: a long declared play is often
+    # a short transient followed by the register's constant level.
+    #
+    # A driver can also latch a pointer a few bytes into the same sample.
+    # Cluster offsets within SSG_PCM_OFFSET_TOLERANCE so those become one
+    # body with a few-frame start shift instead of adjacent duplicates.  Use
+    # one median stream rate per chip; the log's integer rates differ by a
+    # hertz or two and would otherwise resample the same source into distinct
+    # arrays.
+    stream_groups: dict[
+        tuple[int, int], list[tuple[int, int, list[tuple[int, int]]]]
+    ] = {}
+    stream_rates: dict[int, list[int]] = {}
+    for cid, voice, rate, points, offset in streamed:
         if len(points) < 2 or _body_frames(points, rate) < PCM_MIN_FRAMES:
             continue
-        all_segments.append((cid, voice, rate, points))
+        stream_groups.setdefault((cid, offset), []).append(
+            (voice, rate, points)
+        )
+        stream_rates.setdefault(cid, []).append(rate)
+    for cid in sorted(stream_rates):
+        offsets = sorted(off for c, off in stream_groups if c == cid)
+        clusters: list[list[int]] = []
+        current: list[int] = []
+        for off in offsets:
+            if current and off - current[-1] <= SSG_PCM_OFFSET_TOLERANCE:
+                current.append(off)
+            else:
+                if current:
+                    clusters.append(current)
+                current = [off]
+        if current:
+            clusters.append(current)
+        rates = sorted(stream_rates[cid])
+        rate = rates[len(rates) // 2]
+        for cluster in clusters:
+            takes = [
+                take for off in cluster for take in stream_groups[(cid, off)]
+            ]
+            candidates = []
+            for voice, _take_rate, points in takes:
+                data = _trim_dc(_resample(points, rate))
+                if len(data) >= 2:
+                    candidates.append((voice, points, data))
+            if not candidates:
+                continue
+            voice, seg, data = max(candidates, key=lambda c: len(c[2]))
+            plays = [
+                (hit_voice, pts[0][0], pts[-1][0])
+                for hit_voice, _rate, pts in takes
+            ]
+            all_segments.append((
+                cid, voice, rate, data, seg[0][0], seg[-1][0], plays,
+            ))
 
     samples: list[SsgPcmSample] = []
     hits: list[SsgPcmHit] = []
-    for cid, voice, rate, seg in all_segments:
-        data = _resample(seg, rate)
-        if len(data) < 2:
-            continue
+    for cid, voice, rate, data, start, end, plays in all_segments:
         idx = len(samples)
         samples.append(SsgPcmSample(
-            name=f"SSG {cid:02d} {voice + 1} {seg[0][0]:08x}",
+            name=f"SSG {cid:02d} {voice + 1} {start:08x}",
             data=data,
             rate=rate,
-            start=seg[0][0],
-            end=seg[-1][0],
+            start=start,
+            end=end,
             voice=voice,
             chip_id=cid,
         ))
-        hits.append(SsgPcmHit(
-            sample_time=seg[0][0],
-            end_time=seg[-1][0],
-            voice=voice,
-            chip_id=cid,
-            sample_index=idx,
-        ))
+        for hit_voice, hit_start, hit_end in plays:
+            hits.append(SsgPcmHit(
+                sample_time=hit_start,
+                end_time=hit_end,
+                voice=hit_voice,
+                chip_id=cid,
+                sample_index=idx,
+            ))
 
     if not samples:
         return [], [], warnings

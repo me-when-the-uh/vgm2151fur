@@ -131,6 +131,10 @@ CHIP_OPLL_DRUMS = 0xA7
 # ROM.  DIV_SYSTEM_NES: five channels (two pulses, triangle, noise, DPCM).
 CHIP_VRC7 = 0x9D
 CHIP_NES = 0x06
+# DIV_SYSTEM_GB: four channels (two pulses, wavetable, noise). The chip's
+# chipType flag selects the emulated model (0 DMG, 2 CGB-E); the converter
+# writes CGB-E so the zombie-envelope rule matches.
+CHIP_GB = 0x04
 # DIV_SYSTEM_PCE: six wavetable voices (two pulses, triangle, noise, DPCM on
 # the NES sit at 0x06).
 CHIP_PCE = 0x05
@@ -243,6 +247,9 @@ INS_PCE = 5
 # DIV_INS_NES: the 2A03 pulse/triangle/noise and DPCM instrument.  The DPCM
 # sample rides the same `amiga` sample feature (1-bit DPCM or 8-bit PCM).
 INS_NES = 34
+# DIV_INS_GB: the Game Boy's hardware envelope plus an optional wave-synth
+# feature for the wavetable voice.
+INS_GB = 2
 SMP_DEPTH_DPCM = 1
 SMP_DEPTH_ADPCM_K = 7
 SMP_DEPTH_ADPCM_A = 5
@@ -865,6 +872,74 @@ def _write_ins_ay(b: Buf, name: str, ins=None) -> None:
     if ins is None:
         ins = ToneIns()
     _write_tone_macros(b, ins, wave=False, reset=True)
+    b.raw(b"EN")
+    b.end_block(size_off, start)
+
+
+def _write_ins_gb(b: Buf, name: str, ins) -> None:
+    """DIV_INS_GB: hardware envelope plus an optional wavetable (voice 3).
+
+    The GB feature packs NRx2's initial volume/direction/period, the length
+    field and the soft-envelope flag.  A wavetable voice adds the same wave
+    synth the SCC uses; its ``wave1`` picks the 32-nibble waveform.
+    """
+    size_off, start = b.begin_block(b"INS2")
+    b.u16(FUR_VERSION)
+    b.u16(INS_GB)
+    b.raw(b"NA")
+    na_size = len(b.b)
+    b.u16(0)
+    na_start = len(b.b)
+    b.strz(name)
+    b.b[na_size:na_size + 2] = int(len(b.b) - na_start).to_bytes(2, "little")
+    _write_tone_macros(b, ins, wave=bool(getattr(ins, "gb_wave", False)))
+    b.raw(b"GB")
+    gb_size = len(b.b)
+    b.u16(0)
+    gb_start = len(b.b)
+    b.u8(
+        ((int(getattr(ins, "gb_env_len", 0)) & 7) << 5)
+        | ((int(getattr(ins, "gb_env_dir", 0)) & 1) << 4)
+        | (int(getattr(ins, "gb_env_vol", 0)) & 15)
+    )
+    b.u8(int(getattr(ins, "gb_sound_len", 63)) & 0xFF)
+    soft = bool(getattr(ins, "gb_soft_env", False))
+    wave = bool(getattr(ins, "gb_wave", False))
+    b.u8(1 if soft else 0)
+    if soft or wave:
+        b.u8(0)  # no hardware envelope sequence
+    else:
+        # The pattern volume column is the maximum, so the note starts at 15.
+        # This sequence rewrites the hardware envelope to the source's initial
+        # volume (and length/direction) before the key-on write, so the column
+        # does not raise every drum to full level.
+        b.u8(1)
+        env_data = (
+            ((int(getattr(ins, "gb_sound_len", 63)) & 0xFF) << 8)
+            | ((int(getattr(ins, "gb_env_vol", 0)) & 15) << 4)
+            | ((int(getattr(ins, "gb_env_dir", 0)) & 1) << 3)
+            | (int(getattr(ins, "gb_env_len", 0)) & 7)
+        )
+        b.u8(0)  # DIV_GB_HWCMD_ENVELOPE
+        b.u16(env_data)
+    b.b[gb_size:gb_size + 2] = int(len(b.b) - gb_start).to_bytes(2, "little")
+    if getattr(ins, "gb_wave", False):
+        b.raw(b"WS")
+        ws_size = len(b.b)
+        b.u16(0)
+        ws_start = len(b.b)
+        b.u32(max(0, int(getattr(ins, "wave", 0))))  # wave1
+        b.u32(max(0, int(getattr(ins, "wave", 0))))  # wave2
+        b.u8(1)  # rateDivider
+        b.u8(0)  # effect: none
+        b.u8(1)  # enabled
+        b.u8(0)  # global: restart on every note
+        b.u8(0)  # speed
+        b.u8(0)  # param1
+        b.u8(0)  # param2
+        b.u8(0)  # param3
+        b.u8(0)  # param4
+        b.b[ws_size:ws_size + 2] = int(len(b.b) - ws_start).to_bytes(2, "little")
     b.raw(b"EN")
     b.end_block(size_off, start)
 
@@ -1526,13 +1601,13 @@ def _emit_steps(
     # One row can carry one transpose and one fine-tune step.  If the driver
     # wrote several f-nums inside one row, the last one is the row's pitch;
     # the intermediate values are shorter than a row and cannot be heard.
-    by_row: dict[int, int] = {}
+    by_row: dict[int, tuple[int, int]] = {}
     for t, delta in ev.pitch_steps:
-        row = song.place(t, stats)[0]
+        row, delay = song.place(t, stats)
         if row <= note_row:
             row = note_row + 1
         if 0 <= row < total_rows:
-            by_row[row] = delta
+            by_row[row] = (delta, delay)
     e5w = ev.e5
     xpose = 0
 
@@ -1563,13 +1638,18 @@ def _emit_steps(
     for idx, row in enumerate(targets):
         if row >= limit_row:
             break
-        delta = by_row[row]
+        delta, delay = by_row[row]
         next_row = targets[idx + 1] if idx + 1 < len(targets) else total_rows
         next_row = min(next_row, limit_row)
         cell = grid[ch].get(row)
         if cell is not None and 0 <= cell.note < 180:
             # A later note owns this row and carries its own pitch.
             continue
+        # A pitch step written inside a row must land on the driver's tick,
+        # not at the row start: at fast tempos the row is several
+        # milliseconds long and the difference is an audible early bend.
+        if delay > 0 and not any(c == 0xED for c, _v in (cell_at(row).fx or ())):
+            _add_fx(cell_at(row), 0xED, delay, fx_cols, stats)
         # E8xx/E9xx reach +-15 semitones, and a larger jump is split over
         # rows. Never borrow a row a later step owns. Its effect must land
         # there.
@@ -3469,6 +3549,7 @@ def write_fur(
     has_tone_chip = bool(
         getattr(song, "scc_ids", ()) or getattr(song, "ay_ids", ())
         or getattr(song, "nes_ids", ()) or getattr(song, "huc6280_ids", ())
+        or getattr(song, "gb_ids", ())
         or getattr(song, "psg_ids", ())
     )
     if ym2610 or ym2608:
@@ -3583,12 +3664,16 @@ def write_fur(
     huc6280_waves = list(getattr(song, "huc6280_waves", ()) or ())
     huc6280_specs = list(getattr(song, "huc6280_ins", ()) or ())
     huc6280_pcm_smps = list(getattr(song, "huc6280_pcm_samples", ()) or ())
+    gb_ids = list(getattr(song, "gb_ids", ()) or ())
+    gb_waves = list(getattr(song, "gb_waves", ()) or ())
+    gb_specs = list(getattr(song, "gb_ins", ()) or ())
     scc_chip = CHIP_K052539 if song.vgm.k051649_plus else CHIP_K051649
     n_scc = 5 * len(scc_ids)
     n_ay = 3 * len(ay_ids)
     n_psg = 4 * len(psg_ids)
     n_nes = 5 * len(nes_ids)
     n_huc6280 = 6 * len(huc6280_ids)
+    n_gb = 4 * len(gb_ids)
     n_nes_dpcm_ins = len(nes_dpcm_smps)
     n_nes_pcm_ins = len(nes_pcm_smps)
     n_huc6280_pcm_ins = len(huc6280_pcm_smps)
@@ -3630,7 +3715,7 @@ def write_fur(
         + 4 * len(oki_ids) + len(adpcm_ids)
         + (16 if spcm_smps else 0) + n_rf5c
         + 24 * len(c140_ids) + 32 * len(c352_ids)
-        + 4 * len(k053260_ids) + n_scc + n_ay + n_nes + n_huc6280
+        + 4 * len(k053260_ids) + n_scc + n_ay + n_nes + n_huc6280 + n_gb
     )
     if n_ch == 0:
         raise ValueError("write_fur: need include_fm and/or include_pcm")
@@ -3652,7 +3737,7 @@ def write_fur(
         + n_y8950_b_ins + n_opl4_wave_ins + n_ssg_pcm_ins
         + n_nes_dpcm_ins + n_nes_pcm_ins + n_huc6280_pcm_ins
         + len(scc_specs) + len(ay_specs) + len(psg_specs) + len(nes_specs)
-        + len(huc6280_specs)
+        + len(huc6280_specs) + len(gb_specs)
     )
     n_smp = (
         len(pcm_smps) + len(oki_smps) + len(adpcm_smps)
@@ -3663,7 +3748,7 @@ def write_fur(
         + len(y8950_b_smps) + len(opl4_wave_smps) + len(ssg_pcm_smps)
         + len(nes_dpcm_smps) + len(nes_pcm_smps) + len(huc6280_pcm_smps)
     )
-    n_wav = len(scc_waves) + len(huc6280_waves)
+    n_wav = len(scc_waves) + len(huc6280_waves) + len(gb_waves)
 
     # Analysis numbers sample-chip channels after the FM block. With no FM
     # they shift down to stay inside n_ch.
@@ -3751,6 +3836,12 @@ def write_fur(
         for voice, label in enumerate(pce_labels):
             names_long.append(f"{label} ({cid + 1})")
             names_short.append(f"P{cid + 1}-{voice + 1}")
+    gb_labels = ("Pulse 1", "Pulse 2", "Wavetable", "Noise")
+    gb_short = ("S1", "S2", "WA", "NO")
+    for cid in gb_ids:
+        for voice, (label, short) in enumerate(zip(gb_labels, gb_short)):
+            names_long.append(f"{label} ({cid + 1})")
+            names_short.append(f"{short}{cid + 1}" if cid else short)
 
     label_parts: list[str] = []
     if fm_present:
@@ -3812,6 +3903,8 @@ def write_fur(
         label_parts.append("NES APU")
     if huc6280_ids:
         label_parts.append("PC Engine")
+    if gb_ids:
+        label_parts.append("Game Boy")
     chip_label = " + ".join(label_parts) or "empty"
 
     comment = (
@@ -3955,6 +4048,13 @@ def write_fur(
             if kind == "ym2612":
                 chips.append(CHIP_YM2612_EXT if system.ext else CHIP_YM2612)
                 fm_clock = song.vgm.ym2612_clock
+                # Furnace's Genesis clock list has a named 8 MHz FM Towns
+                # entry (clockSel=2).  A source from that machine reports
+                # exactly 8 MHz, so ask for the stock setting rather than a
+                # custom clock.
+                if fm_clock == 8_000_000:
+                    flag_texts.append("clockSel=2")
+                    continue
                 # Furnace's Genesis default is COLOR_NTSC*15/7 truncated to
                 # 7670454, while the VGM header normally says 7670453.  Write
                 # the source clock so the exported pitch register matches it.
@@ -4071,6 +4171,16 @@ def write_fur(
     for cid in huc6280_ids:
         chips.append(CHIP_PCE)
         flag_texts.append(pce_flag_text(song.vgm.huc6280_clock))
+    for cid in gb_ids:
+        chips.append(CHIP_GB)
+        # chipType 2 is the CGB-E core: its single-pass NRx2 rule is what the
+        # converter's software-envelope replay follows. A non-standard clock
+        # still rides as customClock.
+        clock = song.vgm.gb_dmg_clock or 4194304
+        flags = "chipType=2"
+        if abs(clock - 4194304) > 2:
+            flags += f"\ncustomClock={clock}"
+        flag_texts.append(flags)
     n_chips = len(chips)
 
     info_size_off, info_start = b.begin_block(b"INFO")
@@ -4393,6 +4503,24 @@ def write_fur(
         if spec.pitch:
             name += "+pitch"
         _write_ins_pce(b, name, spec)
+    for i, spec in enumerate(gb_specs):
+        ins_ptrs.append(len(b))
+        if getattr(spec, "gb_wave", False):
+            wave = (
+                gb_waves[spec.wave] if spec.wave < len(gb_waves) else b""
+            )
+            name = f"GB Wave {i:02d} {_wave_label(wave)}"
+            if spec.waves:
+                name += "+morph"
+        elif getattr(spec, "gb_soft_env", False):
+            name = "GB Soft" + ("+pitch" if spec.pitch else "")
+        else:
+            name = (
+                f"GB Env {spec.gb_env_vol:x}{spec.gb_env_dir}"
+                f"{spec.gb_env_len}"
+                + ("+pitch" if spec.pitch else "")
+            )
+        _write_ins_gb(b, name, spec)
 
     smp_ptrs: list[int] = []
     for i, smp in enumerate(pcm_smps):
@@ -4576,6 +4704,15 @@ def write_fur(
         # 5-bit samples (0-31); the PCE wavetable height is 31.
         wave_ptrs.append(_write_wave(
             b, f"pce_wave_{_wave_label(wave)}", bytes(wave), maximum=31,
+        ))
+    for wave in gb_waves:
+        # The DMG wave RAM is 32 4-bit samples; height 15. Furnace's GB core
+        # XORs each nibble with 15 when it loads the table (the DAC is
+        # inverted), so store the complement to make the written wave RAM
+        # match the source bytes.
+        data = bytes(15 - (v & 0x0F) for v in wave)
+        wave_ptrs.append(_write_wave(
+            b, f"gb_wave_{_wave_label(wave)}", data, maximum=15,
         ))
 
     for i, p in enumerate(ins_ptrs):

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import bisect
 import math
+import statistics
 from dataclasses import dataclass
 
 from vgm2151fur.timing import place_tick
@@ -28,6 +29,23 @@ DAC_CHUNK_SECONDS = 0.25
 # Furnace clamps a sample-playback rate to this value.
 DAC_RATE_MAX = 192000
 DAC_RATE_MIN = 1
+# Bank samples whose bodies are the same audio at a small frame offset share
+# one module sample. Rate and length are compared loosely, but the interior of
+# the body must match almost exactly; only the leading/trailing fill may move.
+DAC_SIMILAR_RATE = 32
+DAC_SIMILAR_SHIFT = 16
+DAC_SIMILAR_EDGE = 128
+DAC_SIMILAR_MIN_MATCH = 0.90
+DAC_SIMILAR_INTERIOR = 0.999
+DAC_SIMILAR_MIN_LEN = 32
+# A unique sample that starts this soon after the previous unique sample is
+# part of the same contiguous one-shot phrase.
+DAC_ONESHOT_GAP = 64
+# A final body at least this long whose longest silent stretch is over 40%
+# of it is split at that stretch.  Bank runs split earlier at any held
+# silence of DAC_RUN_GAP samples, so a kick does not carry a delayed snare.
+DAC_SILENCE_MIN_LEN = 8192
+DAC_SILENCE_FRACTION = 0.40
 
 
 @dataclass(frozen=True)
@@ -41,13 +59,20 @@ class DacSample:
 
 @dataclass(frozen=True)
 class DacPlay:
-    """One source run played on FM6."""
+    """One source run played on FM6.
+
+    ``source`` marks a play whose sample is a bank segment longer than the
+    run itself. A later note cuts it, so a short slice and the longer block it
+    came from share one sample instead of storing a copy per length.
+    """
 
     onset: int
     sample: int
     pan: int
     span: int
     collapsed: bool = False
+    source: bool = False
+    fresh: bool = False
 
 
 def _signed_bank(raw: bytes) -> bytes:
@@ -419,6 +444,420 @@ def _packed_words(
     return reduced
 
 
+def _frames_from_times(
+    selected: list[tuple[float, int, int]],
+    rate: int,
+    stats: dict | None = None,
+) -> bytes:
+    """Lay source bytes on a ``rate`` frame grid, holding the last value."""
+    out = bytearray()
+    previous = 0x80
+    start = selected[0][0]
+    for t, byte, _wait in selected:
+        frame = int(round((t - start) * rate / VGM_RATE))
+        if frame < len(out):
+            out[frame] = byte
+            if stats is not None:
+                stats["dac_frame_collisions"] = (
+                    stats.get("dac_frame_collisions", 0) + 1
+                )
+            previous = byte
+            continue
+        if frame > len(out):
+            out.extend(bytes([previous]) * (frame - len(out)))
+        out.append(byte)
+        previous = byte
+    return bytes(out)
+
+
+def _source_runs(
+    vgm: VgmFile,
+    stats: dict,
+    enable_tl: list[tuple[int, bool]],
+) -> list[dict] | None:
+    """Bank reads grouped by the `0xE0` pointer, with their source offsets.
+
+    Each pointer change starts a run. A run keeps reading forward from that
+    offset until the driver moves the pointer, so a shorter play of the same
+    data is a prefix of the longer run. A `$2B` state change ends the run as
+    well, because the driver resumes at the next bank address afterwards.
+    Returns `None` when the log writes the DAC directly (`0x2A`), which has no
+    bank offset to reuse.
+    """
+    bank = bytes(vgm.dac_data)
+    signed = _signed_bank(bank)
+    local: dict = {}
+    runs: list[dict] = []
+    cursor = 0
+    pos = 0
+    current: dict | None = None
+    saw_pointer = False
+    fresh_next = False
+    # A 0x2B transition ends a bank run even when no bytes are written while
+    # the DAC is off. The driver resumes reading at the next bank address, so
+    # the post-enable bytes are a new source segment, not a held gap inside
+    # the previous one.
+    change_times: list[int] = []
+    previous_state: bool | None = None
+    for change_t, change_en in enable_tl:
+        if change_en != previous_state:
+            change_times.append(change_t)
+            previous_state = change_en
+    change_i = 0
+
+    def flush() -> None:
+        nonlocal current
+        if current is not None and current["bytes"]:
+            runs.append(current)
+        current = None
+
+    for t, kind, value in vgm.dac_events:
+        while change_i < len(change_times) and t >= change_times[change_i]:
+            # The state at this instant belongs to the new run.
+            flush()
+            fresh_next = True
+            change_i += 1
+        if kind == 0:
+            flush()
+            cursor = max(0, value)
+            pos = 0
+            saw_pointer = True
+            fresh_next = False
+            continue
+        if kind != 1:
+            # A direct 0x2A stream has no bank offset to reuse.
+            return None
+        addr = cursor + pos
+        pos += 1
+        if addr >= len(bank):
+            local["dac_bank_overrun"] = local.get("dac_bank_overrun", 0) + 1
+            continue
+        if not _dac_enabled_at(enable_tl, t):
+            # Inaudible bytes break the bank run: playback resumes at this
+            # later address, which is a new source segment.
+            flush()
+            fresh_next = True
+            local["dac_disabled_bytes"] = (
+                local.get("dac_disabled_bytes", 0) + 1
+            )
+            if signed[addr]:
+                local["dac_disabled_audible"] = (
+                    local.get("dac_disabled_audible", 0) + 1
+                )
+            continue
+        if current is None:
+            current = {
+                "t": t, "off": addr, "bytes": [], "times": [],
+                "fresh": fresh_next,
+            }
+            fresh_next = False
+        current["bytes"].append(signed[addr])
+        current["times"].append(t)
+    flush()
+
+    if not saw_pointer or not runs:
+        return None
+    stats.update(local)
+    return runs
+
+
+def _source_pitch(run: dict) -> int:
+    """Median byte cadence of a run, in bytes per second."""
+    times = run["times"]
+    waits = [b - a for a, b in zip(times, times[1:]) if b > a]
+    if not waits:
+        return VGM_RATE
+    return max(DAC_RATE_MIN, min(
+        DAC_RATE_MAX, int(round(VGM_RATE / statistics.median(waits))),
+    ))
+
+
+def _split_silent_run(run: dict) -> list[dict] | None:
+    """Split one bank run at a long held-silence gap.
+
+    A driver can read from offset 0 through a kick into the next bank
+    sample after a long pause.  Keeping that as one body delays the next
+    sample and stores the pause; split at the gap and let the post part keep
+    its own bank offset and onset.  A held silence of ``DAC_RUN_GAP`` or
+    more is a rest between source segments, not sample data.
+    """
+    times = run["times"]
+    values = run["bytes"]
+    if len(times) < 2 or len(values) < 2:
+        return None
+    best_gap = 0
+    best_i = -1
+    for i in range(len(times) - 1):
+        if values[i]:
+            continue
+        gap = times[i + 1] - times[i]
+        if gap > best_gap:
+            best_gap = gap
+            best_i = i
+    if best_i < 0 or best_gap < DAC_RUN_GAP:
+        return None
+    pre = dict(run)
+    pre["bytes"] = values[:best_i + 1]
+    pre["times"] = times[:best_i + 1]
+    pre["pitch"] = _source_pitch(pre)
+    post = dict(run)
+    post["t"] = times[best_i + 1]
+    post["bytes"] = values[best_i + 1:]
+    post["times"] = times[best_i + 1:]
+    post["off"] = run["off"] + best_i + 1
+    post["pitch"] = _source_pitch(post)
+    post["fresh"] = False
+    return [p for p in (pre, post) if p["bytes"]]
+
+
+def _split_silent_runs(runs: list[dict], stats: dict) -> list[dict]:
+    """Apply `_split_silent_run` repeatedly, keeping source order."""
+    out: list[dict] = []
+    for run in runs:
+        pieces = [run]
+        changed = True
+        while changed:
+            changed = False
+            expanded: list[dict] = []
+            for piece in pieces:
+                parts = _split_silent_run(piece)
+                if parts is None:
+                    expanded.append(piece)
+                    continue
+                changed = True
+                stats["dac_source_silence_splits"] = (
+                    stats.get("dac_source_silence_splits", 0) + 1
+                )
+                expanded.extend(parts)
+            pieces = expanded
+        out.extend(pieces)
+    return out
+
+
+def _collect_source(
+    runs: list[dict],
+    stats: dict,
+    pan_timeline: list[tuple[int, int]],
+) -> tuple[list[DacSample], list[DacPlay]]:
+    """One sample per (bank offset, byte cadence) and one play per run.
+
+    A run that reads fewer bytes than the longest run at the same offset is a
+    prefix of that sample: the note is cut by the next run, so the longer body
+    serves both. This is the first pass the DAC path needs; without it every
+    time slice of a repeated bank sample became its own module sample.
+    """
+    groups: dict[tuple[int, int], list[dict]] = {}
+    for run in runs:
+        run["pitch"] = _source_pitch(run)
+    stats["dac_source_runs_unsplit"] = len(runs)
+    runs = _split_silent_runs(runs, stats)
+    for run in runs:
+        groups.setdefault((run["off"], run["pitch"]), []).append(run)
+
+    samples: list[DacSample] = []
+    sample_of: dict[tuple[int, int], int] = {}
+    for key, items in groups.items():
+        rep = max(items, key=lambda r: (
+            len(r["bytes"]), r["times"][-1] - r["times"][0],
+        ))
+        duration = rep["times"][-1] - rep["times"][0]
+        n = len(rep["bytes"])
+        waits = [
+            b - a for a, b in zip(rep["times"], rep["times"][1:]) if b > a
+        ]
+        if waits and len(set(waits)) == 1:
+            # A uniform cadence is exact: N bytes at one wait occupy N frames
+            # of VGM_RATE/wait, not (N-1).
+            dense = VGM_RATE / waits[0]
+        else:
+            dense = n * VGM_RATE / duration if duration > 0 else VGM_RATE
+        # The fastest interval must still have its own frame or its byte is
+        # overwritten when the body is laid out.
+        fastest = VGM_RATE / min(waits) if waits else float(VGM_RATE)
+        rate = max(1, min(
+            DAC_RATE_MAX, max(key[1], int(round(dense)), int(round(fastest))),
+        ))
+        body = _frames_from_times(
+            [(t, b, 0) for t, b in zip(rep["times"], rep["bytes"])],
+            rate, stats,
+        )
+        sample_of[key] = len(samples)
+        samples.append(DacSample(
+            key[0], len(body), body, rate, rep["t"],
+        ))
+
+    plays: list[DacPlay] = []
+    for run in runs:
+        idx = sample_of[(run["off"], run["pitch"])]
+        plays.append(DacPlay(
+            run["t"], idx, _pan_at(pan_timeline, run["t"]),
+            run["times"][-1] - run["t"], False, True,
+            run.get("fresh", False),
+        ))
+    plays.sort(key=lambda p: p.onset)
+
+    stats["dac_source_offsets"] = len({r["off"] for r in runs})
+    stats["dac_source_runs"] = len(runs)
+    stats["dac_source_groups"] = len(samples)
+    stats["dac_source_silent_runs"] = sum(
+        1 for r in runs if not any(r["bytes"])
+    )
+    stats["dac_source_runs_reused"] = len(runs) - len(samples)
+    stats["dac_source_bytes"] = sum(len(r["bytes"]) for r in runs)
+    stats["dac_source_sample_bytes"] = sum(len(s.data) for s in samples)
+    return samples, plays
+
+
+def _coalesce_singles(
+    samples: list[DacSample],
+    plays: list[DacPlay],
+    stats: dict,
+) -> tuple[list[DacSample], list[DacPlay]]:
+    """Join consecutive runs that are each used exactly once.
+
+    A one-shot sequence of bank samples can be stored as one body and played
+    as-is: there is no later note that could need an earlier entry. Only
+    source plays whose sample is used once, with the same pan and rate, join.
+    """
+    if len(plays) < 2:
+        return samples, plays
+    uses: dict[int, int] = {}
+    for p in plays:
+        uses[p.sample] = uses.get(p.sample, 0) + 1
+    ordered = sorted(plays, key=lambda p: p.onset)
+    chains: list[list[DacPlay]] = []
+    current: list[DacPlay] = []
+
+    def flush() -> None:
+        nonlocal current
+        if len(current) > 1:
+            chains.append(current)
+        current = []
+
+    for p in ordered:
+        smp = samples[p.sample]
+        if not p.source or uses.get(p.sample) != 1 or p.collapsed:
+            flush()
+            continue
+        if p.fresh:
+            # The DAC was disabled before this run; the gap is silence, not
+            # a held value, so it cannot join the previous body.
+            flush()
+        if current:
+            prev = current[-1]
+            psmp = samples[prev.sample]
+            if (
+                p.pan != prev.pan
+                or smp.c4_rate != psmp.c4_rate
+            ):
+                flush()
+        current.append(p)
+    flush()
+    if not chains:
+        return samples, plays
+
+    new_samples = list(samples)
+    chained_ids = {id(q) for chain in chains for q in chain}
+    new_plays = [p for p in ordered if id(p) not in chained_ids]
+    for chain in chains:
+        first = chain[0]
+        rate = samples[first.sample].c4_rate
+        start = first.onset
+        end = chain[-1].onset + chain[-1].span
+        body = bytearray()
+        held = 0x80
+        for p in chain:
+            target = int(round((p.onset - start) * rate / VGM_RATE))
+            if target > len(body):
+                body.extend(bytes([held]) * (target - len(body)))
+            smp = samples[p.sample]
+            frames = max(1, int(round(p.span * rate / VGM_RATE)))
+            payload = smp.data[:frames]
+            if not payload:
+                continue
+            if len(body) > target:
+                body[target:target + len(payload)] = payload
+            else:
+                body.extend(payload)
+            held = payload[-1]
+        if len(body) < 2:
+            continue
+        idx = len(new_samples)
+        new_samples.append(DacSample(
+            -1, len(body), bytes(body), rate, start,
+        ))
+        new_plays.append(DacPlay(
+            start, idx, first.pan, end - start, False, True, first.fresh,
+        ))
+        stats["dac_source_coalesced_chains"] = (
+            stats.get("dac_source_coalesced_chains", 0) + 1
+        )
+        stats["dac_source_coalesced_plays"] = (
+            stats.get("dac_source_coalesced_plays", 0) + len(chain)
+        )
+        stats["dac_source_coalesced_samples"] = (
+            stats.get("dac_source_coalesced_samples", 0) + len(chain) - 1
+        )
+
+    used = {p.sample for p in new_plays}
+    remap: dict[int, int] = {}
+    compact: list[DacSample] = []
+    for i, smp in enumerate(new_samples):
+        if i in used:
+            remap[i] = len(compact)
+            compact.append(smp)
+    rebuilt = [
+        DacPlay(
+            p.onset, remap[p.sample], p.pan, p.span, p.collapsed, p.source,
+            p.fresh,
+        )
+        for p in sorted(new_plays, key=lambda p: p.onset)
+    ]
+    stats["dac_unique_samples"] = len(compact)
+    return compact, rebuilt
+
+
+def _source_row_estimate(
+    samples: list[DacSample],
+    plays: list[DacPlay],
+    *, hz: float, speed: int, t0: int,
+) -> int:
+    """Upper bound on the samples `group_dac_plays` will need.
+
+    Single-play rows reuse their source sample; only a row that concatenates
+    several plays needs a new body. The estimate lets the collector choose the
+    chunk path when the reusable representation cannot fit the sample budget.
+    """
+    row_samples = (VGM_RATE / hz) * speed
+    tick = VGM_RATE / hz
+    rows: dict[int, list[DacPlay]] = {}
+    for p in plays:
+        row, _delay = place_tick(
+            p.onset, t0, row_samples, speed, tick, floor=True,
+        )
+        rows.setdefault(row, []).append(p)
+    count = len(samples)
+    combined: set[tuple] = set()
+    for items in rows.values():
+        if len(items) < 2:
+            continue
+        items.sort(key=lambda p: p.onset)
+        weights = [max(1, p.span) for p in items]
+        rate = int(round(
+            sum(samples[p.sample].c4_rate * w
+                for p, w in zip(items, weights))
+            / max(1, sum(weights))
+        ))
+        key = tuple(
+            (p.sample, max(1, int(round(
+                p.span * samples[p.sample].c4_rate / VGM_RATE
+            ))))
+            for p in items
+        )
+        combined.add((key, rate))
+    return count + len(combined)
+
+
 def _chunk_words(
     words: list[tuple[float, int, int]],
     stats: dict,
@@ -510,11 +949,16 @@ def _chunk_words(
                     continue
                 w0 = audio[a0]
                 w1 = audio[a1]
-                chunk_tail = None
-                for j in range(w1 + 1, len(phrase)):
-                    if phrase[j][1] == 0:
-                        chunk_tail = j
-                        break
+                # A chunk may take the zero byte that immediately follows its
+                # last word, but not a zero thousands of words later: that is
+                # the phrase's trailing silence, and appending it stretched
+                # every chunk to the whole phrase (two overlapped chunks then
+                # made group_dac_plays double the rate).
+                chunk_tail = (
+                    w1 + 1
+                    if w1 + 1 < len(phrase) and phrase[w1 + 1][1] == 0
+                    else None
+                )
                 selected = phrase[w0:w1 + 1] + (
                     [phrase[chunk_tail]] if chunk_tail is not None else []
                 )
@@ -561,9 +1005,45 @@ def _chunk_words(
                     )
 
     if len(samples) > DAC_RELEASE_SAMPLES:
-        stats["dac_release_trimmed"] = len(samples) - DAC_RELEASE_SAMPLES
-        del samples[DAC_RELEASE_SAMPLES:]
-        plays = [p for p in plays if p.sample < DAC_RELEASE_SAMPLES]
+        keep = DAC_RELEASE_SAMPLES - 1
+        tail = sorted(
+            (p for p in plays if p.sample >= keep), key=lambda p: p.onset,
+        )
+        rates = {samples[p.sample].c4_rate for p in tail}
+        pans = {p.pan for p in tail}
+        if len(tail) > 1 and len(rates) == 1 and len(pans) == 1:
+            # The rest of the song is played in order: one final sample can
+            # hold the whole remainder and play as-is. This keeps the end of
+            # a long stream instead of dropping it at the budget.
+            first = tail[0]
+            rate = samples[first.sample].c4_rate
+            start = first.onset
+            body = bytearray()
+            held = 0x80
+            for p in tail:
+                target = int(round((p.onset - start) * rate / VGM_RATE))
+                if target > len(body):
+                    body.extend(bytes([held]) * (target - len(body)))
+                elif target < len(body):
+                    body = body[:target]
+                payload = samples[p.sample].data
+                body.extend(payload)
+                held = payload[-1]
+            end = tail[-1].onset + tail[-1].span
+            samples = samples[:keep] + [DacSample(
+                0, len(body), bytes(body), rate, start,
+            )]
+            plays = [p for p in plays if p.sample < keep]
+            plays.append(DacPlay(
+                start, keep, first.pan, end - start, False,
+            ))
+            stats["dac_release_merged_tail"] = len(tail)
+        else:
+            stats["dac_release_trimmed"] = (
+                len(samples) - DAC_RELEASE_SAMPLES
+            )
+            del samples[DAC_RELEASE_SAMPLES:]
+            plays = [p for p in plays if p.sample < DAC_RELEASE_SAMPLES]
     return samples, plays, pan_chunks, trimmed
 
 
@@ -682,10 +1162,29 @@ def _stream_chunks(
     return out
 
 
+def _pan_chunks(plays: list[DacPlay]) -> int:
+    count = 0
+    last: int | None = None
+    for p in sorted(plays, key=lambda p: p.onset):
+        if p.pan != last:
+            count += 1
+            last = p.pan
+    return count
+
+
 def _collect_packed(
     vgm: VgmFile,
+    *,
+    grid: tuple[float, int, int] | None = None,
 ) -> tuple[list[DacSample], list[DacPlay], list[str], dict]:
-    """Build release-capped PCM chunks, split at pan changes and pauses."""
+    """Build source-segment samples, or release-capped chunks as a fallback.
+
+    A log whose DAC reads a PCM bank through `0xE0` pointers keeps one sample
+    per (offset, byte cadence). Shorter reads are prefixes of the longest run
+    at that offset, so the note is cut by the next run rather than stored
+    again. Other logs (direct `0x2A` writes, block/stream plays) use the
+    time-chunk path.
+    """
     if not (
         vgm.dac_events or vgm.dac_block_plays or vgm.dac_stream_plays
     ):
@@ -694,46 +1193,117 @@ def _collect_packed(
     warnings: list[str] = []
     pan_timeline = None if _fm6_is_used(vgm) else _pan_timeline(vgm)
     enable_tl = _dac_enable_timeline(vgm)
-    words = _packed_words(vgm, stats, enable_tl)
-    chunks = _stream_chunks(vgm, stats)
 
-    if not words and not chunks:
-        if stats.get("dac_disabled_bytes"):
+    source_runs = None
+    if not vgm.dac_block_plays and not vgm.dac_stream_plays:
+        source_runs = _source_runs(vgm, stats, enable_tl)
+
+    samples: list[DacSample] = []
+    plays: list[DacPlay] = []
+    chunks: list[tuple[int, bytes, int]] = []
+    if source_runs:
+        if not any(any(run["bytes"]) for run in source_runs):
             warnings.append(
-                f"{stats['dac_disabled_bytes']} YM2612 DAC writes while the DAC "
-                "is disabled (0x2B bit 7 clear); no DAC audio"
+                "YM2612 DAC stream contains only silence; no DAC notes written"
             )
-        return [], [], warnings, stats
+            return [], [], warnings, stats
+        samples, plays = _collect_source(source_runs, stats, pan_timeline)
+        samples, plays = _coalesce_singles(samples, plays, stats)
+        if not samples or not plays:
+            warnings.append(
+                "YM2612 DAC stream contains only silence; no DAC notes written"
+            )
+            return [], [], warnings, stats
+        if grid is not None:
+            estimate = _source_row_estimate(
+                samples, plays, hz=grid[0], speed=grid[1], t0=grid[2],
+            )
+        else:
+            estimate = len(samples)
+        if estimate > DAC_RELEASE_SAMPLES:
+            warnings.append(
+                f"{estimate} YM2612 DAC source samples would exceed the "
+                f"{DAC_RELEASE_SAMPLES}-sample budget; using time chunks"
+            )
+            stats["dac_source_over_budget"] = estimate
+            source_runs = None
 
-    if words:
-        samples, plays, pan_chunks, trimmed = _chunk_words(
-            words, stats, pan_timeline,
+    if source_runs:
+        stats["dac_mode"] = "source"
+        stats["dac_chunks"] = len(samples)
+        stats["dac_pan_chunks"] = _pan_chunks(plays)
+        stats["dac_unique_samples"] = len(samples)
+        stats["dac_sample_bytes"] = sum(len(s.data) for s in samples)
+        stats["dac_notes"] = len(plays)
+        stats["dac_source_bytes"] = stats.get(
+            "dac_source_bytes", sum(len(s.data) for s in samples),
         )
+        # A source sample longer than the run is cut by the next note; the
+        # extra body is intentional.
+        stats["dac_source_cut_plays"] = sum(
+            1 for p in plays
+            if p.source and p.span < len(samples[p.sample].data)
+        )
+        # A pan change during one long sample is channel state: the writer
+        # places 08xx on the row it lands on, so the note keeps its body and
+        # the pan still moves during playback.
+        if pan_timeline:
+            points: list[tuple[int, int]] = []
+            last_pan: int | None = None
+            for t, raw in pan_timeline:
+                pan = _pan_byte(raw)
+                if pan != last_pan:
+                    points.append((t, pan))
+                    last_pan = pan
+            stats["dac_pan_points"] = points
     else:
-        samples, plays, pan_chunks, trimmed = [], [], 0, 0
-    for onset, body, rate in chunks:
-        idx = len(samples)
-        samples.append(DacSample(0, len(body), body, rate, onset))
-        plays.append(DacPlay(
-            onset, idx, _pan_at(pan_timeline, onset),
-            int(round(len(body) * VGM_RATE / rate)),
-        ))
-    plays.sort(key=lambda p: p.onset)
-    if len(samples) > DAC_RELEASE_SAMPLES:
-        stats["dac_release_trimmed"] = len(samples) - DAC_RELEASE_SAMPLES
-        del samples[DAC_RELEASE_SAMPLES:]
-        plays = [p for p in plays if p.sample < DAC_RELEASE_SAMPLES]
-
-    stats["dac_mode"] = "chunks"
-    stats["dac_source_bytes"] = len(words) + sum(
-        len(body) for _t, body, _r in chunks
-    )
-    stats["dac_trimmed_silence_bytes"] = trimmed
-    stats["dac_chunks"] = len(samples)
-    stats["dac_pan_chunks"] = pan_chunks
-    stats["dac_unique_samples"] = len(samples)
-    stats["dac_sample_bytes"] = sum(len(s.data) for s in samples)
-    stats["dac_notes"] = len(plays)
+        # Drop source-only counters so the chunk stats describe what ran.
+        for key in (
+            "dac_source_offsets", "dac_source_runs", "dac_source_groups",
+            "dac_source_runs_reused", "dac_source_sample_bytes",
+            "dac_source_coalesced_chains", "dac_source_coalesced_plays",
+            "dac_source_coalesced_samples",
+        ):
+            stats.pop(key, None)
+        words = _packed_words(vgm, stats, enable_tl)
+        chunks = _stream_chunks(vgm, stats)
+        if not words and not chunks:
+            if stats.get("dac_disabled_bytes"):
+                warnings.append(
+                    f"{stats['dac_disabled_bytes']} YM2612 DAC writes while "
+                    "the DAC is disabled (0x2B bit 7 clear); no DAC audio"
+                )
+            return [], [], warnings, stats
+        if words:
+            samples, plays, pan_chunks, trimmed = _chunk_words(
+                words, stats, pan_timeline,
+            )
+        else:
+            samples, plays, pan_chunks, trimmed = [], [], 0, 0
+        for onset, body, rate in chunks:
+            idx = len(samples)
+            samples.append(DacSample(0, len(body), body, rate, onset))
+            plays.append(DacPlay(
+                onset, idx, _pan_at(pan_timeline, onset),
+                int(round(len(body) * VGM_RATE / rate)),
+            ))
+        plays.sort(key=lambda p: p.onset)
+        if len(samples) > DAC_RELEASE_SAMPLES:
+            stats["dac_release_trimmed"] = (
+                len(samples) - DAC_RELEASE_SAMPLES
+            )
+            del samples[DAC_RELEASE_SAMPLES:]
+            plays = [p for p in plays if p.sample < DAC_RELEASE_SAMPLES]
+        stats["dac_mode"] = "chunks"
+        stats["dac_source_bytes"] = len(words) + sum(
+            len(body) for _t, body, _r in chunks
+        )
+        stats["dac_trimmed_silence_bytes"] = trimmed
+        stats["dac_chunks"] = len(samples)
+        stats["dac_pan_chunks"] = pan_chunks
+        stats["dac_unique_samples"] = len(samples)
+        stats["dac_sample_bytes"] = sum(len(s.data) for s in samples)
+        stats["dac_notes"] = len(plays)
 
     if stats.get("dac_disabled_audible"):
         warnings.append(
@@ -755,6 +1325,18 @@ def _collect_packed(
         warnings.append(
             f"{stats['dac_bank_overrun']} YM2612 DAC reads ran past the PCM bank"
         )
+    if stats.get("dac_release_merged_tail"):
+        warnings.append(
+            f"{stats['dac_release_merged_tail']} YM2612 DAC tail chunks were "
+            f"joined into the final sample at the {DAC_RELEASE_SAMPLES}-sample "
+            "budget; they play in order"
+        )
+    if stats.get("dac_release_trimmed"):
+        warnings.append(
+            f"{stats['dac_release_trimmed']} YM2612 DAC chunks were dropped "
+            f"to stay inside the {DAC_RELEASE_SAMPLES}-sample budget; the end "
+            "of the stream is missing"
+        )
     if not samples:
         warnings.append(
             "YM2612 DAC stream contains only silence; no DAC notes written"
@@ -764,18 +1346,32 @@ def _collect_packed(
 
 def collect_dac(
     vgm: VgmFile, *, slices: bool = False, timeline: bool = False,
+    grid: tuple[float, int, int] | None = None,
 ) -> tuple[list[DacSample], list[DacPlay], list[str], dict]:
     """Return (samples, plays, warnings, stats).
 
-    Default: release-capped rate-exact PCM chunks, split at pan changes.
-    `slices=True`: the per-run sample-map editor representation.
-    `timeline=True`: the old 22.05 kHz comparison body.
+    Default: bank source samples reused by offset (or rate-exact chunks when
+    the source representation cannot fit). `slices=True`: the per-run
+    sample-map editor representation. `timeline=True`: the old 22.05 kHz
+    comparison body. `grid=(hz, speed, t0)` lets the collector check the row
+    grid's final sample count before choosing a mode.
     """
     if timeline:
         return _collect_timeline(vgm)
     if slices:
         return _collect_slices(vgm)
-    return _collect_packed(vgm)
+    return _collect_packed(vgm, grid=grid)
+
+
+def _play_frames(samples: list[DacSample], p: DacPlay) -> int:
+    """Frames this play needs, which can be fewer than its sample's body."""
+    data = samples[p.sample].data
+    if p.span <= 0 or not p.source:
+        return len(data)
+    frames = int(round(
+        p.span * samples[p.sample].c4_rate / VGM_RATE
+    ))
+    return max(1, min(len(data), frames))
 
 
 def _group_rate(
@@ -786,17 +1382,21 @@ def _group_rate(
     weighted = 0.0
     weight = 0
     for p in items:
-        n = len(samples[p.sample].data)
+        n = _play_frames(samples, p)
         if n > 1 and not p.collapsed:
             weighted += samples[p.sample].c4_rate * n
             weight += n
     natural = weighted / weight if weight else float(VGM_RATE)
     lower = 0.0
-    for p in items:
-        n = len(samples[p.sample].data)
-        nxt = next_onset.get(id(p))
-        if n > 1 and nxt is not None and nxt > p.onset:
-            lower = max(lower, VGM_RATE * n / (nxt - p.onset))
+    if not any(p.source for p in items):
+        # A source play is cut by the next note, so it must keep its own
+        # pitch. The old chunks had to be stretched to fit; source samples
+        # do not.
+        for p in items:
+            n = _play_frames(samples, p)
+            nxt = next_onset.get(id(p))
+            if n > 1 and nxt is not None and nxt > p.onset:
+                lower = max(lower, VGM_RATE * n / (nxt - p.onset))
     return int(round(max(natural, lower)))
 
 
@@ -813,6 +1413,429 @@ def _held_byte(
     return smp.data[frame]
 
 
+def _body_overlap(a: bytes, b: bytes, shift: int):
+    """Overlap of two bodies when ``b[i]`` aligns with ``a[i + shift]``."""
+    if shift >= 0:
+        n = min(len(a) - shift, len(b))
+        if n <= 0:
+            return None
+        return n, shift, 0
+    n = min(len(a), len(b) + shift)
+    if n <= 0:
+        return None
+    return n, 0, -shift
+
+
+def _sampled_mismatch(a: bytes, b: bytes, shift: int, limit: int = 128) -> float:
+    ov = _body_overlap(a, b, shift)
+    if ov is None:
+        return 1.0
+    n, sa, sb = ov
+    step = max(1, n // limit)
+    count = len(range(0, n, step))
+    mism = sum(
+        1 for i in range(0, n, step) if a[i + sa] != b[i + sb]
+    )
+    return mism / max(1, count)
+
+
+def _full_mismatch(a: bytes, b: bytes, shift: int) -> tuple[int, list[int]]:
+    ov = _body_overlap(a, b, shift)
+    if ov is None:
+        return 0, []
+    n, sa, sb = ov
+    return n, [
+        i for i in range(n) if a[i + sa] != b[i + sb]
+    ]
+
+
+def _similar_alignment(a: bytes, b: bytes) -> tuple[int, float, float] | None:
+    """Best body offset if two bank samples are the same audio.
+
+    The leading and trailing fill can move by a few frames when a driver
+    reaches the same bank body from a different row position.  The interior
+    of the bodies must agree almost exactly; returning the offset lets the
+    writer move that play's note so its main body still lands on time.
+    """
+    if len(a) < DAC_SIMILAR_MIN_LEN or len(b) < DAC_SIMILAR_MIN_LEN:
+        return None
+    best_sample = min(
+        (_sampled_mismatch(a, b, sh), abs(sh), sh)
+        for sh in range(-DAC_SIMILAR_SHIFT, DAC_SIMILAR_SHIFT + 1)
+    )
+    if best_sample[0] > 0.5:
+        # Even the best coarse alignment is clearly a different body.
+        return None
+    best: tuple[tuple[float, float, int, int], int, float, float] | None = None
+    center = best_sample[2]
+    for sh in range(center - 3, center + 4):
+        if abs(sh) > DAC_SIMILAR_SHIFT:
+            continue
+        n, mism = _full_mismatch(a, b, sh)
+        if n < max(8, len(a) // 4):
+            continue
+        edge = min(DAC_SIMILAR_EDGE, max(4, n // 8))
+        interior_n = n - 2 * edge
+        interior_mis = sum(1 for i in mism if edge <= i < n - edge)
+        overall = 1.0 - len(mism) / n
+        interior = (
+            1.0 - interior_mis / interior_n if interior_n > 0 else overall
+        )
+        if overall < DAC_SIMILAR_MIN_MATCH:
+            continue
+        if interior < DAC_SIMILAR_INTERIOR:
+            continue
+        cand = (interior, overall, -len(mism), -abs(sh))
+        if best is None or cand > best[0]:
+            best = (cand, sh, overall, interior)
+    if best is None:
+        return None
+    return best[1], best[2], best[3]
+
+
+def _similar_candidates(a: DacSample, b: DacSample) -> bool:
+    if abs(a.c4_rate - b.c4_rate) > DAC_SIMILAR_RATE:
+        return False
+    small = min(len(a.data), len(b.data))
+    if small < DAC_SIMILAR_MIN_LEN:
+        return False
+    tolerance = min(256, max(16, small // 16))
+    return abs(len(a.data) - len(b.data)) <= tolerance
+
+
+def _merge_one_shot_samples(
+    samples: list[DacSample],
+    notes: list[tuple[int, int, int]],
+    off_items: list[tuple[int, int]],
+    stats: dict,
+) -> tuple[list[DacSample], list[tuple[int, int, int]], list[tuple[int, int]]]:
+    """Join unique samples that play back-to-back into one body.
+
+    A sample used exactly once cannot be needed again, so a sequence of such
+    notes on the same channel, pan and rate is stored as one body and played
+    by the first note.  The next note's onset truncates the previous body, so
+    overlapping tails stay exact.
+    """
+    if len(notes) < 2:
+        return samples, notes, off_items
+    uses: dict[int, int] = {}
+    for _t, idx, _pan in notes:
+        uses[idx] = uses.get(idx, 0) + 1
+    off_by_note: dict[int, list[int]] = {}
+    for ni, t in off_items:
+        off_by_note.setdefault(ni, []).append(t)
+
+    ordered = sorted(
+        range(len(notes)), key=lambda i: (notes[i][0], i),
+    )
+    runs: list[list[int]] = []
+    current: list[int] = []
+    for ni in ordered:
+        t, idx, pan = notes[ni]
+        if uses.get(idx) != 1:
+            if len(current) > 1:
+                runs.append(current)
+            current = []
+            continue
+        if current:
+            pt, pidx, ppan = notes[current[-1]]
+            prev = samples[pidx]
+            end = pt + len(prev.data) * VGM_RATE / prev.c4_rate
+            cut = off_by_note.get(current[-1])
+            if cut:
+                end = min(end, min(cut))
+            if (
+                pan == ppan
+                and samples[idx].c4_rate == prev.c4_rate
+                and t >= pt
+                and t <= end + DAC_ONESHOT_GAP
+            ):
+                current.append(ni)
+                continue
+            if len(current) > 1:
+                runs.append(current)
+        current = [ni]
+    if len(current) > 1:
+        runs.append(current)
+    if not runs:
+        return samples, notes, off_items
+
+    removed: set[int] = set()
+    for run in runs:
+        first_ni = run[0]
+        start, first_idx, pan = notes[first_ni]
+        rate = samples[first_idx].c4_rate
+        body = bytearray(samples[first_idx].data)
+        held = body[-1] if body else 0x80
+        for ni in run[1:]:
+            t, idx, _pan = notes[ni]
+            target = int(round((t - start) * rate / VGM_RATE))
+            if target < len(body):
+                del body[target:]
+            elif target > len(body):
+                body.extend(bytes([held]) * (target - len(body)))
+            payload = samples[idx].data
+            body.extend(payload)
+            if payload:
+                held = payload[-1]
+            removed.add(ni)
+        new_idx = len(samples)
+        samples.append(DacSample(-1, len(body), bytes(body), rate, start))
+        notes[first_ni] = (start, new_idx, pan)
+        stats["dac_oneshot_chains"] = (
+            stats.get("dac_oneshot_chains", 0) + 1
+        )
+        stats["dac_oneshot_notes"] = (
+            stats.get("dac_oneshot_notes", 0) + len(run) - 1
+        )
+        stats["dac_oneshot_samples"] = (
+            stats.get("dac_oneshot_samples", 0) + len(run) - 1
+        )
+    if not removed:
+        return samples, notes, off_items
+
+    remap_note: dict[int, int] = {}
+    new_notes: list[tuple[int, int, int]] = []
+    for i, note in enumerate(notes):
+        if i in removed:
+            continue
+        remap_note[i] = len(new_notes)
+        new_notes.append(note)
+    new_offs = [
+        (remap_note[ni], t) for ni, t in off_items if ni in remap_note
+    ]
+    return samples, new_notes, new_offs
+
+
+def _cluster_similar_samples(
+    samples: list[DacSample],
+    notes: list[tuple[int, int, int]],
+    off_items: list[tuple[int, int]],
+    stats: dict,
+) -> tuple[list[DacSample], list[tuple[int, int, int]], list[tuple[int, int]]]:
+    """Share one body between bank samples that differ only by a start offset.
+
+    The representative is the longest member.  A play that used a shorter
+    body starts at its own note time, so the note moves by the body offset to
+    keep the shared main waveform on the same spot on the timeline.
+    """
+    count = len(samples)
+    if count < 2:
+        return samples, notes, off_items
+    groups: list[list[int]] = []
+    for i, smp in enumerate(samples):
+        placed = False
+        for group in groups:
+            rep = group[0]
+            if not _similar_candidates(samples[rep], smp):
+                continue
+            if _similar_alignment(samples[rep].data, smp.data) is not None:
+                group.append(i)
+                placed = True
+                break
+        if not placed:
+            groups.append([i])
+
+    remap = list(range(count))
+    shifts = [0] * count
+    merged_groups = 0
+    for group in groups:
+        if len(group) < 2:
+            continue
+        rep = max(group, key=lambda i: len(samples[i].data))
+        members = []
+        for i in group:
+            if i == rep:
+                members.append(i)
+                continue
+            if not _similar_candidates(samples[rep], samples[i]):
+                continue
+            hit = _similar_alignment(samples[rep].data, samples[i].data)
+            if hit is None:
+                continue
+            shifts[i] = hit[0]
+            members.append(i)
+        if len(members) < 2:
+            continue
+        merged_groups += 1
+        for i in members:
+            remap[i] = rep
+        stats["dac_similar_samples"] = (
+            stats.get("dac_similar_samples", 0) + len(members) - 1
+        )
+    if not merged_groups:
+        return samples, notes, off_items
+    stats["dac_similar_groups"] = merged_groups
+
+    note_dt: list[int] = [0] * len(notes)
+    new_notes: list[tuple[int, int, int]] = []
+    for i, (t, idx, pan) in enumerate(notes):
+        target = remap[idx]
+        sh = shifts[idx]
+        if sh:
+            dt = -sh * VGM_RATE / samples[target].c4_rate
+            note_dt[i] = int(round(dt))
+            t = max(0, t + note_dt[i])
+            stats["dac_similar_shifted_notes"] = (
+                stats.get("dac_similar_shifted_notes", 0) + 1
+            )
+        new_notes.append((t, target, pan))
+    new_notes.sort(key=lambda n: n[0])
+    new_offs = [
+        (ni, max(0, t + note_dt[ni])) for ni, t in off_items
+    ]
+    return samples, new_notes, new_offs
+
+
+def _longest_silence(data: bytes) -> tuple[int, int]:
+    """(length, start) of the longest run of signed-silence bytes (0)."""
+    best_len = 0
+    best_start = 0
+    run = 0
+    start = 0
+    for i, value in enumerate(data):
+        if value:
+            run = 0
+            continue
+        if not run:
+            start = i
+        run += 1
+        if run > best_len:
+            best_len = run
+            best_start = start
+    return best_len, best_start
+
+
+def _split_long_silence(
+    samples: list[DacSample],
+    notes: list[tuple[int, int, int]],
+    off_items: list[tuple[int, int]],
+    stats: dict,
+) -> tuple[list[DacSample], list[tuple[int, int, int]], list[tuple[int, int]]]:
+    """Remove a long silent stretch from a bank body and keep its timing.
+
+    A driver can read one bank range across a long DAC hold, so a kick and a
+    later snare end up in one body.  When over 40% of an 8,192-frame body is
+    one silent run, split before and after it.  Plays that reach the later
+    part get their own note at the original time; the silence becomes note
+    spacing instead of sample data.
+    """
+    if not notes:
+        return samples, notes, off_items
+    split_info: dict[int, tuple[int, int, int, int | None, int | None]] = {}
+    for si, smp in enumerate(samples):
+        if len(smp.data) < DAC_SILENCE_MIN_LEN:
+            continue
+        run, start = _longest_silence(smp.data)
+        if run <= len(smp.data) * DAC_SILENCE_FRACTION:
+            continue
+        pre_end = start
+        post_start = start + run
+        if pre_end == 0 and post_start >= len(smp.data):
+            continue
+        pre_idx = None
+        post_idx = None
+        if pre_end > 0:
+            pre_idx = len(samples)
+            samples.append(DacSample(
+                -1, pre_end, smp.data[:pre_end], smp.c4_rate, smp.onset,
+            ))
+        if post_start < len(smp.data):
+            body = smp.data[post_start:]
+            post_idx = len(samples)
+            samples.append(DacSample(
+                -1, len(body), body, smp.c4_rate, smp.onset,
+            ))
+        split_info[si] = (pre_end, post_start, run, pre_idx, post_idx)
+        stats["dac_silence_split_frames"] = (
+            stats.get("dac_silence_split_frames", 0) + run
+        )
+        stats["dac_silence_split_samples"] = (
+            stats.get("dac_silence_split_samples", 0) + 1
+        )
+    if not split_info:
+        return samples, notes, off_items
+
+    off_by_note: dict[int, list[int]] = {}
+    for ni, t in off_items:
+        off_by_note.setdefault(ni, []).append(t)
+    ordered = sorted(
+        range(len(notes)), key=lambda i: (notes[i][0], i),
+    )
+    next_onset: dict[int, int | None] = {}
+    for k, ni in enumerate(ordered):
+        next_onset[ni] = (
+            notes[ordered[k + 1]][0] if k + 1 < len(ordered) else None
+        )
+
+    new_notes: list[tuple[int, int, int]] = []
+    new_offs: list[tuple[int, int]] = []
+    for ni, (t, si, pan) in enumerate(notes):
+        info = split_info.get(si)
+        if info is None:
+            idx = len(new_notes)
+            new_notes.append((t, si, pan))
+            for off_t in off_by_note.get(ni, ()):
+                new_offs.append((idx, off_t))
+            continue
+        pre_end, post_start, _run, pre_idx, post_idx = info
+        smp = samples[si]
+        rate = smp.c4_rate
+        pre_natural = t + pre_end * VGM_RATE / rate
+        post_time = t + post_start * VGM_RATE / rate
+        natural_end = t + len(smp.data) * VGM_RATE / rate
+        explicit = min(off_by_note.get(ni, ()), default=None)
+        end = natural_end
+        if explicit is not None:
+            end = min(end, explicit)
+        nxt = next_onset.get(ni)
+        if nxt is not None:
+            end = min(end, nxt)
+
+        added = False
+        if pre_idx is not None:
+            idx = len(new_notes)
+            new_notes.append((t, pre_idx, pan))
+            added = True
+            if explicit is not None and explicit < pre_natural:
+                new_offs.append((idx, int(round(max(t, explicit)))))
+        if post_idx is not None and end > post_time:
+            placed = int(round(post_time))
+            idx = len(new_notes)
+            new_notes.append((placed, post_idx, pan))
+            added = True
+            if explicit is not None and explicit < natural_end:
+                new_offs.append((idx, int(round(max(placed, explicit)))))
+        if added:
+            stats["dac_silence_split_notes"] = (
+                stats.get("dac_silence_split_notes", 0) + 1
+            )
+        else:
+            stats["dac_silence_dropped_notes"] = (
+                stats.get("dac_silence_dropped_notes", 0) + 1
+            )
+    new_notes.sort(key=lambda n: n[0])
+    return samples, new_notes, new_offs
+
+
+def _compact_samples(
+    samples: list[DacSample],
+    notes: list[tuple[int, int, int]],
+) -> tuple[list[DacSample], list[tuple[int, int, int]]]:
+    """Drop bodies no note references and renumber the sample map."""
+    used = {idx for _t, idx, _pan in notes}
+    remap: dict[int, int] = {}
+    compact: list[DacSample] = []
+    for i, smp in enumerate(samples):
+        if i not in used:
+            continue
+        remap[i] = len(compact)
+        compact.append(smp)
+    return compact, [
+        (t, remap[idx], pan) for t, idx, pan in notes
+    ]
+
+
 def group_dac_plays(
     samples: list[DacSample],
     plays: list[DacPlay],
@@ -823,12 +1846,18 @@ def group_dac_plays(
     total_samples: int = 0,
     map_capacity: int = DAC_MAP_CAPACITY,
 ) -> tuple[
-    list[DacSample], list[tuple[int, int, int]], list[tuple[int, int]],
+    list[DacSample], list[tuple[int, int, int]],
+    list[tuple[int, int]], list[tuple[int, int]],
     list[str], dict,
 ]:
-    """Merge same-row plays and return grouped samples, notes, pans, warnings and stats."""
+    """Merge same-row plays into samples, note-ons, note-offs and pan events.
+
+    A source sample can be longer than the run that triggered it. When the
+    next run is late, the note-off list cuts the sample at the run's real end
+    instead of letting the longer body play into the gap.
+    """
     if not plays:
-        return samples, [], [], [], {}
+        return samples, [], [], [], [], {}
     stats: dict = {}
     row_samples = (VGM_RATE / hz) * speed
     tick = VGM_RATE / hz
@@ -840,19 +1869,25 @@ def group_dac_plays(
         return int(round(t0 + row * row_samples + delay * tick))
 
     ordered = sorted(plays, key=lambda p: p.onset)
-    next_onset = {
-        id(p): (ordered[i + 1].onset if i + 1 < len(ordered) else total_samples)
-        for i, p in enumerate(ordered)
-    }
-
     groups: dict[int, list[DacPlay]] = {}
     for p in ordered:
         row, _delay = place(p.onset)
         groups.setdefault(row, []).append(p)
+    # The lower-bound rate guard must see the next *note* (the next row), not
+    # the next chunk of the same note. A phrase is split into 0.25 s chunks
+    # that share a row; using a following chunk's onset made the group play at
+    # twice its real rate (a 44.1 kHz chunk stretched to 88.2 kHz).
+    rows = sorted(groups)
+    next_onset: dict[int, int] = {}
+    for i, row in enumerate(rows):
+        nxt = groups[rows[i + 1]][0].onset if i + 1 < len(rows) else total_samples
+        for p in groups[row]:
+            next_onset[id(p)] = nxt
 
     out: list[DacSample] = []
     by_key: dict[tuple[bytes, int], int] = {}
     notes: list[tuple[int, int, int]] = []
+    off_items: list[tuple[int, int]] = []
     pan_events: list[tuple[int, int]] = []
     previous_sample: int | None = None
     previous_time = 0
@@ -860,6 +1895,23 @@ def group_dac_plays(
     def is_silent(p: DacPlay) -> bool:
         payload = samples[p.sample].data
         return bool(payload) and not any(payload)
+
+    def add_off(idx: int, items: list[DacPlay], note_time: int, rate: int) -> None:
+        """Cut a reused body at the run's real end when a gap follows."""
+        last = items[-1]
+        if not last.source:
+            return
+        span_end = last.onset + last.span
+        body_end = note_time + len(out[idx].data) * VGM_RATE / rate
+        tolerance = max(1.0, tick)
+        next_time = next_onset.get(id(last), total_samples)
+        if body_end <= span_end + tolerance:
+            return
+        if total_samples and next_time <= span_end + tolerance:
+            # The next note already cuts this one on time.
+            return
+        off_items.append((len(notes) - 1, int(round(span_end))))
+        stats["dac_cut_offs"] = stats.get("dac_cut_offs", 0) + 1
 
     for row in sorted(groups):
         items = groups[row]
@@ -918,26 +1970,81 @@ def group_dac_plays(
             stats["dac_rate_clamped"] = stats.get("dac_rate_clamped", 0) + 1
         lead = max(0, first.onset - note_time)
         lead_frames = int(round(lead * rate / VGM_RATE))
-        data = bytearray()
         held = _held_byte(out, previous_sample, previous_time, note_time)
+        if first.fresh:
+            # The DAC was off before this run; a lead is silence, not the
+            # previous sample's last value.
+            held = 0x80
+
+        # One source play on its own row already has exactly the body the
+        # note needs. Reusing it is what keeps a repeated bank sample one
+        # module sample; only a same-row concatenation or a lead fill has to
+        # build a new body.
+        only = items[0]
+        next_time = next_onset.get(id(only), total_samples)
+        has_next = bool(total_samples) and next_time < total_samples
+        span_frames = (
+            max(1, int(round(only.span * rate / VGM_RATE)))
+            if only.span > 0 else len(samples[only.sample].data)
+        )
+        if (
+            len(items) == 1 and only.source
+            and rate == samples[only.sample].c4_rate
+            and (
+                has_next
+                or span_frames + 1 >= len(samples[only.sample].data)
+            )
+        ):
+            src = samples[only.sample]
+            idx = _add_sample(
+                out, by_key, src.data, src.c4_rate, note_time,
+            )
+            notes.append((note_time, idx, only.pan))
+            add_off(idx, items, note_time, rate)
+            previous_sample = idx
+            previous_time = note_time
+            stats["dac_groups"] = stats.get("dac_groups", 0) + 1
+            stats["dac_reused_notes"] = (
+                stats.get("dac_reused_notes", 0) + 1
+            )
+            continue
+
+        data = bytearray()
         if lead_frames:
             data.extend(bytes([held]) * lead_frames)
             stats["dac_lead_bytes"] = stats.get("dac_lead_bytes", 0) + lead_frames
 
         note_pan = first.pan
+        last_i = len(items) - 1
+        last_next = next_onset.get(id(items[-1]), total_samples)
+        last_has_next = bool(total_samples) and last_next < total_samples
         for i, p in enumerate(items):
             target = int(round((p.onset - note_time) * rate / VGM_RATE))
             if len(data) > target:
                 over = len(data) - target
                 stats["dac_overshoot"] = stats.get("dac_overshoot", 0) + over
-            else:
-                if target > len(data):
-                    fill = target - len(data)
-                    data.extend(bytes([held]) * fill)
-                    stats["dac_hold_bytes"] = stats.get("dac_hold_bytes", 0) + fill
+                del data[target:]
+                if data:
+                    held = data[-1]
+            elif target > len(data):
+                fill = target - len(data)
+                data.extend(bytes([held]) * fill)
+                stats["dac_hold_bytes"] = stats.get("dac_hold_bytes", 0) + fill
             payload = samples[p.sample].data
+            if p.source and (i < last_i or not last_has_next):
+                if i < last_i:
+                    nxt = int(round(
+                        (items[i + 1].onset - note_time) * rate / VGM_RATE
+                    ))
+                    frames = max(1, nxt - target)
+                else:
+                    frames = max(1, int(round(p.span * rate / VGM_RATE)))
+                    if frames + 1 >= len(payload):
+                        frames = len(payload)
+                payload = payload[:frames]
             data.extend(payload)
-            held = payload[-1]
+            if payload:
+                held = payload[-1]
             if i and p.pan != items[i - 1].pan:
                 # Pan is channel state; land it at the row start.
                 prow, _pdelay = place(p.onset)
@@ -946,21 +2053,55 @@ def group_dac_plays(
         body = bytes(data)
         idx = _add_sample(out, by_key, body, rate, note_time)
         notes.append((note_time, idx, note_pan))
+        add_off(idx, items, note_time, rate)
         previous_sample = idx
         previous_time = note_time
         stats["dac_groups"] = stats.get("dac_groups", 0) + 1
 
+    # Bank source bodies are whole audio regions, so two bodies that differ
+    # only by a small start offset and a one-shot sequence that never repeats
+    # can share storage.  The chunk path must not do this: those bodies are
+    # adjacent time slices of one stream.
+    if plays and all(p.source for p in plays):
+        out, notes, off_items = _split_long_silence(
+            out, notes, off_items, stats,
+        )
+        out, notes = _compact_samples(out, notes)
+        out, notes, off_items = _merge_one_shot_samples(
+            out, notes, off_items, stats,
+        )
+        out, notes = _compact_samples(out, notes)
+        out, notes, off_items = _cluster_similar_samples(
+            out, notes, off_items, stats,
+        )
+        out, notes = _compact_samples(out, notes)
+    offs = [(t, 0) for _ni, t in off_items]
+
+    warnings: list[str] = []
+    trimmed = 0
+    if len(out) > DAC_RELEASE_SAMPLES:
+        trimmed = len(out) - DAC_RELEASE_SAMPLES
+        stats["dac_release_trimmed"] = (
+            stats.get("dac_release_trimmed", 0) + trimmed
+        )
+        del out[DAC_RELEASE_SAMPLES:]
+        notes = [n for n in notes if n[1] < DAC_RELEASE_SAMPLES]
     stats["dac_unique_samples"] = len(out)
     stats["dac_notes"] = len(notes)
     stats["dac_sample_bytes"] = sum(len(s.data) for s in out)
     stats["dac_maps"] = (len(out) + map_capacity - 1) // map_capacity
-    warnings: list[str] = []
     if stats.get("dac_overshoot"):
         warnings.append(
             f"{stats['dac_overshoot']} YM2612 DAC samples were longer than the "
             "gap to the next run; the later bytes start late by that many frames"
         )
-    return out, notes, pan_events, warnings, stats
+    if trimmed:
+        warnings.append(
+            f"{trimmed} YM2612 DAC samples were dropped to stay inside the "
+            f"{DAC_RELEASE_SAMPLES}-sample budget; the end of the stream is "
+            "missing"
+        )
+    return out, notes, offs, pan_events, warnings, stats
 
 
 def _collect_timeline(

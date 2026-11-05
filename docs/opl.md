@@ -11,9 +11,10 @@ Blaster. Furnace implements three systems for them plus a rhythm variant of each
 
 Rhythm mode is a **separate system**, not a flag on the melodic one: bank A's
 last FM channels become the kit, so a track that logs `0xBD` percussion is
-converted to the drums system and gets its own columns. Four-operator voices are
-not a separate system - they are two hardware channels of one `OPL3` pair driven
-as a single voice (see below).
+converted to the drums system and gets its own columns. The rhythm register is
+always **bank 0's `$BD`**; an OPL3's `$1BD` is the second bank's own register,
+not a rhythm control. Four-operator voices are not a separate system - they are
+two hardware channels of one `OPL3` pair driven as a single voice (see below).
 
 ## VGM stream
 
@@ -320,7 +321,7 @@ table is its own: `DivPlatformOPL::setOPLType` overrides the OPL3 base with
 `opl.pitch_table` carries an optional `freq_base` and `analyze` passes the OPL4
 value through `_collect_opl`. Furnace gives the FM half 18 columns (system
 `0xAE`, 42 channels with the 24 wave slots) or 15 + 5 kit columns with rhythm
-(system `0xAF`, 44). Rhythm follows the OPL3 rule: port 1's `0x1BD`.
+(system `0xAF`, 44). Rhythm follows the OPL3 rule: bank 0's `$BD`.
 
 ### Wave slots
 

@@ -211,6 +211,23 @@ class TestHuc6280Tones(unittest.TestCase):
         self.assertEqual(maximum, 31)
         self.assertEqual(values, list(_sine()))
 
+    def test_vibrato_is_not_merged_away(self):
+        # Drivers vibrato by rewriting the period every frame. A one-frame
+        # merge (used to collapse LO/HI pairs) would swallow the whole
+        # oscillation and leave one arbitrary pitch.
+        writes = _load_wave(_square(), period=0x200, sample=0)
+        vals = [0x204, 0x208, 0x204, 0x200] * 4
+        for i, p in enumerate(vals):
+            t = 2000 + i * 730
+            writes += [_w(t, 0x02, p & 0xFF), _w(t, 0x03, (p >> 8) & 0x0F)]
+        writes.append(_w(2000 + len(vals) * 730 + 2000, 0x04, 0x00))
+        song = analyze(_vgm(writes, huc6280_clock=3579545))
+        ev = next(e for e in song.events if e.tone_chip == 5 and e.on)
+        self.assertGreaterEqual(len(ev.tone_pitch_pts), 4)
+        ins = song.huc6280_ins[ev.ins]
+        self.assertTrue(ins.pitch)
+        self.assertGreater(len(set(ins.pitch)), 1)
+
     def test_volume_and_balance(self):
         notes, _offs, _waves, _warn = collect_huc6280(
             _vgm(

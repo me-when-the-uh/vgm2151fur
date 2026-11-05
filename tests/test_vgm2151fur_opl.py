@@ -509,6 +509,27 @@ class TestOplAnalyze(unittest.TestCase):
         self.assertFalse([e for e in song.events if e.on and e.ch == 7])
         self.assertTrue(any("kit" in w for w in song.warnings), song.warnings)
 
+    def test_opl3_rhythm_latches_on_bank_zero(self):
+        # An OPL3's rhythm register is bank 0's $BD, not bank 1's $1BD.
+        ws = heart(KIND_OPL3)
+        ws += [rhythm(2000, KIND_OPL3, bits=0),
+               rhythm(10000, KIND_OPL3, bits=0x1F),
+               rhythm(14000, KIND_OPL3, bits=0)]
+        song = analyze(_vgm(ws, kind=KIND_OPL3))
+        self.assertTrue(song.opl_drums)
+        kit = {e.ch for e in song.events if e.on and e.ch >= 16}
+        self.assertEqual(kit, {16, 17, 18, 19})
+        self.assertTrue([e for e in song.events if e.on and e.ch == 15])
+        self.assertGreater(song.drum_notes, 0)
+
+    def test_opl3_bank_one_bd_is_not_a_rhythm_latch(self):
+        ws = heart(KIND_OPL3) + [
+            ChipWrite(1000, KIND_OPL3, 0, 0x1BD, 0x3F),
+        ]
+        song = analyze(_vgm(ws, kind=KIND_OPL3))
+        self.assertFalse(song.opl_drums)
+        self.assertEqual(song.drum_notes, 0)
+
     def test_opl3_four_op_note_lands_on_the_pair_head(self):
         ws = [ChipWrite(90, KIND_OPL3, 0, 0x104, 0x01)]      # bank A pair 0
         ws += voice(95, KIND_OPL3, 0, four=True, block=4, fnum=0x3D1,
@@ -904,6 +925,35 @@ BUBBLE = (ROOT / "VGM_collection" / "old" / "Bubble_Bobble_(Arcade)"
 # same $BD register, same five percussion voices - the chip only lacks waveform
 # select, so this is what proves the family was not special-cased out of it.
 OPL1KIT = Path(r"D:\Apps\Audio\Furnace\opl1_rhythmtest.vgm")
+# A Furnace OPL3 module that writes bank 0's $BD with all five kit bits. The
+# first note of the opening bar lives on channels 15-19, which used to be blank.
+OPL3KIT = Path(r"D:\Downloads\PhantomBreakerBattleGrounds_Shinjuku-OPL3_optimized.vgm")
+# The same module exported with the OPL4's FM half; its rhythm register is
+# still bank 0's $BD, not $1BD.
+OPL4KIT = Path(r"D:\Downloads\opl4-rhythmtest.vgm")
+
+
+@unittest.skipUnless(OPL3KIT.is_file(), "Phantom Breaker OPL3 rip missing")
+class TestOpl3RhythmRealRip(unittest.TestCase):
+
+    def test_kit_channels_are_not_blank(self):
+        song = analyze(load_vgm(OPL3KIT))
+        self.assertTrue(song.opl_drums)
+        used = {e.ch for e in song.events if e.on and e.ch >= 15}
+        self.assertEqual(used, {15, 16, 17, 18, 19})
+        self.assertGreater(song.drum_notes, 0)
+
+
+@unittest.skipUnless(OPL4KIT.is_file(), "OPL4 rhythm rip missing")
+class TestOpl4RhythmRealRip(unittest.TestCase):
+
+    def test_kit_channels_are_not_blank(self):
+        song = analyze(load_vgm(OPL4KIT))
+        self.assertTrue(song.opl_drums)
+        used = {e.ch for e in song.events if e.on and e.ch >= 15}
+        self.assertEqual(used, {15, 16, 17, 18, 19})
+        self.assertGreater(song.drum_notes, 0)
+        self.assertFalse(any("write no notes" in w for w in song.warnings))
 
 
 @unittest.skipUnless(HAVE_FURNACE and MC01.is_file(),
