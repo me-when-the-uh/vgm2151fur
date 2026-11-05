@@ -189,6 +189,34 @@ class TestGbNotes(unittest.TestCase):
         hits, _o, _w, _warn = collect_gb(_vgm(writes))
         self.assertEqual(len(hits), 1)
 
+    def test_pan_at_the_trigger_is_the_note_pan(self):
+        # NR51 is often written at (or one sample after) the trigger. That is
+        # the note's pan, not a mid-note move.
+        writes = _noise_note(1000, 0xA1, 0x16)
+        writes.append(_gb(1000, 0x15, 0xF7))  # noise left, same sample
+        hits, _o, _w, _warn = collect_gb(_vgm(writes))
+        self.assertEqual(hits[0].pan, 0xF0)
+        self.assertEqual(hits[0].pan_pts, [])
+
+    def test_next_note_setup_is_not_absorbed(self):
+        # A fast percussion driver re-triggers every ~700 samples. The next
+        # note's envelope/pan must not be folded into the previous note.
+        writes = _noise_note(1000, 0xC1, 0x50)
+        writes += [_gb(1000, 0x15, 0xF7)]
+        writes += _noise_note(1680, 0x72, 0x50)
+        writes += [_gb(1680, 0x15, 0xFF)]
+        hits, _o, _w, _warn = collect_gb(_vgm(writes))
+        noise = [h for h in hits if h.voice == 3]
+        self.assertEqual(len(noise), 2)
+        self.assertEqual(
+            (noise[0].env_vol, noise[0].env_dir, noise[0].env_len), (12, 0, 1),
+        )
+        self.assertEqual(noise[0].pan, 0xF0)
+        self.assertEqual(
+            (noise[1].env_vol, noise[1].env_dir, noise[1].env_len), (7, 0, 2),
+        )
+        self.assertEqual(noise[1].pan, 0xFF)
+
     def test_noise_length_disabled_uses_64(self):
         # Furnace enables the noise length counter when soundLen < 64, so a
         # source note with length counting off must carry 64, not 63.

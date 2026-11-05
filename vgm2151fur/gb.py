@@ -42,6 +42,11 @@ GB_MIN_NOTE = 100
 # A pitch write this soon after the trigger is the note's real base, not a
 # bend (drivers often set the frequency just after starting the voice).
 GB_REFIT_SAMPLES = 735
+# An envelope or NR51 write this close to the trigger belongs to that note
+# (drivers write them at or a sample or two after the trigger). The window is
+# deliberately tiny: a frame-sized one would swallow the next note's setup,
+# which lands ~700 samples later in fast percussion.
+GB_ENV_REFIT = 16
 # Two mid-note NRx2 writes mean the driver is doing a software volume ramp.
 GB_SOFT_ENV_WRITES = 2
 # A whole-wave RAM rewrite is a burst of byte writes; writes this close belong
@@ -476,7 +481,7 @@ def collect_gb(
                 if (val >> 4) == 0 and not ((val & 8) and (val & 7)):
                     close(voice, t)
                     continue
-                if t - hit.sample_time <= GB_REFIT_SAMPLES:
+                if t - hit.sample_time <= GB_ENV_REFIT:
                     # Drivers often write NRx2 just after the trigger (e.g.
                     # Blitz's / Kuma's noise: NR43, trigger, then NR42). That
                     # write is this note's envelope, not a mid-note change.
@@ -584,8 +589,13 @@ def collect_gb(
                 if new_pan != pan[v]:
                     pan[v] = new_pan
                     hit = active[v]
-                    if hit is not None and t > hit.sample_time:
-                        if not hit.pan_pts or hit.pan_pts[-1][1] != new_pan:
+                    if hit is not None:
+                        if t - hit.sample_time <= GB_ENV_REFIT:
+                            # The driver writes NR51 at (or just after) the
+                            # trigger; that is this note's pan, not a mid-note
+                            # move.
+                            hit.pan = new_pan
+                        elif not hit.pan_pts or hit.pan_pts[-1][1] != new_pan:
                             hit.pan_pts.append((t, new_pan))
         elif reg == REG_ON:
             on = bool(val & 0x80)

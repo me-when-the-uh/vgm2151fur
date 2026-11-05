@@ -65,6 +65,12 @@ nibble (which is the level the source audibly continues from) and carries the
 new period/direction. Keeping the original instrument would decay at the old
 rate and leave the note too loud for too long.
 
+Drivers often write NRx2 and NR51 at, or a sample or two after, the trigger.
+Those writes are folded into the note's opening envelope and pan (a tiny
+16-sample window). A frame-sized window would instead swallow the *next*
+note's setup in fast percussion, where the next trigger lands ~700 samples
+later.
+
 The writer tags the chip `chipType=2` (CGB-E) so Furnace's emulator uses the
 same zombie rule the replay follows. A hardware-envelope note keeps the volume
 column at its initial level; a software-envelope note pins the column at 15
