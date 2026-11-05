@@ -41,6 +41,11 @@ DAC_SIMILAR_MIN_LEN = 32
 # A unique sample that starts this soon after the previous unique sample is
 # part of the same contiguous one-shot phrase.
 DAC_ONESHOT_GAP = 64
+# A final body at least this long whose longest silent stretch is over 40%
+# of it is split at that stretch.  Bank runs split earlier at any held
+# silence of DAC_RUN_GAP samples, so a kick does not carry a delayed snare.
+DAC_SILENCE_MIN_LEN = 8192
+DAC_SILENCE_FRACTION = 0.40
 
 
 @dataclass(frozen=True)
@@ -567,6 +572,68 @@ def _source_pitch(run: dict) -> int:
     ))
 
 
+def _split_silent_run(run: dict) -> list[dict] | None:
+    """Split one bank run at a long held-silence gap.
+
+    A driver can read from offset 0 through a kick into the next bank
+    sample after a long pause.  Keeping that as one body delays the next
+    sample and stores the pause; split at the gap and let the post part keep
+    its own bank offset and onset.  A held silence of ``DAC_RUN_GAP`` or
+    more is a rest between source segments, not sample data.
+    """
+    times = run["times"]
+    values = run["bytes"]
+    if len(times) < 2 or len(values) < 2:
+        return None
+    best_gap = 0
+    best_i = -1
+    for i in range(len(times) - 1):
+        if values[i]:
+            continue
+        gap = times[i + 1] - times[i]
+        if gap > best_gap:
+            best_gap = gap
+            best_i = i
+    if best_i < 0 or best_gap < DAC_RUN_GAP:
+        return None
+    pre = dict(run)
+    pre["bytes"] = values[:best_i + 1]
+    pre["times"] = times[:best_i + 1]
+    pre["pitch"] = _source_pitch(pre)
+    post = dict(run)
+    post["t"] = times[best_i + 1]
+    post["bytes"] = values[best_i + 1:]
+    post["times"] = times[best_i + 1:]
+    post["off"] = run["off"] + best_i + 1
+    post["pitch"] = _source_pitch(post)
+    post["fresh"] = False
+    return [p for p in (pre, post) if p["bytes"]]
+
+
+def _split_silent_runs(runs: list[dict], stats: dict) -> list[dict]:
+    """Apply `_split_silent_run` repeatedly, keeping source order."""
+    out: list[dict] = []
+    for run in runs:
+        pieces = [run]
+        changed = True
+        while changed:
+            changed = False
+            expanded: list[dict] = []
+            for piece in pieces:
+                parts = _split_silent_run(piece)
+                if parts is None:
+                    expanded.append(piece)
+                    continue
+                changed = True
+                stats["dac_source_silence_splits"] = (
+                    stats.get("dac_source_silence_splits", 0) + 1
+                )
+                expanded.extend(parts)
+            pieces = expanded
+        out.extend(pieces)
+    return out
+
+
 def _collect_source(
     runs: list[dict],
     stats: dict,
@@ -582,6 +649,9 @@ def _collect_source(
     groups: dict[tuple[int, int], list[dict]] = {}
     for run in runs:
         run["pitch"] = _source_pitch(run)
+    stats["dac_source_runs_unsplit"] = len(runs)
+    runs = _split_silent_runs(runs, stats)
+    for run in runs:
         groups.setdefault((run["off"], run["pitch"]), []).append(run)
 
     samples: list[DacSample] = []
@@ -1617,6 +1687,137 @@ def _cluster_similar_samples(
     return samples, new_notes, new_offs
 
 
+def _longest_silence(data: bytes) -> tuple[int, int]:
+    """(length, start) of the longest run of signed-silence bytes (0)."""
+    best_len = 0
+    best_start = 0
+    run = 0
+    start = 0
+    for i, value in enumerate(data):
+        if value:
+            run = 0
+            continue
+        if not run:
+            start = i
+        run += 1
+        if run > best_len:
+            best_len = run
+            best_start = start
+    return best_len, best_start
+
+
+def _split_long_silence(
+    samples: list[DacSample],
+    notes: list[tuple[int, int, int]],
+    off_items: list[tuple[int, int]],
+    stats: dict,
+) -> tuple[list[DacSample], list[tuple[int, int, int]], list[tuple[int, int]]]:
+    """Remove a long silent stretch from a bank body and keep its timing.
+
+    A driver can read one bank range across a long DAC hold, so a kick and a
+    later snare end up in one body.  When over 40% of an 8,192-frame body is
+    one silent run, split before and after it.  Plays that reach the later
+    part get their own note at the original time; the silence becomes note
+    spacing instead of sample data.
+    """
+    if not notes:
+        return samples, notes, off_items
+    split_info: dict[int, tuple[int, int, int, int | None, int | None]] = {}
+    for si, smp in enumerate(samples):
+        if len(smp.data) < DAC_SILENCE_MIN_LEN:
+            continue
+        run, start = _longest_silence(smp.data)
+        if run <= len(smp.data) * DAC_SILENCE_FRACTION:
+            continue
+        pre_end = start
+        post_start = start + run
+        if pre_end == 0 and post_start >= len(smp.data):
+            continue
+        pre_idx = None
+        post_idx = None
+        if pre_end > 0:
+            pre_idx = len(samples)
+            samples.append(DacSample(
+                -1, pre_end, smp.data[:pre_end], smp.c4_rate, smp.onset,
+            ))
+        if post_start < len(smp.data):
+            body = smp.data[post_start:]
+            post_idx = len(samples)
+            samples.append(DacSample(
+                -1, len(body), body, smp.c4_rate, smp.onset,
+            ))
+        split_info[si] = (pre_end, post_start, run, pre_idx, post_idx)
+        stats["dac_silence_split_frames"] = (
+            stats.get("dac_silence_split_frames", 0) + run
+        )
+        stats["dac_silence_split_samples"] = (
+            stats.get("dac_silence_split_samples", 0) + 1
+        )
+    if not split_info:
+        return samples, notes, off_items
+
+    off_by_note: dict[int, list[int]] = {}
+    for ni, t in off_items:
+        off_by_note.setdefault(ni, []).append(t)
+    ordered = sorted(
+        range(len(notes)), key=lambda i: (notes[i][0], i),
+    )
+    next_onset: dict[int, int | None] = {}
+    for k, ni in enumerate(ordered):
+        next_onset[ni] = (
+            notes[ordered[k + 1]][0] if k + 1 < len(ordered) else None
+        )
+
+    new_notes: list[tuple[int, int, int]] = []
+    new_offs: list[tuple[int, int]] = []
+    for ni, (t, si, pan) in enumerate(notes):
+        info = split_info.get(si)
+        if info is None:
+            idx = len(new_notes)
+            new_notes.append((t, si, pan))
+            for off_t in off_by_note.get(ni, ()):
+                new_offs.append((idx, off_t))
+            continue
+        pre_end, post_start, _run, pre_idx, post_idx = info
+        smp = samples[si]
+        rate = smp.c4_rate
+        pre_natural = t + pre_end * VGM_RATE / rate
+        post_time = t + post_start * VGM_RATE / rate
+        natural_end = t + len(smp.data) * VGM_RATE / rate
+        explicit = min(off_by_note.get(ni, ()), default=None)
+        end = natural_end
+        if explicit is not None:
+            end = min(end, explicit)
+        nxt = next_onset.get(ni)
+        if nxt is not None:
+            end = min(end, nxt)
+
+        added = False
+        if pre_idx is not None:
+            idx = len(new_notes)
+            new_notes.append((t, pre_idx, pan))
+            added = True
+            if explicit is not None and explicit < pre_natural:
+                new_offs.append((idx, int(round(max(t, explicit)))))
+        if post_idx is not None and end > post_time:
+            placed = int(round(post_time))
+            idx = len(new_notes)
+            new_notes.append((placed, post_idx, pan))
+            added = True
+            if explicit is not None and explicit < natural_end:
+                new_offs.append((idx, int(round(max(placed, explicit)))))
+        if added:
+            stats["dac_silence_split_notes"] = (
+                stats.get("dac_silence_split_notes", 0) + 1
+            )
+        else:
+            stats["dac_silence_dropped_notes"] = (
+                stats.get("dac_silence_dropped_notes", 0) + 1
+            )
+    new_notes.sort(key=lambda n: n[0])
+    return samples, new_notes, new_offs
+
+
 def _compact_samples(
     samples: list[DacSample],
     notes: list[tuple[int, int, int]],
@@ -1862,6 +2063,10 @@ def group_dac_plays(
     # can share storage.  The chunk path must not do this: those bodies are
     # adjacent time slices of one stream.
     if plays and all(p.source for p in plays):
+        out, notes, off_items = _split_long_silence(
+            out, notes, off_items, stats,
+        )
+        out, notes = _compact_samples(out, notes)
         out, notes, off_items = _merge_one_shot_samples(
             out, notes, off_items, stats,
         )

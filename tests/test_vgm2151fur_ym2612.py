@@ -34,6 +34,8 @@ from vgm2151fur.ym2612dac import (
     DacSample,
     _cluster_similar_samples,
     _merge_one_shot_samples,
+    _split_long_silence,
+    _split_silent_runs,
     collect_dac,
 )
 
@@ -43,6 +45,14 @@ HAVE_FURNACE = find_furnace() is not None
 CLOCK = 7670453
 ALIEN = Path(r"D:\Downloads\Alien Soldier\07 - Runner AD2025.vgz")
 ROBOT = Path(r"D:\Downloads\RobotBattle2.vgz")
+SAILOR_INTRO = Path(
+    r"D:\Downloads\Bishoujo Senshi Sailor Moon"
+    r"\Bishoujo Senshi Sailor Moon - 03 - Introduction (Part 1).vgz"
+)
+SAILOR_STREET = Path(
+    r"D:\Downloads\Bishoujo Senshi Sailor Moon"
+    r"\Bishoujo Senshi Sailor Moon - 09 - Stage 1-1 (Street).vgz"
+)
 
 
 def _vgm(writes, *, total_samples=400000, clock=CLOCK, **kw):
@@ -1540,6 +1550,50 @@ class TestYm2612DacSourceSamples(unittest.TestCase):
         # The intermediate note's cut is gone; the chain's own end stays.
         self.assertEqual(offs, [(0, 176)])
 
+    def test_long_held_gap_splits_the_bank_run(self):
+        # Offset 0 is a kick; the driver then holds silence for 20,000
+        # samples and continues at offset 4 with a snare. The post part must
+        # keep its own offset and onset, not play 0.45 s late inside the kick.
+        run = {
+            "t": 0, "off": 0, "fresh": False, "pitch": 11025,
+            "bytes": [1, 2, 3, 0, 9, 9, 9, 9],
+            "times": [0, 4, 8, 12, 20012, 20016, 20020, 20024],
+        }
+        stats: dict = {}
+        pieces = _split_silent_runs([run], stats)
+        self.assertEqual(stats["dac_source_silence_splits"], 1)
+        self.assertEqual(len(pieces), 2)
+        pre, post = pieces
+        self.assertEqual((pre["t"], pre["off"], pre["bytes"]),
+                         (0, 0, [1, 2, 3, 0]))
+        self.assertEqual((post["t"], post["off"], post["bytes"]),
+                         (20012, 4, [9, 9, 9, 9]))
+
+    def test_body_over_40_percent_silence_is_split(self):
+        body = b"\x01" * 1000 + b"\x00" * 4500 + b"\x02" * 4500
+        smp = DacSample(0, len(body), body, 44100, 0)
+        notes = [(0, 0, 255)]
+        samples, moved, offs = _split_long_silence(
+            [smp], notes, [], {},
+        )
+        self.assertEqual(len(samples), 3)   # original plus the two parts
+        self.assertEqual(len(moved), 2)
+        self.assertEqual(moved[0][0], 0)
+        self.assertEqual(moved[1][0], 5500)  # 1,000 + 4,500 frames at 44.1k
+        self.assertEqual(samples[moved[0][1]].data, b"\x01" * 1000)
+        self.assertEqual(samples[moved[1][1]].data, b"\x02" * 4500)
+        self.assertEqual(offs, [])
+
+    def test_short_body_keeps_its_silence(self):
+        # The 8,192-frame floor is the whole body, not the silent run.
+        body = b"\x01" * 2000 + b"\x00" * 3000
+        smp = DacSample(0, len(body), body, 44100, 0)
+        samples, moved, _offs = _split_long_silence(
+            [smp], [(0, 0, 255)], [], {},
+        )
+        self.assertEqual(len(samples), 1)
+        self.assertEqual(moved, [(0, 0, 255)])
+
     def test_over_budget_tail_is_one_final_sample(self):
         # When the chunk fallback still needs more than the budget, the whole
         # remaining sequence goes into the last sample instead of vanishing.
@@ -1620,6 +1674,44 @@ class TestYm2612DacAlienSoldier(unittest.TestCase):
         )
         self.assertGreater(song.dac_stats.get("dac_oneshot_samples", 0), 0)
         self.assertFalse(song.dac_stats.get("dac_release_trimmed"))
+
+
+@unittest.skipUnless(SAILOR_INTRO.is_file(), "Sailor Moon intro rip missing")
+class TestYm2612DacSailorMoon(unittest.TestCase):
+    """A kick body read through a long DAC hold into the next snare."""
+
+    def _bad_silence(self, song):
+        import vgm2151fur.ym2612dac as dac
+        bad = []
+        for i, smp in enumerate(song.dac_samples):
+            if len(smp.data) < dac.DAC_SILENCE_MIN_LEN:
+                continue
+            run, _start = dac._longest_silence(smp.data)
+            if run > len(smp.data) * dac.DAC_SILENCE_FRACTION:
+                bad.append((i, len(smp.data), run))
+        return bad
+
+    def test_intro_splits_the_kick_and_delayed_snare(self):
+        song = analyze(load_vgm(SAILOR_INTRO))
+        self.assertGreaterEqual(
+            song.dac_stats.get("dac_source_silence_splits", 0), 7,
+        )
+        self.assertLessEqual(len(song.dac_samples), 5)
+        self.assertEqual(self._bad_silence(song), [])
+        # The run that held 16,011 samples before the snare used to lose it.
+        notes = sorted(e.sample for e in song.events if e.dac and e.on)
+        self.assertTrue(
+            any(abs(t - 169750) <= 200 for t in notes), notes,
+        )
+
+    @unittest.skipUnless(SAILOR_STREET.is_file(), "Sailor Moon street rip missing")
+    def test_street_splits_every_long_hold(self):
+        song = analyze(load_vgm(SAILOR_STREET))
+        self.assertGreaterEqual(
+            song.dac_stats.get("dac_source_silence_splits", 0), 20,
+        )
+        self.assertLessEqual(len(song.dac_samples), 10)
+        self.assertEqual(self._bad_silence(song), [])
 
 
 @unittest.skipUnless(ROBOT.is_file(), "RobotBattle2 rip missing")
