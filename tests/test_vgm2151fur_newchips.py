@@ -61,6 +61,46 @@ def _raw_vgm(cmds: bytes, rom_blocks=(), shift: int = 0, mask: int = 0) -> bytes
 
 
 class TestVgmParsing(unittest.TestCase):
+    @staticmethod
+    def _msm6295_vgm(clock: int, cmds: bytes) -> bytes:
+        buf = bytearray(0xC0)
+        buf[0:4] = b"Vgm "
+        buf[8:12] = (0x161).to_bytes(4, "little")
+        buf[0x18:0x1C] = (44100).to_bytes(4, "little")
+        buf[0x34:0x38] = (0xC0 - 0x34).to_bytes(4, "little")
+        buf[0x98:0x9C] = clock.to_bytes(4, "little")
+        return bytes(buf) + cmds + b"\x66"
+
+    def test_msm6295_command_reads_the_dual_flag(self):
+        # Regression: the command walker used a bare `msm6295_dual` name
+        # (NameError) instead of the VgmFile field. Every MSM6295 write hit
+        # it, dual or not.
+        p = TMP / "msm6295_single.vgm"
+        p.write_bytes(self._msm6295_vgm(
+            2_000_000, bytes([0xB8, 0x01, 0x20])
+        ))
+        v = load_vgm(p)
+        self.assertFalse(v.msm6295_dual)
+        self.assertEqual(
+            [(w.chip_id, w.reg, w.val) for w in v.writes
+             if w.chip == "msm6295"],
+            [(0, 0x01, 0x20)],
+        )
+
+        p = TMP / "msm6295_dual.vgm"
+        p.write_bytes(self._msm6295_vgm(
+            0x40000000 | 2_000_000,
+            bytes([0xB8, 0x81, 0x0F, 0xB8, 0x01, 0x20]),
+        ))
+        v = load_vgm(p)
+        self.assertTrue(v.msm6295_dual)
+        self.assertEqual(
+            [(w.chip_id, w.reg, w.val) for w in v.writes
+             if w.chip == "msm6295"],
+            [(1, 0x01, 0x0F), (0, 0x01, 0x20)],
+        )
+        self.assertFalse(any("0xB8" in w for w in v.warnings))
+
     def test_segapcm_write_and_rom(self):
         raw = _raw_vgm(
             b"\xc0\x84\x00\x10\xc0\x85\x00\x02\xc0\x86\x00\x00",

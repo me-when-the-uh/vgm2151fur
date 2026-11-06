@@ -1963,7 +1963,10 @@ def load_vgm(path: Path | str) -> VgmFile:
             aa = buf[pos + 1]
             name = "msm6295" if cmd == CMD_MSM6295 else "msm6258"
             cid = (aa >> 7) & 1
-            dual = msm6295_dual if name == "msm6295" else bool(adpcm_raw & 0x40000000)
+            dual = (
+                vgm.msm6295_dual if name == "msm6295"
+                else bool(adpcm_raw & 0x40000000)
+            )
             if cid and not dual:
                 if name == "msm6295":
                     stray_msm6295_second = True
