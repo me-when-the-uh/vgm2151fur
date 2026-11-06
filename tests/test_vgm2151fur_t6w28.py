@@ -467,6 +467,53 @@ class TestPsgShortGateCut(unittest.TestCase):
         self.assertIn(0xEC, fx)
         self.assertGreater(fx[0xEC], fx[0xED])
 
+    def test_cut_reaching_the_next_key_on_is_not_written(self):
+        # Neo South Island Act 2: the cut (ED03 EC05) lands on the same tick
+        # as the next key-on. Writing ECxx there cuts the new note instead of
+        # the old one, so the next key-on must be allowed to end the note.
+        v = VgmFile(
+            path=Path("synthetic.vgm"), buf=b"", version=0x161,
+            total_samples=100000, loop_samples=0, loop_file_pos=None,
+            loop_sample=None, ym2151_clock=0, k007232_clock=0, gd3={},
+            roms=[], writes=[], sn76489_clock=3579540,
+        )
+        song = Song(v, 0, None, 12, 480.0, [], [], [
+            NoteEvent(
+                sample=61920, ch=11, on=True, note=62, ins=0, vol=12,
+                e5=0x80, pan=0, end=62655, tone_chip=3,
+                tone_clock=3579540, tone_div=16,
+            ),
+            NoteEvent(
+                sample=62655, ch=11, on=False, note=180, ins=-1, vol=-1,
+                e5=0x80, pan=0,
+            ),
+            # Same row tick as the would-be ED+EC cut.
+            NoteEvent(
+                sample=62843, ch=11, on=True, note=62, ins=0, vol=12,
+                e5=0x80, pan=0, end=64000, tone_chip=3,
+                tone_clock=3579540, tone_div=16,
+            ),
+        ])
+        _orders, patterns, _loop, _len = _build_patterns(
+            song, 4, 256, 3, ch_offset=-8, stats={},
+        )
+        rows = next(
+            rows for ch, _pat, rows in patterns
+            if ch == 3 and any(
+                r is not None and r.note not in (-1, NOTE_OFF) for r in rows
+            )
+        )
+        at = next(
+            i for i, r in enumerate(rows)
+            if r is not None and r.note not in (-1, NOTE_OFF)
+        )
+        self.assertNotIn(0xEC, dict(rows[at].fx))
+        self.assertIn(0xED, dict(rows[at].fx))
+        self.assertTrue(
+            rows[at + 1] is not None
+            and rows[at + 1].note not in (-1, NOTE_OFF)
+        )
+
 
 class TestDualYm2151(unittest.TestCase):
     def test_both_instances_get_their_own_columns(self):

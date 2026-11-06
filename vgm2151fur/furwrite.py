@@ -2870,6 +2870,17 @@ def _build_patterns(song: Song, n_ch: int, pat_len_max: int, fx_cols: int,
     # percussive attack can be kept when the following hit rounds onto the
     # same row.
     note_ev: dict[tuple[int, int], object] = {}
+    # The next key-on per channel, in source order. A cut that would reach
+    # that key-on must not be written: it would cut the following note. The
+    # next key-on already ends the previous note.
+    next_on: dict[int, list[tuple[int, object]]] = {}
+    for ev in song.events:
+        if ev.on and not ev.pcm:
+            ev_ch = ev.ch + ch_offset
+            if 0 <= ev_ch < n_ch:
+                next_on.setdefault(ev_ch, []).append((ev.sample, ev))
+    for entries in next_on.values():
+        entries.sort(key=lambda item: item[0])
     for ev in song.events:
         ev_ch = ev.ch + ch_offset
         if ev_ch < 0 or ev_ch >= n_ch:
@@ -2942,6 +2953,22 @@ def _build_patterns(song: Song, n_ch: int, pat_len_max: int, fx_cols: int,
                     ec = max(started + 1, delay)
                 else:
                     ec = max(1, delay - started)
+                # A cut that reaches the following key-on would cut the new
+                # note instead. The next key-on already ends this one, so
+                # leave the row without an ECxx (the Neo South Island Act 2
+                # case: ED03 EC05 with the next note at the same tick).
+                speed_now = max(1, song.speed)
+                nxt = next(
+                    (n for n in next_on.get(ev_ch, ()) if n[0] > ev.sample),
+                    None,
+                )
+                if nxt is not None:
+                    nrow, ndelay = song.place(nxt[0], stats)
+                    cut_tick = row * speed_now + started + ec
+                    next_tick = nrow * speed_now + ndelay
+                    if cut_tick >= next_tick:
+                        _bump(stats, "off_swallowed")
+                        continue
                 _add_fx(cell, 0xEC, ec, fx_cols, stats)
             elif delay > started:
                 # A release from the previous note that lands after this
