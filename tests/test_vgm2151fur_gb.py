@@ -104,6 +104,25 @@ class TestGbNotes(unittest.TestCase):
         self.assertEqual(gb_period_delta(0x600, 0x600), 0)
         self.assertGreater(gb_period_delta(0x600, 0x700), 0)  # higher pitch
 
+    def test_trigger_before_its_setup_is_reordered(self):
+        # Merged logs can emit NRx4 before the period low byte, duty and
+        # envelope at the same sample. Applying the trigger first would open
+        # the note on the previous (here muted) state and lose it.
+        writes = [
+            _gb(1000, 0x04, 0x86),  # trigger, period high 6
+            _gb(1000, 0x03, 0x00),  # period low
+            _gb(1000, 0x02, 0x60),  # volume 6
+            _gb(1000, 0x01, 0x80),  # duty 2
+            _gb(2000, 0x02, 0x00),  # DAC off
+        ]
+        hits, offs, _w, _warn = collect_gb(_vgm(writes))
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0].sample_time, 1000)
+        self.assertEqual(hits[0].period, 0x600)
+        self.assertEqual(hits[0].duty, 2)
+        self.assertEqual(hits[0].vol, 6)
+        self.assertEqual([o.sample_time for o in offs], [2000])
+
     def test_frequency_write_without_a_trigger_is_a_bend(self):
         # Arpeggios rewrite NRx3/NRx4 without a trigger, so the hardware
         # envelope keeps running. Splitting there would restart the envelope
@@ -467,6 +486,24 @@ class TestGbModule(unittest.TestCase):
         self.assertEqual(song.gb_ids, [0])
         mod = parse_fur(write_fur(song, include_pcm=True))
         self.assertIn(CHIP_GB, mod.chips)
+
+
+KUK = Path(r"D:\downloads\timetraxvgm\kuk\djtBMX_vgmmergetest.vgm")
+
+
+class TestGbMergedOrder(unittest.TestCase):
+    """A merged rip that writes each trigger before its same-sample setup."""
+
+    def test_pulse_notes_survive_the_merge(self):
+        if not KUK.is_file():
+            self.skipTest(f"{KUK} not present")
+        hits, _offs, _waves, _warn = collect_gb(load_vgm(KUK))
+        voices = {h.voice for h in hits}
+        self.assertEqual(voices, {0, 1, 2})
+        self.assertEqual(sum(1 for h in hits if h.voice == 0), 22)
+        self.assertEqual(sum(1 for h in hits if h.voice == 1), 24)
+        song = analyze(load_vgm(KUK))
+        self.assertEqual(song.gb_count, 47)
 
 
 if __name__ == "__main__":
