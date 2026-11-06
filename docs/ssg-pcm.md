@@ -134,6 +134,12 @@ the SCC/AY/PSG tone instruments and the `SMP2` bodies after the OPL4 wave
 bodies.  The analyzer shifts the tone instrument bases by the PCM instrument
 count and binds the PCM notes after the FM list is final.
 
+After the pattern pass, the writer removes every sample-map slot that no
+placed note selects.  It renumbers the remaining bodies, rewrites the map
+notes (60 + new slot), and shifts later instrument ids when a whole 120-slot
+group disappears.  A body stored by the collector but never triggered
+therefore does not reach the module.
+
 ## Validation
 
 `tests/test_vgm2151fur_ssgpcm.py` covers detection, the DAC-mode gate, slow

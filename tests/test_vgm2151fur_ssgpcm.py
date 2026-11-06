@@ -11,6 +11,7 @@ from vgm2151fur.furio import decompress_fur, iter_blocks, parse_fur
 from vgm2151fur.furwrite import INS_AY, write_fur
 from vgm2151fur.ssgpcm import (
     DAC_LOG_TABLE_AY,
+    SsgPcmSample,
     collect_ssg_pcm,
 )
 from vgm2151fur.vgm import (
@@ -311,6 +312,22 @@ class TestSsgPcmDacStream(unittest.TestCase):
 
 
 class TestSsgPcmUnused(unittest.TestCase):
+    def test_writer_drops_a_body_no_note_selects(self):
+        writes = [_ay(0, 7, 0xBF)]
+        writes += _square(100, 700, 5, reg=8)
+        song = analyze(_vgm(writes, total=4000))
+        self.assertEqual(len(song.ssg_pcm_samples), 1)
+        song.ssg_pcm_samples.append(SsgPcmSample(
+            "unused", b"\x01\x02\x03", 8820, 0, 0,
+        ))
+        stats: dict = {}
+        data = write_fur(song, stats=stats)
+        mod = parse_fur(data)
+        self.assertEqual(stats.get("ssg_pcm_samples_unused"), 1)
+        self.assertEqual(len(mod.samples), 1)
+        pcm = [e for e in song.events if e.on and e.pcm][0]
+        self.assertEqual(_ins_sm_maps(data, pcm.ins)[pcm.note - 60], 0)
+
     def test_unreferenced_bodies_are_not_written(self):
         # A stream aimed at a second YM2203 instance the module does not have.
         # The body must not survive as an unused SMP2 block.

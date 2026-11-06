@@ -3494,6 +3494,65 @@ _FM_CHIP_NAMES = {
 }
 
 
+def _compact_sample_map_notes(
+    patterns: list[tuple[int, int, list[Row | None]]],
+    ins_base: int,
+    ins_count: int,
+    samples: list,
+) -> tuple[list, int]:
+    """Drop sample-map bodies no placed note selects.
+
+    A note selects a slot as ``60 + slot`` and its instrument picks the map
+    group.  A sample can survive grouping and still never be played (a silent
+    chunk, a collapsed run, or a note lost to a row collision); remove it and
+    renumber both the map notes and the sample list.
+    """
+    if ins_count <= 0 or not samples:
+        return samples, ins_count
+    used: set[int] = set()
+    for _ch, _idx, rows in patterns:
+        for row in rows:
+            if row is None:
+                continue
+            ins, note = row.ins, row.note
+            if ins_base <= ins < ins_base + ins_count and 60 <= note < 180:
+                used.add((ins - ins_base) * 120 + (note - 60))
+    if not used:
+        return [], 0
+    if max(used) >= len(samples):
+        return samples, ins_count
+    ordered = sorted(used)
+    remap = {old: new for new, old in enumerate(ordered)}
+    for _ch, _idx, rows in patterns:
+        for row in rows:
+            if row is None:
+                continue
+            ins, note = row.ins, row.note
+            if ins_base <= ins < ins_base + ins_count and 60 <= note < 180:
+                old = (ins - ins_base) * 120 + (note - 60)
+                new = remap[old]
+                row.ins = ins_base + new // 120
+                row.note = 60 + new % 120
+    return [samples[i] for i in ordered], (len(ordered) + 119) // 120
+
+
+def _shift_sample_map_instruments(
+    patterns: list[tuple[int, int, list[Row | None]]],
+    start: int,
+    delta: int,
+) -> None:
+    """Move later instrument ids when a sample-map group is removed."""
+    if not delta:
+        return
+    for _ch, _idx, rows in patterns:
+        for row in rows:
+            if row is None:
+                continue
+            ins = row.ins
+            if ins != EMPTY and ins >= start:
+                row.ins = ins + delta
+
+
 def write_fur(
     song: Song, *, include_pcm: bool = True, include_fm: bool = True,
     stats: dict | None = None, compress: bool = False,
@@ -3760,6 +3819,86 @@ def write_fur(
         stats=stats,
     )
     effect_cols = _fit_fx_cols(patterns, n_ch)
+
+    # The note-placement pass is final, so now drop sample-map slots that no
+    # placed note ever selects.  Removing a whole 120-slot group also shifts
+    # every later instrument id, so the pattern cells are renumbered before
+    # instrument and sample-map writing.
+    dac_ins_base = len(fm_ins)
+    if include_pcm and dac_smps:
+        old_dac_ins = n_dac_ins
+        old_dac_len = len(dac_smps)
+        dac_smps, n_dac_ins = _compact_sample_map_notes(
+            patterns, dac_ins_base, n_dac_ins, dac_smps,
+        )
+        if n_dac_ins != old_dac_ins:
+            _shift_sample_map_instruments(
+                patterns, dac_ins_base + old_dac_ins,
+                n_dac_ins - old_dac_ins,
+            )
+        if stats is not None:
+            stats["dac_samples_unused"] = old_dac_len - len(dac_smps)
+
+    # Sample bases after the DAC group depend on its final length.
+    dac_smp_base = (
+        len(pcm_smps) + len(oki_smps) + len(adpcm_smps)
+        + len(spcm_smps) + len(rf5c68_smps) + len(rf5c164_smps)
+        + len(c140_smps) + len(c352_smps) + len(k053260_smps)
+    )
+    ym2610_a_smp_base = dac_smp_base + len(dac_smps)
+    ym2610_b_smp_base = ym2610_a_smp_base + len(ym2610_a_smps)
+    ym2608_b_smp_base = ym2610_b_smp_base + len(ym2610_b_smps)
+    y8950_b_smp_base = ym2608_b_smp_base + len(ym2608_b_smps)
+    opl4_wave_smp_base = y8950_b_smp_base + len(y8950_b_smps)
+    ssg_pcm_ins_base = (
+        len(fm_ins) + n_dac_ins + len(pcm_smps) + len(oki_smps)
+        + n_adpcm_ins + len(spcm_smps) + len(rf5c68_smps)
+        + len(rf5c164_smps) + len(c140_smps) + len(c352_smps)
+        + len(k053260_smps) + n_ym2610_a_ins + n_ym2610_b_ins
+        + n_ym2608_rhythm_ins + n_ym2608_b_ins + n_y8950_b_ins
+        + n_opl4_wave_ins
+    )
+    if include_pcm and ssg_pcm_smps:
+        old_ssg_ins = n_ssg_pcm_ins
+        old_ssg_len = len(ssg_pcm_smps)
+        ssg_pcm_smps, n_ssg_pcm_ins = _compact_sample_map_notes(
+            patterns, ssg_pcm_ins_base, n_ssg_pcm_ins, ssg_pcm_smps,
+        )
+        if n_ssg_pcm_ins != old_ssg_ins:
+            _shift_sample_map_instruments(
+                patterns, ssg_pcm_ins_base + old_ssg_ins,
+                n_ssg_pcm_ins - old_ssg_ins,
+            )
+        if stats is not None:
+            stats["ssg_pcm_samples_unused"] = (
+                old_ssg_len - len(ssg_pcm_smps)
+            )
+
+    ssg_pcm_smp_base = opl4_wave_smp_base + len(opl4_wave_smps)
+    nes_dpcm_smp_base = ssg_pcm_smp_base + len(ssg_pcm_smps)
+    nes_pcm_smp_base = nes_dpcm_smp_base + len(nes_dpcm_smps)
+    huc6280_pcm_smp_base = nes_pcm_smp_base + len(nes_pcm_smps)
+    n_ins = (
+        len(fm_ins) + n_dac_ins + len(pcm_smps) + len(oki_smps) + n_adpcm_ins
+        + len(spcm_smps) + len(rf5c68_smps) + len(rf5c164_smps)
+        + len(c140_smps) + len(c352_smps) + len(k053260_smps)
+        + n_ym2610_a_ins + n_ym2610_b_ins
+        + n_ym2608_rhythm_ins + n_ym2608_b_ins
+        + n_y8950_b_ins + n_opl4_wave_ins + n_ssg_pcm_ins
+        + n_nes_dpcm_ins + n_nes_pcm_ins + n_huc6280_pcm_ins
+        + len(scc_specs) + len(ay_specs) + len(psg_specs) + len(nes_specs)
+        + len(huc6280_specs) + len(gb_specs)
+    )
+    n_smp = (
+        len(pcm_smps) + len(oki_smps) + len(adpcm_smps)
+        + len(spcm_smps) + len(rf5c68_smps) + len(rf5c164_smps)
+        + len(c140_smps) + len(c352_smps)
+        + len(k053260_smps) + len(dac_smps)
+        + len(ym2610_a_smps) + len(ym2610_b_smps) + len(ym2608_b_smps)
+        + len(y8950_b_smps) + len(opl4_wave_smps) + len(ssg_pcm_smps)
+        + len(nes_dpcm_smps) + len(nes_pcm_smps) + len(huc6280_pcm_smps)
+    )
+
     n_ord = len(orders[0]) if orders else 1
     n_pat = len(patterns)
 

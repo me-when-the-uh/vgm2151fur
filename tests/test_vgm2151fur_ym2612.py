@@ -6,6 +6,7 @@ import math
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 from vgm2151fur.analyze import (
     analyze, furnace_note_name,
@@ -15,7 +16,12 @@ from vgm2151fur.furio import (
     CHIP_CHANNELS, decompress_fur, iter_blocks, parse_fur,
 )
 from vgm2151fur.furwrite import (
-    CHIP_YM2612, CHIP_YM2612_EXT, INS_FM, write_fur,
+    CHIP_YM2612,
+    CHIP_YM2612_EXT,
+    INS_FM,
+    _compact_sample_map_notes,
+    _shift_sample_map_instruments,
+    write_fur,
 )
 from vgm2151fur.furnace import export_vgm, find_furnace
 from vgm2151fur.vgm import ChipWrite, VgmFile, chips_in_head, load_vgm
@@ -53,6 +59,7 @@ SAILOR_STREET = Path(
     r"D:\Downloads\Bishoujo Senshi Sailor Moon"
     r"\Bishoujo Senshi Sailor Moon - 09 - Stage 1-1 (Street).vgz"
 )
+CONTRA = Path(r"D:\Downloads\Contra Hard Corps\10 - The Hard Corps.vgz")
 
 
 def _vgm(writes, *, total_samples=400000, clock=CLOCK, **kw):
@@ -1712,6 +1719,51 @@ class TestYm2612DacSailorMoon(unittest.TestCase):
         )
         self.assertLessEqual(len(song.dac_samples), 10)
         self.assertEqual(self._bad_silence(song), [])
+
+
+class TestSampleMapCleanup(unittest.TestCase):
+    def test_unused_slots_are_compacted_and_later_instruments_shift(self):
+        rows = [
+            SimpleNamespace(note=60, ins=0),
+            SimpleNamespace(note=62, ins=0),
+            SimpleNamespace(note=60, ins=2),
+        ]
+        patterns = [(0, 0, rows)]
+        samples = list(range(240))
+        samples2, count = _compact_sample_map_notes(
+            patterns, 0, 2, samples,
+        )
+        self.assertEqual(samples2, [0, 2])
+        self.assertEqual(count, 1)
+        self.assertEqual((rows[0].note, rows[0].ins), (60, 0))
+        self.assertEqual((rows[1].note, rows[1].ins), (61, 0))
+        self.assertEqual((rows[2].note, rows[2].ins), (60, 2))
+        _shift_sample_map_instruments(patterns, 2, -1)
+        self.assertEqual((rows[2].note, rows[2].ins), (60, 1))
+
+
+@unittest.skipUnless(CONTRA.is_file(), "Contra Hard Corps rip missing")
+class TestYm2612DacContra(unittest.TestCase):
+    def test_source_mode_fits_after_unused_samples_are_removed(self):
+        song = analyze(load_vgm(CONTRA))
+        self.assertEqual(song.dac_stats.get("dac_mode"), "source")
+        self.assertLessEqual(len(song.dac_samples), DAC_RELEASE_SAMPLES)
+        stats: dict = {}
+        data = write_fur(song, include_pcm=True, stats=stats)
+        mod = parse_fur(data)
+        unused = stats.get("dac_samples_unused", 0)
+        self.assertGreaterEqual(unused, 1)
+        self.assertEqual(
+            len(mod.samples), len(song.dac_samples) - unused,
+        )
+        base = len(song.fm_patches)
+        n_ins = (len(song.dac_samples) + 119) // 120
+        used = set()
+        for (_ch, _pat), rows in mod.patterns.items():
+            for row in rows:
+                if 60 <= row.note < 180 and base <= row.ins < base + n_ins:
+                    used.add((row.ins - base) * 120 + (row.note - 60))
+        self.assertEqual(used, set(range(len(mod.samples))))
 
 
 @unittest.skipUnless(ROBOT.is_file(), "RobotBattle2 rip missing")
