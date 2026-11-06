@@ -9,16 +9,12 @@ Supported chips:
 - Yamaha YM2608 (OPNA)
 - Yamaha YM2413 (OPLL)
 - Konami VRC7 (same OPLL core with its own preset ROM)
-- Yamaha YM3526 (OPL), YM3812 (OPL2) and YMF262 (OPL3), including rhythm mode
-  as its own system and OPL3 four-operator voices
+- Yamaha YM3526 (OPL), YM3812 (OPL2) and YMF262 (OPL3), including rhythm mode as its own system and OPL3 four-operator voices
 - Yamaha Y8950 (OPL with delta-T ADPCM voice)
-- Yamaha YMF278B (OPL4): OPL3 FM plus 24 wave channels. ROM wave samples are
-  extracted into the module from a YRW801 image (`VGM2151FUR_YRW801`)
-- Yamaha YM2149 / General Instrument AY-3-8910 (PSG), including volume-register
-  PCM playback
+- Yamaha YMF278B (OPL4): OPL3 FM plus 24 wave channels. ROM wave samples are extracted into the module from a YRW801 image (`VGM2151FUR_YRW801`)
+- Yamaha YM2149 / General Instrument AY-3-8910 (PSG), including volume-register SSGPCM playback
 - Texas Instruments SN76489 (PSG), including dual-chip logs
-- Toshiba T6W28 (Neo Geo Pocket Color stereo SN76489 variant): one four-channel
-  system with independent left/right attenuation
+- Toshiba T6W28 (Neo Geo Pocket Color stereo SN76489 variant): one four-channel system with independent left/right attenuation
 - Konami K007232 (experimental), including dual-chip logs
 - Konami K053260
 - Yamaha YMZ280B (PCMD8)
@@ -30,12 +26,11 @@ Supported chips:
 - Namco C140 and C219
 - Namco C352 (requires a development build of Furnace from a compatible fork. A build with C352 support (built from https://github.com/me-when-the-uh/furnace-ports) is located in `./furnace-c352` - use at your own risk, since it's always a good idea to build from source instead of relying on someone else's builds)
 - Ricoh RF5C68 (FM Towns) and RF5C164 (Sega CD)
-- NES APU (Ricoh 2A03, A Famicom AY is written as a Sunsoft 5B and its notes are pitched at the chip's half clock)
+- NES APU (Ricoh 2A03)
 - Game Boy DMG (Sharp LR35902)
 - Hudson HuC6280 (PC Engine / TurboGrafx-16) - six wavetable voices with per-wave instruments, periodic noise on voices 4/5 (noise-transient plus tone-tail percussion), and direct-D/A PCM through the DAC stream (8-bit sample bodies)
 
-A log that mixes several chip families is written as one module when the
-combination is supported. `docs/merged-logs.md` lists the rules.
+A log that mixes several chip families is written as one module when the combination is supported. `docs/merged-logs.md` lists the rules.
 
 It runs on Windows and Linux with Python 3.11 or newer.
 
