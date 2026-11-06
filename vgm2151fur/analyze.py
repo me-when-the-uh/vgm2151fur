@@ -2586,8 +2586,31 @@ def _bind_fm_pitch(
         for i, e in enumerate(notes):
             if not e.fm_pitch_pts:
                 continue
-            end = e.end or (notes[i + 1].sample if i + 1 < len(notes) else track_end)
+            next_start = (
+                notes[i + 1].sample if i + 1 < len(notes) else track_end
+            )
+            end = e.end or next_start
+            gate_end = end
             pts = e.fm_pitch_pts
+            if i + 1 < len(notes):
+                # The OPLL collector holds a voice through OPLL_SETTLE before
+                # the next key-on, so that note's f-num preparation lands in
+                # this note's pitch points. Those writes are often a low
+                # placeholder (fnum 1) and turned the previous note into a
+                # sub-octave bass if used as its pitch. Drop the trailing prep
+                # window; a genuine release-tail gesture is earlier.
+                cutoff = next_start - OPLL_SETTLE
+                kept = tuple(p for p in pts if p[0] < cutoff)
+                if kept:
+                    pts = kept
+            if e.end and len(pts) > 1:
+                # The key-off write can also clear the f-num high bit, which
+                # the collector sees as a pitch point on the key-off sample.
+                # It is not a release gesture; using it dropped the note by
+                # several octaves on its last row.
+                pts = (pts[0],) + tuple(
+                    p for p in pts[1:] if abs(p[0] - e.end) > 2
+                )
             if pts:
                 # The key-off can end the note while the driver keeps moving
                 # the f-num through the release tail; the macro must reach
@@ -2598,10 +2621,15 @@ def _bind_fm_pitch(
             # long held notes can change pitch near their end (Avengers 23).
             ticks = max(1, min(int((end - e.sample) / tick_samples) + 1, 65025))
             ref = opn_pitch_units(pts[0][1], pts[0][2])
-            if opll and len(pts) <= 2:
-                # One held pitch step (a drum's tuning change) needs no
-                # instrument and no row effect: retune the note to the final
-                # write.
+            if (
+                opll and len(pts) <= 2
+                and pts[-1][0] < gate_end
+            ):
+                # One held pitch step *inside* the note (a drum's tuning
+                # change) needs no instrument and no row effect: retune the
+                # note to it. A write at or after the key-off is the release
+                # tail or the next note's f-num preparation; retuning to that
+                # turned ordinary notes into sub-octave bass notes.
                 e.note, e.e5 = opll_note_for(
                     pts[-1][1], pts[-1][2], clock,
                 )

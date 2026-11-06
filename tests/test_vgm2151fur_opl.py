@@ -1064,6 +1064,37 @@ class TestOpllTickMacros(unittest.TestCase):
         self.assertEqual(ev.pitch_steps, ())
         self.assertEqual(ev.sweep, ())
 
+    def test_next_note_f_num_prep_does_not_retune_the_previous_note(self):
+        # The driver writes the next note's low f-num (often 1, a placeholder)
+        # shortly before its key-on. The previous note's key-off is earlier,
+        # but the collector still holds the voice, so that write lands in the
+        # previous note's pitch points. Retuning to it dropped an ordinary
+        # note two or more octaves into a bass note.
+        hi1 = ((1 & 7) << 1) | ((216 >> 8) & 1)
+        hi2 = ((1 & 7) << 1) | ((257 >> 8) & 1)
+        ws = [
+            opll_wr(900, 0x35, (1 << 4) | 0),
+            opll_wr(1000, 0x25, hi1 | 0x10),
+            opll_wr(1001, 0x15, 216 & 0xFF),
+            opll_wr(1002, 0x25, hi1 | 0x10),
+            opll_wr(5000, 0x25, hi1),
+            # next note's preparation: low f-num 1, then key-on 50 samples on
+            opll_wr(5400, 0x15, 1),
+            opll_wr(5402, 0x25, (1 & 7) << 1),
+            opll_wr(5480, 0x35, (1 << 4) | 0),
+            opll_wr(5500, 0x25, hi2 | 0x10),
+            opll_wr(5501, 0x15, 257 & 0xFF),
+            opll_wr(5502, 0x25, hi2 | 0x10),
+            opll_wr(9000, 0x25, hi2),
+        ]
+        song = analyze(opll_vgm(ws, total_samples=12000), speed=1)
+        notes = [e for e in song.events if e.on and e.ch == 5]
+        self.assertEqual(notes[0].note, 76)
+        self.assertEqual(notes[1].note, 79)
+        self.assertFalse(notes[0].pitch_steps)
+        self.assertEqual(notes[0].sweep, ())
+        self.assertEqual(song.fm_patches[notes[0].ins].pitch_macro, ())
+
     def test_slow_row_pitch_motion_uses_row_steps(self):
         # Writes spread over separate rows ride E5/E8/E9 exactly. Keeping them
         # as instrument copies is what exhausted the 250-instrument budget on
