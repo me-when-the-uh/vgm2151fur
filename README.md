@@ -19,7 +19,7 @@ Supported chips:
 - Texas Instruments SN76489 (PSG)
 - Konami K007232 (experimental)
 - Konami K053260
-- Yamaha YMZ280B (PCMD8): eight sample voices, 4-bit ADPCM / 8-bit / 16-bit PCM
+- Yamaha YMZ280B (PCMD8)
 - Konami SCC / SCC+ (K051649/K052539)
 - OKI MSM6295
 - OKI MSM6258 (Sharp X68000 ADPCM)
