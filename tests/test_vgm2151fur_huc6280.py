@@ -249,58 +249,47 @@ class TestHuc6280Tones(unittest.TestCase):
         writes += [_w(2, 0x05, 0xCC)]      # attack, just after the gate
         writes += [_w(1000, 0x05, 0x99)]   # decay, a later row
         song = analyze(_vgm(writes, huc6280_clock=3579545))
-        note = [e for e in song.events if e.on and e.ch >= 8][0]
+        evs = [e for e in song.events if e.on and e.ch >= 8]
         attack, _pan = pce_effective(31, 0xCC)
         decay, _dpan = pce_effective(31, 0x99)
-        # The envelope is a tick-rate instrument macro normalized to its peak;
-        # the note column carries the peak itself.
-        macro = next(it.vol for it in song.huc6280_ins if it.vol)
-        self.assertEqual(note.vol, attack)
-        self.assertFalse(note.vol_pts)
-        self.assertEqual(macro[0], 31)
-        self.assertIn(int(round(decay * 31 / attack)), macro)
+        self.assertEqual([e.sample for e in evs][:2], [0, 1000])
+        self.assertEqual(evs[0].vol, attack)
+        self.assertEqual(evs[1].vol, decay)
 
-    def test_balance_envelope_becomes_tick_macro(self):
+    def test_balance_step_becomes_note_on(self):
         # LOX2-style drivers fade with the balance register while the control
-        # volume stays at 31. The envelope goes into the instrument's volume
-        # macro so it advances at tick rate; the pan ratio stays on the row.
+        # volume stays at 31. Each balance step is a new 16th-note level.
         writes = _load_wave(_square(), sample=0)
         writes += [_w(5000, 0x00, 0), _w(5000, 0x05, 0x87)]
         song = analyze(_vgm(writes, huc6280_clock=3579545))
-        note = [e for e in song.events if e.on and e.ch >= 8][0]
-        macro = next(it.vol for it in song.huc6280_ins if it.vol)
-        self.assertEqual(note.vol, 31)
-        self.assertFalse(note.vol_pts)
-        # The balance 0x87 attenuates to an effective level of 16/31.
-        self.assertIn(16, macro)
-        # And the module still writes (it would fail if the envelope were
+        evs = [e for e in song.events if e.on and e.ch >= 8]
+        self.assertEqual([e.sample for e in evs][:2], [0, 5000])
+        self.assertEqual([e.vol for e in evs][:2], [31, 16])
+        # And the module still writes (it would fail if the step were
         # dropped and the empty macro left the note without a level).
         data = write_fur(song, include_pcm=True, include_fm=False)
         self.assertEqual(parse_fur(data).chips, [CHIP_PCE])
 
-    def test_volume_peaks_become_note_ons(self):
-        # A long PCE gate can carry many balance swells. Each peak is the
-        # driver's software attack: it becomes a new note, and the macro
-        # between peaks holds only the following decay.
+    def test_volume_steps_become_note_ons(self):
+        # A long PCE gate can carry many balance steps. In the percussion
+        # drivers each step is the next 16th-note level (hi-hats and a louder
+        # snare accent), so every step becomes a note with its own column.
         writes = _load_wave(_square(), sample=0, balance=0xCC)
         writes += [
             _w(2000, 0x05, 0x99),
             _w(4000, 0x05, 0x88),
-            _w(6000, 0x05, 0xCC),   # second peak
+            _w(6000, 0x05, 0xCC),
             _w(8000, 0x05, 0x99),
         ]
         song = analyze(_vgm(writes, huc6280_clock=3579545))
         evs = [e for e in song.events if e.on and e.ch >= 8]
-        self.assertEqual([e.sample for e in evs][:2], [0, 6000])
-        self.assertEqual(evs[0].end, 6000)
-        self.assertEqual(evs[0].vol, 25)
-        ins = song.huc6280_ins[evs[0].ins]
-        self.assertEqual(ins.vol[0], 31)
-        # One peak: the rest of the normalized macro only holds or decays.
-        self.assertTrue(all(
-            a >= b for a, b in zip(ins.vol, ins.vol[1:])
-        ), ins.vol)
-        self.assertLess(len(ins.vol), 60)
+        self.assertEqual(
+            [e.sample for e in evs][:5], [0, 2000, 4000, 6000, 8000]
+        )
+        self.assertEqual([e.vol for e in evs][:5], [25, 19, 16, 25, 19])
+        self.assertEqual(evs[0].end, 2000)
+        for e in evs[:5]:
+            self.assertLessEqual(len(song.huc6280_ins[e.ins].vol), 60)
 
     def test_noise_transient_then_tone_tail(self):
         # A percussion hit: noise on at the gate, then 0x07=0 mid-gate

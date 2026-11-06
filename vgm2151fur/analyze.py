@@ -1883,13 +1883,15 @@ def _bind_tone_instruments(
 def _split_pce_volume_peaks(
     events: list[NoteEvent], clock: int, track_end: int,
 ) -> list[NoteEvent]:
-    """Split a PCE tone gate at each volume peak (and every five seconds).
+    """Split a PCE tone gate at each volume step (and every five seconds).
 
-    A long balance/control-volume envelope can contain dozens of swells. A
-    single instrument volume macro then holds many peaks and can run for tens
-    of seconds, which is neither a useful instrument nor accurate at the row
-    rate. Each peak is the driver's software attack, so make it a new note:
-    the peak becomes the note row and its following decay the (short) macro.
+    A long balance/control-volume envelope can contain dozens of steps. A
+    single instrument volume macro then holds many of them and can run for
+    tens of seconds, which is neither a useful instrument nor accurate at the
+    row rate. Each step is the driver's next software level - in the
+    percussion drivers it is the 16th-note grid, with different steps acting
+    as hi-hat and snare accents - so make each one a new note. The note row
+    carries that step's level and the macro only the pan/pitch inside it.
     The five-second ceiling keeps any remaining macro bounded.
     """
     cap = 5 * VGM_RATE
@@ -1914,8 +1916,8 @@ def _split_pce_volume_peaks(
         vol_at = [(t, v) for t, v, _p in pts]
         pan_at = [(t, p) for t, _v, p in pts]
         splits = [
-            pts[i][0] for i in range(1, len(pts) - 1)
-            if pts[i][1] >= pts[i - 1][1] and pts[i][1] > pts[i + 1][1]
+            pts[i][0] for i in range(1, len(pts))
+            if pts[i][1] != pts[i - 1][1]
         ]
         t = ev.sample
         while t + cap < end:
