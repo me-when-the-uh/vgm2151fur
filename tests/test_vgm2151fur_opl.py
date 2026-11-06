@@ -580,6 +580,26 @@ class TestOplAnalyze(unittest.TestCase):
         ev = next(e for e in song.events if e.on and e.ch == 6)
         self.assertEqual(ev.pan, 0xF0)          # left only
 
+    def test_centre_after_a_hard_pan_emits_an_explicit_byte(self):
+        # A hard-panned channel that returns to centre must get 0xFF, not an
+        # omitted effect: otherwise the old pan stays latched for every later
+        # row. Both the note byte and a live mid-note change carry it.
+        st = OPLState(KIND_OPL3, False)
+        st.write(0, 0xC0, 0x10)                 # left only
+        self.assertEqual(st.pan_byte(0), 0xF0)
+        st.write(0, 0xC0, 0x30)                 # both sides
+        self.assertEqual(st.pan_byte(0), 0xFF)
+
+        cm = st.chan_map[0]
+        ws = heart(KIND_OPL3) + voice(100, KIND_OPL3, 0, pan=1)
+        ws.append(ChipWrite(20000, KIND_OPL3, 0, cm + 0xC0, 0x30))
+        song = analyze(_vgm(ws, kind=KIND_OPL3))
+        ev = next(e for e in song.events if e.on and e.ch == 0)
+        self.assertEqual(ev.pan, 0xF0)
+        live = [v for t, ch, cmd, v in song.channel_fx
+                if ch == 0 and cmd == 0x08 and t >= 20000]
+        self.assertEqual(live, [0xFF])
+
     def test_an_opl2_column_gets_no_pan_effect(self):
         song = analyze(_vgm(voice(100, KIND_OPL2, 0) + heart()))
         ev = next(e for e in song.events if e.on and e.ch == 0)
@@ -683,6 +703,38 @@ class TestOplWriter(unittest.TestCase):
         self.assertIn(b"BD", data)
         self.assertIn(b"HiHat", data)
         self.assertIn(INS_OPL_DRUMS, ins_types(data))
+
+    def test_zero_attack_after_an_unreleased_operator_gets_hard_reset(self):
+        # The source leaves the previous operator at RR=0 (no release) and
+        # writes the next patch's registers during the silent gap. A module
+        # loads that patch only at the key-on, where a zero-attack operator
+        # would keep the stale level instead of starting from silence. The
+        # writer arms Furnace's hard envelope reset (0x30) for that note.
+        def notes(first_rr):
+            ws = voice(1000, KIND_OPL3, 0,
+                       ops=[{"ar": 15, "dr": 2, "sl": 6, "rr": first_rr},
+                            {"ar": 15, "dr": 2, "sl": 7, "rr": 2}],
+                       block=4, fnum=580, off_time=60000)
+            ws += voice(100000, KIND_OPL3, 0,
+                        ops=[{"ar": 0, "dr": 0, "sl": 15, "rr": 15},
+                             {"ar": 15, "dr": 0, "sl": 15, "rr": 6}],
+                        block=4, fnum=700, off_time=160000)
+            song = analyze(_vgm(ws + heart(KIND_OPL3)))
+            m = parse_fur(write_fur(song, include_pcm=False))
+            rows = [row for oi in m.orders[0]
+                    for row in m.patterns.get((0, oi), [])
+                    if 0 <= row.note < 180]
+            self.assertGreaterEqual(len(rows), 2)
+            return rows
+
+        rows = notes(0)
+        self.assertNotIn(0x30, [c for c, _v in (rows[0].fx or ())])
+        self.assertIn((0x30, 1), list(rows[1].fx or ()))
+
+        # A released modulator already reaches silence, so the reset is not
+        # needed and the note keys normally.
+        rows = notes(4)
+        self.assertNotIn(0x30, [c for c, _v in (rows[1].fx or ())])
 
     def test_instrument_type_and_operator_bytes(self):
         ws = voice(100, KIND_OPL2, 0, alg=0, fb=5,

@@ -3268,6 +3268,70 @@ def _build_patterns(song: Song, n_ch: int, pat_len_max: int, fx_cols: int,
     last_content = max(
         (row for ch in range(n_ch) for row in grid[ch]), default=-1
     )
+
+    # An OPL operator with a zero attack rate never attacks: it keeps whatever
+    # envelope level it holds when the key goes down. If the previous note on
+    # the channel left that operator at RR=0, the level never fell to silence
+    # either. On hardware the source usually writes the next patch's RR during
+    # the silent gap, which releases the envelope before the key-on; a module
+    # applies the patch at the key-on itself, so the stale level survives and
+    # the operator stays audible. Furnace's hard envelope reset (0x30) performs
+    # that release: at the key-on the platform drives every operator through
+    # RR=15 and then restores the logged value.
+    patches = getattr(song, "fm_patches", ()) or ()
+
+    def _opl_reset_patch(ins: int):
+        if not 0 <= ins < len(patches):
+            return None
+        p = patches[ins]
+        if not getattr(p, "opl", False) or getattr(p, "drum", False):
+            return None
+        return p
+
+    if any(
+        getattr(p, "opl", False) and not getattr(p, "drum", False)
+        for p in patches
+    ):
+        for ch in range(n_ch):
+            cells = grid[ch]
+            if not cells:
+                continue
+            carried = -1
+            prev_ins = -1
+            reset_rows: set[int] = set()
+            for row in sorted(cells):
+                cell = cells[row]
+                if cell.ins >= 0:
+                    carried = cell.ins
+                if not (0 <= cell.note < 180):
+                    continue
+                cur = _opl_reset_patch(carried)
+                prev = _opl_reset_patch(prev_ins)
+                if cur is not None and prev is not None:
+                    cur_ops = 4 if cur.four else 2
+                    prev_ops = 4 if prev.four else 2
+                    if any(
+                        cur.ops[i].ar == 0 and prev.ops[i].rr == 0
+                        for i in range(min(cur_ops, prev_ops))
+                    ):
+                        reset_rows.add(row)
+                prev_ins = carried
+            for row in reset_rows:
+                cell = cells.get(row)
+                if cell is None:
+                    continue
+                _add_fx(cell, 0x30, 1, fx_cols, stats)
+                # Disarm on the next row so later notes key normally. A
+                # neighbouring note that needs the same reset keeps it armed.
+                nrow = row + 1
+                if nrow in reset_rows or nrow > last_content:
+                    continue
+                ncell = cells.get(nrow)
+                if ncell is None:
+                    ncell = _blank_row()
+                    cells[nrow] = ncell
+                _add_fx(ncell, 0x30, 0, fx_cols, stats)
+
     pat_len = min(pat_len_max, _phrase_pattern_len(song, last_content, total_rows))
 
     # Walk pat_len-row chunks, but force an order boundary at the VGM loop so

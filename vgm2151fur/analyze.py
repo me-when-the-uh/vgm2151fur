@@ -3195,6 +3195,10 @@ def _collect_opl(
         chan_ops[cid] = ops_of
 
     held: dict[tuple[int, int], int] = {}
+    # The pan byte last written for a held channel.  A source that returns
+    # from a hard pan to centre must get an explicit 0xFF; omitting it leaves
+    # the old pan in force for every later row.
+    pan_last: dict[tuple[int, int], int] = {}
     pitch_pts: dict[tuple[int, int], list[tuple[int, int, int]]] = {}
     pitch_base: dict[tuple[int, int], tuple[int, int]] = {}
     # Mid-note pitch is compared with what the register holds *now*, not with the
@@ -3392,6 +3396,7 @@ def _collect_opl(
         for oi in range(4):
             op_tl_last.pop((cid, fch, oi), None)
         tl_open.pop(key, None)
+        pan_last.pop(key, None)
         if off:
             ev.end = sample
             events.append(NoteEvent(
@@ -3408,6 +3413,7 @@ def _collect_opl(
         block, fnum = st.frequency(fch)
         note, e5 = opl_note_for(block, fnum, clock, opl3, freq_base)
         ins, vol = intern(cid, fch)
+        ev_pan = 0 if kit else st.pan_byte(fch)
         events.append(NoteEvent(
             sample=sample,
             ch=base[cid] + fch,
@@ -3418,13 +3424,15 @@ def _collect_opl(
             e5=e5,
             # The kit's own 0xCn bits mean nothing in rhythm mode. A percussion
             # column never gets a pan effect.
-            pan=0 if kit else st.pan_byte(fch),
+            pan=ev_pan,
             sweep_div=2.0,
             e5_lo=0x00,
             e5_hi=0xFF,
             drum=kit,
         ))
         held[key] = len(events) - 1
+        if not kit:
+            pan_last[key] = ev_pan
         pitch_base[key] = (block, fnum)
         pitch_last[key] = (block, fnum)
         pitch_pts[key] = [(sample, block, fnum)]
@@ -3588,6 +3596,23 @@ def _collect_opl(
 
         prev_val = st.regs[addr]
         st.write(port, r, val)
+
+        if 0xC0 <= r <= 0xC8:
+            # Pan lives in the unused high bits of the feedback/connection
+            # byte.  A live change must reach a held note; the note-start byte
+            # alone would leave a hard pan latched across the next rows.
+            chan_off = (port << 8) | (r - 0xC0)
+            for fch in freq_owners[cid].get(chan_off, ()):
+                key = (cid, fch)
+                if key not in held or (drums and fch > st.melodic):
+                    continue
+                new_pan = st.pan_byte(fch)
+                if new_pan and new_pan != pan_last.get(key):
+                    channel_fx.append((
+                        w.sample, base[cid] + fch, 0x08, new_pan,
+                    ))
+                    pan_last[key] = new_pan
+            continue
 
         if 0xA0 <= r <= 0xA8:
             chan_off = (port << 8) | (r - 0xA0)
