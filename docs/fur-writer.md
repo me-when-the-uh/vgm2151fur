@@ -380,8 +380,8 @@ note change was left to a ramp that could not cross the distance inside its
 row. Those steps are transposes now, so `dev_max` reports only the residual of
 the ramps that stay - on a staccato lead track, nineteen semitones down to a
 quarter tone. That matters for the pick, because `lossless` compares deviation
-as well as structural loss. With `verify` (CLI `--verify`, always on in
-the menu) `convert_variants` instead renders every candidate through Furnace
+as well as structural loss. With `verify` (CLI `--verify`, or a yes at the
+menu's Furnace prompt) `convert_variants` instead renders every candidate through Furnace
 and counts pitch runs against the source at 0.25 st / 60 ms, accepting a
 factor only up to `baseline + 1` runs. A factor is a row-length multiplier,
 and it may be fractional. The default ladder walks the half steps

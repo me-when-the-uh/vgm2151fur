@@ -63,7 +63,7 @@ With no arguments the tool opens a menu. Type a number, or paste a path to a VGM
  7  condense   write copies of tracks with 1x..4x lower BPM
 ```
 
-`packs` is the place to start. It scans a folder (remembered next time), lists the packs with track counts and chips, and opens a track list with a dash next to tracks that have no `.fur` yet. `c` converts all tracks or a selection (`2-6`, `1,4`, or a single number), `e` changes a chip volume on the converted tracks, and `r` renders one to WAV so you can hear it. The menu stores its state in `~/.vgm2151fur.json`.
+`packs` is the place to start. It scans a folder (remembered next time), lists the packs with track counts and chips, and opens a track list with a dash next to tracks that have no `.fur` yet. `c` converts all tracks or a selection (`2-6`, `1,4`, or a single number), `e` changes a chip volume on the converted tracks, and `r` renders one to WAV so you can hear it. Conversion asks `normalize/verify through Furnace? (y/N)`; the default is no, so the menu does not launch Furnace unless you ask it to. The menu stores its state in `~/.vgm2151fur.json`.
 
 ## Commands
 
