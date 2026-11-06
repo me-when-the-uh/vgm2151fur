@@ -146,12 +146,17 @@ does not retrigger the envelope, so those writes stay pitch/high-byte updates
 rather than phase-reset macros. Only a real 0-to-1 key transition starts a
 note.
 
-Pitch motion on OPLL also stays in the instrument's pitch macro (file code
-4). The E5/E8/E9 row-step path does not reach the OPLL registers on export
-and left fast drum bends flat, so OPLL is excluded from it. A trajectory with
-a single held pitch step is folded into the note's own note/E5 instead of
-spending an instrument; the rest become macros, with values quantized to
-1/32 semitone to share near-identical percussion bends.
+Pitch motion with at most about one write per pattern row rides the E5/E8/E9
+row effects; those reach the OPLL registers on export and cost no instrument.
+A single held pitch step is folded into the note's own note/E5 instead of
+spending an instrument. Only a fast sub-row walk (the classic drum bend, whose
+writes all land in one row) stays in the instrument's pitch macro (file code
+4), with values quantized to 1/32 semitone to share near-identical bends.
+Keeping the spread-out motion out of macros matters: on an OPLL-heavy log the
+copies used to fill all 250 slots and leave AY/PSG notes on the plain
+fallback. The analyzer now measures the tone families' real demand before
+the FM macro passes and reserves those slots, keeping a small emergency share
+for FM bends that cannot be row-stepped.
 
 The key-on settle window also snapshots the patch and level at the key-on
 instant, not at the later flush: a retrigger faster than `OPLL_SETTLE` used to

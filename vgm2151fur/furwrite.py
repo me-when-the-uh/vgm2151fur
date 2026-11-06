@@ -2929,15 +2929,25 @@ def _build_patterns(song: Song, n_ch: int, pat_len_max: int, fx_cols: int,
                     _add_fx(cell, 0xED, delay, fx_cols, stats)
             elif delay > started:
                 if started:
-                    # ECxx must not share a line with EDxx: Furnace can
+                    # Never put ECxx on the same line as EDxx: Furnace can
                     # count the cut from the note start and cut the following
-                    # note. The next key-on already ends this one, so drop
-                    # both rather than risk silence.
-                    cell.fx = [
-                        (c, v) for c, v in (cell.fx or ())
-                        if c not in (0xED, EMPTY)
-                    ]
-                    _bump(stats, "ed_stripped_cut")
+                    # note. Keep the note's own delay and put the cut on the
+                    # next row. Dropping it instead let a short noise or drum
+                    # gate run until the channel's next key-on, which is up to
+                    # a whole phrase later. If that next row already starts a
+                    # note, its key-on ends this one and no cut is needed.
+                    target = row + 1
+                    ncell = grid[ev_ch].get(target) if target < total_rows else None
+                    if target < total_rows and (
+                        ncell is None or not (0 <= ncell.note < 180)
+                    ):
+                        if ncell is None:
+                            ncell = _blank_row()
+                            grid[ev_ch][target] = ncell
+                        ncell.note = NOTE_OFF
+                        _bump(stats, "cut_moved")
+                    else:
+                        _bump(stats, "off_swallowed")
                 else:
                     _add_fx(cell, 0xEC, delay, fx_cols, stats)
             else:

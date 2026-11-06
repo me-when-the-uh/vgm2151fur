@@ -715,6 +715,35 @@ def _flag_texts(data: bytes) -> list[str]:
 
 
 @unittest.skipUnless(HAVE_FURNACE, "furnace console build missing")
+class TestComboInstrumentPriority(unittest.TestCase):
+    def test_ay_keeps_its_decay_beside_an_opll_macro_copy(self):
+        # The OPLL level walk creates a macro copy that grows the patch list
+        # into the AY event's pre-bind instrument index. The AY note must not
+        # be taken for an OPLL note: that used to pin its volume column to 15
+        # and lose the decay, leaving a randomly loud square.
+        writes = opll_note(1000, ch=0, off=30000)
+        writes += [
+            ChipWrite(5000, "opll", 0, 0x30, (6 << 4) | 4),
+            ChipWrite(5100, "opll", 0, 0x30, (6 << 4) | 2),
+        ]
+        writes += [
+            ChipWrite(0, "ay8910", 0, 7, 0xFE),
+            ChipWrite(0, "ay8910", 0, 0, 254),
+            ChipWrite(0, "ay8910", 0, 1, 0),
+            ChipWrite(3000, "ay8910", 0, 8, 9),
+            ChipWrite(8000, "ay8910", 0, 8, 8),
+            ChipWrite(13000, "ay8910", 0, 8, 7),
+            ChipWrite(25000, "ay8910", 0, 8, 0),
+        ]
+        song = analyze(_vgm(writes, ym2413_clock=3579545,
+                           ay8910_clock=1789773, total_samples=60000))
+        ay = next(e for e in song.events if e.on and e.tone_chip == 2)
+        idx = ay.ins - len(song.fm_patches)
+        self.assertTrue(0 <= idx < len(song.ay_ins),
+                        (ay.ins, len(song.fm_patches), len(song.ay_ins)))
+        self.assertEqual(song.ay_ins[idx].vol[0], 9)
+        self.assertEqual(ay.vol, 15)      # the macro carries the level
+
 class TestComboRoundTrip(unittest.TestCase):
     """Furnace drives both systems of a combined module."""
 

@@ -58,8 +58,11 @@ row before the boundary carries a note, the boundary moves one row later until
 that row is note-free; otherwise `D00` would jump before the note's `EDxx`
 delay and the note would never start. `ECxx` is never written on a row that
 also has `EDxx`: Furnace can count that cut from the note start, so the cut
-lands inside the following note. In that case the writer drops both and lets
-the next key-on end the note.
+lands inside the following note. When a note-off and its note round onto the
+same row, the note keeps its `EDxx` and the cut moves to the next row. Dropping
+it instead let a one-frame noise or drum gate run until the channel's next
+key-on, which could be a whole phrase later. If that next row already starts a
+note, its key-on ends the previous one and no cut row is needed.
 
 `edit.py` patches both volume copies, so every reader agrees. The float
 triples are located from the payload tail, anchored on the ADIR pointers: the

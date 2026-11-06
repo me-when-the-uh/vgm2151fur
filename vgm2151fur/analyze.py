@@ -1778,6 +1778,40 @@ def _bind_tone_instruments(
             event.ins = tone_ins_base + n_scc + idx
 
 
+def _tone_instrument_demand(
+    events: list[NoteEvent],
+    scc_clock: int,
+    ay_clock: int,
+    psg_clock: int,
+    nes_clock: int,
+    huc6280_clock: int,
+    gb_clock: int,
+    vsu_clock: int,
+    hz: float,
+    total_samples: int,
+) -> int:
+    """How many tone instruments the notes want with an unlimited budget.
+
+    The FM macro passes run before the tone list is built, so an OPL/OPLL
+    driver that changes f-num often can spend every free slot on FM copies and
+    leave every AY/PSG note on the plain fallback. The caller measures the
+    real demand first and reserves that many slots for the tone families.
+    """
+    tone = [replace(e) for e in events if e.on and e.tone_chip]
+    if not tone:
+        return 0
+    scc, ay, psg, nes, huc, gb, vsu = [], [], [], [], [], [], []
+    _bind_tone_instruments(
+        tone, scc, ay, psg, nes, huc, gb, vsu,
+        # A negative base leaves the instrument cap effectively unlimited, so
+        # every distinct macro shape is counted.
+        -1000,
+        scc_clock, ay_clock, psg_clock, nes_clock, huc6280_clock,
+        gb_clock, vsu_clock, hz, total_samples,
+    )
+    return sum(len(bucket) for bucket in (scc, ay, psg, nes, huc, gb, vsu))
+
+
 # The format stores a macro length in one byte, so 255 is the longest macro
 # that can be declared. 256 wraps to 0 and the reader then never consumes the
 # data block, reporting "invalid macro code" on the bytes after it.
@@ -2394,6 +2428,13 @@ def _bind_opll_macros(
     for ev in events:
         if not ev.on:
             continue
+        if ev.tone_chip or ev.pcm or ev.dac:
+            # SCC/AY/PCE/NES/GB tone events also carry `vol_pts`, and their
+            # instrument index lives in the same number space as the FM
+            # patches. Treating one as an OPLL note replaced its instrument
+            # with an FM macro copy and pinned its volume column to 15, so an
+            # AY note with a real decay played at full level.
+            continue
         if not (ev.opll_preset_pts or ev.opll_phase_pts or ev.vol_pts):
             continue
         if not (0 <= ev.ins < len(patch_order)):
@@ -2557,19 +2598,31 @@ def _bind_fm_pitch(
             # long held notes can change pitch near their end (Avengers 23).
             ticks = max(1, min(int((end - e.sample) / tick_samples) + 1, 65025))
             ref = opn_pitch_units(pts[0][1], pts[0][2])
+            if opll and len(pts) <= 2:
+                # One held pitch step (a drum's tuning change) needs no
+                # instrument and no row effect: retune the note to the final
+                # write.
+                e.note, e.e5 = opll_note_for(
+                    pts[-1][1], pts[-1][2], clock,
+                )
+                continue
+            row_ok = _row_steppable(
+                pts, e.sample, tick_samples, row_ticks,
+            )
             # A held pitch with a jump or two is a step function. One
             # E5/E8/E9 row effect reproduces it without an instrument copy.
-            # Only oscillating motion needs a macro.
-            if allow_steps and (
-                len(pts) <= 4
-                or _steppable_pitch(pts)
-                or (
-                    ticks > MACRO_MAX
-                    and _row_steppable(
-                        pts, e.sample, tick_samples, row_ticks,
-                    )
+            # Only oscillating motion needs a macro. OPLL keeps fast sub-row
+            # bends in a macro (its row steps do not reach the registers on
+            # export), but a trajectory with at most about one write per row
+            # rides E5/E8/E9 exactly and must not spend an instrument slot.
+            if (
+                allow_steps
+                and (
+                    len(pts) <= 4
+                    or _steppable_pitch(pts)
+                    or (ticks > MACRO_MAX and row_ok)
                 )
-            ):
+            ) or (opll and row_ok):
                 deltas = tuple(
                     (t, int(round(opn_pitch_units(b, f) - ref)))
                     for t, b, f in pts[1:]
@@ -2597,13 +2650,6 @@ def _bind_fm_pitch(
                     int(round(v / quant)) * quant for v in vals
                 ]
             if len(set(vals)) == 1:
-                continue
-            if opll and len(pts) <= 2:
-                # One held pitch step (a drum's tuning change) needs no
-                # instrument: retune the note to the final write.
-                e.note, e.e5 = opll_note_for(
-                    pts[-1][1], pts[-1][2], clock,
-                )
                 continue
             if len(patch_order) >= cap:
                 # No room for another instrument: the driver's own steps
@@ -8821,12 +8867,28 @@ def analyze(
              (ym2612_clock if is_opn2 else (opl_clock if is_opl else ym_clock)))
         )
     
-    tone_reserve = (
+    # The tone families bind after the FM macros. Without a reservation an
+    # OPL/OPLL driver that rewrites f-num often spends every free instrument
+    # on FM copies and leaves the AY/PSG notes on the plain fallback, so their
+    # vibrato and decay vanish. Measure the tone demand now and keep that many
+    # slots; a small emergency share stays with FM so its fast sub-row bends,
+    # which cannot use row effects, still get their macros.
+    tone_groups = (
         n_ssg_pcm + n_nes_dpcm_ins + n_nes_pcm_ins
         + n_huc6280_pcm_ins + n_opl4_wave_ins
-        + len(scc_ins) + len(ay_ins) + len(psg_ins) + len(nes_ins)
-        + len(huc6280_ins) + len(gb_ins)
     )
+    tone_demand = 0
+    if scc_ids or ay_ids or psg_ids or nes_ids or huc6280_ids or gb_ids or vsu_ids:
+        tone_demand = _tone_instrument_demand(
+            events, vgm.k051649_clock or SCC_DEFAULT_CLOCK, ay_note_clock,
+            psg_clock, nes_clock, huc6280_clock, gb_clock, vsu_clock,
+            hz, vgm.total_samples,
+        )
+    free_slots = max(
+        0, 250 - foreign_ins - len(patch_order) - tone_groups,
+    )
+    tone_demand = min(tone_demand, max(0, free_slots - 32))
+    tone_reserve = tone_groups + tone_demand
     fm_ins_cap = max(
         len(patch_order), 250 - foreign_ins - tone_reserve,
     )
@@ -8862,9 +8924,10 @@ def analyze(
             cap=fm_ins_cap,
         )
     _rebase_non_fm_ins(events, fm_before_pitch, len(patch_order))
-    if fm_pitch_copies:
-        # Keep the DAC maps and the non-FM sample blocks when recomputing
-        # after pitch copies.
+    if len(patch_order) > fm_before_pitch:
+        # Any FM macro copy (pitch, PMS/AMS, OPLL level/preset) moves the
+        # sample and tone bases. Keep the DAC maps and the non-FM sample
+        # blocks while recomputing.
         fm_ins_count = len(patch_order)
         if not fm_ins_count and is_opl and opl4_wave_samples:
             fm_ins_count = 1

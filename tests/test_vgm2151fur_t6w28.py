@@ -15,11 +15,11 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from vgm2151fur.analyze import analyze
+from vgm2151fur.analyze import NoteEvent, Song, analyze
 from vgm2151fur.furio import iter_blocks, parse_fur
 from vgm2151fur.furwrite import (
     CHIP_K007232, CHIP_RF5C68, CHIP_SEGAPCM, CHIP_SMS, CHIP_T6W28,
-    CHIP_YM2151, INS_T6W28, write_fur,
+    CHIP_YM2151, INS_T6W28, NOTE_OFF, _build_patterns, write_fur,
 )
 from vgm2151fur.sn76489 import (
     collect_sn76489, t6w28_note, t6w28_noise_note,
@@ -420,6 +420,48 @@ class TestT6W28CutAndVolumeRows(unittest.TestCase):
             if i > note_rows[0][0] and r.note == -1 and r.vol == 13
         ]
         self.assertTrue(later)
+
+
+class TestPsgShortGateCut(unittest.TestCase):
+    def test_short_noise_gate_keeps_a_cut_after_its_row(self):
+        # A one-frame noise hit whose off rounds onto its own row used to
+        # lose both its ED delay and the off, so the gate ran until the
+        # channel's next key-on much later. The note keeps its delay and the
+        # cut moves to the next row. 1102.5 samples/row is the measured
+        # Fantasy Zone shape: the hit starts two ticks into row 56 and ends
+        # ten ticks in, so both round onto row 56.
+        v = VgmFile(
+            path=Path("synthetic.vgm"), buf=b"", version=0x161,
+            total_samples=100000, loop_samples=0, loop_file_pos=None,
+            loop_sample=None, ym2151_clock=0, k007232_clock=0, gd3={},
+            roms=[], writes=[], sn76489_clock=3579540,
+        )
+        song = Song(v, 0, None, 12, 480.0, [], [], [
+            NoteEvent(
+                sample=61920, ch=11, on=True, note=62, ins=0, vol=12,
+                e5=0x80, pan=0, end=62655, tone_chip=3,
+                tone_clock=3579540, tone_div=16,
+            ),
+            NoteEvent(
+                sample=62655, ch=11, on=False, note=180, ins=-1, vol=-1,
+                e5=0x80, pan=0,
+            ),
+        ])
+        _orders, patterns, _loop, _len = _build_patterns(
+            song, 4, 256, 3, ch_offset=-8, stats={},
+        )
+        rows = next(
+            rows for ch, _pat, rows in patterns
+            if ch == 3 and any(
+                r is not None and r.note not in (-1, NOTE_OFF) for r in rows
+            )
+        )
+        at = next(
+            i for i, r in enumerate(rows)
+            if r is not None and r.note not in (-1, NOTE_OFF)
+        )
+        self.assertIn(0xED, {c for c, _v in rows[at].fx})
+        self.assertEqual(rows[at + 1].note, NOTE_OFF)
 
 
 class TestDualYm2151(unittest.TestCase):

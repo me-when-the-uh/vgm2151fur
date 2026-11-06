@@ -1054,14 +1054,31 @@ class TestOpllTickMacros(unittest.TestCase):
         self.assertEqual(song.warnings, [])
 
     def test_fast_drum_bends_stay_pitch_macros(self):
-        # OPLL has no reliable row-step path, so the f-num walk must remain a
-        # pitch macro rather than a row effect.
+        # A sub-row f-num walk cannot ride row effects (all its writes land on
+        # one row, and OPLL row steps do not reach the registers on export),
+        # so it must remain a pitch macro.
         song = analyze(self._bend(), speed=8)
         ev = next(e for e in song.events if e.on and e.ch == 4)
         patch = song.fm_patches[ev.ins]
         self.assertGreater(len(patch.pitch_macro), 1)
         self.assertEqual(ev.pitch_steps, ())
         self.assertEqual(ev.sweep, ())
+
+    def test_slow_row_pitch_motion_uses_row_steps(self):
+        # Writes spread over separate rows ride E5/E8/E9 exactly. Keeping them
+        # as instrument copies is what exhausted the 250-instrument budget on
+        # OPLL-heavy logs and starved the AY/PSG families.
+        ws = opll_note(1000, ch=4, preset=1, level=0, off=40000)
+        for i, fnum in enumerate((640, 700, 760, 820)):
+            t = 6000 + i * 6000
+            ws += [
+                opll_wr(t, 0x14, fnum & 0xFF),
+                opll_wr(t + 2, 0x24, ((4 & 7) << 1) | ((fnum >> 8) & 1) | 0x10),
+            ]
+        song = analyze(opll_vgm(ws, total_samples=50000), speed=1)
+        ev = next(e for e in song.events if e.on and e.ch == 4)
+        self.assertTrue(ev.pitch_steps)
+        self.assertEqual(song.fm_patches[ev.ins].pitch_macro, ())
 
     def test_opening_volume_and_retriggers_keep_the_loud_level(self):
         # Both keys open at $3x level 15 (silent in the column), then a loud
