@@ -356,6 +356,17 @@ class TestYmz280bModule(unittest.TestCase):
         self.assertIn(CHIP_YMZ280B, mod.chips)
         self.assertEqual(mod.n_ch, 17)  # 9 OPL2 + 8 YMZ
         self.assertEqual(len(mod.samples), 3)
+        # The OPL2 gains operator-level instrument copies after the first
+        # tone base was computed. YMZ rows must point at the final three
+        # sample instruments (0x0C-0x0E), not the stale 0x09-0x0B copies.
+        used = set()
+        for ch in mod.pcm_channels:
+            for oi in mod.orders[ch]:
+                for row in mod.patterns.get((ch, oi), []):
+                    if 0 <= row.note < 180 and row.ins >= 0:
+                        used.add(row.ins)
+        self.assertEqual(used, {12, 13, 14})
+        self.assertEqual(mod.ins_sample[12:15], [0, 1, 2])
 
     def test_real_stage4_two_ymz(self):
         if not STAGE4.is_file():

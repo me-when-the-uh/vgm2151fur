@@ -8571,6 +8571,20 @@ def analyze(
     # HuC6280 direct-D/A bodies follow the NES sample group.
     for ev, idx in huc6280_pcm_events:
         ev.ins = huc6280_pcm_ins_base + idx
+    # The final FM instrument count may include OPL operator-level or pitch
+    # copies added after the tone bases were first computed.  The YMZ events
+    # were placeholders until now, so recompute their base against the final
+    # patch list rather than using the stale pre-copy value.
+    ymz_ins_base = (
+        len(patch_order) + n_dac_ins
+        + (len(audible) if pcm else 0) + len(oki_samples)
+        + n_adpcm_ins + len(spcm_audible) + len(rf5c68_audible)
+        + len(rf5c164_audible) + len(c140_audible) + len(c352_audible)
+        + len(k053260_audible) + n_ym2610_a_ins + n_ym2610_b_ins
+        + n_ym2608_rhythm_ins + n_ym2608_b_ins + n_y8950_b_ins
+        + n_opl4_wave_ins + n_ssg_pcm + n_nes_dpcm_ins
+        + n_nes_pcm_ins + n_huc6280_pcm_ins
+    )
     for ev, idx in ymz_events:
         ev.ins = ymz_ins_base + idx
 
