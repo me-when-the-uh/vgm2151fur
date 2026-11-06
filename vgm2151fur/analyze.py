@@ -145,6 +145,7 @@ from vgm2151fur.gb import (
     gb_period_delta,
 )
 from vgm2151fur.huc6280 import (
+    HUC6280_ATTACK_WINDOW,
     HUC6280_CHANNELS,
     HUC6280_DEFAULT_CLOCK,
     HUC6280_MAX_PERIOD,
@@ -8481,6 +8482,11 @@ def analyze(
                     ev_vol_pts = tuple(
                         p for p in _merge_vol_balance(h) if st < p[0] < en
                     )
+                    if ev_vol_pts and (
+                        ev_vol_pts[0][0] - st <= HUC6280_ATTACK_WINDOW
+                    ):
+                        _t, ev_vol, ev_pan = ev_vol_pts[0]
+                        ev_vol_pts = ev_vol_pts[1:]
                     if m:
                         regs = [
                             (st, _value_at(h.noise_pts, st, h.noise) & 0x1F)
@@ -8560,6 +8566,13 @@ def analyze(
                 vol_pts = tuple(
                     p for p in _merge_vol_balance(h) if st < p[0] < bound
                 )
+                # The PCE driver often writes the note's attack balance a few
+                # samples after the gate. That is the note's first level, not
+                # a same-row volume step (which the writer would drop): fold it
+                # into the note's own volume/pan so the attack is audible.
+                if vol_pts and vol_pts[0][0] - st <= HUC6280_ATTACK_WINDOW:
+                    _t, vol, balance = vol_pts[0]
+                    vol_pts = vol_pts[1:]
                 steps = _tone_steps(
                     intra, st, HUC6280_REFIT_SAMPLES if i == 0 else 0,
                     merge_gap=_AY_MERGE_GAP,

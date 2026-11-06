@@ -239,6 +239,24 @@ class TestHuc6280Tones(unittest.TestCase):
         self.assertEqual(hit.vol, 20)
         self.assertEqual(hit.balance, 0xB9)
 
+    def test_attack_balance_after_the_gate_is_the_note_level(self):
+        # The driver writes the attack balance a couple of samples after the
+        # gate. It belongs to the note's start level, not a same-row volume
+        # step (which the writer would drop). The later decay stays a step.
+        from vgm2151fur.huc6280 import pce_effective
+
+        writes = _load_wave(_square(), sample=0, balance=0x99)
+        writes += [_w(2, 0x05, 0xCC)]      # attack, just after the gate
+        writes += [_w(1000, 0x05, 0x99)]   # decay, a later row
+        song = analyze(_vgm(writes, huc6280_clock=3579545))
+        note = [e for e in song.events if e.on and e.ch >= 8][0]
+        attack, _pan = pce_effective(31, 0xCC)
+        decay, _dpan = pce_effective(31, 0x99)
+        self.assertEqual(note.vol, attack)
+        self.assertTrue(note.vol_pts)
+        self.assertEqual(note.vol_pts[0][0], 1000)
+        self.assertEqual(note.vol_pts[0][1], decay)
+
     def test_balance_envelope_kept_as_row_steps(self):
         # LOX2-style drivers fade with the balance register while the control
         # volume stays at 31.  Those steps must reach the pattern as 08xy,
