@@ -161,11 +161,11 @@ A key-off does not always end the driver's control of the voice. Percussion
 drivers gate the release tail with `$3x`, so a clap is one key-on plus a chain
 of level steps that can run well past the key bit. The note still keys off at
 that bit (the release is what makes the clap noisy), but the analyzer keeps
-recording the later level points into the volume macro and extends the macro
-to the last one. Furnace keeps running instrument macros through release, so
-the export reaches the chip for the whole gesture. During the settle window
-the pending retrigger owns `$3x`, so the released note cannot swallow the new
-note's opening level.
+recording the later level points into the volume macro and the later f-num
+points into the pitch macro, extending both to their last write. Furnace keeps
+running instrument macros through release, so the export reaches the chip for
+the whole gesture. During the settle window the pending retrigger owns `$3x`,
+so the released note cannot swallow the new note's opening level.
 
 ## Multi-system .fur facts (all verified)
 

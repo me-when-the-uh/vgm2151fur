@@ -2379,11 +2379,16 @@ def _bind_fm_pitch(
             if not e.fm_pitch_pts:
                 continue
             end = e.end or (notes[i + 1].sample if i + 1 < len(notes) else track_end)
+            pts = e.fm_pitch_pts
+            if pts:
+                # The key-off can end the note while the driver keeps moving
+                # the f-num through the release tail; the macro must reach
+                # the last write just like the volume macro.
+                end = max(end, pts[-1][0])
             # A macro holds up to 255 values and can step every 255 ticks, so
             # a note of up to 65025 ticks still fits.  Do not truncate earlier:
             # long held notes can change pitch near their end (Avengers 23).
             ticks = max(1, min(int((end - e.sample) / tick_samples) + 1, 65025))
-            pts = e.fm_pitch_pts
             ref = opn_pitch_units(pts[0][1], pts[0][2])
             # A held pitch with a jump or two is a step function. One
             # E5/E8/E9 row effect reproduces it without an instrument copy.
@@ -3626,7 +3631,12 @@ def _collect_opll(
         if idx is None:
             return
         ev = events[idx]
+        rel = released.pop(key, None)
         pts = pitch_pts.pop(key, [])
+        if rel is not None:
+            # `sample` is the next key-on here; its own pitch writes belong to
+            # the new note.
+            pts = [p for p in pts if p[0] < sample]
         if pts:
             merged: list[tuple[int, int, int]] = []
             for p in pts:
@@ -3647,21 +3657,24 @@ def _collect_opll(
                     distinct.append(p)
             if len(distinct) > 1:
                 ev.fm_pitch_pts = tuple(distinct)
-        vp = [
-            (s, v) for s, v in vol_pts.pop(key, []) if s < sample
-        ]
+        vp = vol_pts.pop(key, [])
+        if rel is not None:
+            vp = [(s, v) for s, v in vp if s < sample]
         if vp:
             ev.vol_pts = tuple((s, max(0, min(15, v)), None) for s, v in vp)
         pp = preset_pts.pop(key, [])
+        if rel is not None:
+            pp = [(s, p) for s, p in pp if s < sample]
         if pp:
             ev.opll_preset_pts = tuple(pp)
         ph = phase_pts.pop(key, [])
+        if rel is not None:
+            ph = [t for t in ph if t < sample]
         if ph:
             ev.opll_phase_pts = tuple(ph)
         for d in (pitch_pts, pitch_base, pitch_last, vol_pts, vol_last,
                   held_preset, preset_pts, phase_pts):
             d.pop(key, None)
-        rel = released.pop(key, None)
         if rel is not None:
             # The key-off must still reach the chip: it starts the release
             # that gives a clap its noise character. The driver's later `$3x`
@@ -3738,7 +3751,6 @@ def _collect_opll(
             if key in pending:
                 pending[key]["fnum"] = (block, fnum)
             if (key not in pending and key in held
-                    and key not in released
                     and (block, fnum) != pitch_last[key]):
                 pitch_pts[key].append((sample, block, fnum))
                 pitch_last[key] = (block, fnum)

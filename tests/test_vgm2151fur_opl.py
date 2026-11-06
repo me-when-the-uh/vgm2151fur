@@ -1050,6 +1050,9 @@ class TestOpllTickMacros(unittest.TestCase):
         self.assertEqual(ev.end - ev.sample, 1080)
         self.assertGreater(len(patch.vol_macro), 100)
         self.assertEqual(patch.vol_macro[-1], 0)
+        # The clap's f-num walk also continues through the release. It must
+        # reach at least the volume macro's end, not stop at the key bit.
+        self.assertGreaterEqual(len(patch.pitch_macro), len(patch.vol_macro))
         off = next(
             e for e in song.events
             if not e.on and e.ch == 2 and e.sample - start == 1080
@@ -1077,6 +1080,16 @@ class TestOpllTickMacros(unittest.TestCase):
         # the chip afterwards, ending at the saturated level 15.
         self.assertGreaterEqual(len(after), 10)
         self.assertEqual(after[-1], 15)
+        pitch_after = [
+            w.sample - start for w in back.writes
+            if (
+                w.chip == "opll" and (w.reg & 0xFF) in (0x12, 0x22)
+                and start + 1080 < w.sample <= start + 20736
+            )
+        ]
+        # And the pitch macro must keep moving the f-num through that tail.
+        self.assertGreaterEqual(len(pitch_after), 100)
+        self.assertGreaterEqual(max(pitch_after), 15000)
 
     @unittest.skipUnless(HAVE_FURNACE, "furnace console build missing")
     def test_export_keeps_the_sub_row_preset_walk(self):
