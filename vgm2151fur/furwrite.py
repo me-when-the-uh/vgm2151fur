@@ -2928,7 +2928,18 @@ def _build_patterns(song: Song, n_ch: int, pat_len_max: int, fx_cols: int,
                 if delay:
                     _add_fx(cell, 0xED, delay, fx_cols, stats)
             elif delay > started:
-                _add_fx(cell, 0xEC, delay, fx_cols, stats)
+                if started:
+                    # ECxx must not share a line with EDxx: Furnace can
+                    # count the cut from the note start and cut the following
+                    # note. The next key-on already ends this one, so drop
+                    # both rather than risk silence.
+                    cell.fx = [
+                        (c, v) for c, v in (cell.fx or ())
+                        if c not in (0xED, EMPTY)
+                    ]
+                    _bump(stats, "ed_stripped_cut")
+                else:
+                    _add_fx(cell, 0xEC, delay, fx_cols, stats)
             else:
                 _bump(stats, "off_swallowed")
             continue
@@ -3183,6 +3194,29 @@ def _build_patterns(song: Song, n_ch: int, pat_len_max: int, fx_cols: int,
                         _add_fx(cell, 0xFA, 0x01 if cont else 0x00, fx_cols, stats)
                         if delay:
                             _add_fx(cell, 0xED, delay, fx_cols, stats)
+                    elif value == 0:
+                        # A later mute must not erase the note's own attack:
+                        # the next key-on already ends this note, and a zero
+                        # column here would make an audible blip silent.
+                        continue
+                    elif value > cell.vol:
+                        # The step gets louder: keep the quieter attack and
+                        # put the raise on the following free row instead.
+                        target = row + 1
+                        if target < next_row:
+                            tcell = grid[ev_ch].get(target)
+                            if tcell is None:
+                                tcell = _blank_row()
+                                grid[ev_ch][target] = tcell
+                            if not (0 <= tcell.note < 180):
+                                tcell.vol = value
+                                if (pan is not None
+                                        and (last_pan is None
+                                             or pan != last_pan)):
+                                    _add_fx(
+                                        tcell, 0x08, pan & 0xFF, fx_cols, stats,
+                                    )
+                                    last_pan = pan
                     else:
                         cell.vol = value
                         if pan is not None and (last_pan is None or pan != last_pan):
@@ -3272,6 +3306,18 @@ def _build_patterns(song: Song, n_ch: int, pat_len_max: int, fx_cols: int,
             _add_fx(cell, 0xE5, val, fx_cols, stats)
             cur_e5 = val
 
+    # ECxx and EDxx on one line interact badly in Furnace: the cut can be
+    # counted from the note start and silence the following note. Nothing is
+    # lost by dropping the cut there, because the next key-on already ends the
+    # note; this keeps every remaining EC on a line of its own.
+    for ch in range(n_ch):
+        for cell in grid[ch].values():
+            if not cell.fx:
+                continue
+            cmds = {c for c, _v in cell.fx}
+            if 0xEC in cmds and 0xED in cmds:
+                cell.fx = [(c, v) for c, v in cell.fx if c != 0xEC]
+
     # The pattern window: a whole musical phrase when the order budget
     # allows, otherwise the largest phrase that fits. One length serves
     # every order.
@@ -3347,6 +3393,17 @@ def _build_patterns(song: Song, n_ch: int, pat_len_max: int, fx_cols: int,
     # Walk pat_len-row chunks, but force an order boundary at the VGM loop so
     # Bxx can jump there. A long intro must not become one giant order; only
     # `pat_len` rows would survive.
+    # A short intro order ends at the loop row with 0D00. If the row before it
+    # carries a note, that jump runs before the note's ED delay and the note
+    # never starts. Move the boundary one row later until the last row is
+    # note-free.
+    if loop_row > 0:
+        while loop_row < total_rows and any(
+            0 <= cell.note < 180
+            for ch in range(n_ch)
+            if (cell := grid[ch].get(loop_row - 1)) is not None
+        ):
+            loop_row += 1
     bounds = [0]
     anchor = loop_row if 0 < loop_row < total_rows else None
     pos = 0

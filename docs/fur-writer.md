@@ -53,6 +53,14 @@ delayed note on the jump row keeps its `EDxx`. The `Bxx` rides a channel whose
 row has no delay. That note still lands just before the wrap. When every
 channel is delayed, channel 0 gives up its delay to carry the jump.
 
+The short order before the loop ends with `D00`, which runs at tick 0. If the
+row before the boundary carries a note, the boundary moves one row later until
+that row is note-free; otherwise `D00` would jump before the note's `EDxx`
+delay and the note would never start. `ECxx` is never written on a row that
+also has `EDxx`: Furnace can count that cut from the note start, so the cut
+lands inside the following note. In that case the writer drops both and lets
+the next key-on end the note.
+
 `edit.py` patches both volume copies, so every reader agrees. The float
 triples are located from the payload tail, anchored on the ADIR pointers: the
 tail is `[triples][patchbay 4][auto 1][pad 8][speed 17][groove 1]`, so the

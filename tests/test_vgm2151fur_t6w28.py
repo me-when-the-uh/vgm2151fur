@@ -385,6 +385,43 @@ def _opm_note(cid: int, t: int, ch: int = 0, off: int = 5000):
     return out
 
 
+class TestT6W28CutAndVolumeRows(unittest.TestCase):
+    def test_note_off_does_not_pair_ec_with_ed(self):
+        # The note and its off round onto one row. ECxx on the same line as
+        # EDxx can cut the following note, so the writer must not pair them.
+        writes = _left(100, 0, 200, 10) + _right(100, 0, 10)
+        writes += _close(300, 0)
+        song = analyze(_vgm(
+            writes, sn76489_clock=T6_CLOCK, sn76489_t6w28=True,
+            sn76489_dual=True, total_samples=8000,
+        ))
+        mod = parse_fur(write_fur(song, include_pcm=True))
+        for (ch, _idx), rows in mod.patterns.items():
+            if ch >= 4:
+                continue
+            for row in rows:
+                cmds = {c for c, _v in (row.fx or ())}
+                self.assertFalse(0xEC in cmds and 0xED in cmds, row)
+
+    def test_louder_same_row_step_keeps_the_note_attack(self):
+        writes = _left(0, 0, 200, 10) + _right(0, 0, 10)
+        writes += _left(50, 0, 200, 2) + _right(50, 0, 2)
+        writes += _close(4000, 0)
+        song = analyze(_vgm(
+            writes, sn76489_clock=T6_CLOCK, sn76489_t6w28=True,
+            sn76489_dual=True, total_samples=8000,
+        ))
+        mod = parse_fur(write_fur(song, include_pcm=True))
+        rows = mod.patterns[(0, mod.orders[0][0])]
+        note_rows = [(i, r) for i, r in enumerate(rows) if r.note not in (-1, 180)]
+        self.assertEqual(note_rows[0][1].vol, 5)
+        later = [
+            i for i, r in enumerate(rows)
+            if i > note_rows[0][0] and r.note == -1 and r.vol == 13
+        ]
+        self.assertTrue(later)
+
+
 class TestDualYm2151(unittest.TestCase):
     def test_both_instances_get_their_own_columns(self):
         writes = _opm_note(0, 100, 0) + _opm_note(1, 100, 0)
