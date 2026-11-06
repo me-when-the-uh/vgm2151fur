@@ -63,7 +63,8 @@ triples start 31 bytes plus 12 per chip before the first ADIR pointer.
 - `0x82` YM2151, `0x8D` YM2203, `0x83` YM2612 (`0xA0` Ext, `0xC1` CSM),
   `0x8F` OPL (YM3526), `0x90` OPL2 (YM3812), `0x91` OPL3 (YMF262) and their
   rhythm variants `0xA2`, `0xA3`, `0xA4`, `0xA5` YM2610, `0x9E` YM2610B,
-  `0x03` SN76489 (SMS), `0xC6` K007232, `0xAA` MSM6295, `0xAB` MSM6258,
+  `0x03` SN76489 (SMS), `0xBF` T6W28 (stereo SN76489), `0xC6` K007232,
+  `0xAA` MSM6295, `0xAB` MSM6258,
   `0x9B` SegaPCM, `0xCE` C140, `0xCC` Konami K053260, `0xD0` C352,
   `0xA1` Konami SCC (K051649),
   `0xB4` Konami SCC+ (K052539), `0x80` AY-3-8910, `0x9D` Konami VRC7,
@@ -76,7 +77,9 @@ triples start 31 bytes plus 12 per chip before the first ADIR pointer.
   with channel 3 split into its four operator columns. A Genesis source adds
   a second `0x03` system after it: four SN76489 channels (three tone then
   noise), for ten channels total. A dual source writes two systems in chip
-  order. An OPL is nine channels, an OPL3 eighteen; rhythm mode is its own
+  order. A T6W28 is one `0xBF` system with four channels; its `08xy` split
+  carries the independent left/right attenuation. An OPL is nine channels,
+  an OPL3 eighteen; rhythm mode is its own
   system with the kit's columns after the melodic ones (eleven, or twenty).
 - The YM2151 flag carries `customClock=` when the source clock is not
   3579545: a 4 MHz OPM plays flat otherwise. Each YM2203 system carries the

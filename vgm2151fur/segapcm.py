@@ -215,6 +215,7 @@ class SegapcmHit:
     vol_l: int
     vol_r: int
     ctrl: int = 0
+    chip_id: int = 0
     # Mid-note register writes while the voice stays keyed: the (L, R) volume
     # pair (the balance is part of the write) and the 8-bit frequency.
     vol_pts: list[tuple[int, int, int]] = field(default_factory=list)
@@ -243,6 +244,7 @@ class SegapcmSample:
     loop_start: int | None = None
     loop_end: int | None = None
     hits: list[SegapcmHit] = field(default_factory=list)
+    chip_id: int = 0
 
     @property
     def length(self) -> int:
@@ -276,17 +278,30 @@ def _trim_end(rom: bytes, start: int, end: int, loop_off: int | None) -> int:
 
 
 def collect_segapcm(vgm: VgmFile) -> tuple[bytes, list[SegapcmSample], list[str]]:
-    rom = assemble_rom(vgm, "segapcm")
+    ids = sorted({w.chip_id for w in vgm.writes if w.chip == "segapcm"})
+    roms = {
+        cid: assemble_rom(vgm, "segapcm", cid)
+        for cid in (ids or [0])
+    }
+    rom = roms.get(0, b"")
     warnings: list[str] = []
-    if not any(w.chip == "segapcm" for w in vgm.writes):
+    if not ids:
         return rom, [], warnings
 
-    voices = [_Voice() for _ in range(SEGAPCM_VOICES)]
-    open_burst: list[_Burst | None] = [None] * SEGAPCM_VOICES
+    voices = {
+        cid: [_Voice() for _ in range(SEGAPCM_VOICES)] for cid in ids
+    }
+    open_burst = {
+        cid: [None] * SEGAPCM_VOICES for cid in ids
+    }
     hits: list[SegapcmHit] = []
-    active: list[SegapcmHit | None] = [None] * SEGAPCM_VOICES
-    vol_last = [(0, 0)] * SEGAPCM_VOICES
-    freq_last = [0] * SEGAPCM_VOICES
+    active = {
+        cid: [None] * SEGAPCM_VOICES for cid in ids
+    }
+    vol_last = {
+        cid: [(0, 0)] * SEGAPCM_VOICES for cid in ids
+    }
+    freq_last = {cid: [0] * SEGAPCM_VOICES for cid in ids}
     bankmask = segapcm_bankmask(
         getattr(vgm, "segapcm_bankshift", 0),
         getattr(vgm, "segapcm_bankmask", 0),
@@ -305,18 +320,19 @@ def collect_segapcm(vgm: VgmFile) -> tuple[bytes, list[SegapcmSample], list[str]
         tick_acc -= n * _TICK_DENOM
         last_t = t
         if n:
-            for voice in voices:
-                _advance_voice(voice, n)
+            for chip_voices in voices.values():
+                for voice in chip_voices:
+                    _advance_voice(voice, n)
 
-    def commit(i: int) -> None:
-        burst = open_burst[i]
-        open_burst[i] = None
+    def commit(cid: int, i: int) -> None:
+        burst = open_burst[cid][i]
+        open_burst[cid][i] = None
         if burst is None:
             return
-        voice = voices[i]
+        voice = voices[cid][i]
         if burst.retrigger and burst.window is not None:
             if voice.ctrl & 1:
-                active[i] = None
+                active[cid][i] = None
                 return
             hit = SegapcmHit(
                 sample_time=burst.when if burst.when is not None else burst.start,
@@ -329,46 +345,51 @@ def collect_segapcm(vgm: VgmFile) -> tuple[bytes, list[SegapcmSample], list[str]
                 vol_l=voice.lvol & 0x7F,
                 vol_r=voice.rvol & 0x7F,
                 ctrl=voice.ctrl & 0xFF,
+                chip_id=cid,
             )
             hits.append(hit)
-            active[i] = hit
-            vol_last[i] = (hit.vol_l, hit.vol_r)
-            freq_last[i] = hit.freq
+            active[cid][i] = hit
+            vol_last[cid][i] = (hit.vol_l, hit.vol_r)
+            freq_last[cid][i] = hit.freq
             return
         # A burst without a retrigger is a mid-note register update.  Flush
         # the volume and frequency steps it carried to the sounding note.
         # The steps were captured while it was still playing, so the last
         # one before a disable (usually a fade to zero) still counts.
-        hit = active[i]
+        hit = active[cid][i]
         if hit is not None:
             for t, left, right in burst.pending_vol:
-                if (left, right) != vol_last[i]:
+                if (left, right) != vol_last[cid][i]:
                     hit.vol_pts.append((t, left, right))
-                    vol_last[i] = (left, right)
+                    vol_last[cid][i] = (left, right)
             for t, freq in burst.pending_freq:
-                if freq != freq_last[i]:
+                if freq != freq_last[cid][i]:
                     hit.freq_pts.append((t, freq))
-                    freq_last[i] = freq
+                    freq_last[cid][i] = freq
         if voice.ctrl & 1:
-            active[i] = None
+            active[cid][i] = None
 
     def close_expired(t: int) -> None:
-        for i, burst in enumerate(open_burst):
-            if burst is not None and t - burst.start > _REGISTER_BURST:
-                commit(i)
+        for cid, bursts in open_burst.items():
+            for i, burst in enumerate(bursts):
+                if burst is not None and t - burst.start > _REGISTER_BURST:
+                    commit(cid, i)
 
     for w in vgm.writes:
         if w.chip != "segapcm":
             continue
+        cid = w.chip_id if w.chip_id in voices else 0
         off = w.reg & 0x7FF
         vi = (off >> 3) & 0xF
         close_expired(w.sample)
         advance_to(w.sample)
-        seek, off_to_on, bank_changed, window = _apply_write(voices[vi], off, w.val, bankmask)
-        burst = open_burst[vi]
+        seek, off_to_on, bank_changed, window = _apply_write(
+            voices[cid][vi], off, w.val, bankmask,
+        )
+        burst = open_burst[cid][vi]
         if burst is None:
             burst = _Burst(start=w.sample)
-            open_burst[vi] = burst
+            open_burst[cid][vi] = burst
         if seek or off_to_on or bank_changed:
             burst.retrigger = True
             if burst.when is None:
@@ -378,26 +399,30 @@ def collect_segapcm(vgm: VgmFile) -> tuple[bytes, list[SegapcmSample], list[str]
         # Collect volume/pitch changes made while the voice keeps playing.
         # The burst decides later whether they are steps or the next note's
         # key-on values.
-        if not (voices[vi].ctrl & 1) and not (off & 0x80):
+        if not (voices[cid][vi].ctrl & 1) and not (off & 0x80):
             r = off & 7
             if r in (2, 3):
-                pair = (voices[vi].lvol & 0x7F, voices[vi].rvol & 0x7F)
-                if pair != vol_last[vi]:
+                pair = (
+                    voices[cid][vi].lvol & 0x7F,
+                    voices[cid][vi].rvol & 0x7F,
+                )
+                if pair != vol_last[cid][vi]:
                     if burst.pending_vol and burst.pending_vol[-1][0] == w.sample:
                         burst.pending_vol[-1] = (w.sample, pair[0], pair[1])
                     else:
                         burst.pending_vol.append((w.sample, pair[0], pair[1]))
             elif r == 7:
-                freq = voices[vi].freq & 0xFF
-                if freq != freq_last[vi]:
+                freq = voices[cid][vi].freq & 0xFF
+                if freq != freq_last[cid][vi]:
                     if burst.pending_freq and burst.pending_freq[-1][0] == w.sample:
                         burst.pending_freq[-1] = (w.sample, freq)
                     else:
                         burst.pending_freq.append((w.sample, freq))
-    for i in range(SEGAPCM_VOICES):
-        commit(i)
+    for cid in voices:
+        for i in range(SEGAPCM_VOICES):
+            commit(cid, i)
 
-    if not rom:
+    if not any(roms.values()):
         if hits:
             warnings.append(
                 "no SegaPCM ROM block (0x80); PCM notes will be silent until samples are added"
@@ -414,19 +439,20 @@ def collect_segapcm(vgm: VgmFile) -> tuple[bytes, list[SegapcmSample], list[str]
         bank_base = (h.ctrl & bankmask) << shift
         abs_start = bank_base | h.start
         abs_end = bank_base + win_end if win_end > 0xFFFF else bank_base | win_end
-        if abs_start >= len(rom) or abs_end <= abs_start:
+        chip_rom = roms.get(h.chip_id, b"")
+        if abs_start >= len(chip_rom) or abs_end <= abs_start:
             continue
-        abs_end = min(abs_end, len(rom))
+        abs_end = min(abs_end, len(chip_rom))
         loop_off = None
         if h.loop_on and h.start <= h.loop < min(win_end, 0x10000):
             loop_off = h.loop - h.start
-        key = (abs_start, abs_end, loop_off)
+        key = (h.chip_id, abs_start, abs_end, loop_off)
         smp = by_key.get(key)
         if smp is None:
-            end_trim = _trim_end(rom, abs_start, abs_end, loop_off)
+            end_trim = _trim_end(chip_rom, abs_start, abs_end, loop_off)
             if loop_off is not None and loop_off >= end_trim - abs_start:
                 loop_off = None
-            raw = rom[abs_start:end_trim]
+            raw = chip_rom[abs_start:end_trim]
             body = bytes((b ^ 0x80) & 0xFF for b in raw)
             loop_end = end_trim - abs_start if loop_off is not None else None
             smp = SegapcmSample(
@@ -434,8 +460,12 @@ def collect_segapcm(vgm: VgmFile) -> tuple[bytes, list[SegapcmSample], list[str]
                 data=body,
                 loop_start=loop_off,
                 loop_end=loop_end,
+                chip_id=h.chip_id,
             )
             by_key[key] = smp
         smp.hits.append(h)
-    samples = sorted(by_key.values(), key=lambda s: (s.start, s.loop_start or -1))
+    samples = sorted(
+        by_key.values(),
+        key=lambda s: (s.chip_id, s.start, s.loop_start or -1),
+    )
     return rom, samples, warnings

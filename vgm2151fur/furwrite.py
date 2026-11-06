@@ -83,6 +83,10 @@ CHIP_YM2608_EXT = 0xB7
 # TI SN76489 (the SMS platform): three square voices then noise.  A Genesis
 # module carries it as a second system after the YM2612.
 CHIP_SMS = 0x03
+# DIV_SYSTEM_T6W28: the Neo Geo Pocket Color's stereo SN76489 variant.
+# Four channels (three square + noise), independent panL/panR.
+CHIP_T6W28 = 0xBF
+T6W28_DEFAULT_CLOCK = 3_072_000
 CHIP_MSM6295 = 0xAA
 CHIP_MSM6258 = 0xAB
 CHIP_K007232 = 0xC6
@@ -252,6 +256,9 @@ INS_SCC = 18
 # DIV_INS_PCE: the HuC6280's 32x5-bit wavetable, through the same wave synth
 # as the SCC. Its direct-D/A bodies use DIV_INS_AMIGA (INS_C352 above).
 INS_PCE = 5
+# DIV_INS_T6W28: the T6W28's plain square/noise instrument.  It shares the
+# standard macro layout; only the platform system differs.
+INS_T6W28 = 44
 # DIV_INS_NES: the 2A03 pulse/triangle/noise and DPCM instrument.  The DPCM
 # sample rides the same `amiga` sample feature (1-bit DPCM or 8-bit PCM).
 INS_NES = 34
@@ -321,7 +328,8 @@ _FURNACE_VOLUME_SCALE = {
 _CHIP_DEV = {CHIP_YM2151: 0x03, CHIP_SEGAPCM: 0x04, CHIP_MSM6295: 0x18,
              CHIP_MSM6258: 0x16, CHIP_C140: 0x1C, CHIP_C352: 0x27,
              CHIP_K053260: 0x1D, CHIP_YMZ280B: 0x0F, CHIP_VBOY: 0x22,
-             CHIP_SMS: 0x00, CHIP_K051649: 0x19, CHIP_K052539: 0x19,
+             CHIP_SMS: 0x00, CHIP_T6W28: 0x00,
+             CHIP_K051649: 0x19, CHIP_K052539: 0x19,
              CHIP_AY8910: 0x12,
              CHIP_YM2610: 0x08, CHIP_YM2610B: 0x08}
 
@@ -880,15 +888,17 @@ def _write_tone_macros(b: Buf, ins, *, wave: bool, reset: bool = False) -> None:
     b.b[ma_size:ma_size + 2] = int(len(b.b) - ma_start).to_bytes(2, "little")
 
 
-def _write_ins_psg(b: Buf, name: str, ins=None) -> None:
-    """DIV_INS_STD for the SMS/SN76489: only the pitch macro is needed.
+def _write_ins_psg(
+    b: Buf, name: str, ins=None, ins_type: int = INS_STD,
+) -> None:
+    """Plain SN76489/T6W28 instrument: only the pitch macro is needed.
 
     The 4-bit volume is the pattern column, and noise mode rides on the 20xy
     effect, so a no-motion note gets a plain instrument.
     """
     size_off, start = b.begin_block(b"INS2")
     b.u16(FUR_VERSION)
-    b.u16(INS_STD)
+    b.u16(ins_type)
     b.raw(b"NA")
     na_size = len(b.b)
     b.u16(0)
@@ -3861,10 +3871,12 @@ def write_fur(
     fm_ins = song.fm_patches if (fm_present and include_fm) else []
     
     pcm_smps = [s for s in song.pcm_samples if s.length >= 8] if include_pcm else []
+    pcm_ids = sorted({s.chip_id for s in pcm_smps})
     oki_smps = list(song.oki_samples) if include_pcm else []
     adpcm_smps = list(song.msm6258_samples) if include_pcm else []
     n_adpcm_ins = (len(adpcm_smps) + 119) // 120
     spcm_smps = [s for s in song.segapcm_samples if s.length >= 8] if include_pcm else []
+    spcm_ids = sorted({s.chip_id for s in spcm_smps})
     rf5c68_smps = (
         [s for s in song.rf5c68_samples if s.length >= 8] if include_pcm else []
     )
@@ -3990,7 +4002,7 @@ def write_fur(
     huc6280_pcm_smp_base = nes_pcm_smp_base + len(nes_pcm_smps)
     # K007232 appears only when the source carried usable samples for it, and
     # never beside another sample chip.
-    want_k007 = bool(pcm_smps)
+    want_k007 = bool(pcm_ids)
 
     # Columns per system, summed. A single-family module gets the same totals
     # the old branch chain produced; a combined one adds the families together.
@@ -4014,12 +4026,14 @@ def write_fur(
                 n_ssg += 3
             else:
                 n_fm += system.fm_channels or 8
-    n_k007 = 2 if want_k007 else 0
-    n_rf5c = (8 if rf5c68_smps else 0) + (8 if rf5c164_smps else 0)
+    n_k007 = 2 * len(pcm_ids) if want_k007 else 0
+    rf5c68_ids = sorted({s.chip_id for s in rf5c68_smps})
+    rf5c164_ids = sorted({s.chip_id for s in rf5c164_smps})
+    n_rf5c = 8 * (len(rf5c68_ids) + len(rf5c164_ids))
     n_ch = (
         n_fm + n_ssg + n_adpcm_a + n_adpcm_b + n_psg + n_k007
         + 4 * len(oki_ids) + len(adpcm_ids)
-        + (16 if spcm_smps else 0) + n_rf5c
+        + 16 * len(spcm_ids) + n_rf5c
         + 24 * len(c140_ids) + 32 * len(c352_ids)
         + 4 * len(k053260_ids) + 8 * len(ymz_ids)
         + n_scc + n_ay + n_nes + n_huc6280 + n_gb + n_vsu
@@ -4168,16 +4182,22 @@ def write_fur(
             song, systems, names_long, names_short,
         )
     if psg_ids:
-        for cid in range(len(psg_ids)):
-            suffix = f" ({cid + 1})" if len(psg_ids) > 1 else ""
-            for voice in range(3):
-                names_long.append(f"PSG {voice + 1}{suffix}")
-                names_short.append(f"S{cid + 1}-{voice + 1}")
-            names_long.append(f"PSG Noise{suffix}")
-            names_short.append(f"S{cid + 1}-N")
-    if n_k007:
-        names_long += [f"PCM {i + 1}" for i in range(n_k007)]
-        names_short += [f"P{i + 1}" for i in range(n_k007)]
+        if getattr(song, "psg_t6w28", False):
+            names_long += ["Square 1", "Square 2", "Square 3", "Noise"]
+            names_short += ["S1", "S2", "S3", "NO"]
+        else:
+            for cid in range(len(psg_ids)):
+                suffix = f" ({cid + 1})" if len(psg_ids) > 1 else ""
+                for voice in range(3):
+                    names_long.append(f"PSG {voice + 1}{suffix}")
+                    names_short.append(f"S{cid + 1}-{voice + 1}")
+                names_long.append(f"PSG Noise{suffix}")
+                names_short.append(f"S{cid + 1}-N")
+    for cid in pcm_ids:
+        suffix = f" ({cid + 1})" if len(pcm_ids) > 1 else ""
+        for voice in range(2):
+            names_long.append(f"PCM {voice + 1}{suffix}")
+            names_short.append(f"P{cid + 1}-{voice + 1}")
     for cid in oki_ids:
         for voice in range(4):
             names_long.append(f"OKI{cid + 1} {voice + 1}")
@@ -4189,21 +4209,23 @@ def write_fur(
         else:
             names_long.append(f"ADPCM {cid + 1}")
             names_short.append(f"A{cid + 1}")
-    if spcm_smps:
+    for cid in spcm_ids:
+        suffix = f" ({cid + 1})" if len(spcm_ids) > 1 else ""
         for voice in range(16):
-            names_long.append(f"SEGA {voice + 1}")
-            names_short.append(f"S{voice + 1}")
+            names_long.append(f"SEGA {voice + 1}{suffix}")
+            names_short.append(f"S{cid + 1}-{voice + 1}")
     # The RF5C pair are separate chips to Furnace (one system each), but share
     # a label family: "PCM 1".."PCM 8" for the 68, "PCM 9".."PCM 16" for a 164
     # in the same module, so a combined log never repeats a column name.
     rf5c_n = 0
     for smps in (rf5c68_smps, rf5c164_smps):
-        if not smps:
-            continue
-        for voice in range(8):
-            names_long.append(f"PCM {rf5c_n + voice + 1}")
-            names_short.append(f"P{rf5c_n + voice + 1}")
-        rf5c_n += 8
+        ids = sorted({s.chip_id for s in smps})
+        for cid in ids:
+            suffix = f" ({cid + 1})" if len(ids) > 1 else ""
+            for voice in range(8):
+                names_long.append(f"PCM {rf5c_n + voice + 1}{suffix}")
+                names_short.append(f"P{rf5c_n + voice + 1}")
+            rf5c_n += 8
     for cid in c140_ids:
         for voice in range(24):
             names_long.append(f"C140 {cid + 1}-{voice + 1}")
@@ -4280,15 +4302,23 @@ def write_fur(
                 base = "YM2151"
             label_parts.append(f"{base} x{n}" if n > 1 else base)
     if psg_ids:
-        label_parts.append("SN76489")
-    if n_k007:
-        label_parts.append("K007232")
+        label_parts.append(
+            "T6W28" if getattr(song, "psg_t6w28", False)
+            else f"SN76489 x{len(psg_ids)}" if len(psg_ids) > 1
+            else "SN76489"
+        )
+    if pcm_ids:
+        label_parts.append(
+            f"K007232 x{len(pcm_ids)}" if len(pcm_ids) > 1 else "K007232"
+        )
     if oki_ids:
         label_parts.append("MSM6295")
     if adpcm_ids:
         label_parts.append("MSM6258")
-    if spcm_smps:
-        label_parts.append("SegaPCM")
+    if spcm_ids:
+        label_parts.append(
+            f"SegaPCM x{len(spcm_ids)}" if len(spcm_ids) > 1 else "SegaPCM"
+        )
     if rf5c68_smps:
         label_parts.append("RF5C68")
     if rf5c164_smps:
@@ -4370,11 +4400,20 @@ def write_fur(
                 "rate-exact chunks; one sample-map note starts each of them.\n"
             )
     if psg_ids:
-        comment += (
-            f"\nSN76489 at {song.vgm.sn76489_clock or 3579545} Hz; three "
-            "square voices then noise. The volume column is the 4-bit "
-            "attenuation (15 = loudest) and 20xy selects the noise mode.\n"
-        )
+        if getattr(song, "psg_t6w28", False):
+            comment += (
+                f"\nT6W28 at {song.vgm.sn76489_clock or T6W28_DEFAULT_CLOCK} "
+                "Hz; the two SN76489 halves are one stereo chip. The volume "
+                "column is the louder side's 4-bit attenuation (15 = "
+                "loudest), 08xy splits the two sides, and 20xy selects the "
+                "noise mode.\n"
+            )
+        else:
+            comment += (
+                f"\nSN76489 at {song.vgm.sn76489_clock or 3579545} Hz; three "
+                "square voices then noise. The volume column is the 4-bit "
+                "attenuation (15 = loudest) and 20xy selects the noise mode.\n"
+            )
     elif ym2610:
         comment += (
             f"\nYM2610{'B' if song.ym2610_b else ''} at "
@@ -4509,9 +4548,20 @@ def write_fur(
         len(chips) - sum(1 for s in systems if s.kind == opl_kind)
         if (fm_present and opl) else 0
     )
+    t6w28 = bool(psg_ids and getattr(song, "psg_t6w28", False))
     for _cid in psg_ids:
+        if t6w28:
+            chips.append(CHIP_T6W28)
+            psg_clock = song.vgm.sn76489_clock or T6W28_DEFAULT_CLOCK
+            if abs(psg_clock - T6W28_DEFAULT_CLOCK) <= 2:
+                flag_texts.append("")
+            else:
+                flag_texts.append(f"customClock={psg_clock}")
+            continue
         chips.append(CHIP_SMS)
         psg_clock = song.vgm.sn76489_clock or 3579545
+        if _cid == 1 and getattr(song.vgm, "sn76489_clock_2", 0):
+            psg_clock = song.vgm.sn76489_clock_2
         # Game Gear selects Furnace's stereo SMPSG core (chipType 3). The
         # plain SMS core is mono, so its 08xy panning would be ignored.
         flags = "chipType=3" if getattr(song, "psg_stereo", False) else ""
@@ -4520,7 +4570,7 @@ def write_fur(
         else:
             clock_flag = f"customClock={psg_clock}"
         flag_texts.append(flags + ("\n" if flags else "") + clock_flag)
-    if n_k007:
+    for _cid in pcm_ids:
         chips.append(CHIP_K007232)
         flags = "stereo=true"
         pcm_clock = song.vgm.k007232_clock
@@ -4536,16 +4586,18 @@ def write_fur(
     for cid in adpcm_ids:
         chips.append(CHIP_MSM6258)
         flag_texts.append(msm6258_flag_text(adpcm_groups[cid][0].clock))
-    if spcm_smps:
+    for cid in spcm_ids:
         chips.append(CHIP_SEGAPCM)
         rom_size = max(
-            (s.rom_size for s in song.vgm.roms if s.kind == "segapcm"), default=0
+            (s.rom_size for s in song.vgm.roms
+             if s.kind == "segapcm" and s.chip == cid),
+            default=0,
         )
         flag_texts.append(segapcm_flag_text(song.vgm.segapcm_clock, rom_size))
-    if rf5c68_smps:
+    for _cid in rf5c68_ids:
         chips.append(CHIP_RF5C68)
         flag_texts.append(rf5c68_flag_text(song.vgm.rf5c68_clock, 0))
-    if rf5c164_smps:
+    for _cid in rf5c164_ids:
         chips.append(CHIP_RF5C68)
         flag_texts.append(rf5c68_flag_text(song.vgm.rf5c164_clock, 1))
     for cid in c140_ids:
@@ -4925,9 +4977,16 @@ def write_fur(
     for spec in ay_specs:
         ins_ptrs.append(len(b))
         _write_ins_ay(b, "PSG" + ("+pitch" if spec.pitch else ""), spec)
+    psg_ins_type = (
+        INS_T6W28 if getattr(song, "psg_t6w28", False) else INS_STD
+    )
+    psg_label = "T6W28" if getattr(song, "psg_t6w28", False) else "SN"
     for spec in psg_specs:
         ins_ptrs.append(len(b))
-        _write_ins_psg(b, "SN" + ("+pitch" if spec.pitch else ""), spec)
+        _write_ins_psg(
+            b, psg_label + ("+pitch" if spec.pitch else ""),
+            spec, ins_type=psg_ins_type,
+        )
     for spec in nes_specs:
         ins_ptrs.append(len(b))
         _write_ins_nes(b, "NES", spec)

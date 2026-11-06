@@ -111,6 +111,7 @@ class PcmHit:
     bank: int
     vol_l: int
     vol_r: int
+    chip_id: int = 0
 
 
 @dataclass
@@ -118,6 +119,7 @@ class PcmSample:
     start: int
     pcm7: bytes
     hits: list[PcmHit] = field(default_factory=list)
+    chip_id: int = 0
     # Multiply hardware Hz (Furnace C-4 and the synth path).
     rate_scale: float = 1.0
     # If set, C-4 / pattern notes use this pitch instead of mode_pitch().
@@ -143,14 +145,23 @@ class PcmSample:
 
 
 def collect_pcm_hits(vgm: VgmFile) -> list[PcmHit]:
+    ids = sorted({w.chip_id for w in vgm.writes if w.chip == "k007232"})
+    hits: list[PcmHit] = []
+    for cid in ids:
+        hits.extend(_collect_pcm_chip(
+            [w for w in vgm.writes if w.chip == "k007232" and w.chip_id == cid],
+            cid,
+        ))
+    return hits
+
+
+def _collect_pcm_chip(writes: list, chip_id: int) -> list[PcmHit]:
     ch_pitch = [0, 0]
     ch_start = [0, 0]
     ch_bank = [0, 0]
     vol = [0, 0, 0, 0]  # 0x10..0x13
     hits: list[PcmHit] = []
-    for w in vgm.writes:
-        if w.chip != "k007232" or w.chip_id != 0:
-            continue
+    for w in writes:
         r, v = w.reg, w.val
         if r == 0:
             ch_pitch[0] = (ch_pitch[0] & 0xF00) | v
@@ -189,22 +200,34 @@ def collect_pcm_hits(vgm: VgmFile) -> list[PcmHit]:
                 bank=ch_bank[ch],
                 vol_l=vol[ch * 2],
                 vol_r=vol[ch * 2 + 1],
+                chip_id=chip_id,
             ))
     return hits
 
 
 def build_pcm_bank(vgm: VgmFile) -> tuple[bytes, list[PcmSample]]:
-    rom = assemble_k007232_rom(vgm)
+    ids = sorted({w.chip_id for w in vgm.writes if w.chip == "k007232"})
+    roms = {
+        cid: assemble_k007232_rom(vgm, cid)
+        for cid in (ids or [0])
+    }
+    rom = roms.get(0, b"")
     hits = collect_pcm_hits(vgm)
-    by_start: dict[int, PcmSample] = {}
+    by_start: dict[tuple[int, int], PcmSample] = {}
     for h in hits:
-        smp = by_start.get(h.start)
+        key = (h.chip_id, h.start)
+        smp = by_start.get(key)
         if smp is None:
-            body = decode_7bit_pcm(rom, h.start) if rom else b""
-            smp = PcmSample(start=h.start, pcm7=body)
-            by_start[h.start] = smp
+            chip_rom = roms.get(h.chip_id, b"")
+            body = decode_7bit_pcm(chip_rom, h.start) if chip_rom else b""
+            smp = PcmSample(
+                start=h.start, pcm7=body, chip_id=h.chip_id,
+            )
+            by_start[key] = smp
         smp.hits.append(h)
-    samples = sorted(by_start.values(), key=lambda s: s.start)
+    samples = sorted(
+        by_start.values(), key=lambda s: (s.chip_id, s.start),
+    )
     return rom, samples
 
 

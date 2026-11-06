@@ -12,6 +12,12 @@ the chip's *flags*, and Furnace's YM2151 default is 3.579545 MHz. The
 converter writes `customClock=<Hz>` in the YM2151's `FLAG` block when the
 rip says otherwise.
 
+A dual YM2151 log (header `0x30` bit 30, second stream on command `0xA4`)
+becomes two YM2151 systems in chip order, channels 0-7 and 8-15.  Both share
+the header clock.  Chip-wide LFO effects are taken from the first instance
+only; per-note PMS/AMS, sweeps and carrier-TL moves are collected separately
+for each chip.  Without bit 30 an `0xA4` write is dropped and reported.
+
 The clock flag alone does not fix playback pitch: Furnace keeps a note at
 its musical frequency at *any* clock (`baseFreqOff` in `arcade.cpp`
 compensates the note → KC/KF mapping), so the sounding pitch is set by the

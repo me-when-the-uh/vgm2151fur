@@ -76,6 +76,7 @@ CHIP_CHANNELS = {
     CHIP_K052539: 5,  # Konami SCC+
     CHIP_AY8910: 3,  # AY-3-8910
     0x03: 4,  # TI SN76489 (three tone + noise)
+    0xBF: 4,  # Toshiba T6W28 (stereo SN76489 derivative)
     0xBB: 8,  # Namco C30 WSG
     0xCF: 16,  # Namco C219
 }
