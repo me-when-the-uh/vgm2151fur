@@ -4,13 +4,12 @@ Both chips share one register file and one Furnace system (0x95); the
 chipType flag picks the variant (0 RF5C68, 1 RF5C164). The tests cover the
 $B0/$B1 register writes, $C1/$C2 memory writes, the 0xC0/0xC1 RAM blocks, the
 sign-magnitude sample body, the "loop at the end is a hold" rule and the
-one-shot note-off/retrigger split, then a real FM Towns and Sega CD rip
-through Furnace when those roots are configured.
+one-shot note-off/retrigger split, then a synthetic FM Towns- and Sega
+CD-style log through Furnace and back.
 """
 
 from __future__ import annotations
 
-import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -22,10 +21,7 @@ from vgm2151fur.furwrite import (
 )
 from vgm2151fur.furnace import export_vgm, find_furnace
 from vgm2151fur.rf5c import (
-    RF5C68_DEFAULT_CLOCK,
-    RF5C164_DEFAULT_CLOCK,
     RF5C_VOICES,
-    _scan_end,
     _sign_magnitude,
     build_rf5c_ram,
     collect_rf5c,
@@ -318,39 +314,22 @@ def _iter_ins(data: bytes):
     return [b for b in iter_blocks(data) if b[1] == b"INS2"]
 
 
-def _sample_roots() -> list[Path]:
-    """Directories the RF5C real-rip tests search for their sources."""
-    roots: list[Path] = []
-    for name in (
-        "VGM2151FUR_SAMPLE_RIPS",
-        "VGM2151FUR_SEGACD_RIPS",
-        "VGM2151FUR_FMTOWNS_RIPS",
-        "VGM2151FUR_OPNA_RIPS",
-        "VGM2151FUR_MERGED_RIPS",
-    ):
-        raw = os.environ.get(name)
-        if raw and Path(raw).is_dir():
-            roots.append(Path(raw))
-    return roots
+@unittest.skipUnless(HAVE_FURNACE, "furnace console build missing")
+class TestRf5cRoundTrip(unittest.TestCase):
+    """A synthetic log goes through Furnace and comes back with its key-ons.
 
+    The collector and writer tests prove the register model and the emitted
+    instrument; these prove that a real module round trip keeps the chip
+    variant, its clock and every voice gate.
+    """
 
-@unittest.skipUnless(HAVE_FURNACE and _sample_roots(), "sample rips missing")
-class TestRf5cRealRips(unittest.TestCase):
-    """The FM Towns and Sega CD rips, through Furnace and back."""
-
-    def _find(self, name: str) -> Path:
-        """A rip by its path suffix, so the opn and fmtowns Xenon share a name."""
-        wanted = name.replace("\\", "/")
-        base = Path(name).name
-        for root in _sample_roots():
-            direct = root / name
-            if direct.is_file():
-                return direct
-            for path in root.rglob(base):
-                if path.is_file() and path.as_posix().endswith(wanted):
-                    return path
-        self.skipTest(f"{name} missing")
-        raise AssertionError
+    def _round_trip(self, vgm):
+        song = analyze(vgm)
+        fur = TMP / "rf5c_round.fur"
+        fur.write_bytes(write_fur(song, compress=True))
+        out = TMP / "rf5c_round.export.vgm"
+        export_vgm(fur, out)
+        return vgm, song, load_vgm(out), fur
 
     def _keyons(self, v) -> list[tuple[int, int]]:
         out: list[tuple[int, int]] = []
@@ -362,38 +341,6 @@ class TestRf5cRealRips(unittest.TestCase):
                         out.append((w.sample, i))
                 prev = w.val
         return out
-
-    def _round_trip(self, path: Path):
-        src = load_vgm(path)
-        song = analyze(src)
-        fur = TMP / (path.stem[:40] + ".fur")
-        fur.write_bytes(write_fur(song, compress=True))
-        out = TMP / (path.stem[:40] + ".export.vgm")
-        export_vgm(fur, out)
-        return src, song, load_vgm(out), fur
-
-    def test_fm_towns_xenon(self):
-        src, song, exp, fur = self._round_trip(
-            self._find("xenon-fmtowns/done/13 Synaps.vgz"))
-        self.assertTrue(song.rf5c68_samples)
-        m = parse_fur(fur.read_bytes())
-        self.assertEqual(m.chips[:2], [0xA0, CHIP_RF5C68])  # YM2612 Ext + RF5C
-        self.assertEqual(exp.rf5c68_clock, RF5C68_CLOCK)
-        src_keys = self._keyons(src)
-        exp_keys = [k for k in self._keyons(exp) if k[0] < src.total_samples]
-        self.assertEqual(len(src_keys), len(exp_keys))
-        self._assert_matched(src_keys, exp_keys)
-
-    def test_sega_cd_popful_mail(self):
-        src, song, exp, fur = self._round_trip(
-            self._find("07 - Cave (Battle).vgz"))
-        self.assertTrue(song.rf5c164_samples)
-        self.assertEqual(exp.rf5c164_clock, RF5C164_CLOCK)
-        self.assertEqual([s.kind for s in song.fm_systems], ["ym2612"])
-        src_keys = self._keyons(src)
-        exp_keys = [k for k in self._keyons(exp) if k[0] < src.total_samples]
-        self.assertEqual(len(src_keys), len(exp_keys))
-        self._assert_matched(src_keys, exp_keys)
 
     def _assert_matched(self, a, b):
         used: set[int] = set()
@@ -411,6 +358,32 @@ class TestRf5cRealRips(unittest.TestCase):
             else:
                 used.add(best[1])
         self.assertEqual(missed, 0)
+
+    def test_rf5c68_round_trips_its_keyons(self):
+        src, song, exp, fur = self._round_trip(_synthetic())
+        self.assertTrue(song.rf5c68_samples)
+        self.assertTrue(all(s.data for s in song.rf5c68_samples))
+        m = parse_fur(fur.read_bytes())
+        self.assertEqual(m.chips, [CHIP_YM2151, CHIP_RF5C68])
+        self.assertEqual(exp.rf5c68_clock, RF5C68_CLOCK)
+        src_keys = self._keyons(src)
+        exp_keys = [k for k in self._keyons(exp) if k[0] < src.total_samples]
+        self.assertEqual(len(src_keys), len(exp_keys))
+        self._assert_matched(src_keys, exp_keys)
+
+    def test_rf5c164_round_trips_its_keyons(self):
+        src, song, exp, fur = self._round_trip(
+            _synthetic("rf5c164", start=0x2000, data=_body(seed=5)),
+        )
+        self.assertTrue(song.rf5c164_samples)
+        self.assertTrue(all(s.data for s in song.rf5c164_samples))
+        m = parse_fur(fur.read_bytes())
+        self.assertEqual(m.chips, [CHIP_YM2151, CHIP_RF5C68])
+        self.assertEqual(exp.rf5c164_clock, RF5C164_CLOCK)
+        src_keys = self._keyons(src)
+        exp_keys = [k for k in self._keyons(exp) if k[0] < src.total_samples]
+        self.assertEqual(len(src_keys), len(exp_keys))
+        self._assert_matched(src_keys, exp_keys)
 
 
 if __name__ == "__main__":

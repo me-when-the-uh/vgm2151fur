@@ -13,6 +13,7 @@ from vgm2151fur.furwrite import (
     CHIP_OPL2, CHIP_YMZ280B, INS_YMZ280B, SMP_DEPTH_8BIT, SMP_DEPTH_16BIT,
     SMP_DEPTH_YMZ_ADPCM, write_fur, ymz280b_flag_text,
 )
+from vgm2151fur.opl import N as OPL_N, OPLState, SLOT_ADDR
 from vgm2151fur.vgm import (
     ChipWrite, RomSlice, VgmFile, chips_in_head, load_vgm,
 )
@@ -24,16 +25,14 @@ from vgm2151fur.ymz280b import (
 TMP = Path(tempfile.gettempdir()) / "vgm2151fur_ymz280b"
 TMP.mkdir(exist_ok=True)
 CLOCK = 16934400
-KUK = Path(r"D:\downloads\timetraxvgm\kuk\djtBMX_vgmmergetest.vgm")
-Z66 = Path(r"D:\Downloads\timetraxvgm\kuk\z66_title-test.vgm")
-STAGE4 = Path(r"D:\Downloads\timetraxvgm\kuk\07 Stage4.vgm")
 
 
 def _vgm(writes, roms=(), **kw):
+    kw.setdefault("ym2151_clock", 3579545)
     return VgmFile(
         path=Path("synthetic.vgm"), buf=b"", version=0x154,
         total_samples=400000, loop_samples=0, loop_file_pos=None,
-        loop_sample=None, ym2151_clock=3579545, k007232_clock=0, gd3={},
+        loop_sample=None, k007232_clock=0, gd3={},
         roms=list(roms), writes=list(writes),
         ymz280b_clock=CLOCK, **kw,
     )
@@ -76,6 +75,37 @@ def _note(
     ]
     if off is not None:
         out.append(_w(off, base + 0x01, 0, chip))
+    return out
+
+
+def _opl2_note(t, ch=0, *, block=4, fnum=580, off=None):
+    """One OPL2 voice, used to mix an FM melody beside the YMZ samples."""
+    def ow(when, reg, val):
+        return ChipWrite(when, "opl2", 0, reg, val)
+
+    st = OPLState("opl2", False)
+    out = []
+    for row in range(len(st.slots)):
+        slot = st.slots[row][ch]
+        if slot == OPL_N:
+            continue
+        addr = SLOT_ADDR[slot]
+        out += [
+            ow(t, addr + 0x20, 0x01),
+            ow(t, addr + 0x40, 0x30 if row == 0 else 0x10),
+            ow(t, addr + 0x60, 0xF5),
+            ow(t, addr + 0x80, 0x94),
+            ow(t, addr + 0xE0, row),
+        ]
+    cm = st.chan_map[ch]
+    hi = (block << 2) | ((fnum >> 8) & 3)
+    out += [
+        ow(t + 1, cm + 0xA0, fnum & 0xFF),
+        ow(t + 2, cm + 0xB0, hi | 0x20),
+        ow(t + 2, cm + 0xC0, 0x30),
+    ]
+    if off is not None:
+        out.append(ow(off, cm + 0xB0, hi))
     return out
 
 
@@ -343,50 +373,81 @@ class TestYmz280bModule(unittest.TestCase):
         ]
         self.assertEqual(types, [INS_YMZ280B, INS_YMZ280B])
 
-    def test_real_z66_opl2_plus_ymz(self):
-        if not Z66.is_file():
-            self.skipTest(f"{Z66} not present")
-        song = analyze(load_vgm(Z66))
+    def test_opl2_beside_ymz_points_rows_at_sample_instruments(self):
+        # A mixed OPL2 + YMZ280B log: the YMZ pattern rows must name the
+        # final sample instruments, not an earlier snapshot taken before the
+        # OPL2's operator-level instrument copies were added.
+        rom = _body(256)
+        writes = [_enable()]
+        writes += _note(1000, 0, 64, fnum=0x10, mode=0x40, off=3000)
+        writes += _note(4000, 0, 32, fnum=0x20, mode=0x60, off=6000)
+        writes += _note(7000, 0, 8, fnum=0x30, mode=0x20, off=9000)
+        writes += _opl2_note(500, 0, off=30000)
+        writes += _opl2_note(5500, 4, off=30000)
+        writes.sort(key=lambda w: w.sample)
+        song = analyze(_vgm(
+            writes, [RomSlice(0, len(rom), 0, rom, "ymz280b")],
+            ym2151_clock=0, opl2_clock=3579545,
+        ))
         self.assertEqual(song.ymz280b_ids, [0])
-        self.assertEqual(song.ymz280b_count, 400)
+        self.assertEqual(song.ymz280b_count, 3)
         self.assertEqual(len(song.ymz280b_samples), 3)
+
         data = write_fur(song, include_pcm=True)
         mod = parse_fur(data)
         self.assertIn(CHIP_OPL2, mod.chips)
         self.assertIn(CHIP_YMZ280B, mod.chips)
-        self.assertEqual(mod.n_ch, 17)  # 9 OPL2 + 8 YMZ
+        self.assertEqual(mod.n_ch, 9 + 8)  # 9 OPL2 + 8 YMZ
         self.assertEqual(len(mod.samples), 3)
-        # The OPL2 gains operator-level instrument copies after the first
-        # tone base was computed. YMZ rows must point at the final three
-        # sample instruments (0x0C-0x0E), not the stale 0x09-0x0B copies.
+        # The YMZ rows point at the final three sample instruments, which are
+        # the only instruments that carry a sample index.
         used = set()
         for ch in mod.pcm_channels:
             for oi in mod.orders[ch]:
                 for row in mod.patterns.get((ch, oi), []):
                     if 0 <= row.note < 180 and row.ins >= 0:
                         used.add(row.ins)
-        self.assertEqual(used, {12, 13, 14})
-        self.assertEqual(mod.ins_sample[12:15], [0, 1, 2])
+        first = len(mod.ins_sample) - len(mod.samples)
+        self.assertEqual(used, set(range(first, len(mod.ins_sample))))
+        self.assertEqual(mod.ins_sample[first:], [0, 1, 2])
 
-    def test_real_stage4_two_ymz(self):
-        if not STAGE4.is_file():
-            self.skipTest(f"{STAGE4} not present")
-        v = load_vgm(STAGE4)
-        self.assertTrue(v.ymz280b_dual)
-        self.assertEqual({r.chip for r in v.roms}, {0, 1})
-        song = analyze(v)
+    def test_dual_ymz_mix_is_full_scale_without_an_fm_placeholder(self):
+        # Two YMZ instances run at full output. Furnace's core is 1.27x
+        # quieter than the player's, so the master carries that gain while
+        # each chip volume stays at unity.
+        rom0 = _body(256)
+        rom1 = bytes((i * 13 + 7) & 0xFF for i in range(256))
+        writes = [_enable(0, 0), _enable(0, 1)]
+        for i in range(4):
+            start = i * 32
+            writes += _note(
+                1000 + i * 2000, start, start + 24, fnum=0x10 + i,
+                mode=0x40, chip=0, off=1000 + i * 2000 + 1900,
+            )
+            writes += _note(
+                1200 + i * 2000, start, start + 24, fnum=0x20 + i,
+                mode=0x40, chip=1, off=1200 + i * 2000 + 1900,
+            )
+        writes.sort(key=lambda w: w.sample)
+        song = analyze(_vgm(
+            writes,
+            [
+                RomSlice(0, len(rom0), 0, rom0, "ymz280b"),
+                RomSlice(1, len(rom1), 0, rom1, "ymz280b"),
+            ],
+        ))
         self.assertEqual(song.ymz280b_ids, [0, 1])
-        self.assertEqual(song.ymz280b_count, 5007)
-        self.assertEqual(len(song.ymz280b_samples), 17)
+        self.assertEqual(song.ymz280b_count, 8)
+        self.assertEqual(len(song.ymz280b_samples), 8)
         data = write_fur(song, include_pcm=True)
         mod = parse_fur(data)
         # A YMZ-only log must not gain a silent YM2151 placeholder.
         self.assertEqual(mod.chips, [CHIP_YMZ280B, CHIP_YMZ280B])
         self.assertEqual(mod.n_ch, 16)
-        self.assertEqual(len(mod.samples), 17)
+        self.assertEqual(len(mod.samples), 8)
         self.assertLessEqual(len(song.fm_patches) + len(song.ymz280b_samples), 250)
-        # The two Stage 4 instances run at full output. The measured core
-        # difference is carried by the master, not by halving each chip.
+        # The two instances run at full output. The measured core difference
+        # is carried by the master, not by halving each chip.
         self.assertAlmostEqual(master_volume(data), 1.27, places=2)
         self.assertEqual([round(c.volume, 3) for c in read_chips(data)], [1.0, 1.0])
 

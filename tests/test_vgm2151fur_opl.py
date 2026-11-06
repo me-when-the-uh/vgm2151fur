@@ -14,7 +14,6 @@ from __future__ import annotations
 import math
 import tempfile
 import unittest
-from collections import Counter
 from pathlib import Path
 
 from vgm2151fur.analyze import analyze, format_report
@@ -177,6 +176,34 @@ def rhythm(t: int, kind: str = KIND_OPL2, bits: int = 0, depth: int = 3,
            cid: int = 0) -> ChipWrite:
     """The rhythm latch: both depth bits, mode on, and the trigger bits given."""
     return ChipWrite(t, kind, cid, 0xBD, (depth << 6) | 0x20 | bits)
+
+
+OPLL_CLOCK = 3579545
+
+
+def opll_wr(t: int, addr: int, val: int, cid: int = 0) -> ChipWrite:
+    return ChipWrite(t, "opll", cid, addr, val & 0xFF)
+
+
+def opll_note(t: int, ch: int = 3, *, preset: int = 13, level: int = 0,
+              block: int = 4, fnum: int = 580, off: int | None = None,
+              cid: int = 0) -> list[ChipWrite]:
+    """A keyed YM2413 voice; the key bit is a level, so off clears it."""
+    hi = ((block & 7) << 1) | ((fnum >> 8) & 1)
+    out = [
+        opll_wr(t - 100, 0x30 + ch, (preset << 4) | level, cid),
+        opll_wr(t, 0x20 + ch, hi | 0x10, cid),
+        opll_wr(t + 1, 0x10 + ch, fnum & 0xFF, cid),
+        opll_wr(t + 2, 0x20 + ch, hi | 0x10, cid),
+    ]
+    if off is not None:
+        out.append(opll_wr(off, 0x20 + ch, hi, cid))
+    return out
+
+
+def opll_vgm(writes, *, total_samples: int = 400000, **kw):
+    return _vgm(writes, ym2413_clock=OPLL_CLOCK,
+                total_samples=total_samples, **kw)
 
 
 def ins_types(data: bytes) -> list[int]:
@@ -963,192 +990,114 @@ class TestOplFurnaceRoundTrip(unittest.TestCase):
 
 
 
-SOLAR = Path(r"F:\NASbackup\JamesAlan\_devspace\grbsd\ripwip\_finished"
-             r"\solarwinds1\solar1_BH_MU1_trimmed.vgm")
-MC01 = Path(r"F:\NASbackup\JamesAlan\_devspace\grbsd\ripwip\miwaku\opl3\mc_01.vgm")
-METAL = Path(r"F:\NASbackup\JamesAlan\_devspace\grbsd\ripwip"
-             r"\metalace-opl3\main_010a.vgm")
-KXEMI = Path(r"F:\NASbackup\JamesAlan\_devspace\grbsd\ripwip\_finished"
-             r"\knightsofxentar-opl3\KXEMI1_opl2.vgm")
-ROOT = Path(__file__).resolve().parents[2]
-BUBBLE = (ROOT / "VGM_collection" / "old" / "Bubble_Bobble_(Arcade)"
-          / "02 Hurry! ~ Main Theme (faster).vgz")
-# A YM3526 that really latches the kit. Rhythm mode is identical to a YM3812's -
-# same $BD register, same five percussion voices - the chip only lacks waveform
-# select, so this is what proves the family was not special-cased out of it.
-OPL1KIT = Path(r"D:\Apps\Audio\Furnace\opl1_rhythmtest.vgm")
-# A Furnace OPL3 module that writes bank 0's $BD with all five kit bits. The
-# first note of the opening bar lives on channels 15-19, which used to be blank.
-OPL3KIT = Path(r"D:\Downloads\PhantomBreakerBattleGrounds_Shinjuku-OPL3_optimized.vgm")
-# The same module exported with the OPL4's FM half; its rhythm register is
-# still bank 0's $BD, not $1BD.
-OPL4KIT = Path(r"D:\Downloads\opl4-rhythmtest.vgm")
-
-
-@unittest.skipUnless(OPL3KIT.is_file(), "Phantom Breaker OPL3 rip missing")
-class TestOpl3RhythmRealRip(unittest.TestCase):
-
-    def test_kit_channels_are_not_blank(self):
-        song = analyze(load_vgm(OPL3KIT))
-        self.assertTrue(song.opl_drums)
-        used = {e.ch for e in song.events if e.on and e.ch >= 15}
-        self.assertEqual(used, {15, 16, 17, 18, 19})
-        self.assertGreater(song.drum_notes, 0)
-
-
-@unittest.skipUnless(OPL4KIT.is_file(), "OPL4 rhythm rip missing")
-class TestOpl4RhythmRealRip(unittest.TestCase):
-
-    def test_kit_channels_are_not_blank(self):
-        song = analyze(load_vgm(OPL4KIT))
-        self.assertTrue(song.opl_drums)
-        used = {e.ch for e in song.events if e.on and e.ch >= 15}
-        self.assertEqual(used, {15, 16, 17, 18, 19})
-        self.assertGreater(song.drum_notes, 0)
-        self.assertFalse(any("write no notes" in w for w in song.warnings))
-
-
-@unittest.skipUnless(HAVE_FURNACE and MC01.is_file(),
-                     "Furnace or the reference rips missing")
 class TestOpllTickMacros(unittest.TestCase):
-    """OPLL preset/volume writes faster than one pattern row."""
+    """Sub-row OPLL preset, level and pitch automation."""
 
-    SRC = Path(r"D:\Downloads\mahbod-usedtosay.vgm")
+    @staticmethod
+    def _preset_walk():
+        ws = opll_note(1000, ch=3, preset=13, level=0, off=8000)
+        ws += [
+            opll_wr(1800, 0x33, (5 << 4) | 3),
+            opll_wr(2600, 0x33, (4 << 4) | 6),
+            opll_wr(3400, 0x33, (4 << 4) | 9),
+        ]
+        return opll_vgm(ws, total_samples=14000)
+
+    @staticmethod
+    def _bend():
+        ws = opll_note(1000, ch=4, preset=1, level=0, off=12000)
+        for i, fnum in enumerate((640, 700, 760, 820)):
+            t = 1800 + i * 500
+            ws += [
+                opll_wr(t, 0x14, fnum & 0xFF),
+                opll_wr(t + 2, 0x24, ((4 & 7) << 1) | ((fnum >> 8) & 1) | 0x10),
+            ]
+        return opll_vgm(ws, total_samples=14000)
+
+    @staticmethod
+    def _retriggers():
+        ws: list[ChipWrite] = []
+        for base in (1000, 8000):
+            ws += opll_note(base, ch=3, preset=3, level=15,
+                            off=base + 4000)
+            ws.append(opll_wr(base + 1470, 0x33, (3 << 4) | 0))
+        return opll_vgm(ws, total_samples=14000)
+
+    @staticmethod
+    def _clap():
+        ws = opll_note(1000, ch=2, preset=3, level=0, off=2080)
+        levels = (0, 15, 0, 15, 0, 8, 4, 15)
+        times = (2480, 2880, 3280, 3680, 4080, 4480, 4880, 5410)
+        for t, level in zip(times, levels):
+            ws.append(opll_wr(t, 0x32, (3 << 4) | level))
+        for i, fnum in enumerate((620, 660, 700, 740, 780, 820, 860, 900,
+                                  940, 980)):
+            t = 2500 + i * 400
+            ws += [
+                opll_wr(t, 0x12, fnum & 0xFF),
+                opll_wr(t + 2, 0x22, ((4 & 7) << 1) | ((fnum >> 8) & 1)),
+            ]
+        return opll_vgm(ws, total_samples=14000)
 
     def test_fast_preset_and_volume_changes_become_macros(self):
-        if not self.SRC.exists():
-            self.skipTest(f"{self.SRC} not present")
-        song = analyze(load_vgm(self.SRC))
-        start = int(round(15 * 256 * song.samples_per_row))
-        ev = next(
-            e for e in song.events
-            if e.on and e.ch == 3 and abs(e.sample - start) <= 2
-        )
+        song = analyze(self._preset_walk(), speed=8)
+        ev = next(e for e in song.events if e.on and e.ch == 3)
         patch = song.fm_patches[ev.ins]
-        # The first key uses $33 = $dF (preset 13), not the next write's 5.
+        # The first key keeps its own $3x page (preset 13), while the fast
+        # walk afterwards becomes a wave macro instead of one row value.
         self.assertEqual(patch.preset, 13)
         self.assertIn(5, patch.wave_macro)
         self.assertIn(4, patch.wave_macro)
         self.assertGreater(len(patch.vol_macro), 1)
         self.assertEqual(ev.vol, 15)
         self.assertLess(len(song.fm_patches), 250)
+        self.assertEqual(song.warnings, [])
 
     def test_fast_drum_bends_stay_pitch_macros(self):
-        # Order $0B FM5 and $0C FM3 walk the f-num every 108 samples. Row
-        # effects are not reliable on OPLL, so these must remain macros.
-        if not self.SRC.exists():
-            self.skipTest(f"{self.SRC} not present")
-        song = analyze(load_vgm(self.SRC))
-        self.assertEqual(song.warnings, [])
-        for order, ch in ((0x0B, 4), (0x0C, 2)):
-            start = int(order * 256 * song.samples_per_row)
-            ev = next(
-                e for e in song.events
-                if e.on and e.ch == ch and abs(e.sample - start) <= 2
-            )
-            patch = song.fm_patches[ev.ins]
-            self.assertGreater(len(patch.pitch_macro), 1)
-            self.assertEqual(ev.pitch_steps, ())
-            self.assertEqual(ev.sweep, ())
-
-    def test_channel4_opening_volume_is_not_a_late_row_step(self):
-        # First ch4 write at 331,776: $33=$1F then $33=$10 108 samples later.
-        # Both land in the same pattern row; the volume macro keeps the loud
-        # level from tick 1 instead of losing it to the row-start step.
-        if not self.SRC.exists():
-            self.skipTest(f"{self.SRC} not present")
-        song = analyze(load_vgm(self.SRC))
-        ev = next(
-            e for e in song.events
-            if e.on and e.ch == 3 and abs(e.sample - 331776) <= 2
-        )
+        # OPLL has no reliable row-step path, so the f-num walk must remain a
+        # pitch macro rather than a row effect.
+        song = analyze(self._bend(), speed=8)
+        ev = next(e for e in song.events if e.on and e.ch == 4)
         patch = song.fm_patches[ev.ins]
-        self.assertEqual(ev.vol, 15)
-        self.assertEqual(patch.vol_speed, 1)
-        self.assertEqual(patch.vol_macro[:3], (0, 0, 15))
+        self.assertGreater(len(patch.pitch_macro), 1)
+        self.assertEqual(ev.pitch_steps, ())
+        self.assertEqual(ev.sweep, ())
 
-    def test_channel4_later_retriggers_keep_the_loud_level(self):
-        # Order $03 onward re-keys the same voice after $33=$1F. A released
-        # note still in `held` must not eat the new note's $33=$10 settle
-        # write, or the pattern volume column lands at 00.
-        if not self.SRC.exists():
-            self.skipTest(f"{self.SRC} not present")
-        song = analyze(load_vgm(self.SRC))
-        for order in (0x03, 0x04, 0x05):
-            start = int(order * 256 * song.samples_per_row)
-            ev = next(
-                e for e in song.events
-                if e.on and e.ch == 3 and abs(e.sample - start) <= 2
-            )
+    def test_opening_volume_and_retriggers_keep_the_loud_level(self):
+        # Both keys open at $3x level 15 (silent in the column), then a loud
+        # $3x write lands two ticks later. The macro must carry it, and the
+        # second key must not have its opening write eaten by the released
+        # first note still in `held`.
+        song = analyze(self._retriggers(), speed=8)
+        ons = [e for e in song.events if e.on and e.ch == 3]
+        self.assertEqual(len(ons), 2)
+        for ev in ons:
             patch = song.fm_patches[ev.ins]
-            self.assertEqual(ev.vol, 15, f"order {order:#x}")
-            self.assertEqual(patch.vol_macro[:3], (0, 0, 15),
-                             f"order {order:#x}")
+            self.assertEqual(ev.vol, 15)
+            self.assertEqual(patch.vol_speed, 1)
+            self.assertEqual(patch.vol_macro[:3], (0, 0, 15))
 
     def test_clap_keeps_level_automation_after_key_off(self):
-        # Order $06 FM3: $22 clears the key at +1080, but the driver keeps
-        # gating the release tail with $32 (0,15,0,15,0, then a slow fade to
-        # 15) until +14904. The note must still key off there (that release is
-        # the clap's noise) while its volume macro runs through the whole tail.
-        if not self.SRC.exists():
-            self.skipTest(f"{self.SRC} not present")
-        song = analyze(load_vgm(self.SRC))
-        start = int(0x06 * 256 * song.samples_per_row)
-        ev = next(
-            e for e in song.events
-            if e.on and e.ch == 2 and abs(e.sample - start) <= 2
-        )
+        # The key bit clears at +1080, but the driver keeps gating the tail
+        # with $3x. The note must still release there while its volume macro
+        # runs to the last write, and the f-num walk must reach as far.
+        song = analyze(self._clap(), speed=1)
+        ev = next(e for e in song.events if e.on and e.ch == 2)
         patch = song.fm_patches[ev.ins]
         self.assertEqual(ev.end - ev.sample, 1080)
-        self.assertGreater(len(patch.vol_macro), 100)
+        self.assertGreaterEqual(len(patch.vol_macro), 5)
         self.assertEqual(patch.vol_macro[-1], 0)
-        # The clap's f-num walk also continues through the release. It must
-        # reach at least the volume macro's end, not stop at the key bit.
         self.assertGreaterEqual(len(patch.pitch_macro), len(patch.vol_macro))
         off = next(
             e for e in song.events
-            if not e.on and e.ch == 2 and e.sample - start == 1080
+            if not e.on and e.ch == 2 and e.sample - ev.sample == 1080
         )
         self.assertEqual(off.note, 180)
 
     @unittest.skipUnless(HAVE_FURNACE, "furnace console build missing")
-    def test_clap_level_macro_continues_through_release(self):
-        if not self.SRC.exists():
-            self.skipTest(f"{self.SRC} not present")
-        song = analyze(load_vgm(self.SRC))
-        start = int(0x06 * 256 * song.samples_per_row)
-        stem = TMP / "opll_clap_release"
-        fur = stem.with_suffix(".fur")
-        fur.write_bytes(write_fur(song, include_pcm=False))
-        back = load_vgm(export_fur(fur, stem.with_suffix(".vgm")))
-        after = [
-            w.val & 15 for w in back.writes
-            if (
-                w.chip == "opll" and (w.reg & 0xFF) == 0x32
-                and start + 1080 < w.sample <= start + 15000
-            )
-        ]
-        # The key-off lands at +1080; the tail's level steps must still reach
-        # the chip afterwards, ending at the saturated level 15.
-        self.assertGreaterEqual(len(after), 10)
-        self.assertEqual(after[-1], 15)
-        pitch_after = [
-            w.sample - start for w in back.writes
-            if (
-                w.chip == "opll" and (w.reg & 0xFF) in (0x12, 0x22)
-                and start + 1080 < w.sample <= start + 20736
-            )
-        ]
-        # And the pitch macro must keep moving the f-num through that tail.
-        self.assertGreaterEqual(len(pitch_after), 100)
-        self.assertGreaterEqual(max(pitch_after), 15000)
-
-    @unittest.skipUnless(HAVE_FURNACE, "furnace console build missing")
     def test_export_keeps_the_sub_row_preset_walk(self):
-        if not self.SRC.exists():
-            self.skipTest(f"{self.SRC} not present")
-        song = analyze(load_vgm(self.SRC))
-        start = int(round(15 * 256 * song.samples_per_row))
+        song = analyze(self._preset_walk(), speed=8)
+        start = 1000
         stem = TMP / "opll_tick_macros"
         fur = stem.with_suffix(".fur")
         fur.write_bytes(write_fur(song, include_pcm=False))
@@ -1162,13 +1111,47 @@ class TestOpllTickMacros(unittest.TestCase):
             )
         ]
         self.assertGreaterEqual(len(writes), 3)
-        self.assertEqual([preset for _t, preset in writes[:3]], [13, 5, 4])
+        presets = [preset for _t, preset in writes]
+        self.assertIn(5, presets)
+        self.assertIn(4, presets)
+
+    @unittest.skipUnless(HAVE_FURNACE, "furnace console build missing")
+    def test_export_keeps_level_and_pitch_through_the_release(self):
+        song = analyze(self._clap(), speed=1)
+        start = 1000
+        off = 2080
+        stem = TMP / "opll_clap_release"
+        fur = stem.with_suffix(".fur")
+        fur.write_bytes(write_fur(song, include_pcm=False))
+        back = load_vgm(export_fur(fur, stem.with_suffix(".vgm")))
+        after = [
+            w.val & 15 for w in back.writes
+            if (
+                w.chip == "opll" and (w.reg & 0xFF) == 0x32
+                and off < w.sample <= start + 20000
+            )
+        ]
+        # The tail's level steps still reach the chip after the key-off.
+        self.assertGreaterEqual(len(after), 3)
+        self.assertIn(0, after)
+        self.assertIn(15, after)
+        pitch_after = [
+            w.sample - start for w in back.writes
+            if (
+                w.chip == "opll" and (w.reg & 0xFF) in (0x12, 0x22)
+                and off < w.sample <= start + 20000
+            )
+        ]
+        self.assertGreaterEqual(len(pitch_after), 5)
+        self.assertGreaterEqual(max(pitch_after), 3000)
 
 
-class TestOplRealRips(unittest.TestCase):
-    """The rips the model was tuned on: every unbent note lands exactly."""
+@unittest.skipUnless(HAVE_FURNACE, "furnace console build missing")
+class TestOplRegisterRoundTrip(unittest.TestCase):
+    """Every synthetic attack is handed back the registers it had."""
 
-    def _check(self, path: Path, kind: str, min_attacks: int = 1000):
+    def _check(self, src: VgmFile, kind: str, *, min_attacks: int = 10,
+               name: str = "synthetic") -> None:
         """At every attack the chip is handed the same registers it was before.
 
         The comparison is sample-atomic (``diag.opl_attacks``): a driver that
@@ -1179,14 +1162,14 @@ class TestOplRealRips(unittest.TestCase):
         compared for their operators but not their frequency: two percussion
         voices share one register there, so the byte belongs to whichever was
         written last. A note the analyzer bent is compared at its attack only if
-        it still holds the rip's f-num, because a macro, row step or slide moves
-        it on purpose afterwards.
+        it still holds the source's f-num, because a macro, row step or slide
+        moves it on purpose afterwards.
         """
-        src = load_vgm(path)
         song = analyze(src)
         self.assertEqual(song.fm_chip, kind)
         drums = song.opl_drums
-        stem = TMP / f"real_{kind}_{path.stem}"
+        slug = "".join(c if c.isalnum() else "_" for c in name)[:40]
+        stem = TMP / f"round_{kind}_{slug}"
         fur = stem.with_suffix(".fur")
         fur.write_bytes(write_fur(song, include_pcm=False))
         exp = load_vgm(export_fur(fur, stem.with_suffix(".vgm")))
@@ -1197,7 +1180,7 @@ class TestOplRealRips(unittest.TestCase):
             want.setdefault(row[:2], []).append(row)
         for row in opl_attacks(exp, kind, drums):
             got.setdefault(row[:2], []).append(row)
-        self.assertEqual(sorted(want), sorted(got), f"{path.name}: channels")
+        self.assertEqual(sorted(want), sorted(got), f"{name}: channels")
 
         chunk = channel_count(kind, drums)
         st = OPLState(kind, drums)
@@ -1211,34 +1194,29 @@ class TestOplRealRips(unittest.TestCase):
 
         total = sum(len(v) for v in want.values())
         bytes_cmp = 0
-        pitch_cmp = 0
         bad: list[str] = []
-        # Furnace re-latches the kit as it wraps the loop, so an exported attack
-        # past the source's last sample has nothing to compare with. Drop those,
-        # one row of slack for the tick it lands on; everything inside the song
-        # still has to match exactly.
-        edge = src.total_samples + 600
+        # A module loops back to its first row, so an exported attack after a
+        # channel's last source attack has nothing to compare with. Drop that
+        # seam replay; everything inside the song still matches.
         for key, brows in list(got.items()):
+            rows = want.get(key, [])
+            edge = rows[-1][2] + 600 if rows else src.total_samples + 600
             kept = [r for r in brows if r[2] <= edge]
             if len(kept) != len(brows):
-                # only a rhythm channel may gain at the seam, and only its tail.
-                # The kick is one of them even though it plays a plain DIV_INS_OPL
-                # voice: it owns channel 7's two operators, like BD on the chip.
-                self.assertGreaterEqual(key[1], st.melodic,
-                                f"{path.name} ch{key}: melodic attack past the end")
-                self.assertEqual(kept, brows[:len(kept)])
+                self.assertEqual(kept, brows[:len(kept)],
+                                 f"{name} ch{key}: attack order at the seam")
                 got[key] = kept
         for ch, rows in sorted(want.items()):
             brows = got.get(ch, [])
             self.assertEqual(len(brows), len(rows),
-                             f"{path.name} ch{ch}: attack count")
+                             f"{name} ch{ch}: attack count")
             evs = mine.get(ch, [])
-            cid, col = ch
+            _cid, col = ch
             cm = st.chan_map[col]
             port, off = ((cm >> 8) & 1) if st.opl3 else 0, cm & 0xFF
             kit = is_drum_channel(kind, drums, col)
             for i, (_cid2, _col2, t, simg) in enumerate(rows):
-                _c3, _c4, t2, eimg = brows[i]
+                _c3, _c4, _t2, eimg = brows[i]
                 ev = evs[i] if i < len(evs) else None
                 bent = bool(ev is not None and (ev.fm_pitch_pts or ev.pitch_steps
                                                 or ev.sweep))
@@ -1249,7 +1227,6 @@ class TestOplRealRips(unittest.TestCase):
                     ge = eimg.get((port, 0xB0 + off), 0)
                     got_u = (((ge & 3) << 8) | eimg.get((port, 0xA0 + off), 0)
                              ) << ((ge >> 2) & 7)
-                    pitch_cmp += 1
                     if want_u != got_u:
                         bad.append("ch%s t=%.3f unit want %d got %d"
                                   % (ch, t / VGM_RATE, want_u, got_u))
@@ -1266,99 +1243,108 @@ class TestOplRealRips(unittest.TestCase):
                             bad.append("ch%s t=%.3f op %x/%02X want %02X got %02X"
                                        % (ch, t / VGM_RATE, a_port, a_off + page,
                                           w, g))
-        # Both comparisons must actually have run: every attack of the rip, and
-        # several operator registers at each one. A short fixture sets its own
-        # floor instead, so the test cannot pass by comparing nothing.
-        self.assertGreater(total, min_attacks, path.name)
-        self.assertGreater(bytes_cmp, total * 4, path.name)
-        self.assertEqual(bad[:6], [], f"{path.name}: {len(bad)} diffs")
+        # Both comparisons must actually have run: every attack of the fixture,
+        # and several operator registers at each one.
+        self.assertGreater(total, min_attacks, name)
+        self.assertGreater(bytes_cmp, total * 4, name)
+        self.assertEqual(bad[:6], [], f"{name}: {len(bad)} diffs")
 
-    def test_opl3_medley_with_four_operator_voices(self):
-        song = analyze(load_vgm(MC01))
+    @staticmethod
+    def _four_op_opl3():
+        ws = [ChipWrite(90, KIND_OPL3, 0, 0x104, 0x01)]
+        for i in range(14):
+            base = 1000 + i * 9000
+            ws += voice(base, KIND_OPL3, 0, four=True, block=4, fnum=580,
+                        ops=[{"mult": 1}, {"mult": 5}, {"mult": 3},
+                             {"mult": 7}], alg=0, pan=2,
+                        off_time=base + 6000)
+            ws += voice(base + 100, KIND_OPL3, 2, block=3, fnum=514,
+                        ops=[{"tl": 9}, {"tl": 20}], alg=1,
+                        off_time=base + 5000)
+        return _vgm(ws, kind=KIND_OPL3, total_samples=125000)
+
+    @staticmethod
+    def _opl2_rhythm():
+        ws: list[ChipWrite] = []
+        for i in range(4):
+            base = 1000 + i * 16000
+            ws += voice(base, KIND_OPL2, 6, drums=True, block=3, fnum=900,
+                        off_time=base + 12000)
+            addrs = [SLOT_ADDR[SLOTS_KIT[0][f]] for f in range(7, 11)]
+            ws += op_writes(base + 100, KIND_OPL2, addrs[0], mult=6, tl=11)
+            ws += op_writes(base + 100, KIND_OPL2, addrs[2], mult=9, tl=17)
+            ws += [
+                rhythm(base + 500, bits=0x10),
+                rhythm(base + 2000, bits=0x1E),
+                rhythm(base + 6000, bits=0x02),
+                rhythm(base + 10000, bits=0),
+            ]
+        return _vgm(ws, total_samples=65000)
+
+    @staticmethod
+    def _opl1_rhythm():
+        ws: list[ChipWrite] = []
+        for i in range(4):
+            base = 1000 + i * 16000
+            ws += voice(base, KIND_OPL, 6, drums=True, block=3, fnum=900,
+                        off_time=base + 12000)
+            addrs = [SLOT_ADDR[SLOTS_KIT[0][f]] for f in range(7, 11)]
+            ws += op_writes(base + 100, KIND_OPL, addrs[0], mult=6, tl=11)
+            ws += op_writes(base + 100, KIND_OPL, addrs[2], mult=9, tl=17)
+            ws += [
+                rhythm(base + 500, KIND_OPL, bits=0x10),
+                rhythm(base + 2000, KIND_OPL, bits=0x1E),
+                rhythm(base + 6000, KIND_OPL, bits=0x02),
+                rhythm(base + 10000, KIND_OPL, bits=0),
+            ]
+        return _vgm(ws, kind=KIND_OPL, total_samples=65000)
+
+    @staticmethod
+    def _dual_opl2():
+        ws: list[ChipWrite] = []
+        for i in range(8):
+            base = 1000 + i * 9000
+            ws += voice(base, KIND_OPL2, 0, block=4, fnum=580,
+                        off_time=base + 5000)
+            ws += voice(base + 50, KIND_OPL2, 1, cid=1, block=5, fnum=400,
+                        off_time=base + 5000)
+        return _vgm(ws, opl2_dual=True, opl2_pan=True, total_samples=80000)
+
+    def test_four_operator_pair_keeps_every_register(self):
+        src = self._four_op_opl3()
+        song = analyze(src)
         self.assertTrue(any(p.four for p in song.fm_patches), "no 4-op voice")
-        self._check(MC01, KIND_OPL3)
+        self._check(src, KIND_OPL3, min_attacks=20, name="four_op")
 
-    @unittest.skipUnless(METAL.is_file(), "Metal Ace rip missing")
-    def test_second_opl3_rip_keeps_every_register(self):
-        self._check(METAL, KIND_OPL3)
-
-    @unittest.skipUnless(SOLAR.is_file(), "Solar Winds rip missing")
-    def test_opl2_rhythm_rip(self):
-        song = analyze(load_vgm(SOLAR))
+    def test_opl2_rhythm_kit_keeps_every_register(self):
+        src = self._opl2_rhythm()
+        song = analyze(src)
         self.assertTrue(song.opl_drums)
-        self._check(SOLAR, KIND_OPL2)
+        self.assertEqual(parse_fur(write_fur(song, include_pcm=False)).chips,
+                         [CHIP_OPL2_DRUMS])
+        self._check(src, KIND_OPL2, min_attacks=10, name="opl2_kit")
 
-    @unittest.skipUnless(OPL1KIT.is_file(), "YM3526 rhythm fixture missing")
-    def test_opl1_rhythm_rip(self):
-        # The YM3526 has rhythm mode exactly like a YM3812 - same $BD register,
-        # same kit - so the only thing a real OPL1 log can catch is the family
-        # being special-cased out of the drums layout, or its absent waveform
-        # register ($Ex) being invented on the way back.
-        src = load_vgm(OPL1KIT)
+    def test_opl1_rhythm_keeps_every_register(self):
+        # The YM3526 has rhythm mode exactly like a YM3812: same $BD register,
+        # same kit. Its absent waveform page is checked by TestOplChip1.
+        src = self._opl1_rhythm()
         song = analyze(src)
         self.assertEqual(song.fm_chip, KIND_OPL)
         self.assertTrue(song.opl_drums, "the YM3526 was kept melodic")
         m = parse_fur(write_fur(song, include_pcm=False))
         self.assertEqual(m.chips, [CHIP_OPL_DRUMS])
         self.assertEqual(m.n_ch, 11)
+        self._check(src, KIND_OPL, min_attacks=10, name="opl1_kit")
 
-        # $BD bits 4..0 latch BD, SD, TOM, CYM/TP and HH. BD is driven from
-        # channel 7's two operators of its own; only channels 8 and 9 put two
-        # voices on one frequency register.
-        NAMES = {4: "BD", 3: "SD", 2: "TM", 1: "TP", 0: "HH"}
-
-        def latches(vgm, times=False):
-            """Per-voice rising percussion edges in $BD, counted or timed."""
-            fired, prev = ({n: [] for n in NAMES.values()} if times else Counter()), 0
-            for w in vgm.writes:
-                if w.chip != KIND_OPL or (w.reg & 0xFF) != 0xBD:
-                    continue
-                cur = (w.val & 0x1F) if (w.val & 0x20) else 0
-                for k, name in NAMES.items():
-                    if (cur >> k) & 1 and not (prev >> k) & 1:
-                        if times:
-                            fired[name].append(w.sample)
-                        else:
-                            fired[name] += 1
-                prev = cur
-            return fired
-
-        back = load_vgm(self._export(OPL1KIT, song))
-        a, b = latches(src), latches(back)
-        self.assertGreater(sum(a.values()), 0, "the fixture latched no drum")
-        # Nothing may be lost: every voice the log latches must sound again.
-        for name, n in a.items():
-            self.assertGreaterEqual(b.get(name, 0), n,
-                                    "%s: %d hit(s) lost (%r vs %r)" % (name, n - b.get(name, 0), a, b))
-        # A surplus is only acceptable after the source's last sample, where the
-        # module plays its final row once more across the loop seam. Any earlier
-        # than that and a drum would double up inside the song.
-        for name, hits in latches(back, times=True).items():
-            want = set(latches(src, times=True)[name])
-            for t in hits:
-                if t not in want:
-                    self.assertGreater(
-                        t, src.total_samples - 2 * 551,
-                        "%s latched again at %.0fms, inside the song" % (name, t / 44.1))
-        # and every voice, kit included, lands with the registers it had
-        self._check(OPL1KIT, KIND_OPL, min_attacks=20)
-
-    def _export(self, path: Path, song) -> Path:
-        """Write the module and have Furnace re-export it."""
-        fur = TMP / f"opl1_{path.stem}.fur"
-        fur.write_bytes(write_fur(song, include_pcm=False))
-        return export_fur(fur, TMP / f"opl1_{path.stem}.vgm")
-
-    @unittest.skipUnless(KXEMI.is_file(), "Knights of Xentar rip missing")
-    def test_dual_opl2_rip(self):
-        src = load_vgm(KXEMI)
+    def test_dual_opl2_chips_keep_every_register(self):
+        src = self._dual_opl2()
         self.assertTrue(src.opl2_dual and src.opl2_pan)
-        self._check(KXEMI, KIND_OPL2)
         song = analyze(src)
         self.assertEqual(song.opl_ids, [0, 1])
         m = parse_fur(write_fur(song, include_pcm=False))
         self.assertEqual(m.chips, [CHIP_OPL2, CHIP_OPL2])
         self.assertEqual(m.n_ch, 18)
+        self._check(src, KIND_OPL2, min_attacks=10, name="dual_opl2")
 
 
 class TestMixedFamilySelection(unittest.TestCase):
@@ -1413,20 +1399,6 @@ class TestMixedFamilySelection(unittest.TestCase):
         self.assertEqual(song.fm_chip, KIND_OPL3)
         self.assertTrue(any("more than one OPL family" in w
                             for w in song.warnings), song.warnings)
-
-    @unittest.skipUnless(BUBBLE.is_file(), "Bubble Bobble rip missing")
-    def test_real_mixed_rip_keeps_the_dominant_opl_theme(self):
-        song = analyze(load_vgm(BUBBLE))
-        self.assertEqual(song.fm_chip, KIND_OPL)
-        self.assertEqual(song.opl_ids, [0])
-        self.assertEqual(song.ym2203_ids, [])
-        self.assertGreater(song.fm_notes, 1000)
-        self.assertTrue(
-            any("OPL has more key-ons" in w and "YM2203" in w
-                for w in song.warnings),
-            song.warnings,
-        )
-
 
 class TestOplVerify(unittest.TestCase):
     """--verify's measure: a voice inside its own key, trimmed for row ticks."""
@@ -1547,8 +1519,8 @@ class TestOplChip1(unittest.TestCase):
 
     Rhythm mode is identical - same `0xBD`, same five voices, same drums system -
     so the one thing to prove about this chip is that `0xE0`+ never appears, in
-    the log or in what Furnace writes back. `TestOplRealRips` does that on a real
-    OPL1 kit rip; the synthetic logs here cover what that rip does not reach.
+    the log or in what Furnace writes back. `TestOplRegisterRoundTrip` covers
+    that through a synthetic kit log, too.
     """
 
     def test_the_pitch_table_matches_the_opl2(self):

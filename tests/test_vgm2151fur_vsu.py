@@ -26,9 +26,6 @@ from vgm2151fur.vsu import (
 TMP = Path(tempfile.gettempdir()) / "vgm2151fur_vsu"
 TMP.mkdir(exist_ok=True)
 CLOCK = VSU_DEFAULT_CLOCK
-JACK = Path(r"D:\Downloads\Jack_Bros._(Nintendo_Virtual_Boy)")
-GAL = Path(r"D:\Downloads\GalacticPinballVGM")
-A64 = Path(r"D:\Downloads\a64_redshift.vgm")
 
 
 def _vgm(writes, **kw):
@@ -226,46 +223,28 @@ class TestVsuModule(unittest.TestCase):
         self.assertGreater(fx[0x11], 0)  # noise tap
         self.assertGreater(fx[0x08], 0)  # pan
 
-    def test_real_temple_static(self):
-        p = JACK / "16 Temple of Nightmare [Level 3].vgz"
-        if not p.is_file():
-            self.skipTest(f"{p} not present")
-        song = analyze(load_vgm(p))
+    def test_static_module_layout_and_master_volume(self):
+        writes = _wave(0)
+        writes += _note(1000, 0, vol=15, off=5000)
+        writes += _note(6000, 5, fnum=0x700, vol=10, pan=0x08, ev1=0x10,
+                        off=9000)
+        song = analyze(_vgm(writes))
         self.assertEqual(song.vsu_ids, [0])
-        self.assertEqual(song.vsu_count, 2401)
         self.assertFalse(song.vsu_dynamic)
-        self.assertEqual(len(song.vsu_waves), 6)
+        self.assertGreaterEqual(len(song.vsu_waves), 2)
+        self.assertLessEqual(len(song.vsu_ins), 250)
         data = write_fur(song, include_pcm=True)
         mod = parse_fur(data)
         self.assertEqual(mod.chips, [CHIP_VBOY])
         self.assertEqual(mod.n_ch, 6)
-        self.assertLessEqual(len(song.vsu_ins), 250)
         self.assertAlmostEqual(master_volume(data), 2.2, places=2)
         self.assertEqual([round(c.volume, 3) for c in read_chips(data)], [1.0])
 
-    def test_real_opening_noise(self):
-        p = JACK / "08 Opening 2.vgz"
-        if not p.is_file():
-            self.skipTest(f"{p} not present")
-        song = analyze(load_vgm(p))
-        self.assertTrue(any(h.on and h.tone_chip == 7 and h.ch % 6 == 5
-                            for h in song.events))
-        data = write_fur(song, include_pcm=True)
-        mod = parse_fur(data)
-        tap = 0
-        for ch in range(mod.n_ch):
-            for oi in mod.orders[ch]:
-                for row in mod.patterns.get((ch, oi), []):
-                    tap += sum(1 for cmd, _v in (row.fx or []) if cmd == 0x11)
-        self.assertGreater(tap, 0)
-
-    def test_real_stage_sweep_and_envelope(self):
-        p = GAL / "04 Stage Select.vgz"
-        if not p.is_file():
-            self.skipTest(f"{p} not present")
-        song = analyze(load_vgm(p))
-        data = write_fur(song, include_pcm=True)
-        mod = parse_fur(data)
+    def test_channel4_sweep_effect_is_emitted(self):
+        writes = _wave(0)
+        writes += [_w(1000, 0x147, 0x45)]
+        writes += _note(1000, 4, fnum=0x200, vol=12, ev1=0x40, off=5000)
+        _song, _data, mod = self._module(writes)
         fx = collections.Counter()
         for ch in range(mod.n_ch):
             for oi in mod.orders[ch]:
@@ -273,14 +252,15 @@ class TestVsuModule(unittest.TestCase):
                     for cmd, _val in (row.fx or []):
                         fx[cmd] += 1
         self.assertGreater(fx[0x13], 0)  # channel-4 sweep
+        self.assertEqual(fx[0x14], 0)
 
-    def test_real_important_modulation_table(self):
-        p = GAL / "01 Important.vgz"
-        if not p.is_file():
-            self.skipTest(f"{p} not present")
-        song = analyze(load_vgm(p))
-        data = write_fur(song, include_pcm=True)
-        mod = parse_fur(data)
+    def test_channel4_modulation_effect_and_fd_table(self):
+        table = bytes((0x00, 0xA7, 0x1D)) + bytes(range(3, 32))
+        writes = [_w(0, 0xA0 + i, b) for i, b in enumerate(table)]
+        writes += _wave(0)
+        writes += [_w(1000, 0x147, 0x74)]
+        writes += _note(1000, 4, fnum=0x200, vol=12, ev1=0x50, off=5000)
+        _song, data, mod = self._module(writes)
         fx = collections.Counter()
         for ch in range(mod.n_ch):
             for oi in mod.orders[ch]:
@@ -304,12 +284,14 @@ class TestVsuModule(unittest.TestCase):
                 if code == b"FD" and size >= 41:
                     tables.append(blk[p + 9:p + 41])
                 p += size
-        self.assertTrue(any(t[:3] == bytes((0, 0xA7, 0x1D)) for t in tables))
+        self.assertTrue(any(t[:3] == table[:3] for t in tables))
 
-    def test_real_a64_dynamic_waves(self):
-        if not A64.is_file():
-            self.skipTest(f"{A64} not present")
-        song = analyze(load_vgm(A64))
+    def test_dynamic_waves_emit_live_effects_and_screwthis(self):
+        writes = _wave(0) + _note(1000, 0, vol=15)
+        # Rewrite table 0 while the voice is playing.
+        writes += [_w(2000, i, 0x3F) for i in range(32)]
+        writes += [_w(4000, 0x100, 0x00)]
+        song = analyze(_vgm(writes))
         self.assertTrue(song.vsu_dynamic)
         self.assertLessEqual(len(song.vsu_ins), 250)
         self.assertLessEqual(len(song.vsu_waves), 256)

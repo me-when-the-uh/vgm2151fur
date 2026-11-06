@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import math
 import tempfile
 import unittest
 from pathlib import Path
@@ -11,7 +10,9 @@ from types import SimpleNamespace
 from vgm2151fur.analyze import (
     analyze, furnace_note_name,
 )
-from vgm2151fur.diag import ym2612_keyed_intervals, ym2612_pitch_stream
+from vgm2151fur.diag import (
+    pitch_runs, ym2612_keyed_intervals, ym2612_pitch_stream,
+)
 from vgm2151fur.furio import (
     CHIP_CHANNELS, decompress_fur, iter_blocks, parse_fur,
 )
@@ -49,17 +50,6 @@ TMP = Path(tempfile.gettempdir()) / "vgm2151fur_ym2612"
 TMP.mkdir(exist_ok=True)
 HAVE_FURNACE = find_furnace() is not None
 CLOCK = 7670453
-ALIEN = Path(r"D:\Downloads\Alien Soldier\07 - Runner AD2025.vgz")
-ROBOT = Path(r"D:\Downloads\RobotBattle2.vgz")
-SAILOR_INTRO = Path(
-    r"D:\Downloads\Bishoujo Senshi Sailor Moon"
-    r"\Bishoujo Senshi Sailor Moon - 03 - Introduction (Part 1).vgz"
-)
-SAILOR_STREET = Path(
-    r"D:\Downloads\Bishoujo Senshi Sailor Moon"
-    r"\Bishoujo Senshi Sailor Moon - 09 - Stage 1-1 (Street).vgz"
-)
-CONTRA = Path(r"D:\Downloads\Contra Hard Corps\10 - The Hard Corps.vgz")
 
 
 def _vgm(writes, *, total_samples=400000, clock=CLOCK, **kw):
@@ -1708,36 +1698,38 @@ class TestYm2612DacSourceSamples(unittest.TestCase):
                          [60, 61])
 
 
-@unittest.skipUnless(ALIEN.is_file(), "Alien Soldier rip missing")
-class TestYm2612DacAlienSoldier(unittest.TestCase):
+class TestYm2612DacBudgetReuse(unittest.TestCase):
+    """Drivers that re-read one bank body stay inside the release budget."""
 
-    def test_runner_reuses_bank_samples_inside_the_budget(self):
-        song = analyze(load_vgm(ALIEN))
-        self.assertEqual(song.dac_stats.get("dac_mode"), "source")
-        self.assertLessEqual(len(song.dac_samples), DAC_RELEASE_SAMPLES)
-        self.assertGreater(song.dac_count, len(song.dac_samples))
-        self.assertFalse(song.dac_stats.get("dac_release_trimmed"))
-        self.assertFalse(any(
-            "dropped to stay inside" in w for w in song.warnings
-        ))
-
-    def test_similar_and_one_shot_bank_bodies_share_storage(self):
-        song = analyze(load_vgm(ALIEN))
-        self.assertLessEqual(len(song.dac_samples), 100)
-        self.assertLess(song.dac_stats["dac_sample_bytes"], 250000)
-        self.assertGreater(song.dac_stats.get("dac_similar_samples", 0), 20)
-        self.assertGreater(
-            song.dac_stats.get("dac_similar_shifted_notes", 0), 0,
+    def test_repeated_bank_reads_share_one_sample(self):
+        # A drum driver points back at the same bank offset for every hit.
+        # Each run must reuse the stored body by offset instead of adding a
+        # module sample per hit, or a busy track needs hundreds of slots.
+        body = bytes(0x80 + (i % 31) for i in range(64))
+        events: list[tuple[int, int, int]] = []
+        for hit in range(40):
+            t = hit * 5000
+            events.append((t, 0, 0))
+            events += [(t + i * 4, 1, 4) for i in range(8)]
+        src = _vgm(
+            _fm_note(4, 1204, t=0, off=500),
+            dac_data=bytearray(body), dac_events=events,
+            total_samples=210000,
         )
-        self.assertGreater(song.dac_stats.get("dac_oneshot_samples", 0), 0)
+        song = analyze(src, speed=6)
+        self.assertEqual(song.dac_stats.get("dac_mode"), "source")
+        self.assertEqual(len(song.dac_samples), 1)
+        self.assertGreater(song.dac_count, len(song.dac_samples))
+        self.assertLessEqual(len(song.dac_samples), DAC_RELEASE_SAMPLES)
         self.assertFalse(song.dac_stats.get("dac_release_trimmed"))
+        self.assertFalse(any("dropped to stay inside" in w for w in song.warnings))
 
 
-@unittest.skipUnless(SAILOR_INTRO.is_file(), "Sailor Moon intro rip missing")
-class TestYm2612DacSailorMoon(unittest.TestCase):
-    """A kick body read through a long DAC hold into the next snare."""
+class TestYm2612DacLongHolds(unittest.TestCase):
+    """A bank read held through a long rest must not carry it into a sample."""
 
-    def _bad_silence(self, song):
+    @staticmethod
+    def _bad_silence(song):
         import vgm2151fur.ym2612dac as dac
         bad = []
         for i, smp in enumerate(song.dac_samples):
@@ -1748,27 +1740,112 @@ class TestYm2612DacSailorMoon(unittest.TestCase):
                 bad.append((i, len(smp.data), run))
         return bad
 
-    def test_intro_splits_the_kick_and_delayed_snare(self):
-        song = analyze(load_vgm(SAILOR_INTRO))
-        self.assertGreaterEqual(
-            song.dac_stats.get("dac_source_silence_splits", 0), 7,
+    @staticmethod
+    def _bank_run() -> tuple[bytearray, list[tuple[int, int, int]]]:
+        """One pointer run: a kick, a held silence, then a snare."""
+        kick = bytes(0x80 + v for v in (9, 20, 30, 20))
+        snare = bytes(0x80 + v for v in (40, 60, 40, 20))
+        bank = bytearray(kick + b"\x80" + snare)
+        events = [(0, 0, 0)]
+        events += [(i * 4, 1, 4) for i in range(4)]
+        events.append((1000, 1, 4))  # the silent byte the DAC holds
+        events += [(5000 + i * 4, 1, 4) for i in range(4)]
+        # The driver then reads the same bank range again later.
+        events += [(20000, 0, 0)]
+        events += [(20000 + i * 4, 1, 4) for i in range(4)]
+        events.append((21000, 1, 4))
+        events += [(25000 + i * 4, 1, 4) for i in range(4)]
+        return bank, events
+
+    def test_held_gap_splits_the_source_run(self):
+        bank, events = self._bank_run()
+        src = _vgm(
+            [ChipWrite(0, "ym2612", 0, 0x22, 0)],
+            dac_data=bank, dac_events=events, total_samples=50000,
         )
-        self.assertLessEqual(len(song.dac_samples), 5)
+        song = analyze(src, speed=6)
+        self.assertEqual(song.dac_stats.get("dac_mode"), "source")
+        self.assertGreaterEqual(
+            song.dac_stats.get("dac_source_silence_splits", 0), 1,
+        )
         self.assertEqual(self._bad_silence(song), [])
-        # The run that held 16,011 samples before the snare used to lose it.
         notes = sorted(e.sample for e in song.events if e.dac and e.on)
-        self.assertTrue(
-            any(abs(t - 169750) <= 200 for t in notes), notes,
+        # The snare after the hold is its own note, not a late byte inside
+        # the kick's body.
+        self.assertTrue(any(t >= 4000 for t in notes), notes)
+        self.assertFalse(song.dac_stats.get("dac_release_trimmed"))
+
+    def test_dense_silent_stretch_leaves_the_stored_body(self):
+        # The reads stay dense through the rest, so the source splitter does
+        # not see a gap; the stored body itself has to give the silence back.
+        pre = bytes(0x80 + (i % 30 + 1) for i in range(1000))
+        mid = bytes([0x80] * 5000)
+        post = bytes(0x80 + (i % 30 + 1) for i in range(4500))
+        bank = bytearray(pre + mid + post)
+        events = [(0, 0, 0)]
+        events += [(i * 4, 1, 4) for i in range(len(bank))]
+        src = _vgm(
+            [ChipWrite(0, "ym2612", 0, 0x22, 0)],
+            dac_data=bank, dac_events=events, total_samples=30000,
+        )
+        song = analyze(src, speed=6)
+        self.assertGreaterEqual(
+            song.dac_stats.get("dac_silence_split_samples", 0), 1,
+        )
+        self.assertEqual(self._bad_silence(song), [])
+        self.assertLess(
+            sum(len(s.data) for s in song.dac_samples), len(bank),
         )
 
-    @unittest.skipUnless(SAILOR_STREET.is_file(), "Sailor Moon street rip missing")
-    def test_street_splits_every_long_hold(self):
-        song = analyze(load_vgm(SAILOR_STREET))
-        self.assertGreaterEqual(
-            song.dac_stats.get("dac_source_silence_splits", 0), 20,
+
+class TestYm2612DacUnusedSamples(unittest.TestCase):
+    def test_source_mode_drops_a_sample_no_row_selects(self):
+        # A DAC note and an FM6 note can land on the same cell. The later FM6
+        # key wins the pattern cell, so the body stored for the lost DAC note
+        # is never played. The writer must remove that slot (and keep the
+        # surviving one) instead of shipping an unreachable sample.
+        writes = [
+            ChipWrite(0, "ym2612", 0, 0x2B, 0x80),   # DAC on
+        ] + _patch(0, 0, 1, 2) + [
+            ChipWrite(0, "ym2612", 0, 0x1A4, (4 << 3)),
+            ChipWrite(0, "ym2612", 0, 0x1A0, 0x00),
+            ChipWrite(20, "ym2612", 0, 0x2B, 0x00),  # DAC off
+            ChipWrite(21, "ym2612", 0, 0x28, 0xF6),  # FM6 takes the row
+            ChipWrite(40000, "ym2612", 0, 0x28, 0x06),
+            ChipWrite(50000, "ym2612", 0, 0x2B, 0x80),
+        ]
+        bank = bytearray(bytes(0x80 + v for v in (9, 20, 30, 20)))
+        bank += b"\x80"
+        bank += bytes(0x80 + v for v in (40, 60, 40, 20))
+        events = [(2, 0, 0)]
+        events += [(2 + i * 2, 1, 2) for i in range(4)]
+        events.append((1000, 1, 2))
+        events += [(50002 + i * 4, 1, 4) for i in range(4)]
+        src = _vgm(
+            writes, dac_data=bank, dac_events=events, total_samples=60000,
         )
-        self.assertLessEqual(len(song.dac_samples), 10)
-        self.assertEqual(self._bad_silence(song), [])
+        song = analyze(src, speed=6)
+        self.assertEqual(song.dac_stats.get("dac_mode"), "source")
+        self.assertEqual(len(song.dac_samples), 2)
+        self.assertEqual(song.dac_count, 2)
+
+        stats: dict = {}
+        data = write_fur(song, include_pcm=True, stats=stats)
+        mod = parse_fur(data)
+        unused = stats.get("dac_samples_unused", 0)
+        self.assertGreaterEqual(unused, 1)
+        self.assertGreater(stats.get("note_collision", 0), 0)
+        self.assertEqual(
+            len(mod.samples), len(song.dac_samples) - unused,
+        )
+        base = len(song.fm_patches)
+        n_ins = (len(song.dac_samples) + 119) // 120
+        used = set()
+        for (_ch, _pat), rows in mod.patterns.items():
+            for row in rows:
+                if 60 <= row.note < 180 and base <= row.ins < base + n_ins:
+                    used.add((row.ins - base) * 120 + (row.note - 60))
+        self.assertEqual(used, set(range(len(mod.samples))))
 
 
 class TestSampleMapCleanup(unittest.TestCase):
@@ -1792,125 +1869,32 @@ class TestSampleMapCleanup(unittest.TestCase):
         self.assertEqual((rows[2].note, rows[2].ins), (60, 1))
 
 
-@unittest.skipUnless(CONTRA.is_file(), "Contra Hard Corps rip missing")
-class TestYm2612DacContra(unittest.TestCase):
-    def test_source_mode_fits_after_unused_samples_are_removed(self):
-        song = analyze(load_vgm(CONTRA))
-        self.assertEqual(song.dac_stats.get("dac_mode"), "source")
-        self.assertLessEqual(len(song.dac_samples), DAC_RELEASE_SAMPLES)
-        stats: dict = {}
-        data = write_fur(song, include_pcm=True, stats=stats)
-        mod = parse_fur(data)
-        unused = stats.get("dac_samples_unused", 0)
-        self.assertGreaterEqual(unused, 1)
-        self.assertEqual(
-            len(mod.samples), len(song.dac_samples) - unused,
+@unittest.skipUnless(HAVE_FURNACE, "furnace console build missing")
+class TestYm2612PitchRoundTrip(unittest.TestCase):
+    """Every OPN2 channel keeps its source pitch through Furnace."""
+
+    def test_all_channels_survive_the_round_trip(self):
+        notes = (
+            (4, 1204, 0), (3, 923, 1), (2, 702, 2),
+            (4, 1232, 3), (3, 1466, 4), (4, 1100, 5),
         )
-        base = len(song.fm_patches)
-        n_ins = (len(song.dac_samples) + 119) // 120
-        used = set()
-        for (_ch, _pat), rows in mod.patterns.items():
-            for row in rows:
-                if 60 <= row.note < 180 and base <= row.ins < base + n_ins:
-                    used.add((row.ins - base) * 120 + (row.note - 60))
-        self.assertEqual(used, set(range(len(mod.samples))))
-
-
-@unittest.skipUnless(ROBOT.is_file(), "RobotBattle2 rip missing")
-class TestYm2612DacRobotBattle(unittest.TestCase):
-
-    def test_two_offsets_share_their_longest_bodies(self):
-        song = analyze(load_vgm(ROBOT))
-        self.assertEqual(song.dac_stats.get("dac_mode"), "source")
-        self.assertLessEqual(len(song.dac_samples), 8)
-        self.assertGreater(song.dac_count, 0)
-        self.assertFalse(song.dac_stats.get("dac_release_trimmed"))
-
-
-PACK = (
-    Path(__file__).resolve().parents[2]
-    / "VGM_collection" / "YM2612"
-    / "Thunder Force IV (Lightening Force) (Mega Drive, Genesis)"
-)
-HAVE_PACK = PACK.is_dir() and any(PACK.glob("*.vgz"))
-
-
-class TestYm2612FmTownsExt(unittest.TestCase):
-    """FM Towns MIDI rips whose opening channel-3 chord is only partly keyed."""
-
-    RIPS = (
-        (Path(r"F:\NASbackup\JamesAlan\_devspace\grbsd\ripwip\_finished"
-              r"\xenon-fmtowns\done\17 Ranphar 2.vgz"), 593),
-        (Path(r"F:\NASbackup\JamesAlan\_devspace\grbsd\ripwip\_finished"
-              r"\xenon-fmtowns\done\09 Contact.vgz"), 179),
-    )
-
-    def _check(self, path: Path, first_sample: int):
-        if not path.is_file():
-            self.skipTest(f"{path.name} not present")
-        vgm = load_vgm(path)
-        song = analyze(vgm)
-        self.assertTrue(song.ym2612_ext)
-        first = [(e.sample, e.ch) for e in song.events
-                 if e.on and e.ch in (2, 3, 4, 5)][:2]
-        self.assertEqual(first, [(first_sample, 2), (first_sample, 3)])
-        data = write_fur(song, include_pcm=False)
-        self.assertIn(b"clockSel=2", data)
-        self.assertNotIn(b"customClock=8000000", data)
-
-    def test_ranphar_opening_pair_keeps_its_attack(self):
-        self._check(*self.RIPS[0])
-
-    def test_contact_opening_pair_keeps_its_attack(self):
-        self._check(*self.RIPS[1])
-
-
-@unittest.skipUnless(HAVE_FURNACE and HAVE_PACK, "Furnace or the TFIV pack missing")
-class TestYm2612RealPack(unittest.TestCase):
-    """The pack the YM2612 model was tuned on: every channel pitch-exact."""
-
-    def _check(self, name: str):
-        from vgm2151fur.analyze import analyze as run_analyze
-        from vgm2151fur.diag import pitch_runs
-
-        src = load_vgm(PACK / name)
-        song = run_analyze(src)
+        ws: list[ChipWrite] = []
+        for block, fnum, ch in notes:
+            t = 100 + ch * 12000
+            ws += _fm_note(block, fnum, t=t, off=t + 6000, ch=ch)
+        src = _vgm(ws, total_samples=80000)
+        song = analyze(src)
         self.assertFalse(song.warnings, song.warnings)
-        fur = TMP / "real_pack.fur"
+        fur = TMP / "ym2612_pitch_round_trip.fur"
         fur.write_bytes(write_fur(song, include_pcm=False))
-        out = TMP / "real_pack.vgm"
+        out = TMP / "ym2612_pitch_round_trip.vgm"
         export_vgm(fur, out)
-        other = load_vgm(out)
+        back = load_vgm(out)
         for ch in range(6):
-            runs = pitch_runs(src, other, ch, threshold_st=0.25, min_run_ms=60)
-            self.assertEqual(runs, [], f"{name} ch{ch}: {runs[:3]}")
-
-    def test_fighting_back(self):
-        self._check("04 - Fighting Back (Stage 1A).vgz")
-
-    def test_evil_destroyer_octave_steps(self):
-        self._check("06 - Evil Destroyer (Stage 1 Boss).vgz")
-
-
-TIMETRAX = Path(r"D:\Downloads\timetraxvgm\01 BGM #01.vgm")
-
-
-class TestYm2612MidNotePatch(unittest.TestCase):
-    """Time Trax swaps patches into a drone that is never re-keyed."""
-
-    def test_held_drone_splits_on_the_patch_swap(self):
-        if not TIMETRAX.is_file():
-            self.skipTest(f"{TIMETRAX} not present")
-        song = analyze(load_vgm(TIMETRAX))
-        on = [
-            e for e in song.events
-            if e.on and e.ch == 4 and 1282500 <= e.sample <= 1301600
-        ]
-        self.assertEqual([e.sample for e in on], [1283215, 1301543])
-        self.assertEqual(on[0].end, 1301540)
-        self.assertNotEqual(on[0].ins, on[1].ins)
-        self.assertEqual(song.fm_patches[on[0].ins].alg, 2)
-        self.assertEqual(song.fm_patches[on[1].ins].alg, 4)
+            self.assertEqual(
+                pitch_runs(src, back, ch, threshold_st=0.25, min_run_ms=60),
+                [], f"ch{ch}",
+            )
 
 
 if __name__ == "__main__":

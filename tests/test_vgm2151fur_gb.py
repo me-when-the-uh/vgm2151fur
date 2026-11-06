@@ -488,23 +488,5 @@ class TestGbModule(unittest.TestCase):
         self.assertIn(CHIP_GB, mod.chips)
 
 
-KUK = Path(r"D:\downloads\timetraxvgm\kuk\djtBMX_vgmmergetest.vgm")
-
-
-class TestGbMergedOrder(unittest.TestCase):
-    """A merged rip that writes each trigger before its same-sample setup."""
-
-    def test_pulse_notes_survive_the_merge(self):
-        if not KUK.is_file():
-            self.skipTest(f"{KUK} not present")
-        hits, _offs, _waves, _warn = collect_gb(load_vgm(KUK))
-        voices = {h.voice for h in hits}
-        self.assertEqual(voices, {0, 1, 2})
-        self.assertEqual(sum(1 for h in hits if h.voice == 0), 22)
-        self.assertEqual(sum(1 for h in hits if h.voice == 1), 24)
-        song = analyze(load_vgm(KUK))
-        self.assertEqual(song.gb_count, 47)
-
-
 if __name__ == "__main__":
     unittest.main()

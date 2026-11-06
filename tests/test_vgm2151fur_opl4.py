@@ -2,13 +2,12 @@
 
 The FM half is the shared OPL path under the OPL3 tables; the tests here cover
 the ``$D0`` port split, the 12-byte wave descriptor table, sample extraction
-from the YRW801/ROM and the 0x87 RAM image, the 42-channel system, and the two
-MoonDriver rips through Furnace when the roots are configured.
+from the YRW801/ROM and the 0x87 RAM image, the 42-channel system, the rhythm
+kit, and a synthetic wave round trip through Furnace.
 """
 
 from __future__ import annotations
 
-import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -19,11 +18,11 @@ from vgm2151fur.furwrite import (
     CHIP_OPL4, CHIP_OPL4_DRUMS, INS_MULTIPCM, INS_OPL, write_fur,
 )
 from vgm2151fur.furnace import export_vgm, find_furnace
+from vgm2151fur.opl import KIND_OPL3, OPLState
 from vgm2151fur.vgm import ChipWrite, RomSlice, VgmFile, chips_in_head, load_vgm
 from vgm2151fur.ymf278b import (
     OPL4_WAVE_SLOTS,
     collect_opl4_wave,
-    load_yrw801,
     opl4_pan_fx,
     opl4_rate,
     opl4_step,
@@ -59,7 +58,8 @@ def _rom(wave: int, sample: bytes, start: int = 0x1000) -> bytes:
 def _vgm(writes, roms=(), **kw):
     return VgmFile(
         path=Path("synthetic.vgm"), buf=b"", version=0x161,
-        total_samples=400000, loop_samples=0, loop_file_pos=None,
+        total_samples=kw.pop("total_samples", 400000),
+        loop_samples=0, loop_file_pos=None,
         loop_sample=None, ym2151_clock=3579545, k007232_clock=0, gd3={},
         roms=list(roms), writes=list(writes), ymf278b_clock=CLOCK, **kw,
     )
@@ -81,6 +81,21 @@ def _wave_note(t: int, *, wave: int = 16, slot: int = 0, fnum: int = 0x200,
         ChipWrite(t, "ymf278b", 0, _wave_reg(slot, 4), 0x8F),
         ChipWrite(off, "ymf278b", 0, _wave_reg(slot, 4), 0x0F),
     ]
+
+
+def _fm_key(t: int, ch: int, *, block: int = 4, fnum: int = 580,
+            off: int | None = None) -> list[ChipWrite]:
+    """A keyed OPL3-shaped FM voice on the OPL4's port 0."""
+    cm = OPLState(KIND_OPL3, False).chan_map[ch]
+    out = [
+        ChipWrite(t, "ymf278b", 0, cm + 0xA0, fnum & 0xFF),
+        ChipWrite(t, "ymf278b", 0, cm + 0xB0,
+                  (block << 2) | ((fnum >> 8) & 3) | 0x20),
+    ]
+    if off is not None:
+        out.append(ChipWrite(off, "ymf278b", 0, cm + 0xB0,
+                             (block << 2) | ((fnum >> 8) & 3)))
+    return out
 
 
 def _raw_vgm(cmds: bytes, blocks=(), clock: int = CLOCK) -> bytes:
@@ -120,6 +135,27 @@ class TestOpl4Parsing(unittest.TestCase):
         self.assertEqual(got, [(0x0020, 1), (0x0120, 2), (0x0208, 16)])
         self.assertEqual([s.kind for s in v.roms], ["ymf278b_rom", "ymf278b_ram"])
         self.assertIn("ymf278b", chips_in_head(raw[:0x100]))
+
+
+class TestOpl4Rhythm(unittest.TestCase):
+    def test_bank_zero_bd_latches_the_kit(self):
+        # The OPL4's rhythm register is bank 0's $BD, exactly the OPL3's.
+        # Its FM half must expose the same five kit columns after a latch.
+        ws: list[ChipWrite] = []
+        for k in range(8):
+            t = 1000 + k * 5000
+            ws += _fm_key(t, 15, block=4, fnum=580, off=t + 3000)
+        ws += [
+            ChipWrite(2000, "ymf278b", 0, 0xBD, 0x20),
+            ChipWrite(4000, "ymf278b", 0, 0xBD, 0x3F),
+            ChipWrite(28000, "ymf278b", 0, 0xBD, 0x20),
+        ]
+        song = analyze(_vgm(ws))
+        self.assertTrue(song.opl_drums)
+        used = {e.ch for e in song.events if e.on and e.ch >= 15}
+        self.assertEqual(used, {15, 16, 17, 18, 19})
+        self.assertGreater(song.drum_notes, 0)
+        self.assertFalse(any("write no notes" in w for w in song.warnings))
 
 
 class TestOpl4Wave(unittest.TestCase):
@@ -379,66 +415,43 @@ class TestOpl4Writer(unittest.TestCase):
         self.assertEqual(notes[0][1], 1)
 
 
-def _sample_root() -> Path | None:
-    raw = os.environ.get("VGM2151FUR_OPL4_RIPS")
-    if raw and Path(raw).is_dir():
-        return Path(raw)
-    return None
+def _wave_keys(v):
+    """Every rising wave-slot key bit in a register stream."""
+    out = []; prev = {}
+    for w in v.writes:
+        if w.chip != "ymf278b" or (w.reg >> 8) != 2:
+            continue
+        r = w.reg & 0xFF
+        if 0x08 <= r <= 0xF7 and (r - 8) // 24 == 4:
+            slot = (r - 8) % 24
+            on = bool(w.val & 0x80)
+            was = prev.get(slot, False)
+            prev[slot] = on
+            if on and not was:
+                out.append((w.sample, slot))
+    return out
 
 
-def _have_yrw801() -> bool:
-    return bool(load_yrw801())
-
-
-@unittest.skipUnless(
-    HAVE_FURNACE and _sample_root() and _have_yrw801(),
-    "OPL4 rips or YRW801 missing",
-)
-class TestOpl4RealRips(unittest.TestCase):
-    def _convert(self, name: str):
-        root = _sample_root()
-        path = root / name
-        if not path.is_file():
-            self.skipTest(f"{name} missing")
-        src = load_vgm(path)
+@unittest.skipUnless(HAVE_FURNACE, "furnace console build missing")
+class TestOpl4WaveRoundTrip(unittest.TestCase):
+    def test_wave_keys_and_clock_survive_the_module(self):
+        sample = bytes(range(1, 21))
+        src = _vgm(_wave_note(100, wave=16, slot=0), total_samples=10000,
+                   roms=[RomSlice(0, 0, 0, _rom(16, sample), "ymf278b_rom")])
         song = analyze(src)
-        fur = TMP / (path.stem[:40] + ".fur")
-        fur.write_bytes(write_fur(song, compress=True))
-        out = TMP / (path.stem[:40] + ".export.vgm")
-        export_vgm(fur, out)
-        return src, song, load_vgm(out)
-
-    def _wave_keys(self, v):
-        out = []; prev = {}
-        for w in v.writes:
-            if w.chip != "ymf278b" or (w.reg >> 8) != 2:
-                continue
-            r = w.reg & 0xFF
-            if 0x08 <= r <= 0xF7 and (r - 8) // 24 == 4:
-                slot = (r - 8) % 24
-                on = bool(w.val & 0x80)
-                was = prev.get(slot, False)
-                prev[slot] = on
-                if on and not was:
-                    out.append((w.sample, slot))
-        return out
-
-    def test_encounter_the_unknown_environment(self):
-        src, song, exp = self._convert("05 encounter the unknown environment.vgz")
         self.assertEqual([s.kind for s in song.fm_systems], ["opl4"])
         self.assertTrue(song.opl4_wave_samples)
+
+        fur = TMP / "wave_roundtrip.fur"
+        out = TMP / "wave_roundtrip.vgm"
+        fur.write_bytes(write_fur(song, compress=True))
+        export_vgm(fur, out)
+        exp = load_vgm(out)
+
         self.assertEqual(exp.ymf278b_clock, src.ymf278b_clock)
         lim = src.total_samples
-        src_keys = self._wave_keys(src)
-        exp_keys = [k for k in self._wave_keys(exp) if k[0] < lim]
-        self.assertEqual(len(src_keys), len(exp_keys))
-
-    def test_times_up(self):
-        src, song, exp = self._convert("06 TIME'S UP!.vgz")
-        self.assertTrue(song.opl4_wave_samples)
-        lim = src.total_samples
-        self.assertEqual(len(self._wave_keys(src)),
-                         len([k for k in self._wave_keys(exp) if k[0] < lim]))
+        self.assertEqual(len(_wave_keys(src)),
+                         len([k for k in _wave_keys(exp) if k[0] < lim]))
 
 
 if __name__ == "__main__":

@@ -615,16 +615,33 @@ class TestNesModule(unittest.TestCase):
         self.assertEqual(mod.n_ch, 6)
 
 
-class TestNesPcmBankingRealRip(unittest.TestCase):
-    SRC = Path(r"D:\Apps\Player\NezPlug++\nsf\entry001_01.vgm")
-
+class TestNesPcmBanking(unittest.TestCase):
     def test_long_capture_is_banked_and_tail_silence_dropped(self):
-        if not self.SRC.is_file():
-            self.skipTest(f"{self.SRC} not present")
-        song = analyze(load_vgm(self.SRC))
-        # The whole 155 s $4011 capture used to become one 1.7M-frame sample.
-        # It is now <=240 chunks in 120-slot maps, and the trailing silence is
-        # not stored.
+        # A long $4011 capture is banked across 120-slot sample maps.  Each
+        # sounding burst has a different length so the bodies stay distinct;
+        # the trailing zero run is a rest and is not stored.
+        writes: list[ChipWrite] = []
+        t = 100
+        pieces = 121
+        tail_silence_start = 0
+        for j in range(pieces):
+            length = 64 + 4 * j
+            for i in range(length):
+                writes.append(_nes(t, 0x11, 0x20 + ((i + j) % 16)))
+                t += 4
+            if j == pieces - 1:
+                tail_silence_start = t
+            # A zero run long enough to be a rest after resampling.
+            for _i in range(188):
+                writes.append(_nes(t, 0x11, 0x40))
+                t += 16
+            t += 4
+        for _i in range(256):
+            writes.append(_nes(t, 0x11, 0x40))
+            t += 16
+
+        song = analyze(_vgm(writes))
+        self.assertGreater(len(song.nes_pcm_samples), 120)
         self.assertLessEqual(len(song.nes_pcm_samples), 240)
         self.assertEqual(song.nes_pcm_count, len(song.nes_pcm_samples))
         self.assertEqual(
@@ -638,7 +655,7 @@ class TestNesPcmBankingRealRip(unittest.TestCase):
             e.end for e in song.events
             if e.on and getattr(e, "dac", False)
         )
-        self.assertLess(last_end, 6_700_000)  # tail silence starts here
+        self.assertLess(last_end, tail_silence_start + 64)
 
 
 class TestNesDpcmWriter(unittest.TestCase):
