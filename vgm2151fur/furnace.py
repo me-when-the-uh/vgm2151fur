@@ -70,6 +70,8 @@ def _candidates() -> list[Path]:
         else:
             out.append(p)
     out += [
+        here / "furnace" / exe,
+        here / "furnace" / "build" / exe,
         here.parent / "furnace" / exe,
         here.parent / "furnace" / "build" / exe,
         here / "third_party" / "furnace-console" / exe,

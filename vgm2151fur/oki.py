@@ -229,6 +229,23 @@ def _chip_to_phys(addr: int, banks: list[int], banked: bool) -> int:
     return (page << 16) | (addr & 0xFFFF)
 
 
+def _read_flat(rom: bytes, start: int, stop: int, base: int) -> bytes:
+    """Read a bank-relative range from a flat 256 KB MSM6295 bank.
+
+    Register 0x0F selects one 256 KB bank (the VGMPlay player convention for
+    a 512 KB or larger ROM). Phrase headers and their sample data are both
+    relative to that bank, so a 512 KB ROM uses base 0 or 0x40000.
+    """
+    if stop < start:
+        return b""
+    begin = base + start
+    end = base + stop + 1
+    piece = rom[begin:end]
+    if len(piece) < end - begin:
+        piece += bytes(end - begin - len(piece))
+    return piece
+
+
 def _read_mapped(rom: bytes, start: int, stop: int, banks: list[int], banked: bool) -> bytes:
     if stop < start:
         return b""
@@ -289,6 +306,11 @@ def collect_oki(vgm: VgmFile) -> tuple[list[OkiSample], list[str]]:
             warnings.append(f"MSM6295 chip {chip_id}: no ROM block (0x8B)")
         banks = [0, 0, 0, 0]
         banked = False
+        # Register 0x0F is the single 256 KB bank select some drivers use
+        # instead of the NMK112 map (0x0E + 0x10-0x13). None means "not seen";
+        # an explicit 0 selects the first bank, which is different from the
+        # unbanked read.
+        flat_bank: int | None = None
         latch: int | None = None
         active: list[OkiHit | None] = [None] * OKI_VOICES
         empty_phrases = 0
@@ -299,6 +321,9 @@ def collect_oki(vgm: VgmFile) -> tuple[list[OkiSample], list[str]]:
             reg, val = w.reg, w.val
             if reg == 0x0E:
                 banked = bool(val & 0x80)
+                continue
+            if reg == 0x0F:
+                flat_bank = (val & 0xFF) * 0x40000
                 continue
             if 0x10 <= reg <= 0x13:
                 banks[reg - 0x10] = val
@@ -313,7 +338,12 @@ def collect_oki(vgm: VgmFile) -> tuple[list[OkiSample], list[str]]:
                 vol = oki_furnace_vol(val)
                 if vol is None or mask == 0 or not rom:
                     continue
-                hdr = _read_mapped(rom, phrase * 8, phrase * 8 + 5, banks, banked)
+                if flat_bank is not None:
+                    hdr = _read_flat(rom, phrase * 8, phrase * 8 + 5, flat_bank)
+                else:
+                    hdr = _read_mapped(
+                        rom, phrase * 8, phrase * 8 + 5, banks, banked,
+                    )
                 start = ((hdr[0] << 16) | (hdr[1] << 8) | hdr[2]) & 0x3FFFF
                 stop = ((hdr[3] << 16) | (hdr[4] << 8) | hdr[5]) & 0x3FFFF
                 if stop < start or stop == start == 0:
@@ -322,7 +352,10 @@ def collect_oki(vgm: VgmFile) -> tuple[list[OkiSample], list[str]]:
                 if stop - start > 0x40000:
                     empty_phrases += 1
                     continue
-                data = _read_mapped(rom, start, stop, banks, banked)
+                if flat_bank is not None:
+                    data = _read_flat(rom, start, stop, flat_bank)
+                else:
+                    data = _read_mapped(rom, start, stop, banks, banked)
                 if not data or not any(data):
                     empty_phrases += 1
                     continue

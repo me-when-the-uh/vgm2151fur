@@ -19,6 +19,7 @@ from vgm2151fur.c352 import C352_DEFAULT_CLOCK
 from vgm2151fur.fm import CARRIERS, OPN_CARRIERS
 from vgm2151fur.nes import nes_dpcm_rate
 from vgm2151fur.oki import msm6258_flag_text, oki_flag_text, oki_needs_banked
+from vgm2151fur.ymz280b import ymz280b_clock
 from vgm2151fur.opl import (
     FURNACE_CLOCK, FURNACE_CLOCK_OPL3, opl_module_clock, opll_clock_flag,
     opll_module_clock,
@@ -82,6 +83,10 @@ CHIP_YM2608_EXT = 0xB7
 # TI SN76489 (the SMS platform): three square voices then noise.  A Genesis
 # module carries it as a second system after the YM2612.
 CHIP_SMS = 0x03
+# DIV_SYSTEM_T6W28: the Neo Geo Pocket Color's stereo SN76489 variant.
+# Four channels (three square + noise), independent panL/panR.
+CHIP_T6W28 = 0xBF
+T6W28_DEFAULT_CLOCK = 3_072_000
 CHIP_MSM6295 = 0xAA
 CHIP_MSM6258 = 0xAB
 CHIP_K007232 = 0xC6
@@ -91,6 +96,10 @@ CHIP_SEGAPCM = 0x9B
 CHIP_RF5C68 = 0x95
 CHIP_C140 = 0xCE
 CHIP_K053260 = 0xCC
+# DIV_SYSTEM_YMZ280B: eight PCM/ADPCM sample voices.
+CHIP_YMZ280B = 0xB8
+# DIV_SYSTEM_VBOY: five wavetable voices and one noise voice.
+CHIP_VBOY = 0x9C
 # Furnace format.md reserves 0xD0 for Namco C352, 32 channels, and marks it
 # unavailable. 0.6.8.3 has no C352 core and no C352 instrument type.
 CHIP_C352 = 0xD0
@@ -227,6 +236,9 @@ INS_MSM6295 = 36
 INS_ADPCMA = 37
 INS_ADPCMB = 38
 INS_SEGAPCM = 39
+# DIV_INS_YMZ280B: one sample body per instrument (or a 120-slot note map
+# when the module's instrument budget requires it).
+INS_YMZ280B = 41
 INS_RF5C68 = 42
 # DIV_INS_MULTIPCM: the OPL4 wave slot's sample-map instrument.
 INS_MULTIPCM = 28
@@ -244,16 +256,23 @@ INS_SCC = 18
 # DIV_INS_PCE: the HuC6280's 32x5-bit wavetable, through the same wave synth
 # as the SCC. Its direct-D/A bodies use DIV_INS_AMIGA (INS_C352 above).
 INS_PCE = 5
+# DIV_INS_T6W28: the T6W28's plain square/noise instrument.  It shares the
+# standard macro layout; only the platform system differs.
+INS_T6W28 = 44
 # DIV_INS_NES: the 2A03 pulse/triangle/noise and DPCM instrument.  The DPCM
 # sample rides the same `amiga` sample feature (1-bit DPCM or 8-bit PCM).
 INS_NES = 34
 # DIV_INS_GB: the Game Boy's hardware envelope plus an optional wave-synth
 # feature for the wavetable voice.
 INS_GB = 2
+# DIV_INS_VBOY: a wavetable instrument with the FD modulation table and the
+# wave-synth feature.  VSU wave changes ride the pattern as 10xx effects.
+INS_VBOY = 16
 SMP_DEPTH_DPCM = 1
 SMP_DEPTH_ADPCM_K = 7
 SMP_DEPTH_ADPCM_A = 5
 SMP_DEPTH_ADPCM_B = 6
+SMP_DEPTH_YMZ_ADPCM = 3
 SMP_DEPTH_8BIT = 8
 SMP_DEPTH_16BIT = 16
 SMP_DEPTH_VOX = 10
@@ -282,6 +301,7 @@ _DEV_DEFAULT_VOLUME = {
     0x00: 0x80,
     0x03: 0x100, 0x04: 0x180, 0x08: 0x100, 0x12: 0x100, 0x16: 0x11E,
     0x18: 0x100, 0x19: 0xA0, 0x1C: 0x100, 0x1D: 0x100, 0x27: 0x40,
+    0x0F: 0x100, 0x22: 0x100,  # VSU
 }
 _DEV_CORE_PATCH = {
     0x19: lambda v: v * 8 // 5,  # K051649 SCC core scale
@@ -293,16 +313,23 @@ _DEV_CORE_PATCH = {
 _FURNACE_VOLUME_SCALE = {
     0x00: 1.0, 0x03: 1.0, 0x04: 1.0, 0x12: 1.46, 0x16: 0.61, 0x18: 1.0,
     0x1C: 0.7, 0x19: 1.04,
+    # YMZ280B's Furnace core is 1.27x quieter than VGMPlay's at the same
+    # system volume (measured on the two-chip Stage 4 module).
+    0x0F: 1.27,
     # MAME shifts the voice product by 6 bits, the Furnace core by 7, so the
     # module needs twice the player's system volume to reach the same level.
     0x1D: 2.0,
+    # VBOY's core has a 6x post-amp.  Measured against VGMPlay on Galactic
+    # Pinball and Jack Bros: the module is about 2.2x quieter at unity.
+    0x22: 2.2,
 }
 # MSM6258's player default is 0x11E; its Furnace core is 1.64x louder, so
 # 0.61 lands the sample at the source level. The MSM6295 (0x18) is unity.
 _CHIP_DEV = {CHIP_YM2151: 0x03, CHIP_SEGAPCM: 0x04, CHIP_MSM6295: 0x18,
              CHIP_MSM6258: 0x16, CHIP_C140: 0x1C, CHIP_C352: 0x27,
-             CHIP_K053260: 0x1D,
-             CHIP_SMS: 0x00, CHIP_K051649: 0x19, CHIP_K052539: 0x19,
+             CHIP_K053260: 0x1D, CHIP_YMZ280B: 0x0F, CHIP_VBOY: 0x22,
+             CHIP_SMS: 0x00, CHIP_T6W28: 0x00,
+             CHIP_K051649: 0x19, CHIP_K052539: 0x19,
              CHIP_AY8910: 0x12,
              CHIP_YM2610: 0x08, CHIP_YM2610B: 0x08}
 
@@ -330,11 +357,16 @@ def _sample_chip_volume(song: "Song", chip: int, instances: int) -> float:
     dev = _CHIP_DEV.get(chip)
     if dev is None:
         return 1.0
-    if chip == CHIP_MSM6295 and song.vgm.msm6295_dual:
+    if chip == CHIP_MSM6295 and getattr(song.vgm, "msm6295_dual", False):
         # The player halves every instance when the header carries two,
         # even on a track that only writes to one of them.
         instances = max(instances, 2)
     scale = _FURNACE_VOLUME_SCALE.get(dev, 1.0)
+    if chip == CHIP_YMZ280B:
+        # VGMPlay does not halve a YMZ280B pair: both Stage 4 instances run
+        # at full output. Furnace also mixes the two systems at full level,
+        # so keep the per-chip value independent of the instance count.
+        instances = 1
     return scale * _player_chip_volume(song.vgm, dev, instances)
 
 
@@ -559,6 +591,29 @@ def _write_ma(b: Buf, patch=None) -> None:
                 speed=getattr(patch, "pitch_speed", 1) or 1,
                 loop=getattr(patch, "pitch_loop", 255),
                 width=2,
+            )
+        # OPLL tick-rate automation: volume (code 0), preset wave (code 3) and
+        # repeated key-on retrigger (code 14).
+        vol = getattr(patch, "vol_macro", ()) or ()
+        if vol:
+            _write_macro(
+                b, 0, vol,
+                speed=getattr(patch, "vol_speed", 1) or 1,
+                loop=getattr(patch, "vol_loop", 255),
+            )
+        wave = getattr(patch, "wave_macro", ()) or ()
+        if wave:
+            _write_macro(
+                b, 3, wave,
+                speed=getattr(patch, "wave_speed", 1) or 1,
+                loop=getattr(patch, "wave_loop", 255),
+            )
+        phase = getattr(patch, "phase_macro", ()) or ()
+        if phase:
+            _write_macro(
+                b, 14, phase,
+                speed=getattr(patch, "phase_speed", 1) or 1,
+                loop=getattr(patch, "phase_loop", 255),
             )
     b.u8(255)  # stop
     b.b[size_off:size_off + 2] = int(len(b.b) - start).to_bytes(2, "little")
@@ -833,15 +888,17 @@ def _write_tone_macros(b: Buf, ins, *, wave: bool, reset: bool = False) -> None:
     b.b[ma_size:ma_size + 2] = int(len(b.b) - ma_start).to_bytes(2, "little")
 
 
-def _write_ins_psg(b: Buf, name: str, ins=None) -> None:
-    """DIV_INS_STD for the SMS/SN76489: only the pitch macro is needed.
+def _write_ins_psg(
+    b: Buf, name: str, ins=None, ins_type: int = INS_STD,
+) -> None:
+    """Plain SN76489/T6W28 instrument: only the pitch macro is needed.
 
     The 4-bit volume is the pattern column, and noise mode rides on the 20xy
     effect, so a no-motion note gets a plain instrument.
     """
     size_off, start = b.begin_block(b"INS2")
     b.u16(FUR_VERSION)
-    b.u16(INS_STD)
+    b.u16(ins_type)
     b.raw(b"NA")
     na_size = len(b.b)
     b.u16(0)
@@ -940,6 +997,56 @@ def _write_ins_gb(b: Buf, name: str, ins) -> None:
         b.u8(0)  # param3
         b.u8(0)  # param4
         b.b[ws_size:ws_size + 2] = int(len(b.b) - ws_start).to_bytes(2, "little")
+    b.raw(b"EN")
+    b.end_block(size_off, start)
+
+
+def _write_ins_vsu(
+    b: Buf, name: str, ins, mod_table: bytes, wave_index: int = 0,
+) -> None:
+    """DIV_INS_VBOY: wavetable instrument plus the FD modulation table.
+
+    The five VSU wavetables are selected by ``10xx`` pattern effects, so the
+    instrument's wave-synth entry points at wave 0.  ``initModTableWithFirst
+    Wave`` makes the VBOY platform load the FD table when channel 4 starts a
+    note; Furnace's own VSU core then runs the sweep/modulation.
+    """
+    size_off, start = b.begin_block(b"INS2")
+    b.u16(FUR_VERSION)
+    b.u16(INS_VBOY)
+    b.raw(b"NA")
+    na_size = len(b.b)
+    b.u16(0)
+    na_start = len(b.b)
+    b.strz(name)
+    b.b[na_size:na_size + 2] = int(len(b.b) - na_start).to_bytes(2, "little")
+    b.raw(b"FD")
+    fd_size = len(b.b)
+    b.u16(0)
+    fd_start = len(b.b)
+    b.u32(0)  # modSpeed
+    b.u32(0)  # modDepth
+    b.u8(1)   # initModTableWithFirstWave: load on channel 4 note-on
+    table = bytes((mod_table + bytes(32))[:32])
+    b.raw(table)
+    b.b[fd_size:fd_size + 2] = int(len(b.b) - fd_start).to_bytes(2, "little")
+    b.raw(b"WS")
+    ws_size = len(b.b)
+    b.u16(0)
+    ws_start = len(b.b)
+    b.u32(max(0, int(wave_index)))  # wave1
+    b.u32(max(0, int(wave_index)))  # wave2
+    b.u8(1)   # rateDivider
+    b.u8(0)   # effect: none
+    b.u8(1)   # enabled
+    b.u8(0)   # global
+    b.u8(0)   # speed
+    b.u8(0)   # param1
+    b.u8(0)   # param2
+    b.u8(0)   # param3
+    b.u8(0)   # param4
+    b.b[ws_size:ws_size + 2] = int(len(b.b) - ws_start).to_bytes(2, "little")
+    _write_tone_macros(b, ins, wave=False)
     b.raw(b"EN")
     b.end_block(size_off, start)
 
@@ -1097,10 +1204,14 @@ def _write_sample_s8(
     loop: tuple[int | None, int | None] = (None, None),
     depth: int = SMP_DEPTH_8BIT,
     loop_mode: int = 0,
+    render_masks: tuple[int, int, int, int] = (
+        0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF,
+    ),
 ) -> None:
     """Signed PCM with optional loop points. Depth 16 is int16 LE (mulaw).
 
     loop_mode is the SMP2 byte: 0 forward, 1 backward, 2 ping-pong.
+    render_masks selects the systems whose sample memory receives the body.
     """
     width = 2 if depth == SMP_DEPTH_16BIT else 1
     n_frames = len(data) // width
@@ -1122,9 +1233,48 @@ def _write_sample_s8(
     else:
         b.s32(-1)
         b.s32(-1)
-    for _ in range(4):
-        b.u32(0xFFFFFFFF)
+    for mask in render_masks:
+        b.u32(mask)
     b.raw(data[:n_frames * width])
+    b.end_block(size_off, start)
+
+
+def _write_sample_ymz_adpcm(
+    b: Buf,
+    name: str,
+    data: bytes,
+    c4_rate: int,
+    loop: tuple[int | None, int | None] = (None, None),
+    render_masks: tuple[int, int, int, int] = (
+        0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF,
+    ),
+) -> None:
+    """YMZ280B 4-bit ADPCM body.
+
+    SMP2 stores a nibble count; the loader allocates ``(count+1)/2`` bytes and
+    reads the payload as packed high-nibble-first samples.  Loop points are in
+    nibbles, which is what the YMZ platform divides by two for its byte
+    addresses.
+    """
+    samples = len(data) * 2
+    size_off, start = b.begin_block(b"SMP2")
+    b.strz(name)
+    b.u32(samples)
+    b.u32(c4_rate)
+    b.u32(c4_rate)
+    b.u8(SMP_DEPTH_YMZ_ADPCM)
+    b.u8(0)
+    b.u8(0)
+    b.u8(0)
+    if loop[0] is not None and loop[1] is not None:
+        b.s32(loop[0])
+        b.s32(loop[1])
+    else:
+        b.s32(-1)
+        b.s32(-1)
+    for mask in render_masks:
+        b.u32(mask)
+    b.raw(data)
     b.end_block(size_off, start)
 
 
@@ -1186,6 +1336,24 @@ def _write_sample_adpcm(
         b.u32(mask)
     b.raw(data)
     b.end_block(size_off, start)
+
+
+def ymz280b_flag_text(clock: int) -> str:
+    """Furnace YMZ280B system flags: named clock select or custom clock."""
+    clk = int(clock or 16934400)
+    named = {
+        14318182: 1,              # COLOR_NTSC * 4
+        14187580: 2,              # COLOR_PAL * 16 / 5
+        16000000: 3,
+        16666667: 4,              # 50 MHz / 3
+        14000000: 5,
+    }
+    if clk == 16934400:
+        return ""
+    sel = named.get(clk)
+    if sel is not None:
+        return f"clockSel={sel}"
+    return f"customClock={clk}"
 
 
 def segapcm_flag_text(clock: int, rom_size: int) -> str:
@@ -2444,7 +2612,8 @@ def _place_chip_fx(
 
 
 def _build_patterns(song: Song, n_ch: int, pat_len_max: int, fx_cols: int,
-                    ch_offset: int = 0, stats: dict | None = None) -> tuple[
+                    ch_offset: int = 0, stats: dict | None = None,
+                    vsu_wave_base: int = 0) -> tuple[
     list[list[int]], list[tuple[int, int, list[Row | None]]], int, int
 ]:
     """Return (orders[ch][ord], patterns as (ch, idx, rows), loop_order, pat_len).
@@ -2468,7 +2637,7 @@ def _build_patterns(song: Song, n_ch: int, pat_len_max: int, fx_cols: int,
             last_sample = max(last_sample, ev.vol_pts[-1][0])
         if ev.quad_pts:
             last_sample = max(last_sample, ev.quad_pts[-1][0])
-        if ev.on and ev.pcm and ev.end:
+        if ev.on and (ev.pcm or ev.dac) and ev.end:
             last_sample = max(last_sample, ev.end)
     for entry in (getattr(song, "channel_fx", ()) or ()):
         last_sample = max(last_sample, entry[0])
@@ -2624,6 +2793,15 @@ def _build_patterns(song: Song, n_ch: int, pat_len_max: int, fx_cols: int,
                 prev = note_delay.get(key)
                 note_delay[key] = dest_delay if prev is None else min(prev, dest_delay)
     for sample, ch, cmd, val in getattr(song, "channel_fx", ()) or ():
+        # VSU wave changes carry a sentinel index into the source wave list;
+        # resolve it against the module-wide block order now that the other
+        # families' waves are ahead of it.
+        if cmd == 0x10 and val >= 0x1000:
+            idx = vsu_wave_base + (val & 0x0FFF)
+            if idx > 0xFF:
+                _bump(stats, "vsu_wave_dropped")
+                continue
+            val = idx
         ch += ch_offset
         if ch < 0 or ch >= n_ch:
             continue
@@ -2692,6 +2870,17 @@ def _build_patterns(song: Song, n_ch: int, pat_len_max: int, fx_cols: int,
     # percussive attack can be kept when the following hit rounds onto the
     # same row.
     note_ev: dict[tuple[int, int], object] = {}
+    # The next key-on per channel, in source order. A cut that would reach
+    # that key-on must not be written: it would cut the following note. The
+    # next key-on already ends the previous note.
+    next_on: dict[int, list[tuple[int, object]]] = {}
+    for ev in song.events:
+        if ev.on and not ev.pcm:
+            ev_ch = ev.ch + ch_offset
+            if 0 <= ev_ch < n_ch:
+                next_on.setdefault(ev_ch, []).append((ev.sample, ev))
+    for entries in next_on.values():
+        entries.sort(key=lambda item: item[0])
     for ev in song.events:
         ev_ch = ev.ch + ch_offset
         if ev_ch < 0 or ev_ch >= n_ch:
@@ -2745,13 +2934,46 @@ def _build_patterns(song: Song, n_ch: int, pat_len_max: int, fx_cols: int,
                 if cmd == 0xED:
                     started = val
                     break
+            started_ev = note_ev.get((ev_ch, row))
             if cell.note < 0 or cell.note == NOTE_OFF:
                 cell.note = NOTE_OFF
                 if delay:
                     _add_fx(cell, 0xED, delay, fx_cols, stats)
+            elif (
+                started_ev is not None
+                and ev.sample > getattr(started_ev, "sample", -1)
+            ):
+                # This off belongs to the note on this row, even when both
+                # round onto the same tick (a gate shorter than one tick).
+                # The SN76489/T6W28 short-gate path needs ECxx > EDxx:
+                # EDxx greater than ECxx cut the note before it started
+                # (T6W28 premature-cut bug). Other platforms count ECxx
+                # from the delayed key-on, so the gate is ECxx ticks.
+                if getattr(started_ev, "tone_chip", 0) == 3:
+                    ec = max(started + 1, delay)
+                else:
+                    ec = max(1, delay - started)
+                # A cut that reaches the following key-on would cut the new
+                # note instead. The next key-on already ends this one, so
+                # leave the row without an ECxx (the Neo South Island Act 2
+                # case: ED03 EC05 with the next note at the same tick).
+                speed_now = max(1, song.speed)
+                nxt = next(
+                    (n for n in next_on.get(ev_ch, ()) if n[0] >= ev.sample),
+                    None,
+                )
+                if nxt is not None:
+                    nrow, ndelay = song.place(nxt[0], stats)
+                    cut_tick = row * speed_now + started + ec
+                    next_tick = nrow * speed_now + ndelay
+                    if cut_tick >= next_tick:
+                        _bump(stats, "off_swallowed")
+                        continue
+                _add_fx(cell, 0xEC, ec, fx_cols, stats)
             elif delay > started:
-                _add_fx(cell, 0xEC, delay, fx_cols, stats)
-            else:
+                # A release from the previous note that lands after this
+                # note's delayed start would cut the new note; keep the new
+                # note and let its own key-on own the row.
                 _bump(stats, "off_swallowed")
             continue
         if 0 <= cell.note < 180:
@@ -2806,7 +3028,8 @@ def _build_patterns(song: Song, n_ch: int, pat_len_max: int, fx_cols: int,
         # default (both full). FM pan 0 still means "no 08xx on this row".
         if ev.quad is not None:
             _add_quad_fx(cell, ev.quad, fx_cols, stats)
-        elif (ev.pcm or ev.pan) and not ev.no_pan:
+        elif (ev.pcm or ev.pan or ev.tone_chip == 7) and not ev.no_pan:
+            # VSU LRV 0 is "both sides off", not "leave the previous pan".
             _add_fx(cell, 0x08, ev.pan & 0xFF, fx_cols, stats)
 
     # A PCM note still sounding at the last content row gets an explicit off.
@@ -3004,6 +3227,29 @@ def _build_patterns(song: Song, n_ch: int, pat_len_max: int, fx_cols: int,
                         _add_fx(cell, 0xFA, 0x01 if cont else 0x00, fx_cols, stats)
                         if delay:
                             _add_fx(cell, 0xED, delay, fx_cols, stats)
+                    elif value == 0:
+                        # A later mute must not erase the note's own attack:
+                        # the next key-on already ends this note, and a zero
+                        # column here would make an audible blip silent.
+                        continue
+                    elif value > cell.vol:
+                        # The step gets louder: keep the quieter attack and
+                        # put the raise on the following free row instead.
+                        target = row + 1
+                        if target < next_row:
+                            tcell = grid[ev_ch].get(target)
+                            if tcell is None:
+                                tcell = _blank_row()
+                                grid[ev_ch][target] = tcell
+                            if not (0 <= tcell.note < 180):
+                                tcell.vol = value
+                                if (pan is not None
+                                        and (last_pan is None
+                                             or pan != last_pan)):
+                                    _add_fx(
+                                        tcell, 0x08, pan & 0xFF, fx_cols, stats,
+                                    )
+                                    last_pan = pan
                     else:
                         cell.vol = value
                         if pan is not None and (last_pan is None or pan != last_pan):
@@ -3093,17 +3339,111 @@ def _build_patterns(song: Song, n_ch: int, pat_len_max: int, fx_cols: int,
             _add_fx(cell, 0xE5, val, fx_cols, stats)
             cur_e5 = val
 
+    # On the SN76489/T6W28 path ECxx must land after EDxx. When ECxx <= EDxx
+    # Furnace cut the note before it started (the T6W28 short-gate bug), so
+    # drop that cut and let the next key-on end the note. Other platforms
+    # count ECxx from the delayed key-on, where ECxx < EDxx is the short gate
+    # we actually want (a one-tick VSU noise hit, for example).
+    for ch in range(n_ch):
+        for row, cell in grid[ch].items():
+            if not cell.fx:
+                continue
+            note = note_ev.get((ch, row))
+            if getattr(note, "tone_chip", 0) != 3:
+                continue
+            ed = next((v for c, v in cell.fx if c == 0xED), None)
+            if ed is None:
+                continue
+            ec = next((v for c, v in cell.fx if c == 0xEC), None)
+            if ec is not None and ec <= ed:
+                cell.fx = [(c, v) for c, v in cell.fx if c != 0xEC]
+
     # The pattern window: a whole musical phrase when the order budget
     # allows, otherwise the largest phrase that fits. One length serves
     # every order.
     last_content = max(
         (row for ch in range(n_ch) for row in grid[ch]), default=-1
     )
+
+    # An OPL operator with a zero attack rate never attacks: it keeps whatever
+    # envelope level it holds when the key goes down. If the previous note on
+    # the channel left that operator at RR=0, the level never fell to silence
+    # either. On hardware the source usually writes the next patch's RR during
+    # the silent gap, which releases the envelope before the key-on; a module
+    # applies the patch at the key-on itself, so the stale level survives and
+    # the operator stays audible. Furnace's hard envelope reset (0x30) performs
+    # that release: at the key-on the platform drives every operator through
+    # RR=15 and then restores the logged value.
+    patches = getattr(song, "fm_patches", ()) or ()
+
+    def _opl_reset_patch(ins: int):
+        if not 0 <= ins < len(patches):
+            return None
+        p = patches[ins]
+        if not getattr(p, "opl", False) or getattr(p, "drum", False):
+            return None
+        return p
+
+    if any(
+        getattr(p, "opl", False) and not getattr(p, "drum", False)
+        for p in patches
+    ):
+        for ch in range(n_ch):
+            cells = grid[ch]
+            if not cells:
+                continue
+            carried = -1
+            prev_ins = -1
+            reset_rows: set[int] = set()
+            for row in sorted(cells):
+                cell = cells[row]
+                if cell.ins >= 0:
+                    carried = cell.ins
+                if not (0 <= cell.note < 180):
+                    continue
+                cur = _opl_reset_patch(carried)
+                prev = _opl_reset_patch(prev_ins)
+                if cur is not None and prev is not None:
+                    cur_ops = 4 if cur.four else 2
+                    prev_ops = 4 if prev.four else 2
+                    if any(
+                        cur.ops[i].ar == 0 and prev.ops[i].rr == 0
+                        for i in range(min(cur_ops, prev_ops))
+                    ):
+                        reset_rows.add(row)
+                prev_ins = carried
+            for row in reset_rows:
+                cell = cells.get(row)
+                if cell is None:
+                    continue
+                _add_fx(cell, 0x30, 1, fx_cols, stats)
+                # Disarm on the next row so later notes key normally. A
+                # neighbouring note that needs the same reset keeps it armed.
+                nrow = row + 1
+                if nrow in reset_rows or nrow > last_content:
+                    continue
+                ncell = cells.get(nrow)
+                if ncell is None:
+                    ncell = _blank_row()
+                    cells[nrow] = ncell
+                _add_fx(ncell, 0x30, 0, fx_cols, stats)
+
     pat_len = min(pat_len_max, _phrase_pattern_len(song, last_content, total_rows))
 
     # Walk pat_len-row chunks, but force an order boundary at the VGM loop so
     # Bxx can jump there. A long intro must not become one giant order; only
     # `pat_len` rows would survive.
+    # A short intro order ends at the loop row with 0D00. If the row before it
+    # carries a note, that jump runs before the note's ED delay and the note
+    # never starts. Move the boundary one row later until the last row is
+    # note-free.
+    if loop_row > 0:
+        while loop_row < total_rows and any(
+            0 <= cell.note < 180
+            for ch in range(n_ch)
+            if (cell := grid[ch].get(loop_row - 1)) is not None
+        ):
+            loop_row += 1
     bounds = [0]
     anchor = loop_row if 0 < loop_row < total_rows else None
     pos = 0
@@ -3494,6 +3834,65 @@ _FM_CHIP_NAMES = {
 }
 
 
+def _compact_sample_map_notes(
+    patterns: list[tuple[int, int, list[Row | None]]],
+    ins_base: int,
+    ins_count: int,
+    samples: list,
+) -> tuple[list, int]:
+    """Drop sample-map bodies no placed note selects.
+
+    A note selects a slot as ``60 + slot`` and its instrument picks the map
+    group.  A sample can survive grouping and still never be played (a silent
+    chunk, a collapsed run, or a note lost to a row collision); remove it and
+    renumber both the map notes and the sample list.
+    """
+    if ins_count <= 0 or not samples:
+        return samples, ins_count
+    used: set[int] = set()
+    for _ch, _idx, rows in patterns:
+        for row in rows:
+            if row is None:
+                continue
+            ins, note = row.ins, row.note
+            if ins_base <= ins < ins_base + ins_count and 60 <= note < 180:
+                used.add((ins - ins_base) * 120 + (note - 60))
+    if not used:
+        return [], 0
+    if max(used) >= len(samples):
+        return samples, ins_count
+    ordered = sorted(used)
+    remap = {old: new for new, old in enumerate(ordered)}
+    for _ch, _idx, rows in patterns:
+        for row in rows:
+            if row is None:
+                continue
+            ins, note = row.ins, row.note
+            if ins_base <= ins < ins_base + ins_count and 60 <= note < 180:
+                old = (ins - ins_base) * 120 + (note - 60)
+                new = remap[old]
+                row.ins = ins_base + new // 120
+                row.note = 60 + new % 120
+    return [samples[i] for i in ordered], (len(ordered) + 119) // 120
+
+
+def _shift_sample_map_instruments(
+    patterns: list[tuple[int, int, list[Row | None]]],
+    start: int,
+    delta: int,
+) -> None:
+    """Move later instrument ids when a sample-map group is removed."""
+    if not delta:
+        return
+    for _ch, _idx, rows in patterns:
+        for row in rows:
+            if row is None:
+                continue
+            ins = row.ins
+            if ins != EMPTY and ins >= start:
+                row.ins = ins + delta
+
+
 def write_fur(
     song: Song, *, include_pcm: bool = True, include_fm: bool = True,
     stats: dict | None = None, compress: bool = False,
@@ -3550,7 +3949,11 @@ def write_fur(
         getattr(song, "scc_ids", ()) or getattr(song, "ay_ids", ())
         or getattr(song, "nes_ids", ()) or getattr(song, "huc6280_ids", ())
         or getattr(song, "gb_ids", ())
+        or getattr(song, "vsu_ids", ())
         or getattr(song, "psg_ids", ())
+        # YMZ280B is a sample engine with real module columns; a YMZ-only log
+        # must not gain an empty YM2151 placeholder above it.
+        or getattr(song, "ymz280b_samples", ())
     )
     if ym2610 or ym2608:
         fm_present = (include_fm or include_pcm) and bool(ym_ids)
@@ -3565,10 +3968,12 @@ def write_fur(
     fm_ins = song.fm_patches if (fm_present and include_fm) else []
     
     pcm_smps = [s for s in song.pcm_samples if s.length >= 8] if include_pcm else []
+    pcm_ids = sorted({s.chip_id for s in pcm_smps})
     oki_smps = list(song.oki_samples) if include_pcm else []
     adpcm_smps = list(song.msm6258_samples) if include_pcm else []
     n_adpcm_ins = (len(adpcm_smps) + 119) // 120
     spcm_smps = [s for s in song.segapcm_samples if s.length >= 8] if include_pcm else []
+    spcm_ids = sorted({s.chip_id for s in spcm_smps})
     rf5c68_smps = (
         [s for s in song.rf5c68_samples if s.length >= 8] if include_pcm else []
     )
@@ -3580,6 +3985,11 @@ def write_fur(
     k053260_smps = (
         [s for s in song.k053260_samples if s.length >= 8] if include_pcm else []
     )
+    ymz_smps = (
+        list(getattr(song, "ymz280b_samples", ()) or ())
+        if include_pcm else []
+    )
+    ymz_ids = sorted({s.chip_id for s in ymz_smps})
     dac_smps = list(getattr(song, "dac_samples", ()) or ()) if include_pcm else []
     n_dac_ins = (len(dac_smps) + 119) // 120
     dac_smp_base = (
@@ -3667,6 +4077,10 @@ def write_fur(
     gb_ids = list(getattr(song, "gb_ids", ()) or ())
     gb_waves = list(getattr(song, "gb_waves", ()) or ())
     gb_specs = list(getattr(song, "gb_ins", ()) or ())
+    vsu_ids = list(getattr(song, "vsu_ids", ()) or ())
+    vsu_waves = list(getattr(song, "vsu_waves", ()) or ())
+    vsu_mod_waves = list(getattr(song, "vsu_mod_waves", ()) or ())
+    vsu_specs = list(getattr(song, "vsu_ins", ()) or ())
     scc_chip = CHIP_K052539 if song.vgm.k051649_plus else CHIP_K051649
     n_scc = 5 * len(scc_ids)
     n_ay = 3 * len(ay_ids)
@@ -3674,8 +4088,9 @@ def write_fur(
     n_nes = 5 * len(nes_ids)
     n_huc6280 = 6 * len(huc6280_ids)
     n_gb = 4 * len(gb_ids)
+    n_vsu = 6 * len(vsu_ids)
     n_nes_dpcm_ins = len(nes_dpcm_smps)
-    n_nes_pcm_ins = len(nes_pcm_smps)
+    n_nes_pcm_ins = (len(nes_pcm_smps) + 119) // 120
     n_huc6280_pcm_ins = len(huc6280_pcm_smps)
     # NES DPCM (1-bit) and direct-DAC (8-bit) bodies follow the SSG PCM group.
     nes_dpcm_smp_base = ssg_pcm_smp_base + len(ssg_pcm_smps)
@@ -3684,7 +4099,7 @@ def write_fur(
     huc6280_pcm_smp_base = nes_pcm_smp_base + len(nes_pcm_smps)
     # K007232 appears only when the source carried usable samples for it, and
     # never beside another sample chip.
-    want_k007 = bool(pcm_smps)
+    want_k007 = bool(pcm_ids)
 
     # Columns per system, summed. A single-family module gets the same totals
     # the old branch chain produced; a combined one adds the families together.
@@ -3708,14 +4123,17 @@ def write_fur(
                 n_ssg += 3
             else:
                 n_fm += system.fm_channels or 8
-    n_k007 = 2 if want_k007 else 0
-    n_rf5c = (8 if rf5c68_smps else 0) + (8 if rf5c164_smps else 0)
+    n_k007 = 2 * len(pcm_ids) if want_k007 else 0
+    rf5c68_ids = sorted({s.chip_id for s in rf5c68_smps})
+    rf5c164_ids = sorted({s.chip_id for s in rf5c164_smps})
+    n_rf5c = 8 * (len(rf5c68_ids) + len(rf5c164_ids))
     n_ch = (
         n_fm + n_ssg + n_adpcm_a + n_adpcm_b + n_psg + n_k007
         + 4 * len(oki_ids) + len(adpcm_ids)
-        + (16 if spcm_smps else 0) + n_rf5c
+        + 16 * len(spcm_ids) + n_rf5c
         + 24 * len(c140_ids) + 32 * len(c352_ids)
-        + 4 * len(k053260_ids) + n_scc + n_ay + n_nes + n_huc6280 + n_gb
+        + 4 * len(k053260_ids) + 8 * len(ymz_ids)
+        + n_scc + n_ay + n_nes + n_huc6280 + n_gb + n_vsu
     )
     if n_ch == 0:
         raise ValueError("write_fur: need include_fm and/or include_pcm")
@@ -3736,8 +4154,9 @@ def write_fur(
         + n_ym2608_rhythm_ins + n_ym2608_b_ins
         + n_y8950_b_ins + n_opl4_wave_ins + n_ssg_pcm_ins
         + n_nes_dpcm_ins + n_nes_pcm_ins + n_huc6280_pcm_ins
+        + len(ymz_smps)
         + len(scc_specs) + len(ay_specs) + len(psg_specs) + len(nes_specs)
-        + len(huc6280_specs) + len(gb_specs)
+        + len(huc6280_specs) + len(gb_specs) + len(vsu_specs)
     )
     n_smp = (
         len(pcm_smps) + len(oki_smps) + len(adpcm_smps)
@@ -3747,8 +4166,14 @@ def write_fur(
         + len(ym2610_a_smps) + len(ym2610_b_smps) + len(ym2608_b_smps)
         + len(y8950_b_smps) + len(opl4_wave_smps) + len(ssg_pcm_smps)
         + len(nes_dpcm_smps) + len(nes_pcm_smps) + len(huc6280_pcm_smps)
+        + len(ymz_smps)
     )
-    n_wav = len(scc_waves) + len(huc6280_waves) + len(gb_waves)
+    n_wav = (
+        len(scc_waves) + len(huc6280_waves) + len(gb_waves) + len(vsu_waves)
+    )
+    # The VSU's 10xx effects name a wavetable in the module-wide list.  Keep
+    # the block order in step with the index the patterns use.
+    vsu_wave_base = len(scc_waves) + len(huc6280_waves) + len(gb_waves)
 
     # Analysis numbers sample-chip channels after the FM block. With no FM
     # they shift down to stay inside n_ch.
@@ -3757,9 +4182,93 @@ def write_fur(
     orders, patterns, _loop_ord, pat_len = _build_patterns(
         song, n_ch, PAT_LEN_MAX, fx_cols,
         0 if fm_present else -fm_analysis_block,
-        stats=stats,
+        stats=stats, vsu_wave_base=vsu_wave_base,
     )
     effect_cols = _fit_fx_cols(patterns, n_ch)
+
+    # The note-placement pass is final, so now drop sample-map slots that no
+    # placed note ever selects.  Removing a whole 120-slot group also shifts
+    # every later instrument id, so the pattern cells are renumbered before
+    # instrument and sample-map writing.
+    dac_ins_base = len(fm_ins)
+    if include_pcm and dac_smps:
+        old_dac_ins = n_dac_ins
+        old_dac_len = len(dac_smps)
+        dac_smps, n_dac_ins = _compact_sample_map_notes(
+            patterns, dac_ins_base, n_dac_ins, dac_smps,
+        )
+        if n_dac_ins != old_dac_ins:
+            _shift_sample_map_instruments(
+                patterns, dac_ins_base + old_dac_ins,
+                n_dac_ins - old_dac_ins,
+            )
+        if stats is not None:
+            stats["dac_samples_unused"] = old_dac_len - len(dac_smps)
+
+    # Sample bases after the DAC group depend on its final length.
+    dac_smp_base = (
+        len(pcm_smps) + len(oki_smps) + len(adpcm_smps)
+        + len(spcm_smps) + len(rf5c68_smps) + len(rf5c164_smps)
+        + len(c140_smps) + len(c352_smps) + len(k053260_smps)
+    )
+    ym2610_a_smp_base = dac_smp_base + len(dac_smps)
+    ym2610_b_smp_base = ym2610_a_smp_base + len(ym2610_a_smps)
+    ym2608_b_smp_base = ym2610_b_smp_base + len(ym2610_b_smps)
+    y8950_b_smp_base = ym2608_b_smp_base + len(ym2608_b_smps)
+    opl4_wave_smp_base = y8950_b_smp_base + len(y8950_b_smps)
+    ssg_pcm_ins_base = (
+        len(fm_ins) + n_dac_ins + len(pcm_smps) + len(oki_smps)
+        + n_adpcm_ins + len(spcm_smps) + len(rf5c68_smps)
+        + len(rf5c164_smps) + len(c140_smps) + len(c352_smps)
+        + len(k053260_smps) + n_ym2610_a_ins + n_ym2610_b_ins
+        + n_ym2608_rhythm_ins + n_ym2608_b_ins + n_y8950_b_ins
+        + n_opl4_wave_ins
+    )
+    if include_pcm and ssg_pcm_smps:
+        old_ssg_ins = n_ssg_pcm_ins
+        old_ssg_len = len(ssg_pcm_smps)
+        ssg_pcm_smps, n_ssg_pcm_ins = _compact_sample_map_notes(
+            patterns, ssg_pcm_ins_base, n_ssg_pcm_ins, ssg_pcm_smps,
+        )
+        if n_ssg_pcm_ins != old_ssg_ins:
+            _shift_sample_map_instruments(
+                patterns, ssg_pcm_ins_base + old_ssg_ins,
+                n_ssg_pcm_ins - old_ssg_ins,
+            )
+        if stats is not None:
+            stats["ssg_pcm_samples_unused"] = (
+                old_ssg_len - len(ssg_pcm_smps)
+            )
+
+    ssg_pcm_smp_base = opl4_wave_smp_base + len(opl4_wave_smps)
+    nes_dpcm_smp_base = ssg_pcm_smp_base + len(ssg_pcm_smps)
+    nes_pcm_smp_base = nes_dpcm_smp_base + len(nes_dpcm_smps)
+    huc6280_pcm_smp_base = nes_pcm_smp_base + len(nes_pcm_smps)
+    # YMZ280B bodies and instruments come last among the sample engines.
+    ymz_smp_base = huc6280_pcm_smp_base + len(huc6280_pcm_smps)
+    n_ins = (
+        len(fm_ins) + n_dac_ins + len(pcm_smps) + len(oki_smps) + n_adpcm_ins
+        + len(spcm_smps) + len(rf5c68_smps) + len(rf5c164_smps)
+        + len(c140_smps) + len(c352_smps) + len(k053260_smps)
+        + n_ym2610_a_ins + n_ym2610_b_ins
+        + n_ym2608_rhythm_ins + n_ym2608_b_ins
+        + n_y8950_b_ins + n_opl4_wave_ins + n_ssg_pcm_ins
+        + n_nes_dpcm_ins + n_nes_pcm_ins + n_huc6280_pcm_ins
+        + len(ymz_smps)
+        + len(scc_specs) + len(ay_specs) + len(psg_specs) + len(nes_specs)
+        + len(huc6280_specs) + len(gb_specs) + len(vsu_specs)
+    )
+    n_smp = (
+        len(pcm_smps) + len(oki_smps) + len(adpcm_smps)
+        + len(spcm_smps) + len(rf5c68_smps) + len(rf5c164_smps)
+        + len(c140_smps) + len(c352_smps)
+        + len(k053260_smps) + len(dac_smps)
+        + len(ym2610_a_smps) + len(ym2610_b_smps) + len(ym2608_b_smps)
+        + len(y8950_b_smps) + len(opl4_wave_smps) + len(ssg_pcm_smps)
+        + len(nes_dpcm_smps) + len(nes_pcm_smps) + len(huc6280_pcm_smps)
+        + len(ymz_smps)
+    )
+
     n_ord = len(orders[0]) if orders else 1
     n_pat = len(patterns)
 
@@ -3770,16 +4279,22 @@ def write_fur(
             song, systems, names_long, names_short,
         )
     if psg_ids:
-        for cid in range(len(psg_ids)):
-            suffix = f" ({cid + 1})" if len(psg_ids) > 1 else ""
-            for voice in range(3):
-                names_long.append(f"PSG {voice + 1}{suffix}")
-                names_short.append(f"S{cid + 1}-{voice + 1}")
-            names_long.append(f"PSG Noise{suffix}")
-            names_short.append(f"S{cid + 1}-N")
-    if n_k007:
-        names_long += [f"PCM {i + 1}" for i in range(n_k007)]
-        names_short += [f"P{i + 1}" for i in range(n_k007)]
+        if getattr(song, "psg_t6w28", False):
+            names_long += ["Square 1", "Square 2", "Square 3", "Noise"]
+            names_short += ["S1", "S2", "S3", "NO"]
+        else:
+            for cid in range(len(psg_ids)):
+                suffix = f" ({cid + 1})" if len(psg_ids) > 1 else ""
+                for voice in range(3):
+                    names_long.append(f"PSG {voice + 1}{suffix}")
+                    names_short.append(f"S{cid + 1}-{voice + 1}")
+                names_long.append(f"PSG Noise{suffix}")
+                names_short.append(f"S{cid + 1}-N")
+    for cid in pcm_ids:
+        suffix = f" ({cid + 1})" if len(pcm_ids) > 1 else ""
+        for voice in range(2):
+            names_long.append(f"PCM {voice + 1}{suffix}")
+            names_short.append(f"P{cid + 1}-{voice + 1}")
     for cid in oki_ids:
         for voice in range(4):
             names_long.append(f"OKI{cid + 1} {voice + 1}")
@@ -3791,21 +4306,23 @@ def write_fur(
         else:
             names_long.append(f"ADPCM {cid + 1}")
             names_short.append(f"A{cid + 1}")
-    if spcm_smps:
+    for cid in spcm_ids:
+        suffix = f" ({cid + 1})" if len(spcm_ids) > 1 else ""
         for voice in range(16):
-            names_long.append(f"SEGA {voice + 1}")
-            names_short.append(f"S{voice + 1}")
+            names_long.append(f"SEGA {voice + 1}{suffix}")
+            names_short.append(f"S{cid + 1}-{voice + 1}")
     # The RF5C pair are separate chips to Furnace (one system each), but share
     # a label family: "PCM 1".."PCM 8" for the 68, "PCM 9".."PCM 16" for a 164
     # in the same module, so a combined log never repeats a column name.
     rf5c_n = 0
     for smps in (rf5c68_smps, rf5c164_smps):
-        if not smps:
-            continue
-        for voice in range(8):
-            names_long.append(f"PCM {rf5c_n + voice + 1}")
-            names_short.append(f"P{rf5c_n + voice + 1}")
-        rf5c_n += 8
+        ids = sorted({s.chip_id for s in smps})
+        for cid in ids:
+            suffix = f" ({cid + 1})" if len(ids) > 1 else ""
+            for voice in range(8):
+                names_long.append(f"PCM {rf5c_n + voice + 1}{suffix}")
+                names_short.append(f"P{rf5c_n + voice + 1}")
+            rf5c_n += 8
     for cid in c140_ids:
         for voice in range(24):
             names_long.append(f"C140 {cid + 1}-{voice + 1}")
@@ -3818,6 +4335,10 @@ def write_fur(
         for voice in range(4):
             names_long.append(f"K053260 {cid + 1}-{voice + 1}")
             names_short.append(f"Q{cid + 1}-{voice + 1}")
+    for cid in ymz_ids:
+        for voice in range(8):
+            names_long.append(f"YMZ280B {cid + 1}-{voice + 1}")
+            names_short.append(f"Y{cid + 1}-{voice + 1}")
     for cid in scc_ids:
         for voice in range(5):
             names_long.append(f"SCC {cid + 1}-{voice + 1}")
@@ -3841,6 +4362,12 @@ def write_fur(
     for cid in gb_ids:
         for voice, (label, short) in enumerate(zip(gb_labels, gb_short)):
             names_long.append(f"{label} ({cid + 1})")
+            names_short.append(f"{short}{cid + 1}" if cid else short)
+    vsu_labels = ("Voice 1", "Voice 2", "Voice 3", "Voice 4", "Voice 5", "Noise")
+    vsu_short = ("W1", "W2", "W3", "W4", "W5", "NO")
+    for cid in vsu_ids:
+        for label, short in zip(vsu_labels, vsu_short):
+            names_long.append(f"VB {label} ({cid + 1})")
             names_short.append(f"{short}{cid + 1}" if cid else short)
 
     label_parts: list[str] = []
@@ -3872,15 +4399,23 @@ def write_fur(
                 base = "YM2151"
             label_parts.append(f"{base} x{n}" if n > 1 else base)
     if psg_ids:
-        label_parts.append("SN76489")
-    if n_k007:
-        label_parts.append("K007232")
+        label_parts.append(
+            "T6W28" if getattr(song, "psg_t6w28", False)
+            else f"SN76489 x{len(psg_ids)}" if len(psg_ids) > 1
+            else "SN76489"
+        )
+    if pcm_ids:
+        label_parts.append(
+            f"K007232 x{len(pcm_ids)}" if len(pcm_ids) > 1 else "K007232"
+        )
     if oki_ids:
         label_parts.append("MSM6295")
     if adpcm_ids:
         label_parts.append("MSM6258")
-    if spcm_smps:
-        label_parts.append("SegaPCM")
+    if spcm_ids:
+        label_parts.append(
+            f"SegaPCM x{len(spcm_ids)}" if len(spcm_ids) > 1 else "SegaPCM"
+        )
     if rf5c68_smps:
         label_parts.append("RF5C68")
     if rf5c164_smps:
@@ -3895,6 +4430,8 @@ def write_fur(
         label_parts.append("C352")
     if k053260_ids:
         label_parts.append("K053260")
+    if ymz_ids:
+        label_parts.append("YMZ280B")
     if scc_ids:
         label_parts.append("SCC+" if song.vgm.k051649_plus else "SCC")
     if ay_ids:
@@ -3905,6 +4442,8 @@ def write_fur(
         label_parts.append("PC Engine")
     if gb_ids:
         label_parts.append("Game Boy")
+    if vsu_ids:
+        label_parts.append("Virtual Boy")
     chip_label = " + ".join(label_parts) or "empty"
 
     comment = (
@@ -3958,11 +4497,20 @@ def write_fur(
                 "rate-exact chunks; one sample-map note starts each of them.\n"
             )
     if psg_ids:
-        comment += (
-            f"\nSN76489 at {song.vgm.sn76489_clock or 3579545} Hz; three "
-            "square voices then noise. The volume column is the 4-bit "
-            "attenuation (15 = loudest) and 20xy selects the noise mode.\n"
-        )
+        if getattr(song, "psg_t6w28", False):
+            comment += (
+                f"\nT6W28 at {song.vgm.sn76489_clock or T6W28_DEFAULT_CLOCK} "
+                "Hz; the two SN76489 halves are one stereo chip. The volume "
+                "column is the louder side's 4-bit attenuation (15 = "
+                "loudest), 08xy splits the two sides, and 20xy selects the "
+                "noise mode.\n"
+            )
+        else:
+            comment += (
+                f"\nSN76489 at {song.vgm.sn76489_clock or 3579545} Hz; three "
+                "square voices then noise. The volume column is the 4-bit "
+                "attenuation (15 = loudest) and 20xy selects the noise mode.\n"
+            )
     elif ym2610:
         comment += (
             f"\nYM2610{'B' if song.ym2610_b else ''} at "
@@ -4097,9 +4645,20 @@ def write_fur(
         len(chips) - sum(1 for s in systems if s.kind == opl_kind)
         if (fm_present and opl) else 0
     )
+    t6w28 = bool(psg_ids and getattr(song, "psg_t6w28", False))
     for _cid in psg_ids:
+        if t6w28:
+            chips.append(CHIP_T6W28)
+            psg_clock = song.vgm.sn76489_clock or T6W28_DEFAULT_CLOCK
+            if abs(psg_clock - T6W28_DEFAULT_CLOCK) <= 2:
+                flag_texts.append("")
+            else:
+                flag_texts.append(f"customClock={psg_clock}")
+            continue
         chips.append(CHIP_SMS)
         psg_clock = song.vgm.sn76489_clock or 3579545
+        if _cid == 1 and getattr(song.vgm, "sn76489_clock_2", 0):
+            psg_clock = song.vgm.sn76489_clock_2
         # Game Gear selects Furnace's stereo SMPSG core (chipType 3). The
         # plain SMS core is mono, so its 08xy panning would be ignored.
         flags = "chipType=3" if getattr(song, "psg_stereo", False) else ""
@@ -4108,7 +4667,7 @@ def write_fur(
         else:
             clock_flag = f"customClock={psg_clock}"
         flag_texts.append(flags + ("\n" if flags else "") + clock_flag)
-    if n_k007:
+    for _cid in pcm_ids:
         chips.append(CHIP_K007232)
         flags = "stereo=true"
         pcm_clock = song.vgm.k007232_clock
@@ -4124,16 +4683,18 @@ def write_fur(
     for cid in adpcm_ids:
         chips.append(CHIP_MSM6258)
         flag_texts.append(msm6258_flag_text(adpcm_groups[cid][0].clock))
-    if spcm_smps:
+    for cid in spcm_ids:
         chips.append(CHIP_SEGAPCM)
         rom_size = max(
-            (s.rom_size for s in song.vgm.roms if s.kind == "segapcm"), default=0
+            (s.rom_size for s in song.vgm.roms
+             if s.kind == "segapcm" and s.chip == cid),
+            default=0,
         )
         flag_texts.append(segapcm_flag_text(song.vgm.segapcm_clock, rom_size))
-    if rf5c68_smps:
+    for _cid in rf5c68_ids:
         chips.append(CHIP_RF5C68)
         flag_texts.append(rf5c68_flag_text(song.vgm.rf5c68_clock, 0))
-    if rf5c164_smps:
+    for _cid in rf5c164_ids:
         chips.append(CHIP_RF5C68)
         flag_texts.append(rf5c68_flag_text(song.vgm.rf5c164_clock, 1))
     for cid in c140_ids:
@@ -4147,6 +4708,11 @@ def write_fur(
     for cid in k053260_ids:
         chips.append(CHIP_K053260)
         flag_texts.append(k053260_flag_text(song.vgm.k053260_clock))
+    ymz_sys: dict[int, int] = {}
+    for cid in ymz_ids:
+        ymz_sys[cid] = len(chips)
+        chips.append(CHIP_YMZ280B)
+        flag_texts.append(ymz280b_flag_text(ymz280b_clock(song.vgm, cid)))
     for cid in scc_ids:
         chips.append(scc_chip)
         flag_texts.append(k051649_flag_text(song.vgm.k051649_clock))
@@ -4180,6 +4746,16 @@ def write_fur(
         flags = "chipType=2"
         if abs(clock - 4194304) > 2:
             flags += f"\ncustomClock={clock}"
+        flag_texts.append(flags)
+    for cid in vsu_ids:
+        chips.append(CHIP_VBOY)
+        clock = song.vgm.vsu_clock or 5000000
+        flags = "" if clock == 5000000 else f"customClock={clock}"
+        if getattr(song, "vsu_dynamic", False):
+            # The source rewrites wave RAM while voices are keyed.  Furnace's
+            # default anti-click pass disables every voice around a wave
+            # upload; the log did not, so keep its intended behaviour.
+            flags = (flags + "\n" if flags else "") + "screwThis=true"
         flag_texts.append(flags)
     n_chips = len(chips)
 
@@ -4461,17 +5037,30 @@ def write_fur(
         _write_ins_pcm(
             b, f"NES DPCM {i:02d}", nes_dpcm_smp_base + i, INS_NES,
         )
-    for i, smp in enumerate(nes_pcm_smps):
+    for group in range(n_nes_pcm_ins):
         ins_ptrs.append(len(b))
-        # Note 108 (C-4) plays the 8-bit body at its stored rate in PCM mode.
-        _write_ins_pcm(
-            b, f"NES PCM {i:02d}", nes_pcm_smp_base + i, INS_C352,
+        first = nes_pcm_smp_base + group * 120
+        maps = [
+            first + slot
+            for slot in range(min(120, len(nes_pcm_smps) - group * 120))
+        ]
+        # The NES PCM channel takes the same 120-slot sample map the YM2612
+        # DAC uses; note 60+slot selects the chunk and it plays at its rate.
+        # The sample path also needs useSample, like SSG PCM.
+        _write_ins_sample_map(
+            b, f"NES PCM {group + 1}", 0, maps, INS_C352, flags=0x03,
         )
     for i, smp in enumerate(huc6280_pcm_smps):
         ins_ptrs.append(len(b))
         # Note 108 (C-4) plays the 8-bit DDA body at its stored rate.
         _write_ins_pcm(
             b, f"HuC6280 PCM {i:02d}", huc6280_pcm_smp_base + i, INS_C352,
+        )
+    for i, smp in enumerate(ymz_smps):
+        ins_ptrs.append(len(b))
+        _write_ins_pcm(
+            b, f"YMZ{smp.chip_id + 1} {smp.start:06x}",
+            ymz_smp_base + i, INS_YMZ280B,
         )
     for i, spec in enumerate(scc_specs):
         ins_ptrs.append(len(b))
@@ -4485,9 +5074,16 @@ def write_fur(
     for spec in ay_specs:
         ins_ptrs.append(len(b))
         _write_ins_ay(b, "PSG" + ("+pitch" if spec.pitch else ""), spec)
+    psg_ins_type = (
+        INS_T6W28 if getattr(song, "psg_t6w28", False) else INS_STD
+    )
+    psg_label = "T6W28" if getattr(song, "psg_t6w28", False) else "SN"
     for spec in psg_specs:
         ins_ptrs.append(len(b))
-        _write_ins_psg(b, "SN" + ("+pitch" if spec.pitch else ""), spec)
+        _write_ins_psg(
+            b, psg_label + ("+pitch" if spec.pitch else ""),
+            spec, ins_type=psg_ins_type,
+        )
     for spec in nes_specs:
         ins_ptrs.append(len(b))
         _write_ins_nes(b, "NES", spec)
@@ -4521,6 +5117,21 @@ def write_fur(
                 + ("+pitch" if spec.pitch else "")
             )
         _write_ins_gb(b, name, spec)
+    for i, spec in enumerate(vsu_specs):
+        ins_ptrs.append(len(b))
+        mod = (
+            vsu_mod_waves[spec.vsu_mod]
+            if 0 <= spec.vsu_mod < len(vsu_mod_waves) else bytes(32)
+        )
+        name = f"VSU {i:02d}"
+        if spec.pitch:
+            name += "+pitch"
+        if spec.vol:
+            name += "+vol"
+        _write_ins_vsu(
+            b, name, spec, mod,
+            vsu_wave_base + max(0, int(getattr(spec, "wave", 0))),
+        )
 
     smp_ptrs: list[int] = []
     for i, smp in enumerate(pcm_smps):
@@ -4680,14 +5291,38 @@ def write_fur(
         )
     for smp in nes_pcm_smps:
         smp_ptrs.append(len(b))
-        # 8-bit signed bodies; note 108 plays them at their write rate.
-        _write_sample_s8(b, smp.name, smp.data, smp.rate)
+        # 8-bit signed bodies; the sample engine's C-4 reference is a hair
+        # sharp, so compensate exactly like the YM2612 DAC bodies.
+        rate = max(1, int(round(smp.rate * DAC_RATE_COMPENSATION)))
+        _write_sample_s8(b, smp.name, smp.data, rate)
     for smp in huc6280_pcm_smps:
         smp_ptrs.append(len(b))
         # 8-bit bodies converted from the 5-bit DDA stream; note 108 plays
         # them at their byte rate.
         loop = (0, len(smp.data)) if smp.loop else (None, None)
         _write_sample_s8(b, smp.name, smp.data, smp.rate, loop=loop)
+    for smp in ymz_smps:
+        smp_ptrs.append(len(b))
+        sys = ymz_sys.get(smp.chip_id, 0)
+        # Only the owning YMZ system uploads this body; a dual log's two
+        # chips otherwise both receive the union of their ROMs.
+        masks = ((1 << sys) if sys < 32 else 0, 0, 0, 0)
+        loop = (
+            (smp.loop_start, smp.loop_end)
+            if smp.loop_start is not None and smp.loop_end is not None
+            else (None, None)
+        )
+        name = f"ymz{smp.chip_id + 1}_{smp.start:06x}"
+        if smp.depth == SMP_DEPTH_YMZ_ADPCM:
+            _write_sample_ymz_adpcm(
+                b, name, smp.data, smp.c4_rate(), loop=loop,
+                render_masks=masks,
+            )
+        else:
+            _write_sample_s8(
+                b, name, smp.data, smp.c4_rate(), loop=loop,
+                depth=smp.depth, render_masks=masks,
+            )
 
     pat_ptrs: list[int] = []
     for ch, idx, rows in patterns:
@@ -4713,6 +5348,12 @@ def write_fur(
         data = bytes(15 - (v & 0x0F) for v in wave)
         wave_ptrs.append(_write_wave(
             b, f"gb_wave_{_wave_label(wave)}", data, maximum=15,
+        ))
+    for wave in vsu_waves:
+        # The VSU wave RAM is 32 6-bit samples; the platform uploads them
+        # unchanged, so the wavetable height is 63.
+        wave_ptrs.append(_write_wave(
+            b, f"vsu_wave_{_wave_label(wave)}", bytes(wave), maximum=63,
         ))
 
     for i, p in enumerate(ins_ptrs):

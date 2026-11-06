@@ -438,7 +438,8 @@ def _run_convert(
         return _run_variants(out, files, dest, 4, optimize, verify)
     done = rc = 0
     for src, info, error in convert_folder(
-        files, dest, speed=speed, normalize=True, log=lambda message: out(f"  {message}"),
+        files, dest, speed=speed, normalize=verify,
+        log=lambda message: out(f"  {message}"),
     ):
         if error is not None:
             out(f"  ERROR {src.name}: {error}")
@@ -470,10 +471,10 @@ def _run_variants(
     done = rc = 0
     use_verify = verify and mode != "all"
     if use_verify:
-        out("  verifying each variant through Furnace...")
+        out("  rendering/verifying each variant through Furnace...")
     for src, info, error in convert_folder(
         files, dest, variants=True, condense=factor, optimize=mode,
-        verify=verify, layout=layout, normalize=True,
+        verify=verify, layout=layout, normalize=verify,
         log=lambda message: out(f"  {message}"),
     ):
         if error is not None:
@@ -510,7 +511,7 @@ def cmd_condense(read, out, state, state_path):
     factor = _ask(read, "max condense factor (2-4)", "4")
     mode = _ask_optimise(read)
     verify = _ask(
-        read, "verify through Furnace? (y/N)", "n"
+        read, "normalize/verify through Furnace? (y/N)", "n"
     ).lower() in ("y", "yes")
     rc = _run_variants(
         out, vgms, dst, int(factor) if factor.isdigit() else 4, mode, verify
@@ -529,11 +530,9 @@ def _pack_convert(read, out, pack, tracks, default_dir: Path, state, state_path)
         return
     dst = Path(_ask(read, "output folder", str(default_dir)))
     optimize = _ask_optimise(read)
-    verify = False
-    if optimize != "none":
-        verify = _ask(
-            read, "verify variants through Furnace? (y/N)", "n"
-        ).lower() in ("y", "yes")
+    verify = _ask(
+        read, "normalize/verify through Furnace? (y/N)", "n"
+    ).lower() in ("y", "yes")
     _run_convert(out, [tracks[i] for i in picks], dst, None, optimize, verify)
     state.setdefault("out_dirs", {})[str(pack.path)] = str(dst)
     state["pack"] = str(pack.path)
@@ -601,7 +600,7 @@ def _pack_render(read, out, tracks, fur_dir: Path, *, spec: str | None = None) -
 
 def _convert_now(
     out, files: list[Path], dest: Path, speed: int | None,
-    optimize: str = "all", verify: bool = True,
+    optimize: str = "all", verify: bool = False,
 ) -> int:
     return _run_convert(out, files, dest, speed, optimize, verify)
 
@@ -636,11 +635,9 @@ def cmd_convert_file(read, out, state, state_path):
     dst = Path(_ask(read, "output folder", default_out))
     speed = _ask(read, "ticks per row (blank = auto)")
     optimize = _ask_optimise(read)
-    verify = False
-    if optimize != "none":
-        verify = _ask(
-            read, "verify variants through Furnace? (y/N)", "n"
-        ).lower() in ("y", "yes")
+    verify = _ask(
+        read, "normalize/verify through Furnace? (y/N)", "n"
+    ).lower() in ("y", "yes")
     return _convert_now(
         out, vgms, dst, int(speed) if speed.isdigit() else None, optimize, verify
     )

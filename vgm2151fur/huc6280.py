@@ -54,6 +54,11 @@ HUC6280_MAX_PERIOD = 0xFFF
 HUC6280_REFIT_SAMPLES = 735
 # The LO and HI bytes of one 12-bit frequency update land within a few samples.
 HUC6280_FREQ_PAIR_GAP = 64
+# A driver writes the note's attack volume/balance a few samples after the
+# gate. A change this close is that note's first level, not an envelope step;
+# folding it into the note's own volume keeps the attack transient on the row
+# instead of dropping it as a same-row volume step.
+HUC6280_ATTACK_WINDOW = 64
 # A whole-waveform rewrite is a burst of byte writes; only the settled image is
 # a step of a morph.
 WAVE_BURST_SAMPLES = 64

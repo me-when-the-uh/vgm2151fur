@@ -49,8 +49,8 @@ python -m vgm2151fur convert "pack/02 Track.vgz" -o out --variants --optimize lo
 `--verify` makes `lossless` authoritative: every candidate is rendered through
 Furnace and rejected if it adds a sustained pitch divergence over 1x (0.25 st /
 60 ms, one run of slack). It costs a render per variant but is the only gate
-that catches what the structural counters miss; the menu entry `7` always
-verifies. `--condense N` sets the largest factor (default 4) and the ladder
+that catches what the structural counters miss; the menu asks for it and
+defaults to no. `--condense N` sets the largest factor (default 4) and the ladder
 keeps the half steps - `1, 1.5, 2, 2.5, 3, 3.5, 4`. A row does not have to be
 a whole number of samples, and a musical unit that lands between two whole
 steps would otherwise be skipped. `--factors 1,1.5,2,2.5,3,4` writes an
@@ -105,10 +105,12 @@ you read it.
 
 Genesis PSG notes are converted automatically; `--melody-only` keeps the DAC (and other sample-chip) data out, while the FM/PSG side still converts. The YM2612 DAC default is release-capped PCM chunks: one FM6 note per chunk, split at every `0xB6` pan change and at most every 0.25 s, with a small sample budget so release Furnace loads the module. Silence-only chunks and leading silence get no note. `collect_dac(..., slices=True)` is the explicit per-run slice mode; `timeline=True` is the old comparison body. The SN76489 system volume defaults to 0.500; an absolute VGM extra-header volume entry overrides it.
 
-Conversion renders each finished track once through the Furnace console and
-fits the module's master volume to a -2.5 dBFS peak (one render per track,
-a few seconds). `--no-normalize` skips the render and writes the module at
-unity.
+When requested, conversion renders each finished track once through the
+Furnace console and fits the module's master volume to a -2.5 dBFS peak (one
+render per track, a few seconds). The menu asks
+`normalize/verify through Furnace? (y/N)` and defaults to no, so a normal
+menu conversion never launches Furnace. On the command line, `--no-normalize`
+skips the render and writes the module at unity.
 
 The conversion keeps the VGM marker. A marker placed after a pickup leaves
 that pickup at the end of each iteration, where the source plays it.
@@ -208,7 +210,8 @@ they can be run from anywhere.
 - `tools/pitch_shift.py <a.wav> <b.wav>`: the chroma-rotation table one pair
   of renders at a time, used by the soundcheck.
 - `tools/vgm_scan.py [root ...]`: which VGM packs use SegaPCM, C140, C352,
-  K053260, C219, SCC/SCC+, AY-8910, YM2203 or YM2612 and at which clock. C219 is a
+  K053260, YMZ280B, Virtual Boy VSU, C219, SCC/SCC+, AY-8910, YM2203 or
+  YM2612 and at which clock. C219 is a
   C140-family part the converter does not support; never batch-convert those
   into the C140 target. C352 converts as chip 0xD0; a Furnace build with a
   C352 core can play it. YM2203 converts as chip 0x8D (3 FM + 3 SSG voices

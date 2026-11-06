@@ -12,17 +12,16 @@ Run:  python -m unittest tests.test_vgm2151fur_combo
 
 from __future__ import annotations
 
-import os
 import tempfile
 import unittest
 from collections import Counter
 from pathlib import Path
 
-from vgm2151fur.analyze import _family_keyons, _family_sounds, analyze, format_report
+from vgm2151fur.analyze import _family_sounds, analyze, format_report
 from vgm2151fur.audit import compare_dac
 from vgm2151fur.furwrite import (
     CHIP_AY8910, CHIP_MSM6295, CHIP_OPL2, CHIP_OPL3, CHIP_OPLL_DRUMS,
-    CHIP_SMS, CHIP_YM2151, CHIP_YM2203, CHIP_YM2612, CHIP_YM2612_EXT,
+    CHIP_SMS, CHIP_YM2151, CHIP_YM2203, CHIP_YM2612,
     _append_system_names, _channel_vol_max, write_fur,
 )
 from vgm2151fur.furio import CHIP_CHANNELS, iter_blocks, parse_fur
@@ -285,6 +284,11 @@ class TestStreamCollection(unittest.TestCase):
 
     BANK = bytes(((i * 7) % 253) + 1 for i in range(4096))
 
+    @staticmethod
+    def _signed(data: bytes) -> bytes:
+        """The type-0x00 bank is unsigned; a module sample is signed."""
+        return bytes((x - 0x80) & 0xFF for x in data)
+
     def _file(self, plays: list[DacStreamPlay], *, total: int = 20000):
         v = _vgm(
             [ChipWrite(0, "ym2612", 0, 0x2B, 0x80)],
@@ -299,7 +303,10 @@ class TestStreamCollection(unittest.TestCase):
         v = self._file([_stream(0, 0, 128), _stream(9000, 256, 64)])
         samples, plays, warn, stats = collect_dac(v, slices=True)
         self.assertFalse(warn)
-        self.assertEqual([s.data for s in samples], [bank[:128], bank[256:320]])
+        self.assertEqual(
+            [s.data for s in samples],
+            [self._signed(bank[:128]), self._signed(bank[256:320])],
+        )
         self.assertEqual([p.onset for p in plays], [0, 9000])
         self.assertEqual(stats["dac_stream_plays"], 2)
 
@@ -308,7 +315,9 @@ class TestStreamCollection(unittest.TestCase):
         samples, _plays, _warn, stats = collect_dac(v, slices=False)
         self.assertGreater(len(samples), 1)
         self.assertLessEqual(len(samples), DAC_RELEASE_SAMPLES)
-        self.assertEqual(b"".join(s.data for s in samples), self.BANK)
+        self.assertEqual(
+            b"".join(s.data for s in samples), self._signed(self.BANK),
+        )
         self.assertEqual(stats["dac_stream_chunks"], len(samples))
 
     def test_a_long_stream_spreads_the_budget_over_its_length(self):
@@ -346,6 +355,20 @@ class TestStreamCollection(unittest.TestCase):
         _samples, _plays, _warn, stats = collect_dac(v)
         self.assertEqual(stats["dac_stream_second_chip"], 1)
 
+    def test_unsigned_bank_becomes_signed_pcm(self):
+        # Type 0x00 stores 0x80-centred bytes; a module sample is signed.
+        bank = bytes([0x00, 0x40, 0x80, 0xC0, 0xFF])
+        v = _vgm(
+            [ChipWrite(0, "ym2612", 0, 0x2B, 0x80)],
+            ym2612_clock=7670453, dac_data=bytearray(bank),
+            total_samples=20000,
+        )
+        v.dac_stream_plays = [_stream(0, 0, len(bank))]
+        samples, _plays, _warn, _stats = collect_dac(v, slices=True)
+        self.assertEqual(
+            samples[0].data, bytes([0x80, 0xC0, 0x00, 0x40, 0x7F]),
+        )
+
     def test_milliseconds_count_the_rate(self):
         v = self._file([_stream(0, 0, 100, mode=2)])
         samples, _plays, _warn, _stats = collect_dac(v, slices=True)
@@ -354,12 +377,12 @@ class TestStreamCollection(unittest.TestCase):
     def test_a_step_reads_every_nth_byte(self):
         v = self._file([_stream(0, 0, 64, step=2)])
         samples, _plays, _warn, _stats = collect_dac(v, slices=True)
-        self.assertEqual(samples[0].data, self.BANK[:64:2])
+        self.assertEqual(samples[0].data, self._signed(self.BANK[:64:2]))
 
     def test_reverse_walks_the_range_backwards(self):
         v = self._file([_stream(0, 0, 64, mode=0x11)])
         samples, _plays, _warn, _stats = collect_dac(v, slices=True)
-        self.assertEqual(samples[0].data, self.BANK[:64][::-1])
+        self.assertEqual(samples[0].data, self._signed(self.BANK[:64][::-1]))
 
 
 # ------------------------------------------------- who gets a system at all
@@ -692,6 +715,35 @@ def _flag_texts(data: bytes) -> list[str]:
 
 
 @unittest.skipUnless(HAVE_FURNACE, "furnace console build missing")
+class TestComboInstrumentPriority(unittest.TestCase):
+    def test_ay_keeps_its_decay_beside_an_opll_macro_copy(self):
+        # The OPLL level walk creates a macro copy that grows the patch list
+        # into the AY event's pre-bind instrument index. The AY note must not
+        # be taken for an OPLL note: that used to pin its volume column to 15
+        # and lose the decay, leaving a randomly loud square.
+        writes = opll_note(1000, ch=0, off=30000)
+        writes += [
+            ChipWrite(5000, "opll", 0, 0x30, (6 << 4) | 4),
+            ChipWrite(5100, "opll", 0, 0x30, (6 << 4) | 2),
+        ]
+        writes += [
+            ChipWrite(0, "ay8910", 0, 7, 0xFE),
+            ChipWrite(0, "ay8910", 0, 0, 254),
+            ChipWrite(0, "ay8910", 0, 1, 0),
+            ChipWrite(3000, "ay8910", 0, 8, 9),
+            ChipWrite(8000, "ay8910", 0, 8, 8),
+            ChipWrite(13000, "ay8910", 0, 8, 7),
+            ChipWrite(25000, "ay8910", 0, 8, 0),
+        ]
+        song = analyze(_vgm(writes, ym2413_clock=3579545,
+                           ay8910_clock=1789773, total_samples=60000))
+        ay = next(e for e in song.events if e.on and e.tone_chip == 2)
+        idx = ay.ins - len(song.fm_patches)
+        self.assertTrue(0 <= idx < len(song.ay_ins),
+                        (ay.ins, len(song.fm_patches), len(song.ay_ins)))
+        self.assertEqual(song.ay_ins[idx].vol[0], 9)
+        self.assertEqual(ay.vol, 15)      # the macro carries the level
+
 class TestComboRoundTrip(unittest.TestCase):
     """Furnace drives both systems of a combined module."""
 
@@ -747,65 +799,26 @@ class TestComboRoundTrip(unittest.TestCase):
                 and 0xB0 <= (w.reg & 0xFF) <= 0xB8 and (w.val & 0x20)]
         self.assertTrue(keys, "the OPL melody vanished")
 
-
-def _merged_root() -> Path | None:
-    """The folder holding the merged rips, when this machine has them.
-
-    `VGM2151FUR_MERGED_RIPS` names it directly; otherwise the OPNA rip root's
-    grandparent is tried, which is where that batch of merged logs sits.
-    """
-    raw = os.environ.get("VGM2151FUR_MERGED_RIPS")
-    candidates = [Path(raw)] if raw else []
-    opna = os.environ.get("VGM2151FUR_OPNA_RIPS")
-    if opna:
-        candidates.append(Path(opna).parent.parent)
-    for path in candidates:
-        if path.is_dir() and next(path.glob("*_merged.vgm"), None):
-            return path
-    return None
-
-
-@unittest.skipUnless(HAVE_FURNACE and _merged_root(), "merged rips missing")
-class TestMergedRips(unittest.TestCase):
-    """The merged logs themselves, through Furnace and back.
-
-    The synthetic tests prove the layout; these prove a real rip keeps both
-    halves: the OPL card's melody and the arcade chip underneath it, each on
-    its own channels with its own clock.
-    """
-
-    def _rip(self, name: str) -> Path:
-        """A merged log by file name; the batch sits in a few subfolders.
-
-        The names carry brackets, which a glob reads as a character class, so
-        this walks the `*.vgm` files and compares the names itself.
-        """
-        root = _merged_root()
-        direct = root / name
-        if direct.is_file():
-            return direct
-        for path in root.rglob("*.vgm"):
-            if path.name == name:
-                return path
-        self.skipTest(f"{name} missing")
-        raise AssertionError  # unreachable: skipTest raises
-
-    def _round(self, path: Path):
-        src = load_vgm(path)
-        song = analyze(src)
-        fur = TMP / (path.stem[:40] + ".fur")
-        fur.write_bytes(write_fur(song, compress=True))
-        out = TMP / (path.stem[:40] + ".export.vgm")
-        export_vgm(fur, out)
-        return src, song, load_vgm(out)
-
-    def test_cosmic_dance_keeps_the_opm_under_the_opl3(self):
-        src, song, exp = self._round(
-            self._rip("15 Cosmic Dance [Round 7]_merged.vgm"))
-        self.assertEqual([(s.kind, s.chip_id) for s in song.fm_systems],
-                         [("ym2151", 0), ("opl3", 0)])
+    def test_opm_and_opl3_keep_their_own_channels(self):
+        writes: list = []
+        for ch in range(8):
+            writes += opm_note(1000 + ch * PULSE, ch)
+        for ch in range(4):
+            writes += opl_note(1300 + ch * PULSE, ch, kind="opl3")
+        v = _vgm(writes, ym2151_clock=4000000, opl3_clock=14318180,
+                 total_samples=200000)
+        song = analyze(v)
+        self.assertEqual(
+            [(s.kind, s.chip_id) for s in song.fm_systems],
+            [("ym2151", 0), ("opl3", 0)],
+        )
         self.assertEqual(parse_fur(write_fur(song)).chips[:2],
                          [CHIP_YM2151, CHIP_OPL3])
+        fur = TMP / "opm_opl3.fur"
+        fur.write_bytes(write_fur(song, compress=True))
+        out = TMP / "opm_opl3.vgm"
+        export_vgm(fur, out)
+        exp = load_vgm(out)
         self.assertEqual(exp.ym2151_clock, 4000000)
         self.assertEqual(exp.opl3_clock, 14318180)
 
@@ -819,47 +832,73 @@ class TestMergedRips(unittest.TestCase):
                     if w.chip == "opl3" and 0xB0 <= (w.reg & 0xFF) <= 0xB8
                     and (w.val & 0x20)}
 
-        # The arcade part drives all eight OPM voices; the arrangement keeps
-        # its own channels. Neither family can leak into the other's registers.
-        self.assertEqual(opm_voices(src), opm_voices(exp))
+        # Neither family leaks into the other's registers, and every voice
+        # that was keyed survives the module.
+        self.assertEqual(opm_voices(exp), opm_voices(v))
         self.assertTrue(opm_voices(exp))
-        self.assertEqual(opl_voices(src), opl_voices(exp))
-        limit = min(src.total_samples, exp.total_samples)
-        self.assertGreaterEqual(
-            _family_keyons(exp, {"opl3"}), int(_family_keyons(src, {"opl3"}) * 0.95)
-        )
+        self.assertEqual(opl_voices(exp), opl_voices(v))
+        self.assertTrue(opl_voices(exp))
+        text = format_report(song)
+        self.assertIn("YM2151", text)
+        self.assertIn("YMF262", text)
 
-    def test_z66_streams_its_dac_under_the_opl_melody(self):
-        src, song, exp = self._round(
-            self._rip("z66_pc-fm_trimmed_merged.vgm"))
-        self.assertEqual([s.kind for s in song.fm_systems], ["ym2612", "opl2"])
-        self.assertEqual(song.psg_ids, [])       # the SN never lifted a level
-        audit = compare_dac(src, exp)
+    def test_dac_stream_audit_covers_the_whole_bank(self):
+        bank = bytes(((i * 5) % 251) + 4 for i in range(8192))
+        writes: list = [ChipWrite(0, "ym2612", 0, 0x2B, 0x80)]
+        for ch in range(3):
+            writes += [opl_note(t, ch) for t in (1000 + ch * PULSE,
+                                                 9000 + ch * PULSE)]
+        v = _vgm(writes, ym2612_clock=7600489, opl2_clock=3579545,
+                 dac_data=bytearray(bank), total_samples=80000)
+        v.dac_stream_plays = [_stream(200, 0, len(bank))]
+        song = analyze(v)
+        self.assertEqual([s.kind for s in song.fm_systems],
+                         ["ym2612", "opl2"])
+        self.assertGreater(song.dac_count, 0)
+        fur = TMP / "dac_audit.fur"
+        fur.write_bytes(write_fur(song, compress=True))
+        out = TMP / "dac_audit.vgm"
+        export_vgm(fur, out)
+        exp = load_vgm(out)
+        audit = compare_dac(v, exp)
         self.assertEqual(audit["missed"], 0, audit)
-        self.assertGreater(audit["matched"], 200)
+        self.assertGreater(audit["matched"], 0)
+        self.assertEqual(audit["rate_bad"], 0, audit)
         # Every PCM byte of the source stream is inside the module's banks.
         self.assertGreater(audit["bytes_exp"], audit["bytes_src"] * 99 // 100)
-        self.assertGreater(_family_keyons(exp, {"opl2"}), 1000)
+        keys = [w for w in exp.writes if w.chip == "opl2"
+                and 0xB0 <= (w.reg & 0xFF) <= 0xB8 and (w.val & 0x20)]
+        self.assertTrue(keys, "the OPL melody vanished")
 
-    def test_29test_adds_the_ym2413_kit_to_the_opn2(self):
-        src, song, exp = self._round(
-            self._rip("29test-ym2612-clkfix_merged_merged.vgm"))
-        self.assertEqual([s.kind for s in song.fm_systems], ["ym2612", "opll"])
+    def test_opn2_opll_and_psg_each_survive(self):
+        writes: list = []
+        for ch in range(3):
+            writes += opn_note(1000 + ch * PULSE, ch)
+        for ch in range(3):
+            writes += opll_note(1200 + ch * PULSE, ch)
+        writes.append(ChipWrite(1300, "opll", 0, 0x0E, 0x20 | 0x1F))
+        for ch in range(3):
+            writes += psg_tone(1400 + ch * PULSE, ch)
+        v = _vgm(writes, ym2612_clock=7670453, ym2413_clock=3579545,
+                 sn76489_clock=3579545, total_samples=200000)
+        song = analyze(v)
+        self.assertEqual([s.kind for s in song.fm_systems],
+                         ["ym2612", "opll"])
         self.assertEqual(parse_fur(write_fur(song)).chips[:3],
-                         [CHIP_YM2612_EXT, CHIP_OPLL_DRUMS, CHIP_SMS])
+                         [CHIP_YM2612, CHIP_OPLL_DRUMS, CHIP_SMS])
+        fur = TMP / "three_engines.fur"
+        fur.write_bytes(write_fur(song, compress=True))
+        out = TMP / "three_engines.vgm"
+        export_vgm(fur, out)
+        exp = load_vgm(out)
+        self.assertEqual(exp.ym2612_clock, 7670453)
         self.assertEqual(exp.ym2413_clock, 3579545)
         self.assertEqual(exp.sn76489_clock, 3579545)
         keys = Counter(w.chip for w in exp.writes)
         # All three engines still write: the OPN2 melody, the YM2413 kit and
         # the PSG's own gates.
         for chip in ("ym2612", "opll", "sn76489"):
-            self.assertGreater(keys[chip], 1000, keys)
-
-    def test_a_report_lists_the_systems(self):
-        src = load_vgm(self._rip("15 Cosmic Dance [Round 7]_merged.vgm"))
-        text = format_report(analyze(src))
-        self.assertIn("YM2151", text)
-        self.assertIn("YMF262", text)
+            self.assertGreater(keys[chip], 0, keys)
 
 
 if __name__ == "__main__":

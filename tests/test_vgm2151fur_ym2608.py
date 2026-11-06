@@ -13,14 +13,11 @@ Run:  python -m unittest tests.test_vgm2151fur_ym2608
 
 from __future__ import annotations
 
-import os
 import tempfile
 import unittest
 from pathlib import Path
 
 from vgm2151fur.analyze import analyze, format_report
-from vgm2151fur.audit import compare_ym2608_samples
-from vgm2151fur.diag import pitch_runs
 from vgm2151fur.furwrite import (
     CHIP_YM2608, CHIP_YM2608_EXT, INS_ADPCMA, INS_ADPCMB, INS_FM,
     parse_fur_skeleton, write_fur,
@@ -824,74 +821,6 @@ class TestYm2608RoundTrip(unittest.TestCase):
             self.assertEqual(runs, [], f"ch{ch}: {runs[:2]}")
 
 
-
-
-@unittest.skipUnless(HAVE_FURNACE, "Furnace console build missing")
-class TestYm2608RealRips(unittest.TestCase):
-    """The FM Towns rips this model was tuned on, end to end.
-
-    Rips live in ``VGM_collection/YM2608`` beside the repository, or wherever
-    ``VGM2151FUR_OPNA_RIPS`` points. Each test converts a whole track, exports it
-    back through Furnace and checks the registers that matter: every kit voice at
-    its own level, every delta-T gate with its bytes and step intact, and no voice
-    drifting off pitch - the split channel-3 columns included, which is where a
-    column map that collides with the second FM block shows up.
-    """
-
-    ROOT = Path(__file__).resolve().parents[2]
-    CANDIDATES = [p for p in (
-        os.environ.get("VGM2151FUR_OPNA_RIPS"),
-        str(ROOT / "VGM_collection" / "YM2608"),
-    ) if p]
-
-    def setUp(self):
-        self.dirs = [Path(p) for p in self.CANDIDATES if Path(p).is_dir()]
-        if not self.dirs:
-            self.skipTest("no YM2608 rips (set VGM2151FUR_OPNA_RIPS)")
-
-    def find(self, name: str) -> Path:
-        # Not rglob(name): a rip title carries `[`, which glob reads as a
-        # character class and never matches the file.
-        for d in self.dirs:
-            for path in d.rglob("*.vg*"):
-                if path.name == name:
-                    return path
-        self.skipTest(f"{name} not in the rip folders")
-
-    def _trip(self, name: str):
-        src = load_vgm(self.find(name))
-        song = analyze(src)
-        self.assertFalse([w for w in song.warnings if "limit" in w], song.warnings)
-        self.assertEqual(song.fm_chip, "ym2608")
-        fur = TMP / (Path(name).stem + ".fur")
-        fur.write_bytes(write_fur(song))
-        out = export_vgm(fur, TMP / (Path(name).stem + ".export.vgm"))
-        return src, song, load_vgm(out)
-
-    def test_grounseed_ext_keeps_every_voice(self):
-        src, song, exp = self._trip("16 N.G. [Ease].vgz")
-        self.assertTrue(song.ym2608_ext)
-        rep = compare_ym2608_samples(src, exp)
-        for kind in ("rhythm", "delta_t"):
-            d = rep[kind]
-            self.assertGreater(d["matched"], 100, kind)
-            self.assertEqual(
-                [d[k] for k in ("missed", "data", "length", "vol", "pan", "rate")],
-                [0] * 6, (kind, d))
-        for ch in range(12):
-            runs = pitch_runs(src, exp, ch, threshold_st=0.25, min_run_ms=60)
-            self.assertEqual(runs, [], f"ch{ch}: {runs[:2]}")
-
-    def test_bellias_base_layout_matches_the_ym2610b_span(self):
-        src, song, exp = self._trip("46 The Great Priest Bellias.vgz")
-        self.assertFalse(song.ym2608_ext)
-        rep = compare_ym2608_samples(src, exp)
-        self.assertGreater(rep["rhythm"]["matched"], 500)
-        for field in ("missed", "vol", "pan"):
-            self.assertEqual(rep["rhythm"][field], 0, rep["rhythm"])
-        for ch in range(9):
-            runs = pitch_runs(src, exp, ch, threshold_st=0.25, min_run_ms=60)
-            self.assertEqual(runs, [], f"ch{ch}: {runs[:2]}")
 
 
 if __name__ == "__main__":

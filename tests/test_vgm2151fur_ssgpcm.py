@@ -11,18 +11,15 @@ from vgm2151fur.furio import decompress_fur, iter_blocks, parse_fur
 from vgm2151fur.furwrite import INS_AY, write_fur
 from vgm2151fur.ssgpcm import (
     DAC_LOG_TABLE_AY,
+    SsgPcmSample,
     collect_ssg_pcm,
 )
 from vgm2151fur.vgm import (
-    ChipWrite, DacStreamPlay, VgmFile, load_vgm,
+    ChipWrite, DacStreamPlay, VgmFile,
 )
 
 AY_CLOCK = 1789773
 YM2203_CLOCK = 3993600
-EYE = Path(
-    r"F:\NASbackup\JamesAlan\_devspace\grbsd\ripwip\_finished\rusty-pc98"
-    r"\m-rerip\done\20 Eye Catch.vgz"
-)
 
 
 def _vgm(writes, *, total=200000, ay_clock=AY_CLOCK, ym2203_clock=0):
@@ -157,6 +154,22 @@ class TestSsgPcmDetect(unittest.TestCase):
         self.assertEqual(sorted(h.voice for h in hits), [0, 1, 2])
         self.assertEqual({h.sample_index for h in hits}, {0})
 
+    def test_dominant_level_with_short_runs_is_a_waveform(self):
+        # A body can spend most of its time at one level without reaching the
+        # DC threshold: the run length, not the overall share, decides.
+        writes = [_ay(0, 7, 0xBF)]
+        writes += _square(100, 2500, 5, half=22, reg=8)
+        writes += _square(100, 2500, 5, half=27, reg=9)
+        t = 100
+        for i in range(2500):
+            writes.append(_ay(t, 10, 0 if i % 625 == 624 else 15))
+            t += 5
+        samples, hits, _warn = collect_ssg_pcm(_vgm(writes), chip="ay8910")
+        self.assertEqual(len(samples), 3)
+        self.assertEqual(sorted(s.voice for s in samples), [0, 1, 2])
+        self.assertEqual(len(hits), 3)
+        self.assertTrue(all(len(s.data) > 2048 for s in samples))
+
     def test_ym2203_ssg_uses_the_same_path(self):
         writes = [_ay(0, 7, 0xBF, chip="ym2203_ssg")]
         writes += _square(100, 700, 5, chip="ym2203_ssg")
@@ -269,6 +282,25 @@ class TestSsgPcmDacStream(unittest.TestCase):
         self.assertEqual(len(hits), 1)
         self.assertGreater(len(samples[0].data), 1400)
 
+    def test_stream_and_direct_writes_coexist(self):
+        # A driver can mix DAC-stream notes with direct volume-register PCM.
+        # Both paths must keep their own bodies and rates.
+        body = bytes([(i // 8) % 16 for i in range(2400)])
+        vgm = self._stream(body, sample=1000)
+        vgm.writes.extend(_pcm_writes(1000, 700, reg=8, chip="ym2203_ssg"))
+        for k in range(4):
+            vgm.dac_stream_plays.append(DacStreamPlay(
+                sample=10000 + k * 5000, chip_type=0x06, chip_id=0,
+                stream=0, port=0, reg=10, offset=0, length=2400, mode=1,
+                rate=15964, loop=False, reverse=False, step=1,
+                step_base=0, bank=0,
+            ))
+        samples, hits, _warn = collect_ssg_pcm(vgm, chip="ym2203_ssg")
+        self.assertGreaterEqual(len(hits), 5)
+        self.assertTrue(all(len(s.data) >= 128 for s in samples))
+        self.assertTrue(any(s.rate > 10000 for s in samples))
+        self.assertGreater(len({s.rate for s in samples}), 1)
+
     def test_high_dc_stream_is_dropped(self):
         # A tiny peak followed by a flat DC tail is not worth a sample slot.
         body = bytes([15] * 200 + [0] * 4000)
@@ -311,6 +343,22 @@ class TestSsgPcmDacStream(unittest.TestCase):
 
 
 class TestSsgPcmUnused(unittest.TestCase):
+    def test_writer_drops_a_body_no_note_selects(self):
+        writes = [_ay(0, 7, 0xBF)]
+        writes += _square(100, 700, 5, reg=8)
+        song = analyze(_vgm(writes, total=4000))
+        self.assertEqual(len(song.ssg_pcm_samples), 1)
+        song.ssg_pcm_samples.append(SsgPcmSample(
+            "unused", b"\x01\x02\x03", 8820, 0, 0,
+        ))
+        stats: dict = {}
+        data = write_fur(song, stats=stats)
+        mod = parse_fur(data)
+        self.assertEqual(stats.get("ssg_pcm_samples_unused"), 1)
+        self.assertEqual(len(mod.samples), 1)
+        pcm = [e for e in song.events if e.on and e.pcm][0]
+        self.assertEqual(_ins_sm_maps(data, pcm.ins)[pcm.note - 60], 0)
+
     def test_unreferenced_bodies_are_not_written(self):
         # A stream aimed at a second YM2203 instance the module does not have.
         # The body must not survive as an unused SMP2 block.
@@ -391,49 +439,6 @@ class TestSsgPcmEmission(unittest.TestCase):
         self.assertEqual(
             [maps[e.note - 60] for e in pcm], [0, 1, 2],
         )
-
-
-class TestSsgPcmRealRips(unittest.TestCase):
-    """The user's reference rips, when present."""
-
-    def _check(self, path: Path, chip: str, min_notes: int):
-        vgm = load_vgm(path)
-        samples, hits, _warn = collect_ssg_pcm(vgm, chip=chip)
-        self.assertGreaterEqual(len(hits), min_notes)
-        self.assertTrue(all(len(s.data) == 0 or s.rate for s in samples))
-        self.assertEqual({s.rate for s in samples}.__len__(), 1)
-
-    @unittest.skipUnless(
-        Path(r"D:\Downloads\rforce.vgm").is_file(), "rforce.vgm missing"
-    )
-    def test_rforce_all_three_voices(self):
-        # Voice 0 is 96% one level overall, but its longest consecutive run
-        # is only 31%, so it is a real waveform and is kept.
-        vgm = load_vgm(Path(r"D:\Downloads\rforce.vgm"))
-        samples, hits, _warn = collect_ssg_pcm(vgm, chip="ym2203_ssg")
-        self.assertEqual(len(samples), 3)
-        self.assertEqual(sorted(s.voice for s in samples), [0, 1, 2])
-
-    @unittest.skipUnless(
-        Path(r"F:\NASbackup\JamesAlan\_devspace\grbsd\SELECT-ay.vgm").is_file(),
-        "SELECT-ay.vgm missing",
-    )
-    def test_select_ay_stream(self):
-        self._check(
-            Path(r"F:\NASbackup\JamesAlan\_devspace\grbsd\SELECT-ay.vgm"),
-            "ay8910", 20,
-        )
-
-    @unittest.skipUnless(EYE.is_file(), "20 Eye Catch missing")
-    def test_eye_uses_the_dac_stream_in_full(self):
-        vgm = load_vgm(EYE)
-        samples, hits, _warn = collect_ssg_pcm(vgm, chip="ym2203_ssg")
-        self.assertGreaterEqual(len(hits), 5)
-        # Every body clears the tiny-fragment minimum.  The file has both
-        # DAC-stream notes (~15.9 kHz) and direct-write PCM sections, so the
-        # rates are not all the same.
-        self.assertTrue(all(len(s.data) >= 128 for s in samples))
-        self.assertTrue(any(s.rate > 10000 for s in samples))
 
 
 if __name__ == "__main__":

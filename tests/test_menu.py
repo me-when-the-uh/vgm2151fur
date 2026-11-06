@@ -16,6 +16,7 @@ if str(ROOT) not in sys.path:
 
 from _synth import PATCH, raw_vgm  # noqa: E402
 from vgm2151fur import __main__ as cli  # noqa: E402
+import vgm2151fur.menu as menu  # noqa: E402
 from vgm2151fur.convert import iter_vgms  # noqa: E402
 from vgm2151fur.edit import read_chips_file  # noqa: E402
 from vgm2151fur.menu import _parse_targets, run_menu  # noqa: E402
@@ -427,6 +428,49 @@ class TestMenu(unittest.TestCase):
                 rc = cli.main(["convert", "whatever.vgm"])
         self.assertEqual(rc, 130)
         self.assertIn("cancelled", err.getvalue())
+
+
+class TestMenuFurnaceDefault(unittest.TestCase):
+    """The menu must not launch Furnace unless the user asks for it."""
+
+    def test_direct_conversion_defaults_to_no_normalize(self):
+        from unittest import mock
+
+        calls: list[dict] = []
+
+        def fake_convert(files, dest, **kw):
+            calls.append(kw)
+            return iter([(files[0], {}, None)])
+
+        with mock.patch.object(menu, "convert_folder", fake_convert):
+            menu._convert_now(
+                lambda _message: None, [Path("a.vgm")], Path("out"), None,
+            )
+        self.assertEqual(len(calls), 1)
+        self.assertFalse(calls[0]["normalize"])
+        self.assertFalse(calls[0]["verify"])
+
+    def test_plain_conversion_defaults_to_no_normalize(self):
+        from unittest import mock
+
+        calls: list[dict] = []
+
+        info = {
+            "dst": "out/a.fur", "bytes": 1, "speed": 6, "events": 1,
+            "gain": None, "loop": None, "warnings": [],
+        }
+
+        def fake_plain(files, dest, **kw):
+            calls.append(kw)
+            return iter([(files[0], info, None)])
+
+        with mock.patch.object(menu, "convert_folder", fake_plain):
+            menu._run_convert(
+                lambda _message: None, [Path("a.vgm")], Path("out"), None,
+                "none",
+            )
+        self.assertEqual(len(calls), 1)
+        self.assertFalse(calls[0]["normalize"])
 
 
 if __name__ == "__main__":

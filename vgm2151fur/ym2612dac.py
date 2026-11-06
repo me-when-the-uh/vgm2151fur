@@ -451,7 +451,7 @@ def _frames_from_times(
 ) -> bytes:
     """Lay source bytes on a ``rate`` frame grid, holding the last value."""
     out = bytearray()
-    previous = 0x80
+    previous = 0x00
     start = selected[0][0]
     for t, byte, _wait in selected:
         frame = int(round((t - start) * rate / VGM_RATE))
@@ -765,7 +765,7 @@ def _coalesce_singles(
         start = first.onset
         end = chain[-1].onset + chain[-1].span
         body = bytearray()
-        held = 0x80
+        held = 0x00
         for p in chain:
             target = int(round((p.onset - start) * rate / VGM_RATE))
             if target > len(body):
@@ -815,47 +815,6 @@ def _coalesce_singles(
     ]
     stats["dac_unique_samples"] = len(compact)
     return compact, rebuilt
-
-
-def _source_row_estimate(
-    samples: list[DacSample],
-    plays: list[DacPlay],
-    *, hz: float, speed: int, t0: int,
-) -> int:
-    """Upper bound on the samples `group_dac_plays` will need.
-
-    Single-play rows reuse their source sample; only a row that concatenates
-    several plays needs a new body. The estimate lets the collector choose the
-    chunk path when the reusable representation cannot fit the sample budget.
-    """
-    row_samples = (VGM_RATE / hz) * speed
-    tick = VGM_RATE / hz
-    rows: dict[int, list[DacPlay]] = {}
-    for p in plays:
-        row, _delay = place_tick(
-            p.onset, t0, row_samples, speed, tick, floor=True,
-        )
-        rows.setdefault(row, []).append(p)
-    count = len(samples)
-    combined: set[tuple] = set()
-    for items in rows.values():
-        if len(items) < 2:
-            continue
-        items.sort(key=lambda p: p.onset)
-        weights = [max(1, p.span) for p in items]
-        rate = int(round(
-            sum(samples[p.sample].c4_rate * w
-                for p, w in zip(items, weights))
-            / max(1, sum(weights))
-        ))
-        key = tuple(
-            (p.sample, max(1, int(round(
-                p.span * samples[p.sample].c4_rate / VGM_RATE
-            ))))
-            for p in items
-        )
-        combined.add((key, rate))
-    return count + len(combined)
 
 
 def _chunk_words(
@@ -973,7 +932,7 @@ def _chunk_words(
                     min(DAC_RATE_MAX, int(round(VGM_RATE / min_wait))),
                 )
                 out = bytearray()
-                previous = 0x80
+                previous = 0x00
                 for t, byte, _wait in selected:
                     frame = int(round((t - start) * rate / VGM_RATE))
                     if frame < len(out):
@@ -1019,7 +978,7 @@ def _chunk_words(
             rate = samples[first.sample].c4_rate
             start = first.onset
             body = bytearray()
-            held = 0x80
+            held = 0x00
             for p in tail:
                 target = int(round((p.onset - start) * rate / VGM_RATE))
                 if target > len(body):
@@ -1088,7 +1047,9 @@ def _stream_body(vgm: VgmFile, play: DacStreamPlay) -> bytes:
     loader keeps in `dac_data`.  Mode 1 counts commands (one byte each on the
     YM2612), mode 2 milliseconds of the 0x92 rate, mode 3 the rest of the bank.
     The 0x91 step size is in command units, so a step of two plays every other
-    byte.
+    byte.  The database is unsigned (0x80 centre), while a module sample is
+    signed 8-bit: convert here so the playback engine does not store a -128 DC
+    offset, which clips the waveform against one rail.
     """
     bank = bytes(vgm.dac_data)
     start = max(0, min(len(bank), play.offset))
@@ -1103,7 +1064,7 @@ def _stream_body(vgm: VgmFile, play: DacStreamPlay) -> bytes:
         end = start
     step = play.step if play.step > 1 else 1
     body = bank[start:min(end, len(bank)):step]
-    return body[::-1] if play.reverse else body
+    return _signed_bank(body[::-1] if play.reverse else body)
 
 
 def _stream_chunks(
@@ -1215,9 +1176,15 @@ def _collect_packed(
             )
             return [], [], warnings, stats
         if grid is not None:
-            estimate = _source_row_estimate(
+            # Count the bodies the real row grouping will keep, not an upper
+            # bound: clustering, one-shot joining and silence splitting can
+            # remove most of the source slots.  A preview run avoids dropping
+            # a 104-sample source representation for the 240-sample chunk path.
+            preview, *_rest = group_dac_plays(
                 samples, plays, hz=grid[0], speed=grid[1], t0=grid[2],
+                total_samples=vgm.total_samples or 0, trim=False,
             )
+            estimate = len(preview)
         else:
             estimate = len(samples)
         if estimate > DAC_RELEASE_SAMPLES:
@@ -1406,7 +1373,7 @@ def _held_byte(
 ) -> int:
     """The value the DAC is holding when the next note starts."""
     if previous is None:
-        return 0x80
+        return 0x00
     smp = samples[previous]
     frame = int(round((cut_time - previous_time) * smp.c4_rate / VGM_RATE))
     frame = max(0, min(len(smp.data) - 1, frame))
@@ -1566,7 +1533,7 @@ def _merge_one_shot_samples(
         start, first_idx, pan = notes[first_ni]
         rate = samples[first_idx].c4_rate
         body = bytearray(samples[first_idx].data)
-        held = body[-1] if body else 0x80
+        held = body[-1] if body else 0x00
         for ni in run[1:]:
             t, idx, _pan = notes[ni]
             target = int(round((t - start) * rate / VGM_RATE))
@@ -1845,6 +1812,7 @@ def group_dac_plays(
     t0: int = 0,
     total_samples: int = 0,
     map_capacity: int = DAC_MAP_CAPACITY,
+    trim: bool = True,
 ) -> tuple[
     list[DacSample], list[tuple[int, int, int]],
     list[tuple[int, int]], list[tuple[int, int]],
@@ -1974,7 +1942,7 @@ def group_dac_plays(
         if first.fresh:
             # The DAC was off before this run; a lead is silence, not the
             # previous sample's last value.
-            held = 0x80
+            held = 0x00
 
         # One source play on its own row already has exactly the body the
         # note needs. Reusing it is what keeps a repeated bank sample one
@@ -2079,7 +2047,7 @@ def group_dac_plays(
 
     warnings: list[str] = []
     trimmed = 0
-    if len(out) > DAC_RELEASE_SAMPLES:
+    if trim and len(out) > DAC_RELEASE_SAMPLES:
         trimmed = len(out) - DAC_RELEASE_SAMPLES
         stats["dac_release_trimmed"] = (
             stats.get("dac_release_trimmed", 0) + trimmed
@@ -2120,7 +2088,7 @@ def _collect_timeline(
     run_start: int | None = None
     run_last = 0
     out = bytearray()
-    cur = 0x80
+    cur = 0x00
     last_idx = 0
 
     def flush() -> None:
@@ -2140,7 +2108,7 @@ def _collect_timeline(
             ))
         run_start = None
         out = bytearray()
-        cur = 0x80
+        cur = 0x00
         last_idx = 0
 
     for t, kind, value in vgm.dac_events:

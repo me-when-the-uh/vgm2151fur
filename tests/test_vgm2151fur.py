@@ -569,6 +569,38 @@ class TestOkiVolumeAndFlags(unittest.TestCase):
 
 
 class TestOkiPhrase(unittest.TestCase):
+    def test_0f_bank_selects_the_second_256k_half(self):
+        # Some drivers use $0F as a single 256 KB bank select instead of the
+        # NMK112 map. The phrase book and sample data are both relative to
+        # that bank; reading them from offset 0 saw an empty book and dropped
+        # every MSM6295 channel.
+        from vgm2151fur.oki import collect_oki
+
+        rom = bytearray(0x80000)
+        rom[0x40000:0x40008] = bytes(
+            [0x00, 0x01, 0x00, 0x00, 0x01, 0x07, 0x00, 0x00]
+        )
+        rom[0x40100:0x40108] = b"\x11" * 8
+        v = VgmFile(
+            path=Path("oki_bank.vgm"), buf=b"", version=0x161,
+            total_samples=1000, loop_samples=0, loop_file_pos=None,
+            loop_sample=None, ym2151_clock=4_000_000, k007232_clock=0,
+            gd3={}, roms=[RomSlice(0, 0x80000, 0, bytes(rom), "msm6295")],
+            writes=[
+                ChipWrite(0, "msm6295", 0, 0x0F, 0x00),
+                ChipWrite(10, "msm6295", 0, 0x0F, 0x01),
+                ChipWrite(100, "msm6295", 0, 0x00, 0x80),
+                ChipWrite(110, "msm6295", 0, 0x00, 0x10),
+            ],
+            msm6295_clock=2_000_000,
+            msm6295_pin7=True,
+        )
+        samples, warn = collect_oki(v)
+        self.assertFalse(warn)
+        self.assertEqual(len(samples), 1)
+        self.assertEqual(samples[0].data, b"\x11" * 8)
+        self.assertEqual([(h.voice, h.vol) for h in samples[0].hits], [(0, 8)])
+
     def test_bank_voice3_and_early_stop(self):
         song = analyze(_oki_vgm(), speed=1, pcm=True)
         self.assertEqual([s.length for s in song.oki_samples], [8, 400])

@@ -132,6 +132,46 @@ and `euress opll.vgm` both key their custom voices with nibble 0.
 Note Furnace's melodic OPLL system has no drums; a rip that toggles `$0E`
 needs `DIV_SYSTEM_OPLL_DRUMS`.
 
+Rapid `$3x` automation needs macros, not row effects. A driver can walk the
+preset/volume nibble every 108 samples, which is faster than one pattern row;
+a `10xx` effect keeps only the last value on that row. When a change lands in
+the note's own row (or two changes share a later row), the analyzer builds a
+**wave macro** (file code 3) for the preset nibble and a **volume macro**
+(code 0) for the level nibble, at one entry per tick. The instrument's note
+column stays at 15 so the volume macro is the absolute level. Slower changes
+keep the cheaper row effects.
+
+OPLL's `$2x` key bit is a level, not an edge: rewriting the same keyed byte
+does not retrigger the envelope, so those writes stay pitch/high-byte updates
+rather than phase-reset macros. Only a real 0-to-1 key transition starts a
+note.
+
+Pitch motion with at most about one write per pattern row rides the E5/E8/E9
+row effects; those reach the OPLL registers on export and cost no instrument.
+A single held pitch step is folded into the note's own note/E5 instead of
+spending an instrument. Only a fast sub-row walk (the classic drum bend, whose
+writes all land in one row) stays in the instrument's pitch macro (file code
+4), with values quantized to 1/32 semitone to share near-identical bends.
+Keeping the spread-out motion out of macros matters: on an OPLL-heavy log the
+copies used to fill all 250 slots and leave AY/PSG notes on the plain
+fallback. The analyzer now measures the tone families' real demand before
+the FM macro passes and reserves those slots, keeping a small emergency share
+for FM bends that cannot be row-stepped.
+
+The key-on settle window also snapshots the patch and level at the key-on
+instant, not at the later flush: a retrigger faster than `OPLL_SETTLE` used to
+give the first hit the timbre of the following write.
+
+A key-off does not always end the driver's control of the voice. Percussion
+drivers gate the release tail with `$3x`, so a clap is one key-on plus a chain
+of level steps that can run well past the key bit. The note still keys off at
+that bit (the release is what makes the clap noisy), but the analyzer keeps
+recording the later level points into the volume macro and the later f-num
+points into the pitch macro, extending both to their last write. Furnace keeps
+running instrument macros through release, so the export reaches the chip for
+the whole gesture. During the settle window the pending retrigger owns `$3x`,
+so the released note cannot swallow the new note's opening level.
+
 ## Multi-system .fur facts (all verified)
 
 - `.fur` stores a machine as `sysCount u16`, then per system one **chip-ID

@@ -6,6 +6,13 @@ plus their ROM/ RAM blocks are parsed, samples are extracted per voice, and
 loops are preserved through the SMP2 loop points. The RF5C pair share one
 register model and one Furnace system; `chipType` picks the variant.
 
+VGM chip instances are kept apart.  A second SegaPCM uses address bit 15
+(command `0xC0`), a second C140 address bit 15 (`0xD4`), and a second RF5C
+register bit 7.  Each becomes its own Furnace system in chip order, with its
+own 16/24/8 voice block and ROM image.  Furnace's VGM export still treats the
+RF5C68/RF5C164 pair as its two variants, so a two-RF5C68 module is playable but
+round-trips through a single VGM as the same register stream.
+
 ## Chips
 
 | | SegaPCM | Namco C140 |

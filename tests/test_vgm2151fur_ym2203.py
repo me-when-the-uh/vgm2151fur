@@ -2,14 +2,13 @@
 
 from __future__ import annotations
 
-import math
 import tempfile
 import unittest
 from pathlib import Path
 
 from vgm2151fur.analyze import analyze, furnace_note_name
-from vgm2151fur.ay8910 import ay_rate, collect_ay8910
-from vgm2151fur.diag import export_fur, opn_pitch_stream, pitch_runs
+from vgm2151fur.ay8910 import ay_rate
+from vgm2151fur.diag import opn_pitch_stream, pitch_runs
 from vgm2151fur.furio import CHIP_CHANNELS, iter_blocks, parse_fur
 from vgm2151fur.furwrite import (
     CHIP_YM2203, CHIP_YM2203_EXT, INS_AY, INS_FM, write_fur,
@@ -361,98 +360,114 @@ class TestYm2203ExtColumns(unittest.TestCase):
 
 
 @unittest.skipUnless(HAVE_FURNACE, "furnace console build missing")
-class TestExtRealRip(unittest.TestCase):
-    """The rip that reported it: Grounseed 'Exit Logo' (YM2203 Ext)."""
+class TestYm2203ExtExport(unittest.TestCase):
+    """An automated channel-3 slot must reach the exported chip."""
 
-    SRC = Path(r"F:\NASbackup\JamesAlan\_devspace\grbsd\ripwip\_finished"
-               r"\gs-opn\done\01 Exit Logo.vgz")
+    T_ON = 200_000
+    T_MOVE = 230_000
+    T_OFF = 400_000 - 5_000
 
-    def test_channel3_slot_levels_reach_the_chip(self):
-        if not self.SRC.exists():
-            self.skipTest(f"{self.SRC} not present")
-        song = analyze(load_vgm(self.SRC))
+    @staticmethod
+    def _writes() -> list[ChipWrite]:
+        w: list[ChipWrite] = []
+        for op in range(4):                       # detune/mult, rates
+            w.append(ChipWrite(100, "ym2203", 0, 0x30 + op * 4, 0x01))
+            w.append(ChipWrite(101, "ym2203", 0, 0x50 + op * 4, 0x1F))
+            w.append(ChipWrite(102, "ym2203", 0, 0x60 + op * 4, 0x00))
+            w.append(ChipWrite(103, "ym2203", 0, 0x70 + op * 4, 0x1F))
+            w.append(ChipWrite(104, "ym2203", 0, 0x80 + op * 4, 0x1F))
+        # One distinct level per operator, in register order S1,S3,S2,S4.
+        for reg, tl in ((0x42, 0x10), (0x46, 0x20),
+                        (0x4A, 0x30), (0x4E, 0x40)):
+            w.append(ChipWrite(105, "ym2203", 0, reg, tl))
+        w += [
+            ChipWrite(106, "ym2203", 0, 0xB2, 0x07),     # ch3 alg 7
+            ChipWrite(107, "ym2203", 0, 0xAC, 0x15),     # per-slot f-num:
+            ChipWrite(108, "ym2203", 0, 0xA8, 0x00),     # this makes it Ext
+            ChipWrite(TestYm2203ExtExport.T_ON, "ym2203", 0, 0x28, 0xF2),
+            # The driver walks two columns down while the chord holds.
+            ChipWrite(TestYm2203ExtExport.T_MOVE, "ym2203", 0, 0x4A, 0x18),
+            ChipWrite(TestYm2203ExtExport.T_MOVE, "ym2203", 0, 0x46, 0x18),
+            ChipWrite(TestYm2203ExtExport.T_OFF, "ym2203", 0, 0x28, 0x02),
+        ]
+        return w
+
+    @staticmethod
+    def _levels(stream) -> dict[int, set[int]]:
+        # YM2203 operators step by four within a channel, so ch3's TL
+        # registers are $42,$46,$4A,$4E (S1,S3,S2,S4).
+        out: dict[int, set[int]] = {}
+        for w in stream.writes:
+            r = w.reg & 0xFF
+            if 0x40 <= r <= 0x4E and (r & 3) == 2:
+                out.setdefault(r, set()).add(w.val & 0x7F)
+        return out
+
+    def test_moved_slot_levels_reach_the_chip(self):
+        src = _vgm(self._writes(), ym2203_clock=CLOCK)
+        song = analyze(src, pcm=False)
         self.assertTrue(song.ym2203_ext)
-        stem = TMP / "exit_logo"
-        fur = stem.with_suffix(".fur")
+        fur = TMP / "ym2203_ext_export.fur"
         fur.write_bytes(write_fur(song, include_pcm=False))
-        back = load_vgm(export_fur(fur, stem.with_suffix(".vgm")))
-
-        def walk(stream):
-            # YM2203 operators step by four within a channel, so ch3's TL
-            # registers are $42,$46,$4A,$4E (S1,S3,S2,S4).
-            out: dict[int, set[int]] = {}
-            for w in stream.writes:
-                r = w.reg & 0xFF
-                if 0x40 <= r <= 0x4E and (r & 3) == 2:
-                    out.setdefault(r, set()).add(w.val & 0x7F)
-            return out
-
-        src, got = walk(load_vgm(self.SRC)), walk(back)
-        # Ask only of the slots this rip actually automates: two of them walk a
-        # long way down while the rest hold one or two levels.
-        automated = {}
-        for reg, vals in src.items():
-            moved = {v for v in vals if 0 < v < 0x7F}
-            if len(moved) > 4:
-                automated[reg] = moved
-        print("\n    automated ch3 slots (register: how far the source walks):")
-        for reg, moved in sorted(automated.items()):
-            print(f"      ${reg:02X}: {len(moved)} levels "
-                  f"({min(moved):#04x}-{max(moved):#04x})")
-        self.assertGreaterEqual(len(automated), 2,
-                                "expected this rip to automate two slot levels")
-        for reg, moved in sorted(automated.items()):
-            have = got.get(reg, set())
-            reached = len(have & moved)
-            print(f"    ${reg:02X}: source {len(moved)} levels, converted "
-                  f"hits {reached}")
-            self.assertGreater(
-                reached, 2,
-                f"${reg:02X}: converted produced {sorted(have)}, the source "
-                f"walked {sorted(moved)} - the column is frozen again")
-            self.assertGreaterEqual(
-                reached, len(moved) // 3,
-                f"${reg:02X}: only {reached} of {len(moved)} levels reached")
+        out = TMP / "ym2203_ext_export.vgm"
+        export_vgm(fur, out)
+        back = load_vgm(out)
+        source, got = self._levels(src), self._levels(back)
+        for reg in (0x46, 0x4A):
+            self.assertIn(0x18, source[reg])
+            self.assertIn(
+                0x18, got.get(reg, set()),
+                f"${reg:02X} did not reach the export",
+            )
+            self.assertTrue(source[reg] <= got.get(reg, set()), reg)
+        # The columns the driver never moved keep their source levels.
+        for reg in (0x42, 0x4E):
+            self.assertEqual(got.get(reg), source.get(reg), reg)
 
 
 class TestYm2203LongVibrato(unittest.TestCase):
-    """Madou 23: a 43-second note whose driver writes vibrato every tick."""
+    """A vibrato written every driver tick stays row steps, not a thinned macro."""
 
-    SRC = Path(r"F:\NASbackup\JamesAlan\_devspace\grbsd\ripwip\_finished"
-               r"\madou123\done\23 I can't... go on... anymore....vgz")
+    @staticmethod
+    def _long_vibrato() -> VgmFile:
+        ws = _fm_note(4, 1204, off=2_000_000)
+        for i in range(1900):
+            t = 100 + i * 1000
+            fnum = (1210, 1232, 1250, 1232)[i % 4]
+            ws += [
+                ChipWrite(t, "ym2203", 0, 0xA4,
+                          (4 << 3) | ((fnum >> 8) & 7)),
+                ChipWrite(t, "ym2203", 0, 0xA0, fnum & 0xFF),
+            ]
+        vgm = _vgm(ws, ym2203_clock=CLOCK)
+        vgm.total_samples = 2_000_000
+        return vgm
 
     def test_vibrato_stays_on_row_steps(self):
-        if not self.SRC.exists():
-            self.skipTest(f"{self.SRC} not present")
-        song = analyze(load_vgm(self.SRC))
+        song = analyze(self._long_vibrato())
         moving = [e for e in song.events if e.on and e.fm_pitch_pts]
-        self.assertEqual(len(moving), 5)
-        self.assertTrue(all(e.pitch_steps for e in moving))
-        self.assertGreaterEqual(
-            max(len(e.pitch_steps) for e in moving), 1700,
-        )
-        # A long macro at speed 11 was the non-smooth version.
+        self.assertEqual(len(moving), 1)
+        self.assertTrue(moving[0].pitch_steps)
+        self.assertGreaterEqual(len(moving[0].pitch_steps), 1000)
+        # A macro that fits the vibrato into 255 entries would turn the
+        # 60 Hz wobble into a staircase; any macro left must run at speed 1.
         for patch in song.fm_patches:
             if len(set(patch.pitch_macro)) > 1:
                 self.assertEqual(patch.pitch_speed, 1, patch.name)
 
     @unittest.skipUnless(HAVE_FURNACE, "furnace console build missing")
     def test_exported_pitch_follows_the_source(self):
-        if not self.SRC.exists():
-            self.skipTest(f"{self.SRC} not present")
-        song = analyze(load_vgm(self.SRC))
-        stem = TMP / "madou_lfo"
-        fur = stem.with_suffix(".fur")
+        src = self._long_vibrato()
+        song = analyze(src)
+        fur = TMP / "ym2203_vibrato.fur"
         fur.write_bytes(write_fur(song, include_pcm=False))
-        back = load_vgm(export_fur(fur, stem.with_suffix(".vgm")))
-        src = load_vgm(self.SRC)
+        out = TMP / "ym2203_vibrato.vgm"
+        export_vgm(fur, out)
+        back = load_vgm(out)
         for ch in range(9):
             self.assertEqual(
-                pitch_runs(
-                    src, back, ch, threshold_st=0.25, min_run_ms=60,
-                ),
-                [],
-                f"ch{ch}: pitch diverged",
+                pitch_runs(src, back, ch, threshold_st=0.25, min_run_ms=60),
+                [], f"ch{ch}: pitch diverged",
             )
 
 
@@ -510,6 +525,41 @@ class TestYm2203Analyze(unittest.TestCase):
         _row, delay = song.place(30000, {})
         self.assertGreater(delay, 0, "pick a step inside a row for this test")
         self.assertIn((0xED, delay), fx)
+
+    def test_rising_carrier_level_opens_the_instrument(self):
+        # The driver keys the voice with quiet carriers and then walks them
+        # louder while the note holds. The volume column can only attenuate,
+        # so the instrument must be opened to the loudest level and the note
+        # hung beneath it; otherwise the sustain stays at the key-on TL and
+        # sounds far too quiet (Eternal Dream's first FM note).
+        ws = _fm_note(4, 1204, off=60000)
+        ws = [w for w in ws if not (w.sample == 100 and w.reg == 0xB0)]
+        at = next(
+            i for i, w in enumerate(ws)
+            if w.sample == 100 and w.reg == 0x28
+        )
+        # alg 4: op3/op4 are the carriers. Park both at TL 0x28.
+        ws[at:at] = [
+            ChipWrite(100, "ym2203", 0, 0xB0, 0x34),
+            ChipWrite(100, "ym2203", 0, 0x48, 0x28),
+            ChipWrite(100, "ym2203", 0, 0x4C, 0x28),
+        ]
+        ws.append(ChipWrite(30000, "ym2203", 0, 0x48, 0x14))
+        song = analyze(_vgm(ws, ym2203_clock=CLOCK), speed=2)
+        ev = next(e for e in song.events if e.on)
+        patch = song.fm_patches[ev.ins]
+        self.assertEqual(patch.alg, 4)
+        self.assertEqual(
+            [patch.ops[i].tl & 0x7F for i in (2, 3)], [0x14, 0x14]
+        )
+        self.assertEqual(ev.vol_tl_base, 0x14)
+        self.assertEqual(ev.vol, 107)   # 127 - (0x28 - 0x14)
+        self.assertIn((30000, 0x14), ev.tl_pts)
+        mod = parse_fur(write_fur(song, include_pcm=False, include_fm=True))
+        rows = mod.patterns[(0, mod.orders[0][0])]
+        vols = [r.vol for r in rows if r is not None and r.vol != -1]
+        self.assertIn(107, vols)
+        self.assertIn(127, vols)
 
     def test_long_pitch_sweep_becomes_pitch_macro(self):
         ws = _fm_note(4, 1204, off=60000)

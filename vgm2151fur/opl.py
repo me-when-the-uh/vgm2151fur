@@ -643,14 +643,18 @@ class OPLState:
         """Furnace 08xy for the channel; 0 means "write nothing".
 
         The OPL3 gate is one bit per side, and a full nibble carries the level
-        Furnace scales by. Both sides on is the engine default and stays an
-        omitted effect. Both sides off cannot be written without muting the
-        channel for good, and it is left at whatever the row before held.
+        Furnace scales by.  Both sides on must be written explicitly as 0xFF:
+        a channel that was hard-panned earlier otherwise keeps that pan when
+        the source returns to centre.  Both sides off cannot be written
+        without Furnace's compatibility rule turning 0x00 back into centre,
+        so it stays an omitted effect.
         """
         if not self.opl3:
             return 0
         bits = self.pan_bits(fch)
-        if bits == 3 or not bits:
+        if bits == 3:
+            return 0xFF
+        if not bits:
             return 0
         out = 0
         if bits & 1:

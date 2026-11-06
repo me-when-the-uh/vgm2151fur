@@ -3,12 +3,11 @@
 The FM half is the shared OPL path under `KIND_Y8950`; the tests here cover the
 `$5C` register stream, the ADPCM register map (`$07` control, `$09/$0A` start,
 `$0B/$0C` end, `$10/$11` pitch, `$12` level), the 0x88 ROM block, the 32-byte
-address units, and a real arcade rip through Furnace when the root is set.
+address units, and a synthetic delta-T round trip through Furnace.
 """
 
 from __future__ import annotations
 
-import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -199,33 +198,26 @@ def _iter_ins(data: bytes):
     return [b for b in iter_blocks(data) if b[1] == b"INS2"]
 
 
-def _sample_root() -> Path | None:
-    raw = os.environ.get("VGM2151FUR_Y8950_RIPS")
-    if raw and Path(raw).is_dir():
-        return Path(raw)
-    return None
-
-
-@unittest.skipUnless(HAVE_FURNACE and _sample_root(), "Y8950 rips missing")
-class TestY8950RealRip(unittest.TestCase):
-    def test_ginga_ninkyouden(self):
-        root = _sample_root()
-        path = root / "03v - Credit Inserted (with voice).vgm"
-        if not path.is_file():
-            for cand in root.rglob("03v - Credit Inserted (with voice).vgm"):
-                path = cand
-                break
-        if not path.is_file():
-            self.skipTest("rip missing")
-        src = load_vgm(path)
+@unittest.skipUnless(HAVE_FURNACE, "furnace console build missing")
+class TestY8950RoundTrip(unittest.TestCase):
+    def test_delta_t_and_clock_survive_the_module(self):
+        src = _vgm(
+            [ChipWrite(2000, "y8950", 0, 0xB0, 0x20),
+             ChipWrite(3000, "y8950", 0, 0xB0, 0x00)]
+            + _adpcm_note(1000),
+            roms=[_rom(0x2000, _body())],
+            y8950_clock=CLOCK,
+        )
         song = analyze(src)
         self.assertTrue(song.y8950_b_samples)
         self.assertEqual([s.kind for s in song.fm_systems], ["y8950"])
-        fur = TMP / "ginga.fur"
+
+        fur = TMP / "delta_t_roundtrip.fur"
         fur.write_bytes(write_fur(song, compress=True))
-        out = TMP / "ginga.export.vgm"
+        out = TMP / "delta_t_roundtrip.vgm"
         export_vgm(fur, out)
         exp = load_vgm(out)
+
         self.assertEqual(exp.y8950_clock, src.y8950_clock)
         starts = [
             w.sample for w in exp.writes

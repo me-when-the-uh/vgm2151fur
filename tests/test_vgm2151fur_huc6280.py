@@ -228,6 +228,36 @@ class TestHuc6280Tones(unittest.TestCase):
         self.assertTrue(ins.pitch)
         self.assertGreater(len(set(ins.pitch)), 1)
 
+    def test_frame_rate_portamento_becomes_row_effects(self):
+        # A driver retuning every frame writes a stepped glide (2 semitones
+        # per step here), each held just under a 60 Hz frame. That is not a
+        # short blip to drop: it belongs on the pattern rows as E8/E9 plus E5,
+        # not in a per-note instrument macro and not as a new note every step.
+        writes = _load_wave(_square(), period=0x0D6, sample=0)
+        periods = (0x0BE, 0x0AA, 0x0A0, 0x08F, 0x07F, 0x078, 0x06B)
+        for i, period in enumerate(periods):
+            t = 1000 + i * 687
+            writes += [
+                _w(t, 0x02, period & 0xFF),
+                _w(t, 0x03, (period >> 8) & 0x0F),
+            ]
+        writes.append(_w(1000 + len(periods) * 687, 0x04, 0x00))
+        song = analyze(_vgm(writes, huc6280_clock=3579545))
+        evs = [e for e in song.events if e.on and e.tone_chip == 5]
+        self.assertEqual(len(evs), 1)
+        ev = evs[0]
+        self.assertFalse(ev.tone_pitch_pts)
+        self.assertGreaterEqual(len(ev.pitch_steps), len(periods))
+        self.assertEqual(song.huc6280_ins[ev.ins].pitch, ())
+        m = parse_fur(write_fur(song, include_pcm=True, include_fm=False))
+        fx = [
+            (code, value)
+            for (_ch, _pat), rows in m.patterns.items()
+            for row in rows for code, value in row.fx
+        ]
+        self.assertTrue(any(code == 0xE8 for code, _v in fx), fx)
+        self.assertTrue(any(code == 0xE5 for code, _v in fx), fx)
+
     def test_volume_and_balance(self):
         notes, _offs, _waves, _warn = collect_huc6280(
             _vgm(
@@ -239,23 +269,75 @@ class TestHuc6280Tones(unittest.TestCase):
         self.assertEqual(hit.vol, 20)
         self.assertEqual(hit.balance, 0xB9)
 
-    def test_balance_envelope_kept_as_row_steps(self):
+    def test_attack_balance_after_the_gate_is_the_note_level(self):
+        # The driver writes the attack balance a couple of samples after the
+        # gate. It belongs to the note's start level, not a same-row volume
+        # step (which the writer would drop). The later decay stays a step.
+        from vgm2151fur.huc6280 import pce_effective
+
+        writes = _load_wave(_square(), sample=0, balance=0x99)
+        writes += [_w(2, 0x05, 0xCC)]      # attack, just after the gate
+        writes += [_w(1000, 0x05, 0x99)]   # decay, a later row
+        song = analyze(_vgm(writes, huc6280_clock=3579545))
+        evs = [e for e in song.events if e.on and e.ch >= 8]
+        attack, _pan = pce_effective(31, 0xCC)
+        decay, _dpan = pce_effective(31, 0x99)
+        self.assertEqual([e.sample for e in evs][:2], [0, 1000])
+        self.assertEqual(evs[0].vol, attack)
+        self.assertEqual(evs[1].vol, decay)
+
+    def test_balance_step_becomes_note_on(self):
         # LOX2-style drivers fade with the balance register while the control
-        # volume stays at 31.  Those steps must reach the pattern as 08xy,
-        # not be folded away by an empty volume macro.
+        # volume stays at 31. Each balance step is a new 16th-note level.
         writes = _load_wave(_square(), sample=0)
         writes += [_w(5000, 0x00, 0), _w(5000, 0x05, 0x87)]
         song = analyze(_vgm(writes, huc6280_clock=3579545))
-        note = [e for e in song.events if e.on and e.ch >= 8][0]
-        self.assertTrue(note.vol_pts)
-        # The balance 0x87 attenuates to an effective level of 16/31, carried
-        # on the volume column; the normalized L/R goes on 08xy.
-        self.assertEqual(note.vol_pts[-1][1], 16)
-        self.assertEqual(note.vol_pts[-1][2], 0xFE)
-        # And the module still writes (it would fail if the row steps were
+        evs = [e for e in song.events if e.on and e.ch >= 8]
+        self.assertEqual([e.sample for e in evs][:2], [0, 5000])
+        self.assertEqual([e.vol for e in evs][:2], [31, 16])
+        # And the module still writes (it would fail if the step were
         # dropped and the empty macro left the note without a level).
         data = write_fur(song, include_pcm=True, include_fm=False)
         self.assertEqual(parse_fur(data).chips, [CHIP_PCE])
+
+    def test_volume_steps_become_note_ons(self):
+        # A long PCE gate can carry many balance steps. In the percussion
+        # drivers each step is the next 16th-note level (hi-hats and a louder
+        # snare accent), so every step becomes a note with its own column.
+        writes = _load_wave(_square(), sample=0, balance=0xCC)
+        writes += [
+            _w(2000, 0x05, 0x99),
+            _w(4000, 0x05, 0x88),
+            _w(6000, 0x05, 0xCC),
+            _w(8000, 0x05, 0x99),
+        ]
+        song = analyze(_vgm(writes, huc6280_clock=3579545))
+        evs = [e for e in song.events if e.on and e.ch >= 8]
+        self.assertEqual(
+            [e.sample for e in evs][:5], [0, 2000, 4000, 6000, 8000]
+        )
+        self.assertEqual([e.vol for e in evs][:5], [25, 19, 16, 25, 19])
+        self.assertEqual(evs[0].end, 2000)
+        for e in evs[:5]:
+            self.assertLessEqual(len(song.huc6280_ins[e.ins].vol), 60)
+
+    def test_noise_pitch_returns_to_the_first_value(self):
+        # 0x9F -> 0x9B -> 0x9F is a G2/D#2/G2 snare pattern. The noise
+        # pitch list used to compare each change with the note's *start*
+        # value, so the return to 0x9F was dropped and the voice stayed on
+        # D#2 for the rest of the gate.
+        writes = [
+            _w(0, 0x01, 0xFF), _w(0, 0x00, 4), _w(0, 0x04, 0x00),
+            _w(0, 0x07, 0x9F), _w(0, 0x02, 0x00), _w(0, 0x03, 0x04),
+            _w(0, 0x05, 0xFF), _w(0, 0x04, 0x9F),
+            _w(2000, 0x07, 0x9B), _w(4000, 0x07, 0x9F),
+            _w(6000, 0x04, 0x00),
+        ]
+        song = analyze(_vgm(writes, huc6280_clock=3579545))
+        ev = next(e for e in song.events if e.on and e.ch >= 8)
+        self.assertTrue(ev.tone_noise)
+        self.assertEqual(ev.note, 91)
+        self.assertEqual([n for _t, n in ev.tone_pitch_pts], [31, 27, 31])
 
     def test_noise_transient_then_tone_tail(self):
         # A percussion hit: noise on at the gate, then 0x07=0 mid-gate

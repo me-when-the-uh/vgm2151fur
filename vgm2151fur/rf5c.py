@@ -63,12 +63,14 @@ class Rf5cHit:
     step: int  # 16-bit frequency step
     env: int  # 8-bit envelope
     pan: int  # low nibble left, high nibble right
+    chip_id: int = 0
 
 
 @dataclass
 class Rf5cOff:
     sample_time: int
     voice: int
+    chip_id: int = 0
 
 
 @dataclass
@@ -78,6 +80,7 @@ class Rf5cSample:
     loop_start: int | None = None
     loop_end: int | None = None
     hits: list[Rf5cHit] = field(default_factory=list)
+    chip_id: int = 0
 
     @property
     def length(self) -> int:
@@ -128,18 +131,20 @@ def _apply_reg(voice: _Voice, reg: int, val: int) -> None:
         voice.start = val & 0xFF
 
 
-def build_rf5c_ram(vgm: VgmFile, chip: str) -> bytes:
+def build_rf5c_ram(
+    vgm: VgmFile, chip: str, chip_id: int = 0,
+) -> bytes:
     """Reconstruct a chip's sample RAM from its blocks and memory writes."""
     ram = bytearray(RF5C_RAM_SIZE)
     for slice_ in vgm.roms:
-        if slice_.kind != chip:
+        if slice_.kind != chip or slice_.chip != chip_id:
             continue
         start = slice_.start & 0xFFFF
         end = min(start + len(slice_.data), RF5C_RAM_SIZE)
         if end > start:
             ram[start:end] = slice_.data[: end - start]
     for write in vgm.writes:
-        if write.chip != f"{chip}_mem":
+        if write.chip != f"{chip}_mem" or write.chip_id != chip_id:
             continue
         addr = write.reg & 0xFFFF
         ram[addr] = write.val & 0xFF
@@ -157,6 +162,7 @@ def _scan_end(ram: bytes, start: int) -> int:
 
 def collect_rf5c(
     vgm: VgmFile, chip: str = "rf5c68", clock: int | None = None,
+    chip_id: int = 0,
 ) -> tuple[bytes, list[Rf5cSample], list[Rf5cOff], list[str]]:
     """Read one RF5C chip's notes and the samples they play.
 
@@ -164,8 +170,11 @@ def collect_rf5c(
     only in clock, RAM contents and which write commands feed them.
     """
     warnings: list[str] = []
-    ram = build_rf5c_ram(vgm, chip)
-    writes = [w for w in vgm.writes if w.chip == chip]
+    ram = build_rf5c_ram(vgm, chip, chip_id)
+    writes = [
+        w for w in vgm.writes
+        if w.chip == chip and w.chip_id == chip_id
+    ]
     if not writes:
         return ram, [], [], warnings
     if clock is None:
@@ -185,7 +194,7 @@ def collect_rf5c(
 
     def flush_off(i: int) -> None:
         if pending_off[i] is not None:
-            offs.append(Rf5cOff(pending_off[i], i))
+            offs.append(Rf5cOff(pending_off[i], i, chip_id))
             pending_off[i] = None
 
     for write in writes:
@@ -221,6 +230,7 @@ def collect_rf5c(
                         step=voice.step & 0xFFFF,
                         env=voice.env & 0xFF,
                         pan=voice.pan & 0xFF,
+                        chip_id=chip_id,
                     ))
                 elif was[i] and not voices[i].enabled:
                     flush_off(i)
@@ -258,6 +268,7 @@ def collect_rf5c(
             loop_end = (end - start) if loop_off is not None else None
             sample = Rf5cSample(
                 start=start, data=body, loop_start=loop_off, loop_end=loop_end,
+                chip_id=chip_id,
             )
             by_key[key] = sample
         sample.hits.append(hit)

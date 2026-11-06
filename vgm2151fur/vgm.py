@@ -2,7 +2,8 @@
 
 Chips: YM2151, YM2203, YM2612, YM2610, YM3526 (OPL), YM3812 (OPL2),
 YMF262 (OPL3), RF5C68, RF5C164, K007232, MSM6295, MSM6258, SegaPCM, C140,
-C352, K053260, AY-3-8910, K051649/K052539 (SCC).
+C352, K053260, YMZ280B, Nintendo Virtual Boy (VSU), AY-3-8910,
+K051649/K052539 (SCC), SN76489 and its stereo T6W28 variant.
 """
 
 from __future__ import annotations
@@ -27,6 +28,10 @@ CMD_YM3812 = 0x5A
 # writes arrive on 0x5C; the ADPCM registers are 0x07 (control), 0x08/0x09
 # (start), 0x0A/0x0B (end), 0x10/0x11 (pitch) and 0x12 (level).
 CMD_Y8950 = 0x5C
+# 0x5D is the YMZ280B (PCMD8): register, value.  A dual-chip log uses the
+# second instance at 0xAD, the usual "+0x50" YM-family rule.
+CMD_YMZ280B = 0x5D
+CMD_YMZ280B_2 = 0xAD
 # A dual-OPL2 log (the Sound Blaster Pro layout) keeps the second chip's
 # register stream in its own command. Confirmed on the Knights of Xentar rips:
 # header bit 30 says "Dual YM3812" and 0xAA carries chip 1's writes while
@@ -64,6 +69,19 @@ CMD_YM2608_B_P1 = 0xA7
 CMD_YM2413 = 0x51
 CMD_YM2413_2 = 0xA1
 CMD_SN76489 = 0x50
+# 0x30 is the second SN76489 in a dual/T6W28 log; 0x3F/0x4F are the second/
+# first Game Gear stereo masks (Furnace's vgmOps uses 0x3f for the second).
+CMD_SN76489_2 = 0x30
+CMD_GGSTEREO = 0x4F
+CMD_GGSTEREO_2 = 0x3F
+# 0xA4 is the second YM2151 (YM family: +0x50).
+CMD_YM2151_2 = 0xA4
+# The OPL family's second-instance commands. 0xAB/0xAC are the YM3526 and
+# Y8950 pairs, 0xAE/0xAF the YMF262's two ports.
+CMD_YM3526_2 = 0xAB
+CMD_Y8950_2 = 0xAC
+CMD_OPL3_B_P0 = 0xAE
+CMD_OPL3_B_P1 = 0xAF
 # 0xB3 is the Game Boy DMG (LR35902) APU: register, data.  Register 0x00 maps
 # FF10 (NR10), so 0x00-0x16 are the sound registers and 0x20-0x2F the wave RAM.
 # The DMG has a single APU, so there is no instance bit.
@@ -98,6 +116,12 @@ CMD_SCC = 0xD2
 CMD_C140 = 0xD4
 CMD_C352 = 0xE1
 CMD_K053260 = 0xBA
+# 0xC7 mmll dd is the Virtual Boy VSU: the register is a 16-bit big-endian
+# *word index* (byte address / 4).  Furnace writes it as writeS_BE(addr>>2),
+# and the reference rips use the same form.  Bit 15 selects a second VSU in a
+# dual-chip log (Furnace's baseAddr2S rule).
+CMD_VSU = 0xC7
+VSU_DUAL_BIT = 0x8000
 CMD_DATA_BLOCK = 0x67
 CMD_END = 0x66
 CMD_STREAM_SETUP = 0x90
@@ -126,6 +150,7 @@ RF5C164_RAM_TYPE = 0xC1  # RF5C164 sample-RAM write (16-bit start + data)
 Y8950_DELTAT_ROM_TYPE = 0x88  # Y8950 delta-T (ADPCM-B) ROM
 YMF278B_ROM_TYPE = 0x84  # YMF278B (OPL4) ROM image
 YMF278B_RAM_TYPE = 0x87  # YMF278B (OPL4) RAM image
+YMZ280B_ROM_TYPE = 0x86  # YMZ280B external sample ROM
 C140_ROM_TYPE = 0x8D  # Namco C140 ROM
 C352_ROM_TYPE = 0x92  # Namco C352 ROM
 YM2610_ADPCM_ROM_TYPE = 0x82  # YM2610 ADPCM-A/B ROM
@@ -147,6 +172,8 @@ EXTRA_C140 = 0x1C
 EXTRA_K053260 = 0x1D
 EXTRA_C352 = 0x27
 EXTRA_K007232 = 0x2A
+EXTRA_VSU = 0x22  # Virtual Boy VSU (VGM chip-volume id 34)
+EXTRA_YMZ280B = 0x0F
 # Main-header clocks (VGMFile.h layout, spec v1.71). 0x98 is MSM6295, 0x90
 # MSM6258, 0x94 its flags. K007232 has no spec field; VGMPlay tools put it at
 # 0xE8 (1.71+). C140 is 0xA8 and its type byte 0x96. AY-8910 is 0x74 with its
@@ -172,6 +199,16 @@ Y8950_DEFAULT_CLOCK = 3579545
 # ROM and 0x87 RAM blocks.
 YMF278B_CLOCK_OFF = 0x60
 YMF278B_DEFAULT_CLOCK = 33868800
+# YMZ280B header 0x68 (VGM 1.51+).  Bit 30 marks a second chip; its writes
+# arrive on command 0xAD and a data block's size bit 31 selects its ROM.
+YMZ280B_CLOCK_OFF = 0x68
+YMZ280B_DEFAULT_CLOCK = 16934400
+YMZ280B_DUAL_BIT = 0x40000000
+# Virtual Boy VSU clock at 0x68? No: VGM 1.71 puts it at 0xC4.  Bit 30 marks
+# a second chip, whose writes use register bit 15.  The usual clock is 5 MHz.
+VSU_CLOCK_OFF = 0xC4
+VSU_DEFAULT_CLOCK = 5_000_000
+VSU_HEADER_DUAL_BIT = 0x40000000
 # YM2612 clock at 0x2C.  Bit 30 is the dual-instance flag; 0xA2/0xA3 then
 # answer for the second chip.  The field predates the 1.50 data-offset header.
 YM2612_CLOCK_OFF = 0x2C
@@ -182,6 +219,14 @@ YM2612_DEFAULT_CLOCK = 7670453  # NTSC Genesis master clock (COLOR_NTSC * 15/7)
 # toneDivider 64.
 SN76489_CLOCK_OFF = 0x0C
 SN76489_DEFAULT_CLOCK = 3579545
+# The clock field's high bits are the usual VGM flags: bit 30 marks a second
+# SN76489 instance, and bit 31 selects the Toshiba T6W28 variant, whose two
+# halves are the same silicon wired as a stereo pair.  vgm2txt labels a
+# field T6W28 only when both bits are set; the second half then answers on
+# command 0x30.
+SN76489_DUAL_BIT = 0x40000000
+SN76489_T6W28_BIT = 0x80000000
+EXTRA_SN76489 = 0x00  # extra-header clock id for the first/only SN76489
 # YM2203 clock at 0x44.  Bit 30 is the "cheat mode" flag for a second
 # instance, which then answers on command 0xA5; the clock itself is the same.
 YM2203_CLOCK_OFF = 0x44
@@ -436,7 +481,8 @@ class ChipWrite:
     sample: int
     chip: str  # "ym2151" | "ym2203" | "ym2612" | "ym2610" | "opl" | "opl2" |
     #            "opl3" | "k007232" | "msm6295" | "msm6258" | "segapcm" |
-    #            "c140" | "c352" | "k053260" | "ay8910" | "k051649"
+    #            "c140" | "c352" | "k053260" | "ay8910" | "k051649" |
+    #            "ymz280b" | "vsu" | "sn76489" (chip_id 1 = T6W28 right half)
     chip_id: int
     reg: int
     val: int
@@ -457,6 +503,7 @@ class VgmFile:
     ym2151_clock: int
     k007232_clock: int
     gd3: dict[str, str]
+    ym2151_dual: bool = False
     # VGM header 0x7C: output volume of the first chip (0x100 = unity).
     # 0.0 means the field is absent; the player default then applies.
     main_volume: float = 0.0
@@ -511,6 +558,12 @@ class VgmFile:
     # Genesis SN76489 header 0x0C.  The data bytes arrive as 0x50 writes;
     # they are a serial register stream, not address/data pairs.
     sn76489_clock: int = 0
+    sn76489_clock_2: int = 0
+    # Bit 30 of the clock field means a second SN76489; its serial bytes
+    # arrive on command 0x30.  Bit 31 (with bit 30) selects the Toshiba
+    # T6W28: one stereo chip whose halves are the two register streams.
+    sn76489_dual: bool = False
+    sn76489_t6w28: bool = False
     # A Game Gear rip writes command 0x4F (stereo mask) besides the serial
     # data bytes. A mask other than 0xFF means the left/right enables are in
     # use, so the module needs the Game Gear variant.
@@ -541,38 +594,61 @@ class VgmFile:
     # YM3812s.  Only the YM3812 pair has a stream this tool reads (command 0xAA
     # carries chip 1); a flagged second OPL or OPL3 is reported, not guessed at.
     opl_clock: int = 0
+    opl_dual: bool = False
     opl2_clock: int = 0
     opl2_dual: bool = False
     opl2_pan: bool = False
     opl3_clock: int = 0
+    opl3_dual: bool = False
     # MSM6295 header 0x98 (VGM 1.61+). Bit 31 of the raw field is pin 7,
     # bit 30 marks a second chip (the player halves each instance's volume).
     msm6295_clock: int = 0
     msm6295_pin7: bool = False
     msm6295_dual: bool = False
     # MSM6258 header 0x90 and flag byte 0x94 (divider in bits 0-1).
+    # Bit 30 marks a second chip (register bit 7 selects it).
     msm6258_clock: int = 0
     msm6258_flags: int = 0
+    msm6258_dual: bool = False
     # SegaPCM header 0x38 (VGM 1.51+); C140 header 0xA8 + type byte 0x96
     # (0 = System 2, 1 = System 21, 2 = ASIC219) from 1.61.
     # Bank shift is header byte 0x3C, mask is 0x3E (libvgm). Mask 0 means 0x70.
     segapcm_clock: int = 0
     segapcm_bankshift: int = 0
     segapcm_bankmask: int = 0
+    segapcm_dual: bool = False
     c140_clock: int = 0
     c140_type: int = 0
+    c140_dual: bool = False
     # RF5C68 header 0x40 and RF5C164 header 0x6C (VGM 1.51+). One register
     # interface, two clocks: FM Towns runs the 68 at 8 MHz, Sega CD the 164 at
     # 12.5 MHz. Furnace hosts both as the RF5C68 system with a chipType flag.
     rf5c68_clock: int = 0
     rf5c164_clock: int = 0
+    rf5c68_dual: bool = False
+    rf5c164_dual: bool = False
     # Y8950 header 0x58 (VGM 1.51+): OPL1 FM plus one delta-T ADPCM voice.
     y8950_clock: int = 0
+    y8950_dual: bool = False
     # YMF278B (OPL4) header 0x60 (VGM 1.51+): OPL3-shaped FM plus 24 wave slots.
     ymf278b_clock: int = 0
+    ymf278b_dual: bool = False
+    # YMZ280B header 0x68 (VGM 1.51+): eight sample voices.  Bit 30 marks a
+    # second chip, whose writes arrive on 0xAD and whose ROM is the type-0x86
+    # data block with the size high bit set.
+    ymz280b_clock: int = 0
+    ymz280b_clock_2: int = 0
+    ymz280b_dual: bool = False
+    # Virtual Boy VSU header 0xC4 (VGM 1.71+).  Six voices: five 32-entry
+    # 6-bit wavetable channels and one noise channel.  Register writes arrive
+    # on 0xC7 as a 16-bit big-endian word index; bit 15 selects a second chip.
+    vsu_clock: int = 0
+    vsu_clock_2: int = 0
+    vsu_dual: bool = False
     # K053260 header 0xAC (VGM 1.61+); bit 7 of a 0xBA register selects the
     # second instance, which shares this clock.
     k053260_clock: int = 0
+    k053260_dual: bool = False
     # C352 header 0xDC / divider byte 0xD6 (VGM 1.71). 0 means the chip is absent;
     # the analyzer supplies 24192000 only when it is actually converting C352.
     c352_clock: int = 0
@@ -584,11 +660,15 @@ class VgmFile:
     ay8910_clock: int = 0
     ay8910_type: int = 0
     ay8910_flags: int = 0
+    ay8910_dual: bool = False
     # K051649 / K052539 (SCC) header 0x9C (VGM 1.61+), bit 31 set for the
     # K052539 variant. The clock is the value both libvgm and Furnace run the
     # chip at: pitch = clock / (16 * (period + 1)).
     k051649_clock: int = 0
     k051649_plus: bool = False
+    k051649_dual: bool = False
+    # K007232 header 0xE8 (VGM 1.71+); register bit 7 selects a second chip.
+    k007232_dual: bool = False
     # Extra-header clocks, raw (bit 31 kept). Keyed by libvgm chip id.
     extra_clocks: dict[int, int] = field(default_factory=dict)
     # Extra-header volume mix: chip id -> (flags, raw value, 0x100 = 1.0).
@@ -788,7 +868,7 @@ def chips_in_head(buf: bytes) -> set[str]:
 
     Names match the converter's chips: ym2151, ym2610, msm6295, segapcm, c140,
     c352, k053260, ay8910, k051649 (plus "scc_plus" for the K052539 variant),
-    k007232.
+    k007232, ymz280b and vsu (plus "vsu_dual").
     C219 is the C140-family part the converter does not support. It is reported
     apart from c140, and those packs should not be batch-converted. C352 is
     its own chip (32 voices); it is not folded into c140 or c219.
@@ -797,16 +877,25 @@ def chips_in_head(buf: bytes) -> set[str]:
         return set()
     kinds: set[str] = set()
     version = _header_raw(buf, 8)
-    if _header_clock(buf, 0x30):
+    ym2151_head = _header_raw(buf, 0x30)
+    if ym2151_head & 0x3FFFFFFF:
         kinds.add("ym2151")
+        if ym2151_head & 0x40000000:
+            kinds.add("ym2151_dual")
     if _field_in_header(buf, YM2612_CLOCK_OFF, 4):
         ym2612_raw = _header_raw(buf, YM2612_CLOCK_OFF)
         if CLOCK_MIN <= (ym2612_raw & 0x3FFFFFFF) <= CLOCK_MAX:
             kinds.add("ym2612")
             if ym2612_raw & YM2612_DUAL_BIT:
                 kinds.add("ym2612_dual")
-    if 100_000 <= _header_clock(buf, SN76489_CLOCK_OFF) <= 40_000_000:
-        kinds.add("sn76489")
+    sn_head = _header_raw(buf, SN76489_CLOCK_OFF)
+    if 100_000 <= (sn_head & 0x3FFFFFFF) <= 40_000_000:
+        if (sn_head & SN76489_DUAL_BIT) and (sn_head & SN76489_T6W28_BIT):
+            kinds.add("t6w28")
+        else:
+            kinds.add("sn76489")
+            if sn_head & SN76489_DUAL_BIT:
+                kinds.add("sn76489_dual")
     if version >= 0x131 and _field_in_header(buf, YM2203_CLOCK_OFF, 4):
         ym2203_raw = _header_raw(buf, YM2203_CLOCK_OFF)
         if 100_000 <= (ym2203_raw & 0x3FFFFFFF) <= 40_000_000:
@@ -846,18 +935,46 @@ def chips_in_head(buf: bytes) -> set[str]:
     if version >= 0x151 and _field_in_header(buf, NES_CLOCK_OFF, 4):
         if 100_000 <= _header_clock(buf, NES_CLOCK_OFF) <= 40_000_000:
             kinds.add("nes")
-    if version >= 0x151 and 100_000 <= _header_clock(buf, SEGAPCM_CLOCK_OFF) <= 40_000_000:
-        kinds.add("segapcm")
-    if version >= 0x151 and 100_000 <= _header_clock(buf, RF5C68_CLOCK_OFF) <= 40_000_000:
-        kinds.add("rf5c68")
-    if version >= 0x151 and 100_000 <= _header_clock(buf, RF5C164_CLOCK_OFF) <= 40_000_000:
-        kinds.add("rf5c164")
+    if version >= 0x151 and _field_in_header(buf, SEGAPCM_CLOCK_OFF, 4):
+        raw = _header_raw(buf, SEGAPCM_CLOCK_OFF)
+        if 100_000 <= (raw & 0x3FFFFFFF) <= 40_000_000:
+            kinds.add("segapcm")
+            if raw & 0x40000000:
+                kinds.add("segapcm_dual")
+    if version >= 0x151 and _field_in_header(buf, RF5C68_CLOCK_OFF, 4):
+        raw = _header_raw(buf, RF5C68_CLOCK_OFF)
+        if 100_000 <= (raw & 0x3FFFFFFF) <= 40_000_000:
+            kinds.add("rf5c68")
+            if raw & 0x40000000:
+                kinds.add("rf5c68_dual")
+    if version >= 0x151 and _field_in_header(buf, RF5C164_CLOCK_OFF, 4):
+        raw = _header_raw(buf, RF5C164_CLOCK_OFF)
+        if 100_000 <= (raw & 0x3FFFFFFF) <= 40_000_000:
+            kinds.add("rf5c164")
+            if raw & 0x40000000:
+                kinds.add("rf5c164_dual")
     if version >= 0x151 and 100_000 <= _header_clock(buf, Y8950_CLOCK_OFF) <= 40_000_000:
         kinds.add("y8950")
     if version >= 0x151 and 100_000 <= _header_clock(buf, YMF278B_CLOCK_OFF) <= 40_000_000:
         kinds.add("ymf278b")
-    if version >= 0x151 and 100_000 <= _header_clock(buf, AY8910_CLOCK_OFF) <= 40_000_000:
-        kinds.add("ay8910")
+    if version >= 0x151 and _field_in_header(buf, YMZ280B_CLOCK_OFF, 4):
+        ymz_raw = _header_raw(buf, YMZ280B_CLOCK_OFF)
+        if 100_000 <= (ymz_raw & 0x3FFFFFFF) <= 40_000_000:
+            kinds.add("ymz280b")
+            if ymz_raw & YMZ280B_DUAL_BIT:
+                kinds.add("ymz280b_dual")
+    if version >= 0x171 and _field_in_header(buf, VSU_CLOCK_OFF, 4):
+        vsu_raw = _header_raw(buf, VSU_CLOCK_OFF)
+        if 100_000 <= (vsu_raw & 0x3FFFFFFF) <= 40_000_000:
+            kinds.add("vsu")
+            if vsu_raw & VSU_HEADER_DUAL_BIT:
+                kinds.add("vsu_dual")
+    if version >= 0x151 and _field_in_header(buf, AY8910_CLOCK_OFF, 4):
+        raw = _header_raw(buf, AY8910_CLOCK_OFF)
+        if 100_000 <= (raw & 0x3FFFFFFF) <= 40_000_000:
+            kinds.add("ay8910")
+            if raw & 0x40000000:
+                kinds.add("ay8910_dual")
     # The OPL family joined the header in 1.51. A YM3812 field with bit 30 set
     # carries a second chip on command 0xAA. Bit 31 is the Sound Blaster Pro
     # hard-pan of that pair, and it is reported apart from the chip itself.
@@ -867,31 +984,72 @@ def chips_in_head(buf: bytes) -> set[str]:
             kinds.add("opl2")
             if opl2_raw & OPL_DUAL_BIT:
                 kinds.add("opl2_dual")
-    if version >= 0x151 and 100_000 <= _header_clock(buf, OPL_CLOCK_OFF) <= 40_000_000:
-        kinds.add("opl")
-    if version >= 0x151 and 100_000 <= _header_clock(buf, OPL3_CLOCK_OFF) <= 40_000_000:
-        kinds.add("opl3")
+    if version >= 0x151 and _field_in_header(buf, OPL_CLOCK_OFF, 4):
+        raw = _header_raw(buf, OPL_CLOCK_OFF)
+        if 100_000 <= (raw & 0x3FFFFFFF) <= 40_000_000:
+            kinds.add("opl")
+            if raw & OPL_DUAL_BIT:
+                kinds.add("opl_dual")
+    if version >= 0x151 and _field_in_header(buf, OPL3_CLOCK_OFF, 4):
+        raw = _header_raw(buf, OPL3_CLOCK_OFF)
+        if 100_000 <= (raw & 0x3FFFFFFF) <= 40_000_000:
+            kinds.add("opl3")
+            if raw & OPL_DUAL_BIT:
+                kinds.add("opl3_dual")
+    if version >= 0x151 and _field_in_header(buf, Y8950_CLOCK_OFF, 4):
+        raw = _header_raw(buf, Y8950_CLOCK_OFF)
+        if 100_000 <= (raw & 0x3FFFFFFF) <= 40_000_000:
+            kinds.add("y8950")
+            if raw & 0x40000000:
+                kinds.add("y8950_dual")
+    if version >= 0x151 and _field_in_header(buf, YMF278B_CLOCK_OFF, 4):
+        raw = _header_raw(buf, YMF278B_CLOCK_OFF)
+        if 100_000 <= (raw & 0x3FFFFFFF) <= 40_000_000:
+            kinds.add("ymf278b")
+            if raw & 0x40000000:
+                kinds.add("ymf278b_dual")
     k051 = _header_raw(buf, K051649_CLOCK_OFF)
     if version >= 0x161 and _field_in_header(buf, K051649_CLOCK_OFF, 4):
         if 100_000 <= (k051 & 0x3FFFFFFF) <= 40_000_000:
             kinds.add("k051649")
             if k051 & 0x80000000:
                 kinds.add("scc_plus")
+            if k051 & 0x40000000:
+                kinds.add("k051649_dual")
     ctype = buf[C140_TYPE_OFF] if version >= 0x161 and len(buf) > C140_TYPE_OFF else 0
-    c140 = _header_clock(buf, C140_CLOCK_OFF)
+    c140_raw = _header_raw(buf, C140_CLOCK_OFF)
+    c140 = c140_raw & 0x3FFFFFFF
     if c140 == 21390 or 100_000 <= c140 <= 40_000_000:
         kinds.add("c140")
+        if c140_raw & 0x40000000:
+            kinds.add("c140_dual")
     if ctype == 2:
         kinds.discard("c140")
         kinds.add("c219")
-    if version >= 0x161 and 100_000 <= _header_clock(buf, K053260_CLOCK_OFF) <= 40_000_000:
-        kinds.add("k053260")
-    if version >= 0x161 and 100_000 <= _header_clock(buf, MSM6295_CLOCK_OFF) <= 40_000_000:
-        kinds.add("msm6295")
-    if version >= 0x161 and 100_000 <= _header_clock(buf, MSM6258_CLOCK_OFF) <= 40_000_000:
-        kinds.add("msm6258")
-    if version >= 0x171 and 100_000 <= _header_clock(buf, K007232_EXTRA_CLOCK_OFF) <= 40_000_000:
-        kinds.add("k007232")
+    if version >= 0x161 and _field_in_header(buf, K053260_CLOCK_OFF, 4):
+        raw = _header_raw(buf, K053260_CLOCK_OFF)
+        if 100_000 <= (raw & 0x3FFFFFFF) <= 40_000_000:
+            kinds.add("k053260")
+            if raw & 0x40000000:
+                kinds.add("k053260_dual")
+    if version >= 0x161 and _field_in_header(buf, MSM6295_CLOCK_OFF, 4):
+        raw = _header_raw(buf, MSM6295_CLOCK_OFF)
+        if 100_000 <= (raw & 0x3FFFFFFF) <= 40_000_000:
+            kinds.add("msm6295")
+            if raw & 0x40000000:
+                kinds.add("msm6295_dual")
+    if version >= 0x161 and _field_in_header(buf, MSM6258_CLOCK_OFF, 4):
+        raw = _header_raw(buf, MSM6258_CLOCK_OFF)
+        if 100_000 <= (raw & 0x3FFFFFFF) <= 40_000_000:
+            kinds.add("msm6258")
+            if raw & 0x40000000:
+                kinds.add("msm6258_dual")
+    if version >= 0x171 and _field_in_header(buf, K007232_EXTRA_CLOCK_OFF, 4):
+        raw = _header_raw(buf, K007232_EXTRA_CLOCK_OFF)
+        if 100_000 <= (raw & 0x3FFFFFFF) <= 40_000_000:
+            kinds.add("k007232")
+            if raw & 0x40000000:
+                kinds.add("k007232_dual")
     if len(buf) >= 0xC0:
         clocks, _volumes = _extra_chip_lists(buf)
         if clocks.get(EXTRA_YM2612, 0):
@@ -918,6 +1076,8 @@ def chips_in_head(buf: bytes) -> set[str]:
             kinds.add("k007232")
         if clocks.get(EXTRA_C352, 0):
             kinds.add("c352")
+        if clocks.get(EXTRA_YMZ280B, 0):
+            kinds.add("ymz280b")
     if version >= 0x171 and _field_in_header(buf, C352_CLOCK_OFF, 4):
         raw = _header_raw(buf, C352_CLOCK_OFF) & 0x3FFFFFFF
         if 1000 <= raw <= 50_000_000:
@@ -948,7 +1108,9 @@ def load_vgm(path: Path | str) -> VgmFile:
     loop_pos = (0x1C + loop_rel) if loop_rel else None
     extra = _extra_chip_lists(buf)
     clocks, volumes = extra
-    ym_clock = _header_clock(buf, 0x30) or 3579545
+    ym2151_raw = _header_raw(buf, 0x30)
+    ym2151_dual = bool(ym2151_raw & 0x40000000)
+    ym_clock = (ym2151_raw & 0x3FFFFFFF) or 3579545
     # YM2612: the clock field also carries the dual-instance flag in bit 30.
     ym2612_raw = _header_raw(buf, YM2612_CLOCK_OFF)
     ym2612_dual = bool(ym2612_raw & YM2612_DUAL_BIT)
@@ -999,7 +1161,7 @@ def load_vgm(path: Path | str) -> VgmFile:
     huc6280_clock = _sane_clock(huc_raw)
     if not huc6280_clock:
         huc6280_clock = _sane_clock(clocks.get(EXTRA_HUC6280, 0))
-    huc6280_dual = bool(huc_raw & 0x80000000)
+    huc6280_dual = bool(huc_raw & 0x40000000)
     # OPL family. The three chips share the header's 1.51 block and each of
     # their clock fields carries a second-instance bit; only the YM3812 has a
     # command for the pair (0xAA), and bit 31 there pans them hard.
@@ -1007,41 +1169,84 @@ def load_vgm(path: Path | str) -> VgmFile:
     opl2_clock = _sane_clock(opl2_raw)
     opl2_dual = bool(opl2_raw & OPL_DUAL_BIT)
     opl2_pan = bool(opl2_raw & 0x80000000)
-    opl_clock = _clock_or_zero(buf, OPL_CLOCK_OFF) if ver >= 0x151 else 0
-    opl3_clock = _clock_or_zero(buf, OPL3_CLOCK_OFF) if ver >= 0x151 else 0
-    sn76489_clock = _clock_or_zero(buf, SN76489_CLOCK_OFF)
+    opl_raw = _header_raw(buf, OPL_CLOCK_OFF) if ver >= 0x151 else 0
+    opl_clock = _sane_clock(opl_raw)
+    opl_dual = bool(opl_raw & OPL_DUAL_BIT)
+    opl3_raw = _header_raw(buf, OPL3_CLOCK_OFF) if ver >= 0x151 else 0
+    opl3_clock = _sane_clock(opl3_raw)
+    opl3_dual = bool(opl3_raw & OPL_DUAL_BIT)
+    # SN76489/T6W28: bit 30 is the second instance, bit 31 T6W28 mode.
+    sn76489_raw = _header_raw(buf, SN76489_CLOCK_OFF)
+    sn76489_clock = _sane_clock(sn76489_raw)
+    sn76489_dual = bool(sn76489_raw & SN76489_DUAL_BIT)
+    sn76489_t6w28 = bool(
+        sn76489_raw & SN76489_T6W28_BIT
+        and sn76489_raw & SN76489_DUAL_BIT
+    )
+    sn76489_clock_2 = 0
+    if sn76489_dual:
+        sn76489_clock_2 = _sane_clock(clocks.get(EXTRA_SN76489, 0))
+    if not sn76489_clock:
+        sn76489_clock = _sane_clock(clocks.get(EXTRA_SN76489, 0))
     k_clock = _k007232_clock(buf, clocks, ym_clock, ver)
     oki_raw = _header_raw(buf, 0x98) if ver >= 0x161 else 0
     adpcm_raw = _header_raw(buf, 0x90) if ver >= 0x161 else 0
     adpcm_flags = buf[0x94] if ver >= 0x161 and _field_in_header(buf, 0x94, 1) else 0
-    spcm_clock = _clock_or_zero(buf, SEGAPCM_CLOCK_OFF) if ver >= 0x151 else 0
+    spcm_raw = _header_raw(buf, SEGAPCM_CLOCK_OFF) if ver >= 0x151 else 0
+    spcm_clock = _sane_clock(spcm_raw)
+    segapcm_dual = bool(spcm_raw & 0x40000000)
     if not spcm_clock:
         spcm_clock = _sane_clock(clocks.get(EXTRA_SEGAPCM, 0))
     spcm_shift = buf[SEGAPCM_INTF_OFF] if ver >= 0x151 and _field_in_header(buf, SEGAPCM_INTF_OFF, 1) else 0
     spcm_mask = buf[SEGAPCM_MASK_OFF] if ver >= 0x151 and _field_in_header(buf, SEGAPCM_MASK_OFF, 1) else 0
     # RF5C68 and RF5C164 share the register set but ride different header
     # clocks. The extra-header list (chip id 0x05 = RF5C68) is the fallback.
-    rf5c68_clock = (
-        _clock_or_zero(buf, RF5C68_CLOCK_OFF) if ver >= 0x151 else 0
-    )
+    rf5c68_raw = _header_raw(buf, RF5C68_CLOCK_OFF) if ver >= 0x151 else 0
+    rf5c68_clock = _sane_clock(rf5c68_raw)
+    rf5c68_dual = bool(rf5c68_raw & 0x40000000)
     if not rf5c68_clock:
         rf5c68_clock = _sane_clock(clocks.get(0x05, 0))
-    rf5c164_clock = (
-        _clock_or_zero(buf, RF5C164_CLOCK_OFF) if ver >= 0x151 else 0
-    )
-    y8950_clock = _clock_or_zero(buf, Y8950_CLOCK_OFF) if ver >= 0x151 else 0
-    ymf278b_clock = (
-        _clock_or_zero(buf, YMF278B_CLOCK_OFF) if ver >= 0x151 else 0
-    )
+    rf5c164_raw = _header_raw(buf, RF5C164_CLOCK_OFF) if ver >= 0x151 else 0
+    rf5c164_clock = _sane_clock(rf5c164_raw)
+    rf5c164_dual = bool(rf5c164_raw & 0x40000000)
+    y8950_raw = _header_raw(buf, Y8950_CLOCK_OFF) if ver >= 0x151 else 0
+    y8950_clock = _sane_clock(y8950_raw)
+    y8950_dual = bool(y8950_raw & 0x40000000)
+    ymf278b_raw = _header_raw(buf, YMF278B_CLOCK_OFF) if ver >= 0x151 else 0
+    ymf278b_clock = _sane_clock(ymf278b_raw)
+    ymf278b_dual = bool(ymf278b_raw & 0x40000000)
+    # YMZ280B clock 0x68 (1.51+), bit 30 selecting a second chip.  The
+    # extra-header clock list supplies the second instance's clock when the
+    # writer put the pair on different crystals.
+    ymz_raw = _header_raw(buf, YMZ280B_CLOCK_OFF) if ver >= 0x151 else 0
+    ymz280b_dual = bool(ymz_raw & YMZ280B_DUAL_BIT)
+    ymz280b_clock = _sane_clock(ymz_raw)
+    ymz280b_clock_2 = 0
+    if ymz280b_dual:
+        ymz280b_clock_2 = _sane_clock(clocks.get(EXTRA_YMZ280B, 0))
+    if not ymz280b_clock:
+        ymz280b_clock = _sane_clock(clocks.get(EXTRA_YMZ280B, 0))
+    # Virtual Boy VSU clock 0xC4 (VGM 1.71+).  Furnace uses bit 30 for a
+    # second chip; the second chip's writes set bit 15 of the register word.
+    vsu_raw = _header_raw(buf, VSU_CLOCK_OFF) if ver >= 0x171 else 0
+    vsu_dual = bool(vsu_raw & VSU_HEADER_DUAL_BIT)
+    vsu_clock = _sane_clock(vsu_raw)
+    vsu_clock_2 = 0
+    if vsu_dual:
+        vsu_clock_2 = _sane_clock(clocks.get(EXTRA_VSU, 0))
+    if not vsu_clock:
+        vsu_clock = _sane_clock(clocks.get(EXTRA_VSU, 0))
     # Read the field for every version: the legacy System 21 rips carry
     # 21390 there even in 1.51 files, and players resolve it the same way.
-    c140_raw = _header_raw(buf, C140_CLOCK_OFF) & 0x3FFFFFFF
+    c140_header = _header_raw(buf, C140_CLOCK_OFF)
+    c140_dual = bool(c140_header & 0x40000000)
+    c140_raw = c140_header & 0x3FFFFFFF
     if not c140_raw:
         c140_raw = clocks.get(EXTRA_C140, 0) & 0x3FFFFFFF
     c140_clock = _c140_effective_clock(c140_raw)
-    k053260_clock = (
-        _clock_or_zero(buf, K053260_CLOCK_OFF) if ver >= 0x161 else 0
-    )
+    k053260_raw = _header_raw(buf, K053260_CLOCK_OFF) if ver >= 0x161 else 0
+    k053260_clock = _sane_clock(k053260_raw)
+    k053260_dual = bool(k053260_raw & 0x40000000)
     if not k053260_clock:
         k053260_clock = _sane_clock(clocks.get(EXTRA_K053260, 0))
     c140_type = 0
@@ -1064,7 +1269,9 @@ def load_vgm(path: Path | str) -> VgmFile:
         # Extra-header id 0x27 is already a crystal. Applying the divider
         # byte again would rescale a clock that was stored with divider 1.
         c352_clock = _sane_clock(clocks.get(EXTRA_C352, 0))
-    ay_clock = _clock_or_zero(buf, AY8910_CLOCK_OFF) if ver >= 0x151 else 0
+    ay_raw = _header_raw(buf, AY8910_CLOCK_OFF) if ver >= 0x151 else 0
+    ay_clock = _sane_clock(ay_raw)
+    ay8910_dual = bool(ay_raw & 0x40000000)
     if not ay_clock:
         ay_clock = _sane_clock(clocks.get(EXTRA_AY8910, 0))
     ay_type = (
@@ -1077,12 +1284,16 @@ def load_vgm(path: Path | str) -> VgmFile:
     )
     k051_clock = 0
     k051_plus = False
+    k051649_dual = False
     if ver >= 0x161 and _field_in_header(buf, K051649_CLOCK_OFF, 4):
         raw = _header_raw(buf, K051649_CLOCK_OFF)
         k051_plus = bool(raw & 0x80000000)
+        k051649_dual = bool(raw & 0x40000000)
         k051_clock = _sane_clock(raw & 0x3FFFFFFF)
     if not k051_clock:
         k051_clock = _sane_clock(clocks.get(EXTRA_K051649, 0))
+    k007232_header = _header_raw(buf, K007232_EXTRA_CLOCK_OFF) if ver >= 0x171 else 0
+    k007232_dual = bool(k007232_header & 0x40000000)
 
     main_volume = 0.0
     # Bytes past the declared command offset are not header fields. Synthetic
@@ -1103,9 +1314,13 @@ def load_vgm(path: Path | str) -> VgmFile:
         k007232_clock=k_clock,
         gd3=parse_gd3(buf),
         main_volume=main_volume,
+        ym2151_dual=ym2151_dual,
         ym2612_clock=ym2612_clock,
         ym2612_dual=ym2612_dual,
         sn76489_clock=sn76489_clock,
+        sn76489_clock_2=sn76489_clock_2,
+        sn76489_dual=sn76489_dual,
+        sn76489_t6w28=sn76489_t6w28,
         ym2203_clock=ym2203_clock,
         ym2203_dual=ym2203_dual,
         ym2610_clock=ym2610_clock,
@@ -1124,33 +1339,52 @@ def load_vgm(path: Path | str) -> VgmFile:
         huc6280_clock=huc6280_clock,
         huc6280_dual=huc6280_dual,
         opl_clock=opl_clock,
+        opl_dual=opl_dual,
         opl2_clock=opl2_clock,
         opl2_dual=opl2_dual,
         opl2_pan=opl2_pan,
         opl3_clock=opl3_clock,
+        opl3_dual=opl3_dual,
         msm6295_clock=oki_raw & 0x3FFFFFFF,
         msm6295_pin7=bool(oki_raw & 0x80000000),
         msm6295_dual=bool(oki_raw & 0x40000000),
         msm6258_clock=adpcm_raw & 0x3FFFFFFF,
         msm6258_flags=adpcm_flags,
+        msm6258_dual=bool(adpcm_raw & 0x40000000),
         segapcm_clock=spcm_clock,
         segapcm_bankshift=spcm_shift,
         segapcm_bankmask=spcm_mask,
+        segapcm_dual=segapcm_dual,
         rf5c68_clock=rf5c68_clock,
         rf5c164_clock=rf5c164_clock,
+        rf5c68_dual=rf5c68_dual,
+        rf5c164_dual=rf5c164_dual,
         y8950_clock=y8950_clock,
+        y8950_dual=y8950_dual,
         ymf278b_clock=ymf278b_clock,
+        ymf278b_dual=ymf278b_dual,
+        ymz280b_clock=ymz280b_clock,
+        ymz280b_clock_2=ymz280b_clock_2,
+        ymz280b_dual=ymz280b_dual,
+        vsu_clock=vsu_clock,
+        vsu_clock_2=vsu_clock_2,
+        vsu_dual=vsu_dual,
         c140_clock=c140_clock,
         c140_type=c140_type,
+        c140_dual=c140_dual,
         k053260_clock=k053260_clock,
+        k053260_dual=k053260_dual,
         c352_clock=c352_clock,
         c352_divider=c352_divider,
         c352_mute_rear=c352_mute_rear,
         ay8910_clock=ay_clock,
         ay8910_type=ay_type,
         ay8910_flags=ay_flags,
+        ay8910_dual=ay8910_dual,
         k051649_clock=k051_clock,
         k051649_plus=k051_plus,
+        k051649_dual=k051649_dual,
+        k007232_dual=k007232_dual,
         extra_clocks=clocks,
         extra_volumes=volumes,
     )
@@ -1165,7 +1399,24 @@ def load_vgm(path: Path | str) -> VgmFile:
     stray_ym2610_second = False
     stray_ym2608_second = False
     stray_opll_second = False
+    stray_ym2151_second = False
+    stray_opl_second = False
     stray_opl2_second = False
+    stray_opl3_second = False
+    stray_y8950_second = False
+    stray_opl4_second = False
+    stray_sn_second = False
+    stray_rf5c_second = False
+    stray_segapcm_second = False
+    stray_k007232_second = False
+    stray_c140_second = False
+    stray_k053260_second = False
+    stray_ay_second = False
+    stray_scc_second = False
+    stray_ymz_second = False
+    stray_vsu_second = False
+    stray_msm6258_second = False
+    stray_msm6295_second = False
     saw_end = False
     saw_adpcm_compressed = False
     # stream id -> setup recorded by 0x90/0x91/0x92
@@ -1250,6 +1501,7 @@ def load_vgm(path: Path | str) -> VgmFile:
                     Y8950_DELTAT_ROM_TYPE: "y8950_deltat",
                     YMF278B_ROM_TYPE: "ymf278b_rom",
                     YMF278B_RAM_TYPE: "ymf278b_ram",
+                    YMZ280B_ROM_TYPE: "ymz280b",
                 }.get(typ) if len(payload) >= 8 else None
                 if kind:
                     rom_size = int.from_bytes(payload[0:4], "little")
@@ -1459,28 +1711,48 @@ def load_vgm(path: Path | str) -> VgmFile:
             vgm.writes.append(ChipWrite(sample, "ym2612", 0, 0x2B, buf[pos + 1]))
             pos += 2
             continue
-        if cmd == 0x4F and pos + 2 <= n:
+        if cmd in (CMD_GGSTEREO, CMD_GGSTEREO_2) and pos + 2 <= n:
             # Game Gear stereo: four left and four right enable bits.  Keep it
             # on the same chip stream with reg 1 so the collector sees it in
-            # order with the tone/volume bytes.
+            # order with the tone/volume bytes.  0x3F is the second chip.
             value = buf[pos + 1]
-            vgm.writes.append(ChipWrite(sample, "sn76489", 0, 1, value))
+            cid = 0 if cmd == CMD_GGSTEREO else 1
+            if cid and not sn76489_dual:
+                stray_sn_second = True
+            vgm.writes.append(ChipWrite(sample, "sn76489", cid, 1, value))
             if value != 0xFF:
                 vgm.sn76489_stereo = True
             pos += 2
             continue
-        if cmd == CMD_SN76489 and pos + 2 <= n:
+        if cmd in (CMD_SN76489, CMD_SN76489_2) and pos + 2 <= n:
             # One SN76489 serial data byte.  The latch/register/channel is
-            # encoded inside the byte; reg 0.
-            vgm.writes.append(ChipWrite(sample, "sn76489", 0, 0, buf[pos + 1]))
+            # encoded inside the byte; reg 0.  0x30 is the second half of a
+            # dual SN76489 or the right half of a T6W28.
+            cid = 0 if cmd == CMD_SN76489 else 1
+            if cid and not sn76489_dual:
+                stray_sn_second = True
+            vgm.writes.append(ChipWrite(sample, "sn76489", cid, 0, buf[pos + 1]))
             pos += 2
             continue
-        if cmd == CMD_YM2151 and pos + 3 <= n:
-            vgm.writes.append(ChipWrite(sample, "ym2151", 0, buf[pos + 1], buf[pos + 2]))
+        if cmd in (CMD_YM2151, CMD_YM2151_2) and pos + 3 <= n:
+            cid = 0
+            if cmd == CMD_YM2151_2:
+                if ym2151_dual:
+                    cid = 1
+                else:
+                    stray_ym2151_second = True
+            if cmd != CMD_YM2151_2 or ym2151_dual:
+                vgm.writes.append(ChipWrite(
+                    sample, "ym2151", cid, buf[pos + 1], buf[pos + 2],
+                ))
             pos += 3
             continue
         if (
-            cmd in (CMD_YM3526, CMD_YM3812, CMD_YM3812_2, CMD_OPL3_P0, CMD_OPL3_P1)
+            cmd in (
+                CMD_YM3526, CMD_YM3526_2, CMD_YM3812, CMD_YM3812_2,
+                CMD_OPL3_P0, CMD_OPL3_P1, CMD_OPL3_B_P0, CMD_OPL3_B_P1,
+                CMD_Y8950, CMD_Y8950_2,
+            )
             and pos + 3 <= n
         ):
             # The OPL chips take (register, value) in one flat space. The YMF262
@@ -1488,37 +1760,91 @@ def load_vgm(path: Path | str) -> VgmFile:
             # port is folded into bit 8 of reg exactly like the YM2612's
             # second register bank; every per-channel register then names one
             # hardware channel unambiguously.
-            if cmd == CMD_YM3526:
-                vgm.writes.append(ChipWrite(sample, "opl", 0, buf[pos + 1], buf[pos + 2]))
-            elif cmd == CMD_YM3812:
-                vgm.writes.append(ChipWrite(sample, "opl2", 0, buf[pos + 1], buf[pos + 2]))
-            elif cmd == CMD_YM3812_2:
-                if opl2_dual:
-                    vgm.writes.append(ChipWrite(sample, "opl2", 1, buf[pos + 1], buf[pos + 2]))
-                else:
-                    stray_opl2_second = True
+            if cmd in (CMD_YM3526, CMD_YM3526_2):
+                cid = 0
+                if cmd == CMD_YM3526_2:
+                    if opl_dual:
+                        cid = 1
+                    else:
+                        stray_opl_second = True
+                if cmd != CMD_YM3526_2 or opl_dual:
+                    vgm.writes.append(ChipWrite(
+                        sample, "opl", cid, buf[pos + 1], buf[pos + 2],
+                    ))
+            elif cmd in (CMD_YM3812, CMD_YM3812_2):
+                cid = 0
+                if cmd == CMD_YM3812_2:
+                    if opl2_dual:
+                        cid = 1
+                    else:
+                        stray_opl2_second = True
+                if cmd != CMD_YM3812_2 or opl2_dual:
+                    vgm.writes.append(ChipWrite(
+                        sample, "opl2", cid, buf[pos + 1], buf[pos + 2],
+                    ))
+            elif cmd in (CMD_Y8950, CMD_Y8950_2):
+                cid = 0
+                if cmd == CMD_Y8950_2:
+                    if y8950_dual:
+                        cid = 1
+                    else:
+                        stray_y8950_second = True
+                if cmd != CMD_Y8950_2 or y8950_dual:
+                    vgm.writes.append(ChipWrite(
+                        sample, "y8950", cid, buf[pos + 1], buf[pos + 2],
+                    ))
             else:
-                port = 1 if cmd == CMD_OPL3_P1 else 0
-                vgm.writes.append(ChipWrite(
-                    sample, "opl3", 0, (port << 8) | buf[pos + 1], buf[pos + 2],
-                ))
+                cid = 0
+                if cmd in (CMD_OPL3_B_P0, CMD_OPL3_B_P1):
+                    if opl3_dual:
+                        cid = 1
+                    else:
+                        stray_opl3_second = True
+                if cmd not in (CMD_OPL3_B_P0, CMD_OPL3_B_P1) or opl3_dual:
+                    port = 1 if cmd in (CMD_OPL3_P1, CMD_OPL3_B_P1) else 0
+                    vgm.writes.append(ChipWrite(
+                        sample, "opl3", cid,
+                        (port << 8) | buf[pos + 1], buf[pos + 2],
+                    ))
             pos += 3
             continue
         if cmd == CMD_YMF278B and pos + 4 <= n:
             # 0xD0 pp aa dd. Ports 0/1 are the OPL3 FM banks and port 2 the 24
             # wave slots; the port rides in bit 8 (or 9) of reg so one flat
-            # stream keeps its order.
-            port = buf[pos + 1]
+            # stream keeps its order.  Bit 7 of the port selects the second
+            # chip (Furnace exports it that way).
+            pp = buf[pos + 1]
+            cid = (pp >> 7) & 1
+            if cid and not ymf278b_dual:
+                stray_opl4_second = True
+            port = pp & 0x7F
             vgm.writes.append(ChipWrite(
-                sample, "ymf278b", 0, (port << 8) | buf[pos + 2], buf[pos + 3],
+                sample, "ymf278b", cid,
+                (port << 8) | buf[pos + 2], buf[pos + 3],
             ))
             pos += 4
             continue
-        if cmd == CMD_Y8950 and pos + 3 <= n:
-            # 0x5C: one flat register space. The FM half is the YM3526 map;
-            # the ADPCM half is the delta-T engine at 0x07-0x12.
-            vgm.writes.append(ChipWrite(sample, "y8950", 0, buf[pos + 1],
-                                        buf[pos + 2]))
+        if cmd == CMD_VSU and pos + 4 <= n:
+            # 0xC7 mmll dd: 16-bit big-endian register *word* index.  Bit 15
+            # marks the second chip.  Wave RAM, the mod table and the channel
+            # registers all live in one flat index space.
+            reg = int.from_bytes(buf[pos + 1:pos + 3], "big")
+            cid = 1 if (reg & VSU_DUAL_BIT) else 0
+            if cid and not vsu_dual:
+                stray_vsu_second = True
+            vgm.writes.append(ChipWrite(
+                sample, "vsu", cid, reg & 0x7FFF, buf[pos + 3],
+            ))
+            pos += 4
+            continue
+        if cmd in (CMD_YMZ280B, CMD_YMZ280B_2) and pos + 3 <= n:
+            # 0x5D is the first YMZ280B, 0xAD the second (YM-family +0x50).
+            cid = 0 if cmd == CMD_YMZ280B else 1
+            if cid and not ymz280b_dual:
+                stray_ymz_second = True
+            vgm.writes.append(ChipWrite(
+                sample, "ymz280b", cid, buf[pos + 1], buf[pos + 2],
+            ))
             pos += 3
             continue
         if (
@@ -1617,26 +1943,48 @@ def load_vgm(path: Path | str) -> VgmFile:
             continue
         if cmd == CMD_K007232 and pos + 3 <= n:
             aa = buf[pos + 1]
-            vgm.writes.append(ChipWrite(sample, "k007232", (aa >> 7) & 1, aa & 0x7F, buf[pos + 2]))
+            cid = (aa >> 7) & 1
+            if cid:
+                stray_k007232_second = True
+            vgm.writes.append(ChipWrite(sample, "k007232", cid, aa & 0x7F, buf[pos + 2]))
             pos += 3
             continue
         if cmd == CMD_AY8910 and pos + 3 <= n:
             # 0xA0: register, then data. Bit 7 of the register selects the
             # second chip instance (libvgm reads it the same way).
             rr = buf[pos + 1]
-            vgm.writes.append(ChipWrite(sample, "ay8910", (rr >> 7) & 1, rr & 0x7F, buf[pos + 2]))
+            cid = (rr >> 7) & 1
+            if cid and not ay8910_dual:
+                stray_ay_second = True
+            vgm.writes.append(ChipWrite(sample, "ay8910", cid, rr & 0x7F, buf[pos + 2]))
             pos += 3
             continue
         if cmd in (CMD_MSM6295, CMD_MSM6258) and pos + 3 <= n:
             aa = buf[pos + 1]
             name = "msm6295" if cmd == CMD_MSM6295 else "msm6258"
-            vgm.writes.append(ChipWrite(sample, name, (aa >> 7) & 1, aa & 0x7F, buf[pos + 2]))
+            cid = (aa >> 7) & 1
+            dual = (
+                vgm.msm6295_dual if name == "msm6295"
+                else bool(adpcm_raw & 0x40000000)
+            )
+            if cid and not dual:
+                if name == "msm6295":
+                    stray_msm6295_second = True
+                else:
+                    stray_msm6258_second = True
+            vgm.writes.append(ChipWrite(sample, name, cid, aa & 0x7F, buf[pos + 2]))
             pos += 3
             continue
         if cmd == CMD_SEGAPCM and pos + 4 <= n:
-            # 0xC0: u16-LE address (register/voice map), then data.
+            # 0xC0: u16-LE address (register/voice map), then data.  Bit 15
+            # selects the second instance, matching Furnace's export.
             addr = int.from_bytes(buf[pos + 1:pos + 3], "little")
-            vgm.writes.append(ChipWrite(sample, "segapcm", 0, addr & 0x7FF, buf[pos + 3]))
+            cid = (addr >> 15) & 1
+            if cid:
+                stray_segapcm_second = True
+            vgm.writes.append(ChipWrite(
+                sample, "segapcm", cid, addr & 0x7FF, buf[pos + 3],
+            ))
             pos += 4
             continue
         if cmd == CMD_GB and pos + 3 <= n:
@@ -1644,8 +1992,14 @@ def load_vgm(path: Path | str) -> VgmFile:
             # is the wave RAM.  Bit 7 of the register selects a second APU
             # (Dual Chip Support #2), so mask it off like the NES does.
             rr = buf[pos + 1]
+            gb_cid = (rr >> 7) & 1
+            if gb_cid and not gb_dmg_dual:
+                vgm.warnings.append(
+                    "0xB3 Game Boy writes with register bit 7 set but no "
+                    "dual-instance header bit; they were treated as the second APU"
+                )
             vgm.writes.append(ChipWrite(
-                sample, "gb", (rr >> 7) & 1, rr & 0x7F, buf[pos + 2],
+                sample, "gb", gb_cid, rr & 0x7F, buf[pos + 2],
             ))
             pos += 3
             continue
@@ -1653,8 +2007,14 @@ def load_vgm(path: Path | str) -> VgmFile:
             # 0xB4: register, data. Bit 7 of the register selects the second
             # APU instance (0x00-0x17 = $4000-$4017).
             rr = buf[pos + 1]
+            nes_cid = (rr >> 7) & 1
+            if nes_cid and not nes_dual:
+                vgm.warnings.append(
+                    "0xB4 NES writes with register bit 7 set but no "
+                    "dual-instance header bit; they were treated as the second APU"
+                )
             vgm.writes.append(ChipWrite(
-                sample, "nes", (rr >> 7) & 1, rr & 0x7F, buf[pos + 2],
+                sample, "nes", nes_cid, rr & 0x7F, buf[pos + 2],
             ))
             pos += 3
             continue
@@ -1663,20 +2023,32 @@ def load_vgm(path: Path | str) -> VgmFile:
             # chip instance.  The register file is a channel-select latch at
             # 0x00 followed by per-channel writes.
             rr = buf[pos + 1]
+            huc_cid = (rr >> 7) & 1
+            if huc_cid and not huc6280_dual:
+                vgm.warnings.append(
+                    "0xB9 HuC6280 writes with register bit 7 set but no "
+                    "dual-instance header bit; they were treated as the second chip"
+                )
             vgm.writes.append(ChipWrite(
-                sample, "huc6280", (rr >> 7) & 1, rr & 0x7F, buf[pos + 2],
+                sample, "huc6280", huc_cid, rr & 0x7F, buf[pos + 2],
             ))
             pos += 3
             continue
         if cmd in (CMD_RF5C68, CMD_RF5C164) and pos + 3 <= n:
             # 0xB0/0xB1: (register, data). One shared register file; the clock
-            # tells the two chips apart. Register 0x07 selects the RAM bank.
+            # tells the two chips apart. Register 0x07 selects the RAM bank;
+            # bit 7 selects a second chip (Furnace's RF5C is not dual-able,
+            # but the stream still names it).
             name = "rf5c68" if cmd == CMD_RF5C68 else "rf5c164"
-            reg = buf[pos + 1]
+            rr = buf[pos + 1]
+            cid = (rr >> 7) & 1
+            reg = rr & 0x7F
             val = buf[pos + 2]
+            if cid:
+                stray_rf5c_second = True
             if reg == 0x07 and not (val & 0x40):
-                rf5c_wbank[name] = (val & 0x0F) << 12
-            vgm.writes.append(ChipWrite(sample, name, 0, reg, val))
+                rf5c_wbank[(name, cid)] = (val & 0x0F) << 12
+            vgm.writes.append(ChipWrite(sample, name, cid, reg, val))
             pos += 3
             continue
         if cmd in (CMD_RF5C68_MEM, CMD_RF5C164_MEM) and pos + 4 <= n:
@@ -1685,7 +2057,7 @@ def load_vgm(path: Path | str) -> VgmFile:
             # flat address so the collector can just fill bytes in order.
             name = "rf5c68" if cmd == CMD_RF5C68_MEM else "rf5c164"
             offset = int.from_bytes(buf[pos + 1:pos + 3], "little")
-            addr = (rf5c_wbank[name] | offset) & 0xFFFF
+            addr = (rf5c_wbank.get((name, 0), 0) | offset) & 0xFFFF
             vgm.writes.append(ChipWrite(sample, f"{name}_mem", 0, addr, buf[pos + 3]))
             pos += 4
             continue
@@ -1695,14 +2067,23 @@ def load_vgm(path: Path | str) -> VgmFile:
             # kept flat as (port << 8) | addr; scc.py decodes the banks.
             pp = buf[pos + 1]
             reg = ((pp & 0x7F) << 8) | buf[pos + 2]
-            vgm.writes.append(ChipWrite(sample, "k051649", (pp >> 7) & 1, reg, buf[pos + 3]))
+            cid = (pp >> 7) & 1
+            if cid and not k051649_dual:
+                stray_scc_second = True
+            vgm.writes.append(ChipWrite(sample, "k051649", cid, reg, buf[pos + 3]))
             pos += 4
             continue
         if cmd == CMD_C140 and pos + 4 <= n:
-            # 0xD4: 9-bit register address, big-endian, then data. Bits 9+ are
-            # the chip select Furnace writes for a second instance.
+            # 0xD4: 16-bit big-endian address, then data.  Bit 15 is the chip
+            # select Furnace writes for a second instance; the register is the
+            # low nine bits.
             addr = int.from_bytes(buf[pos + 1:pos + 3], "big")
-            vgm.writes.append(ChipWrite(sample, "c140", addr >> 9, addr & 0x1FF, buf[pos + 3]))
+            cid = (addr >> 15) & 1
+            if cid and not c140_dual:
+                stray_c140_second = True
+            vgm.writes.append(ChipWrite(
+                sample, "c140", cid, addr & 0x1FF, buf[pos + 3],
+            ))
             pos += 4
             continue
         if cmd == CMD_C352 and pos + 5 <= n:
@@ -1719,8 +2100,11 @@ def load_vgm(path: Path | str) -> VgmFile:
             # 0xBA: register, data. Bit 7 of the register selects the second
             # instance; the register space is six bits.
             aa = buf[pos + 1]
+            cid = (aa >> 7) & 1
+            if cid and not k053260_dual:
+                stray_k053260_second = True
             vgm.writes.append(ChipWrite(
-                sample, "k053260", (aa >> 7) & 1, aa & 0x3F, buf[pos + 2],
+                sample, "k053260", cid, aa & 0x3F, buf[pos + 2],
             ))
             pos += 3
             continue
@@ -1885,9 +2269,15 @@ def load_vgm(path: Path | str) -> VgmFile:
                 "register stream is converted"
             )
     if any(w.chip == "sn76489" for w in vgm.writes) and not vgm.sn76489_clock:
-        vgm.warnings.append(
-            f"SN76489 clock is missing or out of range; using {SN76489_DEFAULT_CLOCK}"
-        )
+        if vgm.sn76489_t6w28:
+            vgm.sn76489_clock = 3072000
+            vgm.warnings.append(
+                "T6W28 clock is missing or out of range; using 3072000"
+            )
+        else:
+            vgm.warnings.append(
+                f"SN76489 clock is missing or out of range; using {SN76489_DEFAULT_CLOCK}"
+            )
     if (
         vgm.dac_data and not vgm.dac_events and not vgm.dac_block_plays
         and not vgm.dac_stream_plays
@@ -1936,6 +2326,96 @@ def load_vgm(path: Path | str) -> VgmFile:
             "0xAA YM3812 writes without the dual-instance header bit; "
             "they were treated as the first chip"
         )
+    if stray_ym2151_second:
+        vgm.warnings.append(
+            "0xA4 YM2151 writes without the dual-instance header bit; "
+            "they were treated as the first chip"
+        )
+    if stray_opl_second:
+        vgm.warnings.append(
+            "0xAB YM3526 writes without the dual-instance header bit; "
+            "they were treated as the first chip"
+        )
+    if stray_opl3_second:
+        vgm.warnings.append(
+            "0xAE/0xAF YMF262 writes without the dual-instance header bit; "
+            "they were treated as the first chip"
+        )
+    if stray_y8950_second:
+        vgm.warnings.append(
+            "0xAC Y8950 writes without the dual-instance header bit; "
+            "they were treated as the first chip"
+        )
+    if stray_opl4_second:
+        vgm.warnings.append(
+            "0xD0 YMF278B writes with port bit 7 set but no dual-instance "
+            "header bit; they were treated as the second chip"
+        )
+    if stray_sn_second:
+        vgm.warnings.append(
+            "0x30/0x3F SN76489 writes without the dual-instance header bit; "
+            "they were treated as the second chip"
+        )
+    if vgm.sn76489_dual and not vgm.sn76489_t6w28:
+        vgm.warnings.append(
+            "dual SN76489 log: both chips are converted as separate systems"
+        )
+    if (sn76489_raw & SN76489_T6W28_BIT) and not vgm.sn76489_dual:
+        vgm.warnings.append(
+            "T6W28 flag without the dual-instance header bit; the SN76489 "
+            "stream was converted as mono"
+        )
+    if stray_c140_second:
+        vgm.warnings.append(
+            "0xD4 C140 address bit 15 selects a second chip without the "
+            "dual-instance header bit; it was still treated as chip 1"
+        )
+    if stray_k053260_second:
+        vgm.warnings.append(
+            "0xBA K053260 register bit 7 selects a second chip without the "
+            "dual-instance header bit; it was still treated as chip 1"
+        )
+    if stray_ay_second:
+        vgm.warnings.append(
+            "0xA0 AY-8910 register bit 7 selects a second chip without the "
+            "dual-instance header bit; it was still treated as chip 1"
+        )
+    if stray_scc_second:
+        vgm.warnings.append(
+            "0xD2 K051649 port bit 7 selects a second chip without the "
+            "dual-instance header bit; it was still treated as chip 1"
+        )
+    if stray_msm6295_second:
+        vgm.warnings.append(
+            "0xB8 MSM6295 register bit 7 selects a second chip without the "
+            "dual-instance header bit; it was still treated as chip 1"
+        )
+    if stray_msm6258_second:
+        vgm.warnings.append(
+            "0xB7 MSM6258 register bit 7 selects a second chip without the "
+            "dual-instance header bit; it was still treated as chip 1"
+        )
+    if stray_ymz_second:
+        vgm.warnings.append(
+            "0xAD YMZ280B writes without the dual-instance header bit; "
+            "they were treated as the second chip"
+        )
+    if (any(w.chip == "ymz280b" for w in vgm.writes)
+            and not vgm.ymz280b_clock):
+        vgm.warnings.append(
+            "YMZ280B writes without a header clock; using 16934400 Hz"
+        )
+        vgm.ymz280b_clock = YMZ280B_DEFAULT_CLOCK
+    if stray_vsu_second:
+        vgm.warnings.append(
+            "0xC7 VSU writes with register bit 15 set but no dual-instance "
+            "header bit; they were treated as the second chip"
+        )
+    if any(w.chip == "vsu" for w in vgm.writes) and not vgm.vsu_clock:
+        vgm.warnings.append(
+            "VSU writes without a header clock; using 5000000 Hz"
+        )
+        vgm.vsu_clock = VSU_DEFAULT_CLOCK
     return vgm
 
 

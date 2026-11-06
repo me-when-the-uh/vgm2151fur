@@ -53,6 +53,19 @@ delayed note on the jump row keeps its `EDxx`. The `Bxx` rides a channel whose
 row has no delay. That note still lands just before the wrap. When every
 channel is delayed, channel 0 gives up its delay to carry the jump.
 
+The short order before the loop ends with `D00`, which runs at tick 0. If the
+row before the boundary carries a note, the boundary moves one row later until
+that row is note-free; otherwise `D00` would jump before the note's `EDxx`
+delay and the note would never start. `ECxx` is row-relative, so it may share
+a row with `EDxx` only when the cut lands after the delayed key-on
+(`ECxx > EDxx`). When `ECxx <= EDxx` Furnace cuts before the note starts and
+the note never sounds (the T6W28 premature-cut bug), so that cut is dropped
+and the next key-on ends the note. A gate shorter than the row delay gets
+`ECxx = EDxx + 1`, the earliest safe cut. Keeping the cut on the note row is
+what stops a one-frame noise or drum gate from running until the channel's
+next key-on, which could be a whole phrase later; moving it to the next row
+fails when that row already starts the next note.
+
 `edit.py` patches both volume copies, so every reader agrees. The float
 triples are located from the payload tail, anchored on the ADIR pointers: the
 tail is `[triples][patchbay 4][auto 1][pad 8][speed 17][groove 1]`, so the
@@ -63,7 +76,8 @@ triples start 31 bytes plus 12 per chip before the first ADIR pointer.
 - `0x82` YM2151, `0x8D` YM2203, `0x83` YM2612 (`0xA0` Ext, `0xC1` CSM),
   `0x8F` OPL (YM3526), `0x90` OPL2 (YM3812), `0x91` OPL3 (YMF262) and their
   rhythm variants `0xA2`, `0xA3`, `0xA4`, `0xA5` YM2610, `0x9E` YM2610B,
-  `0x03` SN76489 (SMS), `0xC6` K007232, `0xAA` MSM6295, `0xAB` MSM6258,
+  `0x03` SN76489 (SMS), `0xBF` T6W28 (stereo SN76489), `0xC6` K007232,
+  `0xAA` MSM6295, `0xAB` MSM6258,
   `0x9B` SegaPCM, `0xCE` C140, `0xCC` Konami K053260, `0xD0` C352,
   `0xA1` Konami SCC (K051649),
   `0xB4` Konami SCC+ (K052539), `0x80` AY-3-8910, `0x9D` Konami VRC7,
@@ -76,7 +90,9 @@ triples start 31 bytes plus 12 per chip before the first ADIR pointer.
   with channel 3 split into its four operator columns. A Genesis source adds
   a second `0x03` system after it: four SN76489 channels (three tone then
   noise), for ten channels total. A dual source writes two systems in chip
-  order. An OPL is nine channels, an OPL3 eighteen; rhythm mode is its own
+  order. A T6W28 is one `0xBF` system with four channels; its `08xy` split
+  carries the independent left/right attenuation. An OPL is nine channels,
+  an OPL3 eighteen; rhythm mode is its own
   system with the kit's columns after the melodic ones (eleven, or twenty).
 - The YM2151 flag carries `customClock=` when the source clock is not
   3579545: a 4 MHz OPM plays flat otherwise. Each YM2203 system carries the
@@ -377,8 +393,8 @@ note change was left to a ramp that could not cross the distance inside its
 row. Those steps are transposes now, so `dev_max` reports only the residual of
 the ramps that stay - on a staccato lead track, nineteen semitones down to a
 quarter tone. That matters for the pick, because `lossless` compares deviation
-as well as structural loss. With `verify` (CLI `--verify`, always on in
-the menu) `convert_variants` instead renders every candidate through Furnace
+as well as structural loss. With `verify` (CLI `--verify`, or a yes at the
+menu's Furnace prompt) `convert_variants` instead renders every candidate through Furnace
 and counts pitch runs against the source at 0.25 st / 60 ms, accepting a
 factor only up to `baseline + 1` runs. A factor is a row-length multiplier,
 and it may be fractional. The default ladder walks the half steps

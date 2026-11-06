@@ -35,6 +35,15 @@ frequency write without a trigger keeps the hardware envelope running, so it
 becomes a pitch macro (this is how the drivers build arpeggios). Splitting
 those would restart the envelope and hold notes the source lets decay.
 
+Writes that share a VGM sample are applied to the chip in stream order. A
+merged or re-exported log can keep the sample group but put the trigger byte
+before the period low byte, duty/length, envelope/DAC or wave level. The chip
+would then start the note from the previous (often muted) state, which is
+silent; a plain VGM player renders those pulse channels as silence. The
+collector moves NRx4/NR44 trigger writes to the end of their sample group, the
+same way the YM2612 key-on handling does, so the note takes the setup written
+beside it. Correctly ordered logs are unchanged.
+
 Noise has no period register: `gb_noise_note` inverts Furnace's `noiseTable`.
 The note number is a table index, not a 12-TET pitch: each chromatic step moves
 the hardware rate by two to four semitones (and the last few steps by up to an

@@ -278,6 +278,20 @@ def collect_gb(
     if not writes:
         return [], [], [], warnings
 
+    # A merged log can preserve a sample group but not the order of its
+    # writes. Some tools emit NRx4/NR44 (the trigger byte) before the period
+    # low byte, duty, envelope/DAC or wave level at the same sample; on the
+    # chip that trigger sees the previous (often muted) state. Apply every
+    # other write at the sample first and the trigger last, matching the
+    # YM2612 key-on handling. Correctly ordered logs are unchanged.
+    def is_trigger(w) -> bool:
+        reg = w.reg & 0x7F
+        return bool(w.val & 0x80) and (
+            reg in (REG_P1_HI, REG_P2_HI, REG_W_HI) or reg == REG_N_CTL
+        )
+
+    writes.sort(key=lambda w: (w.sample, 1 if is_trigger(w) else 0))
+
     duty = [0, 0]                       # pulse 1/2 duty
     length_val = [0, 0, 0, 0]           # raw length counter
     length_en = [False, False, False, False]
