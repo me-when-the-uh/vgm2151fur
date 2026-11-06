@@ -232,6 +232,13 @@ from vgm2151fur.ym2612dac import (
 # the patch's real TL a few samples later. A level write this close to the
 # key-on is the note's starting level, not a mid-note step.
 OPN_TL_FOLD = 512
+# A driver can load a new patch into a still-keyed OPN voice (Time Trax holds
+# a drone while swapping patches). The chip changes the operator pitch and
+# timbre at once, but a Furnace note keeps its instrument until the next
+# key-on. Split the note when a pitch/timbre register changes, after giving
+# the patch block time to settle. A key transition inside this window is the
+# next note taking the patch, so the split is not emitted then.
+OPN_PATCH_SETTLE = 512
 
 
 # Official YM2151 KC note nibble → semitone from C of this octave.
@@ -5587,6 +5594,70 @@ def analyze(
                 return tuple(st.frequency_op(2, g) for g in range(4))
             return (st.frequency(ch),)
 
+        # First key transitions per channel. A patch load just before one is
+        # preloading the next note, not changing the held voice; the split
+        # below must not fire for it.
+        key_times: dict[tuple[int, int], list[int]] = {}
+        for w in vgm.writes:
+            if w.chip != block_port_chip or (w.reg & 0x100):
+                continue
+            r0 = w.reg & 0xFF
+            if r0 != 0x28:
+                continue
+            rc = w.val & 0x07
+            if rc in (3, 7):
+                continue
+            key_times.setdefault(
+                (w.chip_id, rc if rc < 3 else rc - 1), []
+            ).append(w.sample)
+
+        patch_pending: dict[tuple[int, int, int], tuple[int, int]] = {}
+
+        def patch_identity_write(r: int) -> bool:
+            """A passive write that changes the voice's pitch or timbre."""
+            return (
+                0x30 <= r <= 0x3E
+                or 0x90 <= r <= 0x9E
+                or 0xB0 <= r <= 0xB2
+            )
+
+        def split_held_note(key, sample: int) -> None:
+            """Start a new note for a patch the driver loaded mid-note."""
+            idx = held_idx.get(key)
+            if idx is None:
+                return
+            cid, ch, _op = key
+            st = states[cid]
+            ev = events[idx]
+            # Anything the block recorded after the split instant belongs to
+            # the new note, which restarts from the settled registers.
+            pts = pitch_pts.get(key)
+            if pts is not None:
+                pitch_pts[key] = [p for p in pts if p[0] < sample]
+            ev.end = sample
+            close_opn_note(key, sample, off=False)
+            block, fnum = st.frequency(ch)
+            note, e5 = ym2612_note_for(block, fnum, block_port_clock)
+            ins, vol = intern_opn_patch(cid, ch, st.op_mask[ch])
+            events.append(NoteEvent(
+                sample=sample,
+                ch=ev.ch,
+                on=True,
+                note=note,
+                ins=ins,
+                vol=vol,
+                e5=e5,
+                pan=st.pan_byte(ch),
+                sweep_div=2.0,
+                e5_lo=0x00,
+                e5_hi=0xFF,
+            ))
+            held_idx[key] = len(events) - 1
+            pitch_base[key] = (block, fnum)
+            pitch_pts[key] = [(sample, block, fnum)]
+            opn_tl_pts[key] = []
+            opn_tl_last[key] = st.carrier_tl(ch)
+
         def kon_last(writes):
             """Apply non-KON writes at a sample before its key-on writes.
 
@@ -5624,6 +5695,14 @@ def analyze(
             st = states.get(cid)
             if st is None:
                 continue
+            # A patch block that has gone quiet is a real mid-note change.
+            for pk in list(patch_pending):
+                if pk[0] != cid:
+                    continue
+                first, last = patch_pending[pk]
+                if w.sample - last > OPN_PATCH_SETTLE:
+                    del patch_pending[pk]
+                    split_held_note(pk, first)
             reg, val = w.reg, w.val
             r = reg & 0xFF
             port = bool(reg & 0x100)
@@ -5664,6 +5743,14 @@ def analyze(
                 # group continues the 0-based index after a reserved slot.
                 ch = raw_ch if raw_ch < 3 else raw_ch - 1
                 mask = (val >> 4) & 0x0F
+                # A key transition takes the loaded patch itself; a pending
+                # split here would put two notes on the same row.
+                if not (block_port_ext and ch == 2):
+                    pkey = (cid, ch, -1)
+                    if pkey in patch_pending:
+                        first, last = patch_pending.pop(pkey)
+                        if w.sample - last > OPN_PATCH_SETTLE:
+                            split_held_note(pkey, first)
                 if st.dac_enabled and ch == 5:
                     # FM6 is replaced by the DAC: its key-ons are the sample
                     # player's writes, not FM notes.
@@ -5797,10 +5884,33 @@ def analyze(
                 st.write(reg, val)
                 continue
 
+            key = (cid, ch, -1)
+            # A frequency write ends a patch block: split before it so the new
+            # note starts at the pitch the block left, then keep this write as
+            # the new note's first pitch step.
+            if (not (block_port_ext and ch == 2)
+                    and key in patch_pending and 0xA0 <= r <= 0xA6):
+                first, _last = patch_pending.pop(key)
+                split_held_note(key, first)
             before = chan_freqs(cid, ch)
             b4 = st.pan_pms_ams[ch]
             st.write(reg, val)
             after = chan_freqs(cid, ch)
+            if (not (block_port_ext and ch == 2)
+                    and patch_identity_write(r)
+                    and key in held_idx):
+                pend = patch_pending.get(key)
+                if pend is None:
+                    # Do not split when the next key-on/off is about to take
+                    # this voice anyway.
+                    soon = any(
+                        0 <= t - w.sample <= OPN_PATCH_SETTLE
+                        for t in key_times.get((cid, ch), ())
+                    )
+                    if not soon:
+                        patch_pending[key] = (w.sample, w.sample)
+                else:
+                    patch_pending[key] = (pend[0], w.sample)
 
             if block_port_ext and ch == 2:
                 for c in range(4):
@@ -5829,7 +5939,8 @@ def analyze(
                 key = (cid, ch, -1)
                 if key in held_idx and after[0] != before[0]:
                     pitch_pts[key].append((w.sample, *after[0]))
-                if 0x40 <= r <= 0x4E and key in held_idx:
+                if (0x40 <= r <= 0x4E and key in held_idx
+                        and key not in patch_pending):
                     cur = st.carrier_tl(ch)
                     if cur != opn_tl_last.get(key, 0x7F):
                         opn_tl_pts[key].append((w.sample, cur))

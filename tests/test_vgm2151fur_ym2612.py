@@ -1049,6 +1049,39 @@ class TestYm2612Analyze(unittest.TestCase):
         self.assertTrue(ev.pitch_steps)
         self.assertEqual(ev.ins, 0)
 
+    def test_mid_note_patch_change_splits_the_held_note(self):
+        # A driver can load a new patch into a still-keyed voice (Time Trax
+        # holds a drone through several patch swaps). The chip changes the
+        # operators at once, but a tracker note keeps its instrument until the
+        # next key-on, so the hold has to become a second note.
+        ws = _fm_note(4, 1204, ch=4, off=60000)
+        t = 30000
+        ws += [
+            ChipWrite(t, "ym2612", 0, 0x1B1, 0x3A),  # alg 2, feedback 7
+            ChipWrite(t, "ym2612", 0, 0x131, 0x08),
+            ChipWrite(t, "ym2612", 0, 0x135, 0x24),
+        ]
+        song = analyze(_vgm(ws))
+        on = [e for e in song.events if e.on and e.ch == 4]
+        self.assertEqual([e.sample for e in on], [100, t])
+        self.assertEqual(on[0].end, t)
+        self.assertNotEqual(on[0].ins, on[1].ins)
+        self.assertEqual(song.fm_patches[on[1].ins].alg, 2)
+
+    def test_patch_load_before_key_on_does_not_split(self):
+        # The patch bytes just before a key transition belong to the next
+        # note. Splitting the old note would put two notes on one row.
+        ws = _fm_note(4, 1204, ch=4, off=0)
+        ws += [
+            ChipWrite(29900, "ym2612", 0, 0x1B1, 0x3A),
+            ChipWrite(29900, "ym2612", 0, 0x131, 0x08),
+            ChipWrite(30000, "ym2612", 0, 0x28, 0x05),
+            ChipWrite(30001, "ym2612", 0, 0x28, 0xF5),
+        ]
+        song = analyze(_vgm(ws))
+        on = [e for e in song.events if e.on and e.ch == 4]
+        self.assertEqual([e.sample for e in on], [100, 30001])
+
     def test_long_pitch_sweep_becomes_pitch_macro(self):
         ws = _fm_note(4, 1204, off=60000)
         for i, fnum in enumerate((1210, 1260) * 6):
@@ -1857,6 +1890,27 @@ class TestYm2612RealPack(unittest.TestCase):
 
     def test_evil_destroyer_octave_steps(self):
         self._check("06 - Evil Destroyer (Stage 1 Boss).vgz")
+
+
+TIMETRAX = Path(r"D:\Downloads\timetraxvgm\01 BGM #01.vgm")
+
+
+class TestYm2612MidNotePatch(unittest.TestCase):
+    """Time Trax swaps patches into a drone that is never re-keyed."""
+
+    def test_held_drone_splits_on_the_patch_swap(self):
+        if not TIMETRAX.is_file():
+            self.skipTest(f"{TIMETRAX} not present")
+        song = analyze(load_vgm(TIMETRAX))
+        on = [
+            e for e in song.events
+            if e.on and e.ch == 4 and 1282500 <= e.sample <= 1301600
+        ]
+        self.assertEqual([e.sample for e in on], [1283215, 1301543])
+        self.assertEqual(on[0].end, 1301540)
+        self.assertNotEqual(on[0].ins, on[1].ins)
+        self.assertEqual(song.fm_patches[on[0].ins].alg, 2)
+        self.assertEqual(song.fm_patches[on[1].ins].alg, 4)
 
 
 if __name__ == "__main__":
