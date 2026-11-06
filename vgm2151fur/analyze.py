@@ -476,6 +476,10 @@ class NoteEvent:
     # SCC only: the wavetable index the note itself starts on (-1 = no wave).
     tone_wave: int = -1
     tone_period_offset: int = 0
+    # PCE only: the raw 12-bit period the note starts on. Splitting a long
+    # gate at volume peaks needs the pitch at each new note start, which the
+    # note/E5 pair encodes only indirectly.
+    tone_period: int = 0
     # 0 = not a tone-chip note, 1 = SCC, 2 = AY. The phase-2 pass finds the
     # instrument for these once the tick rate is known.
     tone_chip: int = 0
@@ -1857,6 +1861,103 @@ def _bind_tone_instruments(
         else:
             event.ins = tone_ins_base + n_scc + idx
     return merged
+
+
+def _split_pce_volume_peaks(
+    events: list[NoteEvent], clock: int, track_end: int,
+) -> list[NoteEvent]:
+    """Split a PCE tone gate at each volume peak (and every five seconds).
+
+    A long balance/control-volume envelope can contain dozens of swells. A
+    single instrument volume macro then holds many peaks and can run for tens
+    of seconds, which is neither a useful instrument nor accurate at the row
+    rate. Each peak is the driver's software attack, so make it a new note:
+    the peak becomes the note row and its following decay the (short) macro.
+    The five-second ceiling keeps any remaining macro bounded.
+    """
+    cap = 5 * VGM_RATE
+    out: list[NoteEvent] = []
+    for ev in events:
+        if not (ev.on and ev.tone_chip == 5 and ev.vol_pts):
+            out.append(ev)
+            continue
+        end = ev.end or track_end
+        if end <= ev.sample:
+            out.append(ev)
+            continue
+        timeline = [(ev.sample, ev.vol, ev.pan)]
+        timeline += [(t, v, p) for t, v, p in ev.vol_pts]
+        timeline.sort(key=lambda item: item[0])
+        pts: list[tuple[int, int, int]] = []
+        for t, v, p in timeline:
+            if pts and pts[-1][0] == t:
+                pts[-1] = (t, v, p)
+            else:
+                pts.append((t, v, p))
+        vol_at = [(t, v) for t, v, _p in pts]
+        pan_at = [(t, p) for t, _v, p in pts]
+        splits = [
+            pts[i][0] for i in range(1, len(pts) - 1)
+            if pts[i][1] >= pts[i - 1][1] and pts[i][1] > pts[i + 1][1]
+        ]
+        t = ev.sample
+        while t + cap < end:
+            t += cap
+            splits.append(t)
+        splits = sorted({s for s in splits if ev.sample < s < end})
+        if not splits:
+            out.append(ev)
+            continue
+        starts = [ev.sample] + splits
+        for i, st in enumerate(starts):
+            seg_end = starts[i + 1] if i + 1 < len(starts) else ev.end
+            bound = seg_end or track_end
+            vol = _value_at(vol_at, st, ev.vol)
+            pan = _value_at(pan_at, st, ev.pan)
+            if ev.tone_noise:
+                base_noise = _value_at(
+                    [(ev.sample, ev.note - 60)] + list(ev.tone_pitch_pts),
+                    st, ev.note - 60,
+                )
+                note = huc6280_noise_note(base_noise)
+                e5 = 0x80
+                base_period = 0
+                pitch_pts = tuple(
+                    (t, n) for t, n in ev.tone_pitch_pts if st < t < bound
+                )
+            else:
+                base_period = _value_at(
+                    [(ev.sample, ev.tone_period)] + list(ev.tone_pitch_pts),
+                    st, ev.tone_period,
+                )
+                note, e5 = huc6280_note(clock, base_period)
+                pitch_pts = tuple(
+                    (t, p) for t, p in ev.tone_pitch_pts if st < t < bound
+                )
+            wave = _value_at(
+                [(ev.sample, ev.tone_wave)] + list(ev.tone_wave_pts),
+                st, ev.tone_wave,
+            )
+            out.append(replace(
+                ev,
+                sample=st,
+                note=note,
+                e5=e5,
+                vol=vol,
+                pan=pan,
+                end=seg_end,
+                vol_pts=tuple(
+                    (t, v, p) for t, v, p in pts if st < t < bound
+                ),
+                tone_pitch_pts=pitch_pts,
+                tone_wave_pts=tuple(
+                    (t, idx) for t, idx in ev.tone_wave_pts
+                    if st < t < bound
+                ),
+                tone_wave=wave,
+                tone_period=base_period,
+            ))
+    return out
 
 
 def _tone_instrument_demand(
@@ -8539,6 +8640,7 @@ def analyze(
                             pan=ev_pan, end=en, vol_pts=ev_vol_pts,
                             tone_pitch_pts=tuple(tail),
                             tone_wave=n.wave_index, tone_chip=5,
+                            tone_period=base_p,
                         ))
                     huc6280_count += 1
                 continue
@@ -8613,8 +8715,13 @@ def analyze(
                     tone_wave=wave_index,
                     tone_period_offset=0,
                     tone_chip=5,
+                    tone_period=period,
                 ))
                 huc6280_count += 1
+        events[:] = _split_pce_volume_peaks(
+            events, huc_clock, vgm.total_samples or 0,
+        )
+
         # The PCE effective level is control volume + balance. Once the volume
         # envelope moves into the instrument's tick-rate macro, the balance's
         # left/right ratio is the only part left for the pattern. Split it out

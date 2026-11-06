@@ -278,6 +278,29 @@ class TestHuc6280Tones(unittest.TestCase):
         data = write_fur(song, include_pcm=True, include_fm=False)
         self.assertEqual(parse_fur(data).chips, [CHIP_PCE])
 
+    def test_volume_peaks_become_note_ons(self):
+        # A long PCE gate can carry many balance swells. Each peak is the
+        # driver's software attack: it becomes a new note, and the macro
+        # between peaks holds only the following decay.
+        writes = _load_wave(_square(), sample=0, balance=0xCC)
+        writes += [
+            _w(2000, 0x05, 0x99),
+            _w(4000, 0x05, 0x88),
+            _w(6000, 0x05, 0xCC),   # second peak
+            _w(8000, 0x05, 0x99),
+        ]
+        song = analyze(_vgm(writes, huc6280_clock=3579545))
+        evs = [e for e in song.events if e.on and e.ch >= 8]
+        self.assertEqual([e.sample for e in evs][:2], [0, 6000])
+        self.assertEqual(evs[0].end, 6000)
+        ins = song.huc6280_ins[evs[0].ins]
+        self.assertEqual(ins.vol[0], 25)
+        # One peak: the rest of the macro only holds or decays.
+        self.assertTrue(all(
+            a >= b for a, b in zip(ins.vol, ins.vol[1:])
+        ), ins.vol)
+        self.assertLess(len(ins.vol), 60)
+
     def test_noise_transient_then_tone_tail(self):
         # A percussion hit: noise on at the gate, then 0x07=0 mid-gate
         # switches back to the waveform.  It stays one note; the switch is the
