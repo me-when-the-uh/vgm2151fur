@@ -1015,6 +1015,69 @@ class TestOpllTickMacros(unittest.TestCase):
         self.assertEqual(patch.vol_speed, 1)
         self.assertEqual(patch.vol_macro[:3], (0, 0, 15))
 
+    def test_channel4_later_retriggers_keep_the_loud_level(self):
+        # Order $03 onward re-keys the same voice after $33=$1F. A released
+        # note still in `held` must not eat the new note's $33=$10 settle
+        # write, or the pattern volume column lands at 00.
+        if not self.SRC.exists():
+            self.skipTest(f"{self.SRC} not present")
+        song = analyze(load_vgm(self.SRC))
+        for order in (0x03, 0x04, 0x05):
+            start = int(order * 256 * song.samples_per_row)
+            ev = next(
+                e for e in song.events
+                if e.on and e.ch == 3 and abs(e.sample - start) <= 2
+            )
+            patch = song.fm_patches[ev.ins]
+            self.assertEqual(ev.vol, 15, f"order {order:#x}")
+            self.assertEqual(patch.vol_macro[:3], (0, 0, 15),
+                             f"order {order:#x}")
+
+    def test_clap_keeps_level_automation_after_key_off(self):
+        # Order $06 FM3: $22 clears the key at +1080, but the driver keeps
+        # gating the release tail with $32 (0,15,0,15,0, then a slow fade to
+        # 15) until +14904. The note must still key off there (that release is
+        # the clap's noise) while its volume macro runs through the whole tail.
+        if not self.SRC.exists():
+            self.skipTest(f"{self.SRC} not present")
+        song = analyze(load_vgm(self.SRC))
+        start = int(0x06 * 256 * song.samples_per_row)
+        ev = next(
+            e for e in song.events
+            if e.on and e.ch == 2 and abs(e.sample - start) <= 2
+        )
+        patch = song.fm_patches[ev.ins]
+        self.assertEqual(ev.end - ev.sample, 1080)
+        self.assertGreater(len(patch.vol_macro), 100)
+        self.assertEqual(patch.vol_macro[-1], 0)
+        off = next(
+            e for e in song.events
+            if not e.on and e.ch == 2 and e.sample - start == 1080
+        )
+        self.assertEqual(off.note, 180)
+
+    @unittest.skipUnless(HAVE_FURNACE, "furnace console build missing")
+    def test_clap_level_macro_continues_through_release(self):
+        if not self.SRC.exists():
+            self.skipTest(f"{self.SRC} not present")
+        song = analyze(load_vgm(self.SRC))
+        start = int(0x06 * 256 * song.samples_per_row)
+        stem = TMP / "opll_clap_release"
+        fur = stem.with_suffix(".fur")
+        fur.write_bytes(write_fur(song, include_pcm=False))
+        back = load_vgm(export_fur(fur, stem.with_suffix(".vgm")))
+        after = [
+            w.val & 15 for w in back.writes
+            if (
+                w.chip == "opll" and (w.reg & 0xFF) == 0x32
+                and start + 1080 < w.sample <= start + 15000
+            )
+        ]
+        # The key-off lands at +1080; the tail's level steps must still reach
+        # the chip afterwards, ending at the saturated level 15.
+        self.assertGreaterEqual(len(after), 10)
+        self.assertEqual(after[-1], 15)
+
     @unittest.skipUnless(HAVE_FURNACE, "furnace console build missing")
     def test_export_keeps_the_sub_row_preset_walk(self):
         if not self.SRC.exists():

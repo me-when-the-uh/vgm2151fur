@@ -2255,6 +2255,10 @@ def _bind_opll_macros(
         if len(rows) >= len(times) and note_row not in rows:
             continue
         end = ev.end or next_on.get(id(ev), total_samples or ev.sample)
+        if ev.vol_pts:
+            # The key-off ends the note but a driver can keep gating the
+            # release tail; the volume macro must reach its last write.
+            end = max(end, ev.vol_pts[-1][0])
         ticks = max(1, min(
             int((end - ev.sample) / tick) + 1, 65025,
         ))
@@ -3543,6 +3547,12 @@ def _collect_opll(
     """
     states = {cid: OPLLState(drums) for cid in ids}
     held: dict[tuple[int, int], int] = {}
+    # A key-off does not necessarily end the driver's control of a voice.
+    # Percussion drivers (the clap in mahbod-usedtosay) key off the carrier
+    # and then keep walking `$3x`, using the level nibble as a burst gate
+    # during the release tail.  Keep such a voice "held" so those level
+    # points reach its volume macro, but still release it at the key bit.
+    released: dict[tuple[int, int], int] = {}
     pitch_pts: dict[tuple[int, int], list[tuple[int, int, int]]] = {}
     pitch_base: dict[tuple[int, int], tuple[int, int]] = {}
     pitch_last: dict[tuple[int, int], tuple[int, int]] = {}
@@ -3637,7 +3647,9 @@ def _collect_opll(
                     distinct.append(p)
             if len(distinct) > 1:
                 ev.fm_pitch_pts = tuple(distinct)
-        vp = vol_pts.pop(key, [])
+        vp = [
+            (s, v) for s, v in vol_pts.pop(key, []) if s < sample
+        ]
         if vp:
             ev.vol_pts = tuple((s, max(0, min(15, v)), None) for s, v in vp)
         pp = preset_pts.pop(key, [])
@@ -3649,7 +3661,20 @@ def _collect_opll(
         for d in (pitch_pts, pitch_base, pitch_last, vol_pts, vol_last,
                   held_preset, preset_pts, phase_pts):
             d.pop(key, None)
-        if off:
+        rel = released.pop(key, None)
+        if rel is not None:
+            # The key-off must still reach the chip: it starts the release
+            # that gives a clap its noise character. The driver's later `$3x`
+            # steps stay in the volume macro, which Furnace keeps running
+            # through release, so the gesture is not cut short.
+            end = rel
+            ev.end = end
+            events.append(NoteEvent(
+                sample=end, ch=ev.ch, on=False, note=180, ins=-1,
+                vol=-1, e5=0x80, pan=0,
+            ))
+            off_idx.append(len(events) - 1)
+        elif off:
             ev.end = sample
             events.append(NoteEvent(
                 sample=sample, ch=ev.ch, on=False, note=180, ins=-1,
@@ -3712,25 +3737,30 @@ def _collect_opll(
             key = (cid, fch)
             if key in pending:
                 pending[key]["fnum"] = (block, fnum)
-            if key in held and (block, fnum) != pitch_last[key]:
+            if (key not in pending and key in held
+                    and key not in released
+                    and (block, fnum) != pitch_last[key]):
                 pitch_pts[key].append((sample, block, fnum))
                 pitch_last[key] = (block, fnum)
 
     def update_level(cid: int, fch: int, sample: int) -> None:
         key = (cid, fch)
+        # A retrigger can leave the previous (released) note in `held` while
+        # the new key-on waits out the settle window. `$3x` writes from that
+        # instant belong to the new voice, so the pending note wins.
+        item = pending.get(key)
+        if item is not None:
+            level = column_level(cid, fch)
+            if level != item["vol_last"]:
+                item["volpts"].append((sample, level))
+                item["vol_last"] = level
+            return
         if key in held:
             level = column_level(cid, fch)
             if level != vol_last[key]:
                 vol_pts[key].append((sample, level))
                 vol_last[key] = level
             return
-        item = pending.get(key)
-        if item is None:
-            return
-        level = column_level(cid, fch)
-        if level != item["vol_last"]:
-            item["volpts"].append((sample, level))
-            item["vol_last"] = level
 
     def keyed_here(w) -> bool:
         r = w.reg & 0xFF
@@ -3798,6 +3828,19 @@ def _collect_opll(
                     cid, fch, item["t"], item["snap"], item["vol"], item,
                 )
 
+    def release_note(cid: int, fch: int, sample: int) -> None:
+        """Keep collecting `$3x` level automation after a key-off.
+
+        Drivers use the level nibble as a burst gate during the release tail
+        (a clap is a chain of these). The note still keys off at `sample`, but
+        the voice stays in `held` so the later writes reach its volume macro;
+        it is finalised at the next key-on or when the log ends.
+        """
+        key = (cid, fch)
+        if key not in held:
+            return
+        released[key] = sample
+
     stream = ordered(vgm.writes)
     for w in stream:
         # Settle first, but only once the window is fully behind this write: a
@@ -3853,13 +3896,13 @@ def _collect_opll(
                     key_on_edge(cid, hw, w.sample)
                 elif was_on and not is_on:
                     flush_one(cid, hw)
-                    close_note(cid, hw, w.sample, off=True)
+                    release_note(cid, hw, w.sample)
             else:
                 if is_on and not was_on:
                     key_on_edge(cid, hw, w.sample)
                 elif was_on and not is_on:
                     flush_one(cid, hw)
-                    close_note(cid, hw, w.sample, off=True)
+                    release_note(cid, hw, w.sample)
             touch_freq(cid, hw, w.sample)
             continue
 
@@ -3898,7 +3941,7 @@ def _collect_opll(
                             (w.sample, base[cid] + hw, 0x10, preset)
                         )
                         stats["inst_fx"] += 1
-                    else:
+                    elif key not in released:
                         stats["midnote_inst"] += 1
                     held_preset[key] = preset
                 update_level(cid, hw, w.sample)
@@ -3910,6 +3953,8 @@ def _collect_opll(
         st.write(r, val)
         if r <= 0x07:
             for key in held:
+                if key in released:
+                    continue
                 if key[0] == cid and not held_preset.get(key, 0):
                     stats["midnote_inst"] += 1
                     break
