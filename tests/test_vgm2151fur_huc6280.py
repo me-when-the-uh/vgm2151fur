@@ -291,6 +291,24 @@ class TestHuc6280Tones(unittest.TestCase):
         for e in evs[:5]:
             self.assertLessEqual(len(song.huc6280_ins[e.ins].vol), 60)
 
+    def test_noise_pitch_returns_to_the_first_value(self):
+        # 0x9F -> 0x9B -> 0x9F is a G2/D#2/G2 snare pattern. The noise
+        # pitch list used to compare each change with the note's *start*
+        # value, so the return to 0x9F was dropped and the voice stayed on
+        # D#2 for the rest of the gate.
+        writes = [
+            _w(0, 0x01, 0xFF), _w(0, 0x00, 4), _w(0, 0x04, 0x00),
+            _w(0, 0x07, 0x9F), _w(0, 0x02, 0x00), _w(0, 0x03, 0x04),
+            _w(0, 0x05, 0xFF), _w(0, 0x04, 0x9F),
+            _w(2000, 0x07, 0x9B), _w(4000, 0x07, 0x9F),
+            _w(6000, 0x04, 0x00),
+        ]
+        song = analyze(_vgm(writes, huc6280_clock=3579545))
+        ev = next(e for e in song.events if e.on and e.ch >= 8)
+        self.assertTrue(ev.tone_noise)
+        self.assertEqual(ev.note, 91)
+        self.assertEqual([n for _t, n in ev.tone_pitch_pts], [31, 27, 31])
+
     def test_noise_transient_then_tone_tail(self):
         # A percussion hit: noise on at the gate, then 0x07=0 mid-gate
         # switches back to the waveform.  It stays one note; the switch is the

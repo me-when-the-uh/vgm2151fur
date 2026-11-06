@@ -8619,11 +8619,20 @@ def analyze(
                         regs = [
                             (st, _value_at(h.noise_pts, st, h.noise) & 0x1F)
                         ]
-                        regs += [
-                            (t, reg & 0x1F) for t, reg in h.noise_pts
-                            if st < t < en and (reg & NOISE_ENABLE)
-                            and (reg & 0x1F) != regs[-1][1]
-                        ]
+                        last_noise = regs[0][1]
+                        for t, reg in h.noise_pts:
+                            if not (st < t < en and (reg & NOISE_ENABLE)):
+                                continue
+                            value = reg & 0x1F
+                            # Compare against the last *accepted* pitch. The
+                            # list comprehension compared against the start
+                            # value every time, so the alternating return to
+                            # the first noise pitch was dropped: the channel
+                            # stayed on the snare pitch for the rest of the
+                            # gate.
+                            if value != last_noise:
+                                regs.append((t, value))
+                                last_noise = value
                         note = huc6280_noise_note(
                             _value_at(h.noise_pts, st, h.noise)
                         )
