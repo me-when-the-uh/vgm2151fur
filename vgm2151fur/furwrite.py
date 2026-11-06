@@ -560,6 +560,29 @@ def _write_ma(b: Buf, patch=None) -> None:
                 loop=getattr(patch, "pitch_loop", 255),
                 width=2,
             )
+        # OPLL tick-rate automation: volume (code 0), preset wave (code 3) and
+        # repeated key-on retrigger (code 14).
+        vol = getattr(patch, "vol_macro", ()) or ()
+        if vol:
+            _write_macro(
+                b, 0, vol,
+                speed=getattr(patch, "vol_speed", 1) or 1,
+                loop=getattr(patch, "vol_loop", 255),
+            )
+        wave = getattr(patch, "wave_macro", ()) or ()
+        if wave:
+            _write_macro(
+                b, 3, wave,
+                speed=getattr(patch, "wave_speed", 1) or 1,
+                loop=getattr(patch, "wave_loop", 255),
+            )
+        phase = getattr(patch, "phase_macro", ()) or ()
+        if phase:
+            _write_macro(
+                b, 14, phase,
+                speed=getattr(patch, "phase_speed", 1) or 1,
+                loop=getattr(patch, "phase_loop", 255),
+            )
     b.u8(255)  # stop
     b.b[size_off:size_off + 2] = int(len(b.b) - start).to_bytes(2, "little")
 

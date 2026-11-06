@@ -132,6 +132,31 @@ and `euress opll.vgm` both key their custom voices with nibble 0.
 Note Furnace's melodic OPLL system has no drums; a rip that toggles `$0E`
 needs `DIV_SYSTEM_OPLL_DRUMS`.
 
+Rapid `$3x` automation needs macros, not row effects. A driver can walk the
+preset/volume nibble every 108 samples, which is faster than one pattern row;
+a `10xx` effect keeps only the last value on that row. When a change lands in
+the note's own row (or two changes share a later row), the analyzer builds a
+**wave macro** (file code 3) for the preset nibble and a **volume macro**
+(code 0) for the level nibble, at one entry per tick. The instrument's note
+column stays at 15 so the volume macro is the absolute level. Slower changes
+keep the cheaper row effects.
+
+OPLL's `$2x` key bit is a level, not an edge: rewriting the same keyed byte
+does not retrigger the envelope, so those writes stay pitch/high-byte updates
+rather than phase-reset macros. Only a real 0-to-1 key transition starts a
+note.
+
+Pitch motion on OPLL also stays in the instrument's pitch macro (file code
+4). The E5/E8/E9 row-step path does not reach the OPLL registers on export
+and left fast drum bends flat, so OPLL is excluded from it. A trajectory with
+a single held pitch step is folded into the note's own note/E5 instead of
+spending an instrument; the rest become macros, with values quantized to
+1/32 semitone to share near-identical percussion bends.
+
+The key-on settle window also snapshots the patch and level at the key-on
+instant, not at the later flush: a retrigger faster than `OPLL_SETTLE` used to
+give the first hit the timbre of the following write.
+
 ## Multi-system .fur facts (all verified)
 
 - `.fur` stores a machine as `sysCount u16`, then per system one **chip-ID

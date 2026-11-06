@@ -958,6 +958,85 @@ class TestOpl4RhythmRealRip(unittest.TestCase):
 
 @unittest.skipUnless(HAVE_FURNACE and MC01.is_file(),
                      "Furnace or the reference rips missing")
+class TestOpllTickMacros(unittest.TestCase):
+    """OPLL preset/volume writes faster than one pattern row."""
+
+    SRC = Path(r"D:\Downloads\mahbod-usedtosay.vgm")
+
+    def test_fast_preset_and_volume_changes_become_macros(self):
+        if not self.SRC.exists():
+            self.skipTest(f"{self.SRC} not present")
+        song = analyze(load_vgm(self.SRC))
+        start = int(round(15 * 256 * song.samples_per_row))
+        ev = next(
+            e for e in song.events
+            if e.on and e.ch == 3 and abs(e.sample - start) <= 2
+        )
+        patch = song.fm_patches[ev.ins]
+        # The first key uses $33 = $dF (preset 13), not the next write's 5.
+        self.assertEqual(patch.preset, 13)
+        self.assertIn(5, patch.wave_macro)
+        self.assertIn(4, patch.wave_macro)
+        self.assertGreater(len(patch.vol_macro), 1)
+        self.assertEqual(ev.vol, 15)
+        self.assertLess(len(song.fm_patches), 250)
+
+    def test_fast_drum_bends_stay_pitch_macros(self):
+        # Order $0B FM5 and $0C FM3 walk the f-num every 108 samples. Row
+        # effects are not reliable on OPLL, so these must remain macros.
+        if not self.SRC.exists():
+            self.skipTest(f"{self.SRC} not present")
+        song = analyze(load_vgm(self.SRC))
+        self.assertEqual(song.warnings, [])
+        for order, ch in ((0x0B, 4), (0x0C, 2)):
+            start = int(order * 256 * song.samples_per_row)
+            ev = next(
+                e for e in song.events
+                if e.on and e.ch == ch and abs(e.sample - start) <= 2
+            )
+            patch = song.fm_patches[ev.ins]
+            self.assertGreater(len(patch.pitch_macro), 1)
+            self.assertEqual(ev.pitch_steps, ())
+            self.assertEqual(ev.sweep, ())
+
+    def test_channel4_opening_volume_is_not_a_late_row_step(self):
+        # First ch4 write at 331,776: $33=$1F then $33=$10 108 samples later.
+        # Both land in the same pattern row; the volume macro keeps the loud
+        # level from tick 1 instead of losing it to the row-start step.
+        if not self.SRC.exists():
+            self.skipTest(f"{self.SRC} not present")
+        song = analyze(load_vgm(self.SRC))
+        ev = next(
+            e for e in song.events
+            if e.on and e.ch == 3 and abs(e.sample - 331776) <= 2
+        )
+        patch = song.fm_patches[ev.ins]
+        self.assertEqual(ev.vol, 15)
+        self.assertEqual(patch.vol_speed, 1)
+        self.assertEqual(patch.vol_macro[:3], (0, 0, 15))
+
+    @unittest.skipUnless(HAVE_FURNACE, "furnace console build missing")
+    def test_export_keeps_the_sub_row_preset_walk(self):
+        if not self.SRC.exists():
+            self.skipTest(f"{self.SRC} not present")
+        song = analyze(load_vgm(self.SRC))
+        start = int(round(15 * 256 * song.samples_per_row))
+        stem = TMP / "opll_tick_macros"
+        fur = stem.with_suffix(".fur")
+        fur.write_bytes(write_fur(song, include_pcm=False))
+        back = load_vgm(export_fur(fur, stem.with_suffix(".vgm")))
+        writes = [
+            (w.sample - start, (w.val >> 4) & 15)
+            for w in back.writes
+            if (
+                w.chip == "opll" and (w.reg & 0xFF) == 0x33
+                and start <= w.sample < start + int(song.samples_per_row)
+            )
+        ]
+        self.assertGreaterEqual(len(writes), 3)
+        self.assertEqual([preset for _t, preset in writes[:3]], [13, 5, 4])
+
+
 class TestOplRealRips(unittest.TestCase):
     """The rips the model was tuned on: every unbent note lands exactly."""
 

@@ -497,6 +497,11 @@ class NoteEvent:
     # OPL only: (sample, operator index, level) on the rows where the
     # modulator's level differs from the instrument baseline.
     op_tl_fx: tuple[tuple[int, int, int], ...] = ()
+    # OPLL only: mid-note `$3x` high-nibble changes and repeated key-on writes
+    # that arrive faster than one pattern row. A phase-2 pass turns them into
+    # the instrument's wave and phase-reset macros.
+    opll_preset_pts: tuple[tuple[int, int], ...] = ()
+    opll_phase_pts: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -2182,6 +2187,158 @@ def _row_steppable(
     return len(rows) * 5 >= len(pts) * 4
 
 
+def _bind_opll_macros(
+    events: list[NoteEvent],
+    patches: dict[tuple, FMPatch],
+    patch_order: list[tuple],
+    channel_fx: list[tuple[int, int, int, int]],
+    hz: float,
+    speed: int,
+    t0: int,
+    total_samples: int,
+    cap: int = 200,
+) -> int:
+    """Turn sub-row OPLL preset/level/retrigger writes into instrument macros.
+
+    A driver can walk `$3x` at tick rate: a preset change every 108 samples is
+    faster than one pattern row, so a row effect keeps only the last value.
+    Furnace's OPLL platform reads a wave macro for the high nibble and a volume
+    macro for the low nibble, and a phase-reset macro for a repeated keyed
+    `$2x` write.  Build those series only when the writes really land faster
+    than a row; slower motion keeps the cheaper row effects.
+    """
+    if not events or hz <= 0:
+        return 0
+    tick = VGM_RATE / hz
+    row_samples = tick * max(1, speed)
+    by_ch: dict[int, list[NoteEvent]] = {}
+    for ev in events:
+        if ev.on:
+            by_ch.setdefault(ev.ch, []).append(ev)
+    next_on: dict[int, int] = {}
+    for notes in by_ch.values():
+        for i, ev in enumerate(notes):
+            next_on[id(ev)] = (
+                notes[i + 1].sample if i + 1 < len(notes)
+                else total_samples or ev.sample
+            )
+    made = 0
+    cache: dict[tuple, int] = {}
+    for ev in events:
+        if not ev.on:
+            continue
+        if not (ev.opll_preset_pts or ev.opll_phase_pts or ev.vol_pts):
+            continue
+        if not (0 <= ev.ins < len(patch_order)):
+            continue
+        base = patches[patch_order[ev.ins]]
+        if not base.opll:
+            continue
+        times = (
+            [t for t, _p in ev.opll_preset_pts]
+            + list(ev.opll_phase_pts)
+            + [t for t, _v, _pan in ev.vol_pts]
+        )
+        if not times:
+            continue
+        rows = {
+            place_tick(t, t0, row_samples, speed, tick, floor=True)[0]
+            for t in times
+        }
+        note_row = place_tick(
+            ev.sample, t0, row_samples, speed, tick, floor=True,
+        )[0]
+        # A single change in the note's own row is still inaudible as a row
+        # effect (the volume-step writer lands it at the row start), so use a
+        # macro then too.  Duplicates in any later row mean multiple writes
+        # that one row effect cannot carry.
+        if len(rows) >= len(times) and note_row not in rows:
+            continue
+        end = ev.end or next_on.get(id(ev), total_samples or ev.sample)
+        ticks = max(1, min(
+            int((end - ev.sample) / tick) + 1, 65025,
+        ))
+        # A macro has one byte of entries. Keep the early tick-rate detail
+        # exact; a change after the first 255 ticks is slow enough to remain a
+        # row effect instead of thinning the early pulse into a staircase.
+        macro_ticks = min(ticks, 255)
+        macro_end = ev.sample + macro_ticks * tick
+        wave = wave_speed = wave_loop = None
+        if ev.opll_preset_pts:
+            pts = sorted([(ev.sample, base.preset)] + list(ev.opll_preset_pts))
+            series = _tick_values(pts, ev.sample, macro_ticks, tick)
+            if len(set(series)) > 1:
+                wave, wave_speed, wave_loop = _macro_series(series)
+        volm = vol_speed = vol_loop = None
+        if ev.vol_pts:
+            pts = sorted(
+                [(ev.sample, max(0, ev.vol))]
+                + [(t, max(0, v)) for t, v, _pan in ev.vol_pts]
+            )
+            series = _tick_values(pts, ev.sample, macro_ticks, tick)
+            if len(set(series)) > 1:
+                volm, vol_speed, vol_loop = _macro_series(series)
+        phase = phase_speed = phase_loop = None
+        if ev.opll_phase_pts:
+            series = [0] * macro_ticks
+            hit = False
+            for t in ev.opll_phase_pts:
+                k = int(round((t - ev.sample) / tick))
+                if 0 < k < macro_ticks:
+                    series[k] = 1
+                    hit = True
+            if hit:
+                phase, phase_speed, phase_loop = _macro_series(series)
+        if not (wave or volm or phase):
+            continue
+        if len(patch_order) >= cap:
+            continue
+        key = (
+            "opll-macro", patch_order[ev.ins],
+            wave, wave_speed, wave_loop,
+            volm, vol_speed, vol_loop,
+            phase, phase_speed, phase_loop,
+        )
+        idx = cache.get(key)
+        if idx is None:
+            copy = replace(
+                base,
+                wave_macro=wave or (),
+                wave_speed=wave_speed or 1,
+                wave_loop=wave_loop if wave_loop is not None else 255,
+                vol_macro=volm or (),
+                vol_speed=vol_speed or 1,
+                vol_loop=vol_loop if vol_loop is not None else 255,
+                phase_macro=phase or (),
+                phase_speed=phase_speed or 1,
+                phase_loop=phase_loop if phase_loop is not None else 255,
+                uses=1,
+                name=f"{base.name}+T",
+            )
+            patches[key] = copy
+            patch_order.append(key)
+            idx = len(patch_order) - 1
+            cache[key] = idx
+        ev.ins = idx
+        if volm:
+            ev.vol = 15
+            ev.vol_pts = tuple(
+                p for p in ev.vol_pts if p[0] >= macro_end
+            )
+        if wave:
+            channel_fx[:] = [
+                fx for fx in channel_fx
+                if not (
+                    fx[1] == ev.ch and fx[2] == 0x10
+                    and ev.sample <= fx[0] < macro_end
+                )
+            ]
+        ev.opll_preset_pts = ()
+        ev.opll_phase_pts = ()
+        made += 1
+    return made
+
+
 def _bind_fm_pitch(
     events: list[NoteEvent],
     patches: dict[tuple, FMPatch],
@@ -2192,6 +2349,8 @@ def _bind_fm_pitch(
     cap: int = 200,
     allow_steps: bool = False,
     row_ticks: int = 1,
+    quant: int = 0,
+    opll: bool = False,
 ) -> tuple[int, int]:
     """Turn YM2203/YM2612 f-num trajectories into instrument pitch macros.
 
@@ -2254,7 +2413,21 @@ def _bind_fm_pitch(
                 max(-32768, min(32767, int(round(2.0 * d))))
                 for d in series
             ]
+            if quant > 1:
+                # OPLL pitch macros are short and numerous. A coarser value
+                # grid merges near-identical drum bends without leaving them
+                # as row ramps (which do not reach OPLL registers on export).
+                vals = [
+                    int(round(v / quant)) * quant for v in vals
+                ]
             if len(set(vals)) == 1:
+                continue
+            if opll and len(pts) <= 2:
+                # One held pitch step (a drum's tuning change) needs no
+                # instrument: retune the note to the final write.
+                e.note, e.e5 = opll_note_for(
+                    pts[-1][1], pts[-1][2], clock,
+                )
                 continue
             if len(patch_order) >= cap:
                 # No room for another instrument: the driver's own steps
@@ -3376,7 +3549,13 @@ def _collect_opll(
     vol_pts: dict[tuple[int, int], list[tuple[int, int]]] = {}
     vol_last: dict[tuple[int, int], int] = {}
     held_preset: dict[tuple[int, int], int] = {}
-    pending: dict[tuple[int, int], int] = {}
+    preset_pts: dict[tuple[int, int], list[tuple[int, int]]] = {}
+    phase_pts: dict[tuple[int, int], list[int]] = {}
+    # A key-on is opened after OPLL_SETTLE so the low f-num byte lands.  Keep
+    # the patch and level from the key-on instant: a driver that retriggers
+    # faster than the settle window must not give the first hit the timbre of
+    # the next one.
+    pending: dict[tuple[int, int], dict] = {}
     off_idx: list[int] = []
     stats = {
         "notes": 0, "drums": 0, "midnote_inst": 0, "inst_fx": 0,
@@ -3408,13 +3587,10 @@ def _collect_opll(
             return 15
         return 15 - st.volume(fch)
 
-    def intern(cid: int, fch: int) -> int:
-        st = states[cid]
+    def intern_patch(snap: FMPatch, cid: int, fch: int) -> int:
         if drums and fch >= 6:
-            snap = st.drum_patch()
             key = ("opll-drum",) + snap.identity()
         else:
-            snap = st.snapshot(fch)
             key = snap.identity()
         if key not in patches:
             if drums and fch >= 6:
@@ -3428,6 +3604,11 @@ def _collect_opll(
         p = patches[key]
         p.uses += 1
         return patch_order.index(key)
+
+    def intern(cid: int, fch: int) -> int:
+        st = states[cid]
+        snap = st.drum_patch() if drums and fch >= 6 else st.snapshot(fch)
+        return intern_patch(snap, cid, fch)
 
     def close_note(cid: int, fch: int, sample: int, *, off: bool) -> None:
         key = (cid, fch)
@@ -3459,8 +3640,14 @@ def _collect_opll(
         vp = vol_pts.pop(key, [])
         if vp:
             ev.vol_pts = tuple((s, max(0, min(15, v)), None) for s, v in vp)
+        pp = preset_pts.pop(key, [])
+        if pp:
+            ev.opll_preset_pts = tuple(pp)
+        ph = phase_pts.pop(key, [])
+        if ph:
+            ev.opll_phase_pts = tuple(ph)
         for d in (pitch_pts, pitch_base, pitch_last, vol_pts, vol_last,
-                  held_preset):
+                  held_preset, preset_pts, phase_pts):
             d.pop(key, None)
         if off:
             ev.end = sample
@@ -3470,7 +3657,10 @@ def _collect_opll(
             ))
             off_idx.append(len(events) - 1)
 
-    def open_note(cid: int, fch: int, sample: int) -> None:
+    def open_note(
+        cid: int, fch: int, sample: int, snap: FMPatch | None = None,
+        vol: int | None = None, pend: dict | None = None,
+    ) -> None:
         st = states[cid]
         close_note(cid, fch, sample, off=False)
         hw = fch
@@ -3479,10 +3669,16 @@ def _collect_opll(
                 if entry[0] == fch:
                     hw = entry[2]
                     break
-        block, fnum = st.block_fnum(hw)
+        if pend is not None and "fnum" in pend:
+            block, fnum = pend["fnum"]
+        else:
+            block, fnum = st.block_fnum(hw)
         note, e5 = opll_note_for(block, fnum, clock)
-        ins = intern(cid, fch)
-        vol = column_level(cid, fch)
+        if snap is None:
+            snap = st.drum_patch() if drums and fch >= 6 else st.snapshot(fch)
+        ins = intern_patch(snap, cid, fch)
+        if vol is None:
+            vol = column_level(cid, fch)
         key = (cid, fch)
         events.append(NoteEvent(
             sample=sample, ch=base[cid] + fch, on=True, note=note, ins=ins,
@@ -3493,9 +3689,16 @@ def _collect_opll(
         pitch_base[key] = (block, fnum)
         pitch_last[key] = (block, fnum)
         pitch_pts[key] = [(sample, block, fnum)]
-        vol_pts[key] = []
-        vol_last[key] = vol
-        held_preset[key] = st.preset(hw) if hw < 9 else 0
+        vol_pts[key] = list(pend["volpts"]) if pend else []
+        vol_last[key] = (
+            pend["vol_last"] if pend else vol
+        )
+        held_preset[key] = (
+            pend["preset"][-1][1] if pend and pend["preset"]
+            else snap.preset if (not drums and hw < 9) else 0
+        )
+        preset_pts[key] = list(pend["preset"]) if pend else []
+        phase_pts[key] = list(pend["phase"]) if pend else []
         keyon_times.append(sample)
         if drums and fch >= 6:
             stats["drums"] += 1
@@ -3507,18 +3710,27 @@ def _collect_opll(
         block, fnum = st.block_fnum(hw)
         for fch in hw_channels(hw):
             key = (cid, fch)
+            if key in pending:
+                pending[key]["fnum"] = (block, fnum)
             if key in held and (block, fnum) != pitch_last[key]:
                 pitch_pts[key].append((sample, block, fnum))
                 pitch_last[key] = (block, fnum)
 
     def update_level(cid: int, fch: int, sample: int) -> None:
         key = (cid, fch)
-        if key not in held:
+        if key in held:
+            level = column_level(cid, fch)
+            if level != vol_last[key]:
+                vol_pts[key].append((sample, level))
+                vol_last[key] = level
+            return
+        item = pending.get(key)
+        if item is None:
             return
         level = column_level(cid, fch)
-        if level != vol_last[key]:
-            vol_pts[key].append((sample, level))
-            vol_last[key] = level
+        if level != item["vol_last"]:
+            item["volpts"].append((sample, level))
+            item["vol_last"] = level
 
     def keyed_here(w) -> bool:
         r = w.reg & 0xFF
@@ -3553,19 +3765,38 @@ def _collect_opll(
         lands on, which is also what one pattern row can hold.
         """
         flush_one(cid, fch)
-        pending[(cid, fch)] = sample
+        st = states[cid]
+        snap = st.drum_patch() if drums and fch >= 6 else st.snapshot(fch)
+        vol = column_level(cid, fch)
+        hw = fch
+        if drums and fch >= 6:
+            for entry in OPLL_DRUMS:
+                if entry[0] == fch:
+                    hw = entry[2]
+                    break
+        pending[(cid, fch)] = {
+            "t": sample, "snap": snap, "vol": vol,
+            "volpts": [], "vol_last": vol,
+            "preset": [], "phase": [],
+            "preset_last": snap.preset if not (drums and fch >= 6) else 0,
+            "fnum": st.block_fnum(hw),
+        }
 
     def flush_one(cid: int, fch: int) -> None:
-        t = pending.pop((cid, fch), None)
-        if t is not None:
-            open_note(cid, fch, t)
+        item = pending.pop((cid, fch), None)
+        if item is not None:
+            open_note(
+                cid, fch, item["t"], item["snap"], item["vol"], item,
+            )
 
     def flush_due(sample: int) -> None:
-        for key, t in list(pending.items()):
-            if t + OPLL_SETTLE < sample:
+        for key, item in list(pending.items()):
+            if item["t"] + OPLL_SETTLE < sample:
                 cid, fch = key
                 pending.pop(key, None)
-                open_note(cid, fch, t)
+                open_note(
+                    cid, fch, item["t"], item["snap"], item["vol"], item,
+                )
 
     stream = ordered(vgm.writes)
     for w in stream:
@@ -3641,16 +3872,24 @@ def _collect_opll(
                         update_level(cid, entry[0], w.sample)
             else:
                 key = (cid, hw)
-                if key in held and st.preset(hw) != held_preset[key]:
+                preset = st.preset(hw)
+                if key in pending and preset != pending[key]["preset_last"]:
+                    # The settle window is still open. Keep the change on the
+                    # pending note so the tick-rate macro sees it too.
+                    pending[key]["preset"].append((w.sample, preset))
+                    pending[key]["preset_last"] = preset
+                if key in held and preset != held_preset[key]:
                     # Furnace reloads a held OPLL voice through the wave
                     # column: effect 10xx is DIV_CMD_WAVE, which writes the
-                    # $3x instrument nibble without touching the note.
-                    preset = st.preset(hw)
+                    # $3x instrument nibble without touching the note.  A
+                    # macro pass later replaces this with a tick-rate wave
+                    # macro when the writes are faster than a row.
                     ev = events[held[key]]
                     bank = (
                         patches[patch_order[ev.ins]].preset == 0
                         if 0 <= ev.ins < len(patch_order) else False
                     )
+                    preset_pts[key].append((w.sample, preset))
                     if preset or bank:
                         # A switch to the user patch is only faithful while
                         # the note already plays one: $00-$07 hold that
@@ -7900,17 +8139,37 @@ def analyze(
              (ym2612_clock if is_opn2 else (opl_clock if is_opl else ym_clock)))
         )
     
+    tone_reserve = (
+        n_ssg_pcm + n_nes_dpcm_ins + n_nes_pcm_ins
+        + n_huc6280_pcm_ins + n_opl4_wave_ins
+        + len(scc_ins) + len(ay_ins) + len(psg_ins) + len(nes_ins)
+        + len(huc6280_ins) + len(gb_ins)
+    )
+    fm_ins_cap = max(
+        len(patch_order), 250 - foreign_ins - tone_reserve,
+    )
     fm_before_pitch = len(patch_order)
+    opll_macro_copies = 0
+    if is_opll:
+        opll_macro_copies = _bind_opll_macros(
+            events, patches, patch_order, channel_fx, hz, use_speed, t0,
+            vgm.total_samples or 0,
+            cap=fm_ins_cap,
+        )
     _pms_copies, pms_lost = _bind_pms_macros(
         events, patches, patch_order, hz, vgm.total_samples or 0,
-        cap=max(len(patch_order), 250 - foreign_ins - 24),
+        cap=fm_ins_cap,
     )
     fm_pitch_copies, fm_pitch_lost = _bind_fm_pitch(
         events, patches, patch_order, fm_pitch_clock, hz, vgm.total_samples or 0,
-        cap=max(len(patch_order), 250 - foreign_ins - 24),
-        allow_steps=(is_opn or is_opn2 or is_opl or is_opnb
-                     or is_opna or is_opll),
+        cap=fm_ins_cap,
+        # OPLL keeps pitch motion in a macro. Its platform has no E8/E9
+        # quick-legato path the writer can rely on, so row steps played in the
+        # module but vanished on export and left a fast drum bend flat.
+        allow_steps=(is_opn or is_opn2 or is_opl or is_opnb or is_opna),
         row_ticks=use_speed,
+        quant=4 if is_opll else 0,
+        opll=is_opll,
     )
     # An operator level the driver scripted while its note sounded. The volume
     # column reaches only a KVS operator. The rest travel as instrument macros.
@@ -7918,7 +8177,7 @@ def analyze(
     if is_opl:
         op_tl_copies, op_tl_lost = _bind_op_macros(
             events, patches, patch_order, VGM_RATE / hz,
-            cap=max(len(patch_order), 250 - foreign_ins - 24),
+            cap=fm_ins_cap,
         )
     _rebase_non_fm_ins(events, fm_before_pitch, len(patch_order))
     if fm_pitch_copies:

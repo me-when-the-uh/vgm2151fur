@@ -194,6 +194,18 @@ class FMPatch:
     pitch_macro: tuple[int, ...] = ()
     pitch_speed: int = 1
     pitch_loop: int = 255
+    # OPLL only: tick-rate preset / volume / retrigger automation. The chip
+    # changes `$3x`'s high nibble through `std.wave`, its low nibble through
+    # `std.vol`, and a repeated key-on write through `std.phaseReset`.
+    wave_macro: tuple[int, ...] = ()
+    wave_speed: int = 1
+    wave_loop: int = 255
+    vol_macro: tuple[int, ...] = ()
+    vol_speed: int = 1
+    vol_loop: int = 255
+    phase_macro: tuple[int, ...] = ()
+    phase_speed: int = 1
+    phase_loop: int = 255
     # OPL only: per-operator output level automation as the log wrote it.
     # Entries are (operator index, values, speed): from the key-on the
     # operator takes one absolute `$4n` entry every `speed` ticks and holds
