@@ -20,6 +20,7 @@ from vgm2151fur.furwrite import (
     CHIP_OPL3_DRUMS, CHIP_OPL_DRUMS, CHIP_RF5C68, CHIP_SEGAPCM, CHIP_VRC7,
     CHIP_YM2608, CHIP_YM2608_EXT,
     CHIP_YM2610, CHIP_YM2610B, CHIP_YM2612, CHIP_YM2612_CSM, CHIP_YM2612_EXT,
+    CHIP_YMZ280B,
     FUR_MAGIC, decompress_fur,
 )
 
@@ -69,6 +70,7 @@ CHIP_CHANNELS = {
     CHIP_C140: 24,  # Namco C140
     CHIP_C352: 32,  # Namco C352
     CHIP_K053260: 4,  # Konami K053260
+    CHIP_YMZ280B: 8,  # Yamaha YMZ280B (PCMD8)
     CHIP_K051649: 5,  # Konami SCC
     CHIP_K052539: 5,  # Konami SCC+
     CHIP_AY8910: 3,  # AY-3-8910
@@ -80,7 +82,7 @@ CHIP_CHANNELS = {
 # Chips whose samples carry playable 8-bit bodies (VOX depths stay out).
 _PCM_BODY_CHIPS = (
     CHIP_K007232, CHIP_SEGAPCM, CHIP_RF5C68, CHIP_C140, CHIP_C352,
-    CHIP_K053260,
+    CHIP_K053260, CHIP_YMZ280B,
 )
 
 
@@ -163,7 +165,7 @@ def parse_smp2_payload(payload: bytes) -> dict:
     pos += 16
     width = 2 if depth == 16 else 1
     rest = len(payload) - pos
-    if depth in (5, 6, 7, 10):
+    if depth in (3, 5, 6, 7, 10):
         # ADPCM depths store a nibble count in the samples field; the payload
         # holds (count+1)/2 bytes. VOX also has the legacy byte-count form.
         if depth == 10 and rest == n_frames:

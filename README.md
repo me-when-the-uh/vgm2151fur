@@ -19,6 +19,7 @@ Supported chips:
 - Texas Instruments SN76489 (PSG)
 - Konami K007232 (experimental)
 - Konami K053260
+- Yamaha YMZ280B (PCMD8): eight sample voices, 4-bit ADPCM / 8-bit / 16-bit PCM
 - Konami SCC / SCC+ (K051649/K052539)
 - OKI MSM6295
 - OKI MSM6258 (Sharp X68000 ADPCM)
@@ -105,7 +106,7 @@ tests/          pytest suite
 docs/           operating guide, format notes, chip notes
 ```
 
-Project state and workflow are in `docs/portable-context.md` and `docs/implementation-notes.md`. Chip details are in `docs/opm-notes.md`, `docs/ym2203.md`, `docs/ym2612.md`, `docs/ym2610.md`, `docs/opna-opll.md`, `docs/opl.md`, `docs/k053260.md`, `docs/scc-ay8910.md`, `docs/segapcm-c140.md`, `docs/ssg-pcm.md`, `docs/nes-vrc7.md`, `docs/gb.md`, `docs/huc6280.md` and `docs/c352.md`. `docs/merged-logs.md` covers multi-family modules, and `docs/psg-open-items.md` tracks the remaining AY accuracy gaps.
+Project state and workflow are in `docs/portable-context.md` and `docs/implementation-notes.md`. Chip details are in `docs/opm-notes.md`, `docs/ym2203.md`, `docs/ym2612.md`, `docs/ym2610.md`, `docs/opna-opll.md`, `docs/opl.md`, `docs/k053260.md`, `docs/scc-ay8910.md`, `docs/segapcm-c140.md`, `docs/ssg-pcm.md`, `docs/nes-vrc7.md`, `docs/gb.md`, `docs/huc6280.md`, `docs/c352.md` and `docs/ymz280b.md`. `docs/merged-logs.md` covers multi-family modules, and `docs/psg-open-items.md` tracks the remaining AY accuracy gaps.
 
 Open follow-ups are tracked in [TODO.md](./TODO.md).
 
@@ -114,6 +115,7 @@ Open follow-ups are tracked in [TODO.md](./TODO.md).
 - The YM2151, YM2203, YM2612, YM2610 and YM2608 models cover the OPM/OPN register sets the arcade and console drivers use; the YM3526, YM3812, YMF262, Y8950 and YMF278B models cover the OPL family (`docs/opl.md`). The YM2608 converts channel-3 Ext, its rhythm kit and delta-T ADPCM-B, but CSM timer key-ons are not synthesized (`docs/opna-opll.md`).
 - The YM2413 keeps preset, volume and fast pitch motion as wave, volume and pitch instrument macros; slower preset/volume changes stay `10xx`/volume-column row effects, and a single held pitch step retunes the note. A key-off still releases the voice, and level/f-num steps the driver writes afterwards extend the volume and pitch macros through the release tail (`docs/opna-opll.md`).
 - The YMF278B's ROM wave samples need the YRW801 image; point `VGM2151FUR_YRW801` at the `.rom` or `.zip`. Furnace's OPL4 core does not load the ROM itself, so the converter embeds the extracted bodies. RAM wave IDs need the RAM dump in the VGM. The Y8950's ADPCM voice is silent when the file carries no delta-T data block (`$88`).
+- The YMZ280B extracts each distinct ROM body as `DIV_INS_YMZ280B` (8-bit, 16-bit or YMZ ADPCM), keeps its key-on start/stop/loop, and maps the chip's 0-255 linear level and 0-15 pan to the volume and `08xy` columns. A dual-chip log uses `0xAD` and header bit 30; a YMZ-only log gets its own 8/16 columns instead of a silent YM2151. Mid-note frequency writes become pitch sweeps, level writes become volume steps, and a one-shot note releases at its ROM stop (`docs/ymz280b.md`).
 - SegaPCM and C140 mid-note volume and frequency writes become volume-column steps and pitch sweeps; start/end/loop/bank changes mid-note stay at the key-on values. The C140 sign-flip and sign-magnitude mode bits are ignored, as libvgm ignores them (`docs/segapcm-c140.md`).
 - The RF5C68 and RF5C164 share one Furnace system, selected by `chipType`. A looping SSG PCM DAC stream plays once because the AY sample instrument is one-shot (`docs/ssg-pcm.md`).
 - An OPL track whose log mixes OPL2 with OPL3, or two different crystals, is converted on the family that plays most of it and the report says so. Two pitched families share a module only for the combinations in `docs/merged-logs.md`. Below about C-3 one f-num step is wider than a half tone, so a very deep register lands on the nearest cell; a waveform or envelope change written inside a held note is picked up at the next key-on instead, while a modulator level the log moves mid-note travels as an operator macro. `docs/opl.md` lists both with the measured numbers.

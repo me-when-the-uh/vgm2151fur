@@ -2,7 +2,7 @@
 
 Chips: YM2151, YM2203, YM2612, YM2610, YM3526 (OPL), YM3812 (OPL2),
 YMF262 (OPL3), RF5C68, RF5C164, K007232, MSM6295, MSM6258, SegaPCM, C140,
-C352, K053260, AY-3-8910, K051649/K052539 (SCC).
+C352, K053260, YMZ280B, AY-3-8910, K051649/K052539 (SCC).
 """
 
 from __future__ import annotations
@@ -27,6 +27,10 @@ CMD_YM3812 = 0x5A
 # writes arrive on 0x5C; the ADPCM registers are 0x07 (control), 0x08/0x09
 # (start), 0x0A/0x0B (end), 0x10/0x11 (pitch) and 0x12 (level).
 CMD_Y8950 = 0x5C
+# 0x5D is the YMZ280B (PCMD8): register, value.  A dual-chip log uses the
+# second instance at 0xAD, the usual "+0x50" YM-family rule.
+CMD_YMZ280B = 0x5D
+CMD_YMZ280B_2 = 0xAD
 # A dual-OPL2 log (the Sound Blaster Pro layout) keeps the second chip's
 # register stream in its own command. Confirmed on the Knights of Xentar rips:
 # header bit 30 says "Dual YM3812" and 0xAA carries chip 1's writes while
@@ -126,6 +130,7 @@ RF5C164_RAM_TYPE = 0xC1  # RF5C164 sample-RAM write (16-bit start + data)
 Y8950_DELTAT_ROM_TYPE = 0x88  # Y8950 delta-T (ADPCM-B) ROM
 YMF278B_ROM_TYPE = 0x84  # YMF278B (OPL4) ROM image
 YMF278B_RAM_TYPE = 0x87  # YMF278B (OPL4) RAM image
+YMZ280B_ROM_TYPE = 0x86  # YMZ280B external sample ROM
 C140_ROM_TYPE = 0x8D  # Namco C140 ROM
 C352_ROM_TYPE = 0x92  # Namco C352 ROM
 YM2610_ADPCM_ROM_TYPE = 0x82  # YM2610 ADPCM-A/B ROM
@@ -147,6 +152,7 @@ EXTRA_C140 = 0x1C
 EXTRA_K053260 = 0x1D
 EXTRA_C352 = 0x27
 EXTRA_K007232 = 0x2A
+EXTRA_YMZ280B = 0x0F
 # Main-header clocks (VGMFile.h layout, spec v1.71). 0x98 is MSM6295, 0x90
 # MSM6258, 0x94 its flags. K007232 has no spec field; VGMPlay tools put it at
 # 0xE8 (1.71+). C140 is 0xA8 and its type byte 0x96. AY-8910 is 0x74 with its
@@ -172,6 +178,11 @@ Y8950_DEFAULT_CLOCK = 3579545
 # ROM and 0x87 RAM blocks.
 YMF278B_CLOCK_OFF = 0x60
 YMF278B_DEFAULT_CLOCK = 33868800
+# YMZ280B header 0x68 (VGM 1.51+).  Bit 30 marks a second chip; its writes
+# arrive on command 0xAD and a data block's size bit 31 selects its ROM.
+YMZ280B_CLOCK_OFF = 0x68
+YMZ280B_DEFAULT_CLOCK = 16934400
+YMZ280B_DUAL_BIT = 0x40000000
 # YM2612 clock at 0x2C.  Bit 30 is the dual-instance flag; 0xA2/0xA3 then
 # answer for the second chip.  The field predates the 1.50 data-offset header.
 YM2612_CLOCK_OFF = 0x2C
@@ -436,7 +447,8 @@ class ChipWrite:
     sample: int
     chip: str  # "ym2151" | "ym2203" | "ym2612" | "ym2610" | "opl" | "opl2" |
     #            "opl3" | "k007232" | "msm6295" | "msm6258" | "segapcm" |
-    #            "c140" | "c352" | "k053260" | "ay8910" | "k051649"
+    #            "c140" | "c352" | "k053260" | "ay8910" | "k051649" |
+    #            "ymz280b"
     chip_id: int
     reg: int
     val: int
@@ -570,6 +582,12 @@ class VgmFile:
     y8950_clock: int = 0
     # YMF278B (OPL4) header 0x60 (VGM 1.51+): OPL3-shaped FM plus 24 wave slots.
     ymf278b_clock: int = 0
+    # YMZ280B header 0x68 (VGM 1.51+): eight sample voices.  Bit 30 marks a
+    # second chip, whose writes arrive on 0xAD and whose ROM is the type-0x86
+    # data block with the size high bit set.
+    ymz280b_clock: int = 0
+    ymz280b_clock_2: int = 0
+    ymz280b_dual: bool = False
     # K053260 header 0xAC (VGM 1.61+); bit 7 of a 0xBA register selects the
     # second instance, which shares this clock.
     k053260_clock: int = 0
@@ -856,6 +874,12 @@ def chips_in_head(buf: bytes) -> set[str]:
         kinds.add("y8950")
     if version >= 0x151 and 100_000 <= _header_clock(buf, YMF278B_CLOCK_OFF) <= 40_000_000:
         kinds.add("ymf278b")
+    if version >= 0x151 and _field_in_header(buf, YMZ280B_CLOCK_OFF, 4):
+        ymz_raw = _header_raw(buf, YMZ280B_CLOCK_OFF)
+        if 100_000 <= (ymz_raw & 0x3FFFFFFF) <= 40_000_000:
+            kinds.add("ymz280b")
+            if ymz_raw & YMZ280B_DUAL_BIT:
+                kinds.add("ymz280b_dual")
     if version >= 0x151 and 100_000 <= _header_clock(buf, AY8910_CLOCK_OFF) <= 40_000_000:
         kinds.add("ay8910")
     # The OPL family joined the header in 1.51. A YM3812 field with bit 30 set
@@ -918,6 +942,8 @@ def chips_in_head(buf: bytes) -> set[str]:
             kinds.add("k007232")
         if clocks.get(EXTRA_C352, 0):
             kinds.add("c352")
+        if clocks.get(EXTRA_YMZ280B, 0):
+            kinds.add("ymz280b")
     if version >= 0x171 and _field_in_header(buf, C352_CLOCK_OFF, 4):
         raw = _header_raw(buf, C352_CLOCK_OFF) & 0x3FFFFFFF
         if 1000 <= raw <= 50_000_000:
@@ -1033,6 +1059,17 @@ def load_vgm(path: Path | str) -> VgmFile:
     ymf278b_clock = (
         _clock_or_zero(buf, YMF278B_CLOCK_OFF) if ver >= 0x151 else 0
     )
+    # YMZ280B clock 0x68 (1.51+), bit 30 selecting a second chip.  The
+    # extra-header clock list supplies the second instance's clock when the
+    # writer put the pair on different crystals.
+    ymz_raw = _header_raw(buf, YMZ280B_CLOCK_OFF) if ver >= 0x151 else 0
+    ymz280b_dual = bool(ymz_raw & YMZ280B_DUAL_BIT)
+    ymz280b_clock = _sane_clock(ymz_raw)
+    ymz280b_clock_2 = 0
+    if ymz280b_dual:
+        ymz280b_clock_2 = _sane_clock(clocks.get(EXTRA_YMZ280B, 0))
+    if not ymz280b_clock:
+        ymz280b_clock = _sane_clock(clocks.get(EXTRA_YMZ280B, 0))
     # Read the field for every version: the legacy System 21 rips carry
     # 21390 there even in 1.51 files, and players resolve it the same way.
     c140_raw = _header_raw(buf, C140_CLOCK_OFF) & 0x3FFFFFFF
@@ -1140,6 +1177,9 @@ def load_vgm(path: Path | str) -> VgmFile:
         rf5c164_clock=rf5c164_clock,
         y8950_clock=y8950_clock,
         ymf278b_clock=ymf278b_clock,
+        ymz280b_clock=ymz280b_clock,
+        ymz280b_clock_2=ymz280b_clock_2,
+        ymz280b_dual=ymz280b_dual,
         c140_clock=c140_clock,
         c140_type=c140_type,
         k053260_clock=k053260_clock,
@@ -1166,6 +1206,7 @@ def load_vgm(path: Path | str) -> VgmFile:
     stray_ym2608_second = False
     stray_opll_second = False
     stray_opl2_second = False
+    stray_ymz_second = False
     saw_end = False
     saw_adpcm_compressed = False
     # stream id -> setup recorded by 0x90/0x91/0x92
@@ -1250,6 +1291,7 @@ def load_vgm(path: Path | str) -> VgmFile:
                     Y8950_DELTAT_ROM_TYPE: "y8950_deltat",
                     YMF278B_ROM_TYPE: "ymf278b_rom",
                     YMF278B_RAM_TYPE: "ymf278b_ram",
+                    YMZ280B_ROM_TYPE: "ymz280b",
                 }.get(typ) if len(payload) >= 8 else None
                 if kind:
                     rom_size = int.from_bytes(payload[0:4], "little")
@@ -1519,6 +1561,16 @@ def load_vgm(path: Path | str) -> VgmFile:
             # the ADPCM half is the delta-T engine at 0x07-0x12.
             vgm.writes.append(ChipWrite(sample, "y8950", 0, buf[pos + 1],
                                         buf[pos + 2]))
+            pos += 3
+            continue
+        if cmd in (CMD_YMZ280B, CMD_YMZ280B_2) and pos + 3 <= n:
+            # 0x5D is the first YMZ280B, 0xAD the second (YM-family +0x50).
+            cid = 0 if cmd == CMD_YMZ280B else 1
+            if cid and not ymz280b_dual:
+                stray_ymz_second = True
+            vgm.writes.append(ChipWrite(
+                sample, "ymz280b", cid, buf[pos + 1], buf[pos + 2],
+            ))
             pos += 3
             continue
         if (
@@ -1936,6 +1988,17 @@ def load_vgm(path: Path | str) -> VgmFile:
             "0xAA YM3812 writes without the dual-instance header bit; "
             "they were treated as the first chip"
         )
+    if stray_ymz_second:
+        vgm.warnings.append(
+            "0xAD YMZ280B writes without the dual-instance header bit; "
+            "they were treated as the second chip"
+        )
+    if (any(w.chip == "ymz280b" for w in vgm.writes)
+            and not vgm.ymz280b_clock):
+        vgm.warnings.append(
+            "YMZ280B writes without a header clock; using 16934400 Hz"
+        )
+        vgm.ymz280b_clock = YMZ280B_DEFAULT_CLOCK
     return vgm
 
 

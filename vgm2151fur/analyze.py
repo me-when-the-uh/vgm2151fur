@@ -201,6 +201,15 @@ from vgm2151fur.ymf278b import (
     opl4_pan_fx,
     opl4_rate,
 )
+from vgm2151fur.ymz280b import (
+    YMZ280B_VOICES,
+    YmzOff,
+    YmzSample,
+    collect_ymz280b,
+    hit_played_fnum as ymz_played_fnum,
+    ymz280b_rate,
+    ymz_pan_fx,
+)
 from vgm2151fur.ssgpcm import (
     SsgPcmHit,
     SsgPcmSample,
@@ -643,6 +652,11 @@ class Song:
     c140_samples: list[C140Sample] = field(default_factory=list)
     c352_samples: list[C352Sample] = field(default_factory=list)
     k053260_samples: list[K053260Sample] = field(default_factory=list)
+    # YMZ280B (PCMD8): one sample body per distinct ROM range/loop/depth.
+    # `ymz280b_ids` are the chip instances in channel order.
+    ymz280b_samples: list[YmzSample] = field(default_factory=list)
+    ymz280b_ids: list[int] = field(default_factory=list)
+    ymz280b_count: int = 0
     # (sample, channel, effect, value) placed before notes. MSM6258 divider.
     channel_fx: list[tuple[int, int, int, int]] = field(default_factory=list)
     # Chip-wide YM2151 LFO effects: (sample, effect, value[, tick offset]).
@@ -6779,6 +6793,11 @@ def analyze(
     c140_audible: list[C140Sample] = []
     c352_audible: list[C352Sample] = []
     k053260_audible: list[K053260Sample] = []
+    ymz_audible: list[YmzSample] = []
+    ymz_offs: list[YmzOff] = []
+    ymz_ids: list[int] = []
+    ymz_events: list[tuple[NoteEvent, int]] = []
+    ymz_count = 0
     # Set where the C352 runs and the source drives its rear pair.
     c352_quad_events = False
     if pcm:
@@ -7289,6 +7308,99 @@ def analyze(
             rf5c164_audible, rf5c164_clock, rf5c164_at,
             ins6 + len(rf5c68_audible), rf5c164_offs,
         )
+
+        # Yamaha YMZ280B (PCMD8): eight sample voices per instance.  Its
+        # channels follow K053260 and precede the pitched tone chips.  Bodies
+        # are already sliced from the type-0x86 ROM; each distinct body gets
+        # one DIV_INS_YMZ280B instrument.
+        ymz_samples, ymz_offs, ymz_warn = collect_ymz280b(vgm)
+        warnings.extend(ymz_warn)
+        ymz_audible = [s for s in ymz_samples if s.length > 0 and s.hits]
+        ymz_ids = sorted({s.chip_id for s in ymz_audible})
+        ymz_base = (
+            fm_end + (2 if audible else 0)
+            + 4 * len({s.chip_id for s in oki_samples}) + n_adpcm_ch
+            + (16 if spcm_audible else 0)
+            + RF5C_VOICES * (1 if rf5c68_audible else 0)
+            + RF5C_VOICES * (1 if rf5c164_audible else 0)
+            + 24 * len({h.chip_id for s in c140_audible for h in s.hits})
+            + 32 * len({h.chip_id for s in c352_audible for h in s.hits})
+            + 4 * len({h.chip_id for s in k053260_audible for h in s.hits})
+        )
+        ymz_at = {
+            cid: ymz_base + YMZ280B_VOICES * i
+            for i, cid in enumerate(ymz_ids)
+        }
+        for i, smp in enumerate(ymz_audible):
+            ref = smp.c4_rate()
+            for h in smp.hits:
+                base_f = ymz_played_fnum(h)
+                clock = smp.clock
+                note, e5 = rate_to_note(
+                    ymz280b_rate(clock, base_f, smp.depth), ref,
+                )
+                sweep: tuple[tuple[int, int], ...] = ()
+                if h.freq_pts and base_f:
+                    base_rate = ymz280b_rate(clock, base_f, smp.depth)
+                    deltas = tuple(
+                        (t, int(round(64.0 * 12.0 * math.log2(
+                            ymz280b_rate(clock, f, smp.depth) / base_rate
+                        ))))
+                        for t, f in h.freq_pts if f
+                    )
+                    vals = [d for _t, d in deltas]
+                    if deltas and max(vals + [0]) - min(vals + [0]) >= 4:
+                        sweep = deltas
+                pts = tuple(
+                    (t, v & 0xFF, None) for t, v in h.vol_pts
+                )
+                # A looping body ends only at a real key-off.  A one-shot also
+                # ends at the ROM stop address, so the pattern releases there
+                # instead of holding a silent keyed voice.
+                natural_end = h.sample_time + int(round(
+                    smp.length / ymz280b_rate(clock, base_f, smp.depth)
+                    * VGM_RATE
+                ))
+                if smp.loop_start is None:
+                    end = min(h.off_sample or natural_end, natural_end)
+                else:
+                    end = h.off_sample
+                ev = NoteEvent(
+                    sample=h.sample_time,
+                    ch=ymz_at.get(h.chip_id, ymz_base) + h.voice,
+                    on=True,
+                    note=note,
+                    ins=-1,  # bound after the sample-instrument base is known
+                    vol=h.vol & 0xFF,
+                    e5=e5,
+                    pan=ymz_pan_fx(h.pan),
+                    pcm=True,
+                    end=end,
+                    sweep=sweep,
+                    vol_pts=pts,
+                )
+                events.append(ev)
+                ymz_events.append((ev, i))
+                ymz_count += 1
+                for t, pan in h.pan_pts:
+                    channel_fx.append((
+                        t, ev.ch, 0x08, ymz_pan_fx(pan),
+                    ))
+        for off in ymz_offs:
+            base = ymz_at.get(off.chip_id)
+            if base is None:
+                continue
+            events.append(NoteEvent(
+                sample=off.sample_time,
+                ch=base + off.voice,
+                on=False,
+                note=180,
+                ins=-1,
+                vol=-1,
+                e5=0x80,
+                pan=0,
+                pcm=True,
+            ))
     else:
         audible = []
 
@@ -7330,6 +7442,7 @@ def analyze(
         + 24 * len({h.chip_id for s in c140_audible for h in s.hits})
         + 32 * len({h.chip_id for s in c352_audible for h in s.hits})
         + 4 * len({h.chip_id for s in k053260_audible for h in s.hits})
+        + YMZ280B_VOICES * len(ymz_ids)
     )
     # Count the final DAC maps once, below; the collector's list is transient.
     n_ym2610_a_ins = (len(ym2610_a_samples) + YM2610_MAP_SLOTS - 1) // YM2610_MAP_SLOTS
@@ -8104,6 +8217,10 @@ def analyze(
     # NES group.
     huc6280_pcm_ins_base = tone_ins_base
     tone_ins_base += n_huc6280_pcm_ins
+    # YMZ280B bodies come last among the sample instruments, just before the
+    # pitched SCC/AY/NES/PCE/GB tone instruments.
+    ymz_ins_base = tone_ins_base
+    tone_ins_base += len(ymz_audible)
 
     events.sort(key=lambda e: (e.sample, e.ch, 0 if e.on else 1))
 
@@ -8315,7 +8432,7 @@ def analyze(
         + (len(audible) if pcm else 0) + len(oki_samples) + n_adpcm_ins
         + len(spcm_audible) + len(c140_audible) + len(c352_audible)
         + len(k053260_audible) + n_ym2610_a_ins + n_ym2610_b_ins
-        + n_ym2608_rhythm_ins + n_ym2608_b_ins
+        + n_ym2608_rhythm_ins + n_ym2608_b_ins + len(ymz_audible)
     )
     for ins, ramps in held_lfo.items():
         if not (0 <= ins < len(patch_order)):
@@ -8403,6 +8520,8 @@ def analyze(
         tone_ins_base += n_nes_pcm_ins
         huc6280_pcm_ins_base = tone_ins_base
         tone_ins_base += n_huc6280_pcm_ins
+        ymz_ins_base = tone_ins_base
+        tone_ins_base += len(ymz_audible)
     if pms_lost:
         warnings.append(
             f"{pms_lost} YM2151 PMS/AMS ramps stayed on the base instrument: "
@@ -8452,6 +8571,8 @@ def analyze(
     # HuC6280 direct-D/A bodies follow the NES sample group.
     for ev, idx in huc6280_pcm_events:
         ev.ins = huc6280_pcm_ins_base + idx
+    for ev, idx in ymz_events:
+        ev.ins = ymz_ins_base + idx
 
     loop_sample = vgm.loop_sample
     if loop_sample is not None and loop_sample < 0:
@@ -8466,7 +8587,7 @@ def analyze(
         or ym2608_b_samples or ym2608_rhythm_events
         or y8950_b_samples or opl4_wave_samples or ssg_pcm_samples
         or nes_ids or nes_dpcm_samples or nes_pcm_samples
-        or huc_pcm_samples
+        or huc_pcm_samples or ymz_audible
         or any(s.length >= 8 for s in pcm_samples)
         or scc_waves or ay_count or dac_samples or psg_count
     )
@@ -8526,7 +8647,7 @@ def analyze(
         + len(k053260_audible) + n_ym2610_a_ins + n_ym2610_b_ins
         + len(scc_ins) + len(ay_ins) + len(psg_ins)
         + n_ym2608_rhythm_ins + n_ym2608_b_ins
-        + n_ssg_pcm
+        + n_ssg_pcm + len(ymz_audible)
     )
     if n_total_ins > 250:
         warnings.append(
@@ -8539,6 +8660,7 @@ def analyze(
         + len(k053260_audible) + len(dac_samples)
         + len(ym2610_a_samples) + len(ym2610_b_samples)
         + len(ym2608_b_samples) + len(ssg_pcm_samples)
+        + len(ymz_audible)
     )
     if n_total_smp > 65535:
         warnings.append(
@@ -8580,6 +8702,9 @@ def analyze(
         c140_samples=c140_audible,
         c352_samples=c352_audible,
         k053260_samples=k053260_audible,
+        ymz280b_samples=ymz_audible,
+        ymz280b_ids=ymz_ids,
+        ymz280b_count=ymz_count,
         channel_fx=channel_fx,
         k007232_volume=k007232_volume,
         c352_quad=c352_quad_events,
@@ -8910,6 +9035,7 @@ def format_report(song: Song) -> str:
         + len(song.c140_samples)
         + len(song.c352_samples) + len(song.k053260_samples)
         + len(song.ym2610_a_samples) + len(song.ym2610_b_samples)
+        + len(song.ymz280b_samples)
     )
     lines.append(f"PCM notes   {pcm_ons}  ({n_regions} sample regions)")
     if song.scc_ids:
@@ -8987,6 +9113,7 @@ def format_report(song: Song) -> str:
         ("C140", song.c140_samples),
         ("C352", song.c352_samples),
         ("K053260", song.k053260_samples),
+        ("YMZ280B", song.ymz280b_samples),
     ):
         if not smps:
             continue

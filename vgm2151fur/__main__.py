@@ -120,6 +120,7 @@ def _sample_counts(info: dict) -> str:
         ("c140_samples", "C140"),
         ("c352_samples", "C352"),
         ("k053260_samples", "K053260"),
+        ("ymz280b_samples", "YMZ280B"),
         ("oki_samples", "OKI"),
         ("msm6258_samples", "ADPCM"),
         ("ym2610_a_samples", "ADPCM-A"),
@@ -525,7 +526,7 @@ def build_parser() -> argparse.ArgumentParser:
             "Transcribe YM2151 (OPM), YM2203 (OPN), YM2612 (OPN2), YM2610 and "
             "OPL-family (YM3526/YM3812/YMF262) + "
             "sample-chip (K007232, MSM6295, MSM6258, SegaPCM, C140, C352, "
-            "K053260) "
+            "K053260, YMZ280B) "
             "VGMs into Furnace .fur files, and edit the result."
         ),
         epilog=EPILOG,

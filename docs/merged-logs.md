@@ -49,6 +49,12 @@ a single-family module is just the one-element case.
 `estimate_grid()` takes the union of every converted family's writes, so a PCM
 stream whose onsets are the only rhythm still measures the melody's tempo.
 
+YMZ280B is a sample engine rather than an FM family. Its systems follow the
+same module order as the other sample chips: after the FM block and K053260,
+before SCC/AY/NES/PCE/Game Boy. A YMZ-only log suppresses the legacy YM2151
+placeholder, so `07 Stage4.vgm` becomes two `0xB8` systems and sixteen real
+columns (`docs/ymz280b.md`).
+
 ## Who is allowed to share
 
 `share_fm`: one arcade family plus one OPL-family system coexist when the

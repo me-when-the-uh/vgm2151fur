@@ -19,6 +19,7 @@ from vgm2151fur.c352 import C352_DEFAULT_CLOCK
 from vgm2151fur.fm import CARRIERS, OPN_CARRIERS
 from vgm2151fur.nes import nes_dpcm_rate
 from vgm2151fur.oki import msm6258_flag_text, oki_flag_text, oki_needs_banked
+from vgm2151fur.ymz280b import ymz280b_clock
 from vgm2151fur.opl import (
     FURNACE_CLOCK, FURNACE_CLOCK_OPL3, opl_module_clock, opll_clock_flag,
     opll_module_clock,
@@ -91,6 +92,8 @@ CHIP_SEGAPCM = 0x9B
 CHIP_RF5C68 = 0x95
 CHIP_C140 = 0xCE
 CHIP_K053260 = 0xCC
+# DIV_SYSTEM_YMZ280B: eight PCM/ADPCM sample voices.
+CHIP_YMZ280B = 0xB8
 # Furnace format.md reserves 0xD0 for Namco C352, 32 channels, and marks it
 # unavailable. 0.6.8.3 has no C352 core and no C352 instrument type.
 CHIP_C352 = 0xD0
@@ -227,6 +230,9 @@ INS_MSM6295 = 36
 INS_ADPCMA = 37
 INS_ADPCMB = 38
 INS_SEGAPCM = 39
+# DIV_INS_YMZ280B: one sample body per instrument (or a 120-slot note map
+# when the module's instrument budget requires it).
+INS_YMZ280B = 41
 INS_RF5C68 = 42
 # DIV_INS_MULTIPCM: the OPL4 wave slot's sample-map instrument.
 INS_MULTIPCM = 28
@@ -254,6 +260,7 @@ SMP_DEPTH_DPCM = 1
 SMP_DEPTH_ADPCM_K = 7
 SMP_DEPTH_ADPCM_A = 5
 SMP_DEPTH_ADPCM_B = 6
+SMP_DEPTH_YMZ_ADPCM = 3
 SMP_DEPTH_8BIT = 8
 SMP_DEPTH_16BIT = 16
 SMP_DEPTH_VOX = 10
@@ -282,6 +289,7 @@ _DEV_DEFAULT_VOLUME = {
     0x00: 0x80,
     0x03: 0x100, 0x04: 0x180, 0x08: 0x100, 0x12: 0x100, 0x16: 0x11E,
     0x18: 0x100, 0x19: 0xA0, 0x1C: 0x100, 0x1D: 0x100, 0x27: 0x40,
+    0x0F: 0x100,
 }
 _DEV_CORE_PATCH = {
     0x19: lambda v: v * 8 // 5,  # K051649 SCC core scale
@@ -293,6 +301,9 @@ _DEV_CORE_PATCH = {
 _FURNACE_VOLUME_SCALE = {
     0x00: 1.0, 0x03: 1.0, 0x04: 1.0, 0x12: 1.46, 0x16: 0.61, 0x18: 1.0,
     0x1C: 0.7, 0x19: 1.04,
+    # YMZ280B's Furnace core is 1.27x quieter than VGMPlay's at the same
+    # system volume (measured on the two-chip Stage 4 module).
+    0x0F: 1.27,
     # MAME shifts the voice product by 6 bits, the Furnace core by 7, so the
     # module needs twice the player's system volume to reach the same level.
     0x1D: 2.0,
@@ -301,7 +312,7 @@ _FURNACE_VOLUME_SCALE = {
 # 0.61 lands the sample at the source level. The MSM6295 (0x18) is unity.
 _CHIP_DEV = {CHIP_YM2151: 0x03, CHIP_SEGAPCM: 0x04, CHIP_MSM6295: 0x18,
              CHIP_MSM6258: 0x16, CHIP_C140: 0x1C, CHIP_C352: 0x27,
-             CHIP_K053260: 0x1D,
+             CHIP_K053260: 0x1D, CHIP_YMZ280B: 0x0F,
              CHIP_SMS: 0x00, CHIP_K051649: 0x19, CHIP_K052539: 0x19,
              CHIP_AY8910: 0x12,
              CHIP_YM2610: 0x08, CHIP_YM2610B: 0x08}
@@ -330,11 +341,16 @@ def _sample_chip_volume(song: "Song", chip: int, instances: int) -> float:
     dev = _CHIP_DEV.get(chip)
     if dev is None:
         return 1.0
-    if chip == CHIP_MSM6295 and song.vgm.msm6295_dual:
+    if chip == CHIP_MSM6295 and getattr(song.vgm, "msm6295_dual", False):
         # The player halves every instance when the header carries two,
         # even on a track that only writes to one of them.
         instances = max(instances, 2)
     scale = _FURNACE_VOLUME_SCALE.get(dev, 1.0)
+    if chip == CHIP_YMZ280B:
+        # VGMPlay does not halve a YMZ280B pair: both Stage 4 instances run
+        # at full output. Furnace also mixes the two systems at full level,
+        # so keep the per-chip value independent of the instance count.
+        instances = 1
     return scale * _player_chip_volume(song.vgm, dev, instances)
 
 
@@ -1120,10 +1136,14 @@ def _write_sample_s8(
     loop: tuple[int | None, int | None] = (None, None),
     depth: int = SMP_DEPTH_8BIT,
     loop_mode: int = 0,
+    render_masks: tuple[int, int, int, int] = (
+        0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF,
+    ),
 ) -> None:
     """Signed PCM with optional loop points. Depth 16 is int16 LE (mulaw).
 
     loop_mode is the SMP2 byte: 0 forward, 1 backward, 2 ping-pong.
+    render_masks selects the systems whose sample memory receives the body.
     """
     width = 2 if depth == SMP_DEPTH_16BIT else 1
     n_frames = len(data) // width
@@ -1145,9 +1165,48 @@ def _write_sample_s8(
     else:
         b.s32(-1)
         b.s32(-1)
-    for _ in range(4):
-        b.u32(0xFFFFFFFF)
+    for mask in render_masks:
+        b.u32(mask)
     b.raw(data[:n_frames * width])
+    b.end_block(size_off, start)
+
+
+def _write_sample_ymz_adpcm(
+    b: Buf,
+    name: str,
+    data: bytes,
+    c4_rate: int,
+    loop: tuple[int | None, int | None] = (None, None),
+    render_masks: tuple[int, int, int, int] = (
+        0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF,
+    ),
+) -> None:
+    """YMZ280B 4-bit ADPCM body.
+
+    SMP2 stores a nibble count; the loader allocates ``(count+1)/2`` bytes and
+    reads the payload as packed high-nibble-first samples.  Loop points are in
+    nibbles, which is what the YMZ platform divides by two for its byte
+    addresses.
+    """
+    samples = len(data) * 2
+    size_off, start = b.begin_block(b"SMP2")
+    b.strz(name)
+    b.u32(samples)
+    b.u32(c4_rate)
+    b.u32(c4_rate)
+    b.u8(SMP_DEPTH_YMZ_ADPCM)
+    b.u8(0)
+    b.u8(0)
+    b.u8(0)
+    if loop[0] is not None and loop[1] is not None:
+        b.s32(loop[0])
+        b.s32(loop[1])
+    else:
+        b.s32(-1)
+        b.s32(-1)
+    for mask in render_masks:
+        b.u32(mask)
+    b.raw(data)
     b.end_block(size_off, start)
 
 
@@ -1209,6 +1268,24 @@ def _write_sample_adpcm(
         b.u32(mask)
     b.raw(data)
     b.end_block(size_off, start)
+
+
+def ymz280b_flag_text(clock: int) -> str:
+    """Furnace YMZ280B system flags: named clock select or custom clock."""
+    clk = int(clock or 16934400)
+    named = {
+        14318182: 1,              # COLOR_NTSC * 4
+        14187580: 2,              # COLOR_PAL * 16 / 5
+        16000000: 3,
+        16666667: 4,              # 50 MHz / 3
+        14000000: 5,
+    }
+    if clk == 16934400:
+        return ""
+    sel = named.get(clk)
+    if sel is not None:
+        return f"clockSel={sel}"
+    return f"customClock={clk}"
 
 
 def segapcm_flag_text(clock: int, rom_size: int) -> str:
@@ -3633,6 +3710,9 @@ def write_fur(
         or getattr(song, "nes_ids", ()) or getattr(song, "huc6280_ids", ())
         or getattr(song, "gb_ids", ())
         or getattr(song, "psg_ids", ())
+        # YMZ280B is a sample engine with real module columns; a YMZ-only log
+        # must not gain an empty YM2151 placeholder above it.
+        or getattr(song, "ymz280b_samples", ())
     )
     if ym2610 or ym2608:
         fm_present = (include_fm or include_pcm) and bool(ym_ids)
@@ -3662,6 +3742,11 @@ def write_fur(
     k053260_smps = (
         [s for s in song.k053260_samples if s.length >= 8] if include_pcm else []
     )
+    ymz_smps = (
+        list(getattr(song, "ymz280b_samples", ()) or ())
+        if include_pcm else []
+    )
+    ymz_ids = sorted({s.chip_id for s in ymz_smps})
     dac_smps = list(getattr(song, "dac_samples", ()) or ()) if include_pcm else []
     n_dac_ins = (len(dac_smps) + 119) // 120
     dac_smp_base = (
@@ -3797,7 +3882,8 @@ def write_fur(
         + 4 * len(oki_ids) + len(adpcm_ids)
         + (16 if spcm_smps else 0) + n_rf5c
         + 24 * len(c140_ids) + 32 * len(c352_ids)
-        + 4 * len(k053260_ids) + n_scc + n_ay + n_nes + n_huc6280 + n_gb
+        + 4 * len(k053260_ids) + 8 * len(ymz_ids)
+        + n_scc + n_ay + n_nes + n_huc6280 + n_gb
     )
     if n_ch == 0:
         raise ValueError("write_fur: need include_fm and/or include_pcm")
@@ -3818,6 +3904,7 @@ def write_fur(
         + n_ym2608_rhythm_ins + n_ym2608_b_ins
         + n_y8950_b_ins + n_opl4_wave_ins + n_ssg_pcm_ins
         + n_nes_dpcm_ins + n_nes_pcm_ins + n_huc6280_pcm_ins
+        + len(ymz_smps)
         + len(scc_specs) + len(ay_specs) + len(psg_specs) + len(nes_specs)
         + len(huc6280_specs) + len(gb_specs)
     )
@@ -3829,6 +3916,7 @@ def write_fur(
         + len(ym2610_a_smps) + len(ym2610_b_smps) + len(ym2608_b_smps)
         + len(y8950_b_smps) + len(opl4_wave_smps) + len(ssg_pcm_smps)
         + len(nes_dpcm_smps) + len(nes_pcm_smps) + len(huc6280_pcm_smps)
+        + len(ymz_smps)
     )
     n_wav = len(scc_waves) + len(huc6280_waves) + len(gb_waves)
 
@@ -3901,6 +3989,8 @@ def write_fur(
     nes_dpcm_smp_base = ssg_pcm_smp_base + len(ssg_pcm_smps)
     nes_pcm_smp_base = nes_dpcm_smp_base + len(nes_dpcm_smps)
     huc6280_pcm_smp_base = nes_pcm_smp_base + len(nes_pcm_smps)
+    # YMZ280B bodies and instruments come last among the sample engines.
+    ymz_smp_base = huc6280_pcm_smp_base + len(huc6280_pcm_smps)
     n_ins = (
         len(fm_ins) + n_dac_ins + len(pcm_smps) + len(oki_smps) + n_adpcm_ins
         + len(spcm_smps) + len(rf5c68_smps) + len(rf5c164_smps)
@@ -3909,6 +3999,7 @@ def write_fur(
         + n_ym2608_rhythm_ins + n_ym2608_b_ins
         + n_y8950_b_ins + n_opl4_wave_ins + n_ssg_pcm_ins
         + n_nes_dpcm_ins + n_nes_pcm_ins + n_huc6280_pcm_ins
+        + len(ymz_smps)
         + len(scc_specs) + len(ay_specs) + len(psg_specs) + len(nes_specs)
         + len(huc6280_specs) + len(gb_specs)
     )
@@ -3920,6 +4011,7 @@ def write_fur(
         + len(ym2610_a_smps) + len(ym2610_b_smps) + len(ym2608_b_smps)
         + len(y8950_b_smps) + len(opl4_wave_smps) + len(ssg_pcm_smps)
         + len(nes_dpcm_smps) + len(nes_pcm_smps) + len(huc6280_pcm_smps)
+        + len(ymz_smps)
     )
 
     n_ord = len(orders[0]) if orders else 1
@@ -3980,6 +4072,10 @@ def write_fur(
         for voice in range(4):
             names_long.append(f"K053260 {cid + 1}-{voice + 1}")
             names_short.append(f"Q{cid + 1}-{voice + 1}")
+    for cid in ymz_ids:
+        for voice in range(8):
+            names_long.append(f"YMZ280B {cid + 1}-{voice + 1}")
+            names_short.append(f"Y{cid + 1}-{voice + 1}")
     for cid in scc_ids:
         for voice in range(5):
             names_long.append(f"SCC {cid + 1}-{voice + 1}")
@@ -4057,6 +4153,8 @@ def write_fur(
         label_parts.append("C352")
     if k053260_ids:
         label_parts.append("K053260")
+    if ymz_ids:
+        label_parts.append("YMZ280B")
     if scc_ids:
         label_parts.append("SCC+" if song.vgm.k051649_plus else "SCC")
     if ay_ids:
@@ -4309,6 +4407,11 @@ def write_fur(
     for cid in k053260_ids:
         chips.append(CHIP_K053260)
         flag_texts.append(k053260_flag_text(song.vgm.k053260_clock))
+    ymz_sys: dict[int, int] = {}
+    for cid in ymz_ids:
+        ymz_sys[cid] = len(chips)
+        chips.append(CHIP_YMZ280B)
+        flag_texts.append(ymz280b_flag_text(ymz280b_clock(song.vgm, cid)))
     for cid in scc_ids:
         chips.append(scc_chip)
         flag_texts.append(k051649_flag_text(song.vgm.k051649_clock))
@@ -4642,6 +4745,12 @@ def write_fur(
         _write_ins_pcm(
             b, f"HuC6280 PCM {i:02d}", huc6280_pcm_smp_base + i, INS_C352,
         )
+    for i, smp in enumerate(ymz_smps):
+        ins_ptrs.append(len(b))
+        _write_ins_pcm(
+            b, f"YMZ{smp.chip_id + 1} {smp.start:06x}",
+            ymz_smp_base + i, INS_YMZ280B,
+        )
     for i, spec in enumerate(scc_specs):
         ins_ptrs.append(len(b))
         wave = scc_waves[spec.wave] if spec.wave < len(scc_waves) else b""
@@ -4859,6 +4968,28 @@ def write_fur(
         # them at their byte rate.
         loop = (0, len(smp.data)) if smp.loop else (None, None)
         _write_sample_s8(b, smp.name, smp.data, smp.rate, loop=loop)
+    for smp in ymz_smps:
+        smp_ptrs.append(len(b))
+        sys = ymz_sys.get(smp.chip_id, 0)
+        # Only the owning YMZ system uploads this body; a dual log's two
+        # chips otherwise both receive the union of their ROMs.
+        masks = ((1 << sys) if sys < 32 else 0, 0, 0, 0)
+        loop = (
+            (smp.loop_start, smp.loop_end)
+            if smp.loop_start is not None and smp.loop_end is not None
+            else (None, None)
+        )
+        name = f"ymz{smp.chip_id + 1}_{smp.start:06x}"
+        if smp.depth == SMP_DEPTH_YMZ_ADPCM:
+            _write_sample_ymz_adpcm(
+                b, name, smp.data, smp.c4_rate(), loop=loop,
+                render_masks=masks,
+            )
+        else:
+            _write_sample_s8(
+                b, name, smp.data, smp.c4_rate(), loop=loop,
+                depth=smp.depth, render_masks=masks,
+            )
 
     pat_ptrs: list[int] = []
     for ch, idx, rows in patterns:
