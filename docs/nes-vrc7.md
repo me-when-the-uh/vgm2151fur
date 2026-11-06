@@ -75,8 +75,18 @@ Some drivers bypass DPCM and bit-bang the 7-bit DAC at audio rate. Runs of at
 least eight `$4011` writes with a median spacing of 16 samples or less become
 8-bit sample bodies (sample-and-hold, split at pauses of 46 ms, deduplicated,
 minimum 128 frames). The body byte is `(level << 1) - 0x80`, the inverse of
-the NES platform's `(data8 + 0x80) >> 1`. The note is C-4 (108), which plays
-the body at its stored rate, and `18xx = 00` selects PCM mode.
+the NES platform's `(data8 + 0x80) >> 1`.
+
+A long capture is **not** stored as one sample. It is split first at long
+contiguous zero runs (46 ms or more); the silent stretch is not sample data,
+so the channel simply goes OFF there and the next sounding part gets its own
+note at the source time. Each sounding part is then cut into chunks of at most
+8192 frames, with the chunk size grown if needed to keep the whole capture
+inside the same 240-sample budget the YM2612 DAC uses (Furnace sample indices
+are one byte). The chunks use 120-slot sample-map instruments like the DAC:
+note `60 + slot` selects the chunk and every slot plays at C-4 at the body's
+stored rate, so a small tracker/sample-rate error can only drift inside one
+chunk instead of across the song. `18xx = 00` selects PCM mode.
 
 ## Famicom AY = Sunsoft 5B
 

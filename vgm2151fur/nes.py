@@ -68,6 +68,17 @@ PCM_SPLIT_GAP = 2048
 PCM_MIN_RATE = 4000
 PCM_MAX_RATE = 32000
 PCM_MIN_FRAMES = 128
+# Long bit-banged bodies are cut into chunks so a small tracker/sample-rate
+# error cannot desync the whole song. Each chunk gets its own sample-map note
+# at the source time, and 120 chunks share one map instrument. Furnace sample
+# indices are one byte, so keep the chunks inside the same 240-slot budget the
+# YM2612 DAC uses; a longer body gets proportionally longer chunks.
+NES_PCM_CHUNK_FRAMES = 8192
+NES_PCM_MAP_SLOTS = 120
+NES_PCM_SAMPLE_BUDGET = 240
+# A zero run at least this long (VGM samples) is a rest between phrases, not
+# sample data. Split there first, then chunk the sounding parts.
+NES_PCM_SILENCE_GAP = PCM_SPLIT_GAP
 
 REG_PULSE1 = (0x00, 0x01, 0x02, 0x03)
 REG_PULSE2 = (0x04, 0x05, 0x06, 0x07)
@@ -604,6 +615,30 @@ def _pcm_resample(points: list[tuple[int, int]], rate: int) -> bytes:
     return bytes(out)
 
 
+def _pcm_sounding_pieces(data: bytes, rate: int) -> list[tuple[int, bytes]]:
+    """Split resampled PCM at long zero runs; return (frame offset, body)."""
+    gap = max(1, int(round(NES_PCM_SILENCE_GAP * rate / VGM_RATE)))
+    out: list[tuple[int, bytes]] = []
+    start = 0
+    i = 0
+    n = len(data)
+    while i < n:
+        if data[i] != 0:
+            i += 1
+            continue
+        j = i
+        while j < n and data[j] == 0:
+            j += 1
+        if j - i >= gap:
+            if i > start:
+                out.append((start, data[start:i]))
+            start = j
+        i = j
+    if start < n:
+        out.append((start, data[start:]))
+    return out
+
+
 def collect_nes_pcm(
     vgm: VgmFile, clock: int | None = None,
 ) -> tuple[list[NesPcmSample], list[NesPcmHit], list[str]]:
@@ -629,9 +664,7 @@ def collect_nes_pcm(
             merged[-1].extend(burst)
         elif burst:
             merged.append(list(burst))
-    samples: list[NesPcmSample] = []
-    hits: list[NesPcmHit] = []
-    by_data: dict[bytes, int] = {}
+    prepared: list[tuple[list[tuple[int, int]], int, int, bytes]] = []
     for seg in merged:
         if len(seg) < 2:
             continue
@@ -642,15 +675,47 @@ def collect_nes_pcm(
         data = _pcm_resample(seg, rate)
         if len(data) < PCM_MIN_FRAMES:
             continue
-        idx = by_data.get(data)
-        if idx is None:
-            idx = len(samples)
-            by_data[data] = idx
-            samples.append(NesPcmSample(
-                name=f"NES PCM {idx:02d}", data=data, rate=rate,
-                start=seg[0][0], end=seg[-1][0],
-            ))
-        hits.append(NesPcmHit(
-            sample_time=seg[0][0], end_time=seg[-1][0], sample_index=idx,
+        for base_off, piece in _pcm_sounding_pieces(data, rate):
+            if piece:
+                prepared.append((seg, rate, base_off, piece))
+    if not prepared:
+        return [], [], warnings
+    total_frames = sum(len(piece) for _seg, _rate, _off, piece in prepared)
+    chunk_frames = NES_PCM_CHUNK_FRAMES
+    if total_frames > chunk_frames * NES_PCM_SAMPLE_BUDGET:
+        chunk_frames = int(math.ceil(
+            total_frames / float(NES_PCM_SAMPLE_BUDGET),
         ))
+    samples: list[NesPcmSample] = []
+    hits: list[NesPcmHit] = []
+    by_data: dict[bytes, int] = {}
+    for seg, rate, base_off, data in prepared:
+        total = len(data)
+        for off in range(0, total, chunk_frames):
+            part = data[off:off + chunk_frames]
+            if not part:
+                continue
+            start_t = seg[0][0] + int(round(
+                (base_off + off) * VGM_RATE / rate,
+            ))
+            final = off + len(part) >= total
+            end_t = seg[0][0] + int(round(
+                (base_off + total) * VGM_RATE / rate,
+            ))
+            idx = by_data.get(part)
+            if idx is None:
+                idx = len(samples)
+                by_data[part] = idx
+                samples.append(NesPcmSample(
+                    name=f"NES PCM {idx:02d}", data=part, rate=rate,
+                    start=start_t, end=end_t,
+                ))
+            hits.append(NesPcmHit(
+                sample_time=start_t,
+                # Non-final chunks are cut by the next chunk's note. The last
+                # chunk of each sounding piece gets the OFF that covers the
+                # following silent gap.
+                end_time=end_t if final else 0,
+                sample_index=idx,
+            ))
     return samples, hits, warnings

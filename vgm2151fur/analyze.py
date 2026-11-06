@@ -120,6 +120,7 @@ from vgm2151fur.nes import (
     NES_CPU_DIVIDER,
     NES_DEFAULT_CLOCK,
     NES_FURNACE_CLOCK,
+    NES_PCM_MAP_SLOTS,
     NesDpcmHit,
     NesDpcmSample,
     NesPcmHit,
@@ -794,6 +795,7 @@ class Song:
     nes_dpcm_samples: list[NesDpcmSample] = field(default_factory=list)
     nes_pcm_samples: list[NesPcmSample] = field(default_factory=list)
     nes_count: int = 0
+    nes_pcm_count: int = 0
     # HuC6280 (PC Engine): six wavetable voices per instance. `huc6280_waves`
     # is the deduplicated 32x5-bit wavetable list, `huc6280_ins` one instrument
     # per distinct (wave, pitch macro, wave macro), `huc6280_count` notes.
@@ -7202,7 +7204,9 @@ def analyze(
         nes_dpcm_samples, nes_dpcm_hits = [], []
         nes_pcm_samples, nes_pcm_hits = [], []
     n_nes_dpcm_ins = len(nes_dpcm_samples)
-    n_nes_pcm_ins = len(nes_pcm_samples)
+    n_nes_pcm_ins = (
+        (len(nes_pcm_samples) + NES_PCM_MAP_SLOTS - 1) // NES_PCM_MAP_SLOTS
+    )
 
     # SCC and AY are pitched chips and convert even under --melody-only. Their
     # channels follow the FM block and every sample chip.
@@ -7517,20 +7521,24 @@ def analyze(
                     vol=-1, e5=0x80, pan=0, pcm=True,
                 ))
         nes_pcm_events: list[tuple[NoteEvent, int]] = []
+        pcm_mode_set = False
         for hit in nes_pcm_hits:
             ch = nes_base + 4
-            channel_fx.append((hit.sample_time, ch, 0x18, 0))
+            if not pcm_mode_set:
+                channel_fx.append((hit.sample_time, ch, 0x18, 0))
+                pcm_mode_set = True
             ev = NoteEvent(
-                sample=hit.sample_time, ch=ch, on=True, note=108, ins=-1,
-                vol=15, e5=0x80, pan=0, end=hit.end_time, no_pan=True,
-                pcm=True,
+                sample=hit.sample_time, ch=ch, on=True,
+                note=60 + (hit.sample_index % NES_PCM_MAP_SLOTS),
+                ins=-1, vol=15, e5=0x80, pan=0, end=hit.end_time,
+                no_pan=True, dac=True,
             )
             events.append(ev)
             nes_pcm_events.append((ev, hit.sample_index))
             if hit.end_time:
                 events.append(NoteEvent(
                     sample=hit.end_time, ch=ch, on=False, note=180, ins=-1,
-                    vol=-1, e5=0x80, pan=0, pcm=True,
+                    vol=-1, e5=0x80, pan=0,
                 ))
     else:
         nes_base = None
@@ -8329,7 +8337,7 @@ def analyze(
     for ev, idx in nes_dpcm_events:
         ev.ins = nes_dpcm_ins_base + idx
     for ev, idx in nes_pcm_events:
-        ev.ins = nes_pcm_ins_base + idx
+        ev.ins = nes_pcm_ins_base + idx // NES_PCM_MAP_SLOTS
     # HuC6280 direct-D/A bodies follow the NES sample group.
     for ev, idx in huc6280_pcm_events:
         ev.ins = huc6280_pcm_ins_base + idx
@@ -8505,6 +8513,7 @@ def analyze(
         nes_dpcm_samples=nes_dpcm_samples,
         nes_pcm_samples=nes_pcm_samples,
         nes_count=len(nes_tones) + len(nes_dpcm_hits) + len(nes_pcm_hits),
+        nes_pcm_count=len(nes_pcm_hits),
         huc6280_ids=huc6280_ids,
         huc6280_waves=huc6280_waves,
         huc6280_ins=huc6280_ins,
@@ -8829,6 +8838,11 @@ def format_report(song: Song) -> str:
         lines.append(
             f"SSG PCM     {song.ssg_pcm_count} note(s) in "
             f"{len(song.ssg_pcm_samples)} 8-bit sample(s)"
+        )
+    if song.nes_pcm_samples:
+        lines.append(
+            f"NES PCM     {song.nes_pcm_count} note(s) in "
+            f"{len(song.nes_pcm_samples)} 8-bit sample(s)"
         )
     if song.pcm_samples:
         lines.append(f"PCM level   {song.k007232_volume:.4g}x of the YM2151 (rip mix)")

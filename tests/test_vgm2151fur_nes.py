@@ -10,7 +10,7 @@ from pathlib import Path
 from vgm2151fur.analyze import NoteEvent, _absorb_detune, analyze
 from vgm2151fur.furio import iter_blocks, parse_fur
 from vgm2151fur.furwrite import (
-    CHIP_NES, CHIP_VRC7, INS_NES, SMP_DEPTH_DPCM, write_fur,
+    CHIP_NES, CHIP_VRC7, INS_C352, INS_NES, SMP_DEPTH_DPCM, write_fur,
 )
 from vgm2151fur.nes import (
     collect_nes_dpcm, collect_nes_pcm, collect_nes_tones, nes_note,
@@ -499,6 +499,71 @@ class TestNesDpcm(unittest.TestCase):
         self.assertGreater(len(samples[0].data), 180)
         self.assertEqual(warn, [])
 
+    def test_long_4011_stream_is_banked(self):
+        # 12000 writes at 4-sample spacing is about 50k frames. One body would
+        # desync over a long track; slice it into sample-map chunks instead.
+        writes = [
+            _nes(100 + i * 4, 0x11, (i * 7) & 0x7F) for i in range(12000)
+        ]
+        samples, hits, warn = collect_nes_pcm(_vgm(writes))
+        self.assertGreater(len(samples), 1)
+        self.assertEqual(len(samples), len(hits))
+        self.assertTrue(all(len(s.data) <= 8192 for s in samples))
+        self.assertEqual(hits[0].sample_time, 100)
+        self.assertTrue(hits[-1].end_time)
+        self.assertEqual(warn, [])
+
+    def test_long_4011_stream_uses_a_sample_map(self):
+        writes = [
+            _nes(100 + i * 4, 0x11, (i * 7) & 0x7F) for i in range(12000)
+        ]
+        song = analyze(_vgm(writes))
+        data = write_fur(song, include_pcm=True)
+        ons = [e for e in song.events if e.on and getattr(e, "dac", False)]
+        self.assertEqual(len(ons), len(song.nes_pcm_samples))
+        self.assertTrue(all(60 <= e.note < 180 for e in ons))
+        mod = parse_fur(data)
+        notes = [
+            row.note
+            for oi in mod.orders[4]
+            for row in mod.patterns.get((4, oi), [])
+            if row.note >= 0
+        ]
+        self.assertTrue(any(60 <= n < 180 for n in notes))
+        self.assertIn(180, notes)  # the final chunk's OFF
+        types = [
+            int.from_bytes(payload[2:4], "little")
+            for _pos, mag, _size, payload in iter_blocks(data)
+            if mag == b"INS2"
+        ]
+        self.assertIn(INS_C352, types)
+
+    def test_long_silence_becomes_a_rest(self):
+        # A long zero run is not sample data: split there and let the channel
+        # go OFF until the next sounding part.
+        writes = [
+            _nes(100 + i * 4, 0x11, (i * 7) & 0x7F) for i in range(1000)
+        ]
+        quiet_at = 100 + 1000 * 4
+        writes += [
+            _nes(quiet_at + i * 4, 0x11, 0x40) for i in range(1500)
+        ]
+        resume_at = quiet_at + 1500 * 4
+        writes += [
+            _nes(resume_at + i * 4, 0x11, (i * 5) & 0x7F)
+            for i in range(1000)
+        ]
+        samples, hits, warn = collect_nes_pcm(_vgm(writes))
+        self.assertEqual(len(hits), 2)
+        self.assertEqual(len(samples), 2)
+        self.assertEqual(hits[0].sample_time, 100)
+        self.assertEqual(hits[1].sample_time, resume_at)
+        self.assertLess(hits[0].end_time, hits[1].sample_time)
+        self.assertLessEqual(
+            sum(len(s.data) for s in samples), 2100,
+        )
+        self.assertEqual(warn, [])
+
 
 class TestNesModule(unittest.TestCase):
     def _nes_song(self):
@@ -548,6 +613,32 @@ class TestNesModule(unittest.TestCase):
         mod = parse_fur(data)
         self.assertEqual(mod.chips, [CHIP_VRC7])
         self.assertEqual(mod.n_ch, 6)
+
+
+class TestNesPcmBankingRealRip(unittest.TestCase):
+    SRC = Path(r"D:\Apps\Player\NezPlug++\nsf\entry001_01.vgm")
+
+    def test_long_capture_is_banked_and_tail_silence_dropped(self):
+        if not self.SRC.is_file():
+            self.skipTest(f"{self.SRC} not present")
+        song = analyze(load_vgm(self.SRC))
+        # The whole 155 s $4011 capture used to become one 1.7M-frame sample.
+        # It is now <=240 chunks in 120-slot maps, and the trailing silence is
+        # not stored.
+        self.assertLessEqual(len(song.nes_pcm_samples), 240)
+        self.assertEqual(song.nes_pcm_count, len(song.nes_pcm_samples))
+        self.assertEqual(
+            (len(song.nes_pcm_samples) + 119) // 120,
+            2,
+        )
+        self.assertLess(
+            max(len(s.data) for s in song.nes_pcm_samples), 8193,
+        )
+        last_end = max(
+            e.end for e in song.events
+            if e.on and getattr(e, "dac", False)
+        )
+        self.assertLess(last_end, 6_700_000)  # tail silence starts here
 
 
 class TestNesDpcmWriter(unittest.TestCase):

@@ -2491,7 +2491,7 @@ def _build_patterns(song: Song, n_ch: int, pat_len_max: int, fx_cols: int,
             last_sample = max(last_sample, ev.vol_pts[-1][0])
         if ev.quad_pts:
             last_sample = max(last_sample, ev.quad_pts[-1][0])
-        if ev.on and ev.pcm and ev.end:
+        if ev.on and (ev.pcm or ev.dac) and ev.end:
             last_sample = max(last_sample, ev.end)
     for entry in (getattr(song, "channel_fx", ()) or ()):
         last_sample = max(last_sample, entry[0])
@@ -3757,7 +3757,7 @@ def write_fur(
     n_huc6280 = 6 * len(huc6280_ids)
     n_gb = 4 * len(gb_ids)
     n_nes_dpcm_ins = len(nes_dpcm_smps)
-    n_nes_pcm_ins = len(nes_pcm_smps)
+    n_nes_pcm_ins = (len(nes_pcm_smps) + 119) // 120
     n_huc6280_pcm_ins = len(huc6280_pcm_smps)
     # NES DPCM (1-bit) and direct-DAC (8-bit) bodies follow the SSG PCM group.
     nes_dpcm_smp_base = ssg_pcm_smp_base + len(ssg_pcm_smps)
@@ -4623,11 +4623,18 @@ def write_fur(
         _write_ins_pcm(
             b, f"NES DPCM {i:02d}", nes_dpcm_smp_base + i, INS_NES,
         )
-    for i, smp in enumerate(nes_pcm_smps):
+    for group in range(n_nes_pcm_ins):
         ins_ptrs.append(len(b))
-        # Note 108 (C-4) plays the 8-bit body at its stored rate in PCM mode.
-        _write_ins_pcm(
-            b, f"NES PCM {i:02d}", nes_pcm_smp_base + i, INS_C352,
+        first = nes_pcm_smp_base + group * 120
+        maps = [
+            first + slot
+            for slot in range(min(120, len(nes_pcm_smps) - group * 120))
+        ]
+        # The NES PCM channel takes the same 120-slot sample map the YM2612
+        # DAC uses; note 60+slot selects the chunk and it plays at its rate.
+        # The sample path also needs useSample, like SSG PCM.
+        _write_ins_sample_map(
+            b, f"NES PCM {group + 1}", 0, maps, INS_C352, flags=0x03,
         )
     for i, smp in enumerate(huc6280_pcm_smps):
         ins_ptrs.append(len(b))
@@ -4842,8 +4849,10 @@ def write_fur(
         )
     for smp in nes_pcm_smps:
         smp_ptrs.append(len(b))
-        # 8-bit signed bodies; note 108 plays them at their write rate.
-        _write_sample_s8(b, smp.name, smp.data, smp.rate)
+        # 8-bit signed bodies; the sample engine's C-4 reference is a hair
+        # sharp, so compensate exactly like the YM2612 DAC bodies.
+        rate = max(1, int(round(smp.rate * DAC_RATE_COMPENSATION)))
+        _write_sample_s8(b, smp.name, smp.data, rate)
     for smp in huc6280_pcm_smps:
         smp_ptrs.append(len(b))
         # 8-bit bodies converted from the 5-bit DDA stream; note 108 plays
