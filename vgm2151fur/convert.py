@@ -533,8 +533,8 @@ def convert_variants(
         if shared_gain is None and gain is not None:
             shared_gain = gain
         row_ms = song.samples_per_row / 44.1
-        # Furnace rejects a module over its instrument limit.
-        over_limit = any("250-slot" in w for w in warnings)
+        # Furnace rejects a module over its one-byte instrument limit.
+        over_limit = any("0xFF instrument limit" in w for w in warnings)
         verify_failed = bool(use_verify and over_limit)
         verdict = None
         if use_verify and over_limit:

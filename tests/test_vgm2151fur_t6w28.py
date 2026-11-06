@@ -423,13 +423,15 @@ class TestT6W28CutAndVolumeRows(unittest.TestCase):
 
 
 class TestPsgShortGateCut(unittest.TestCase):
-    def test_short_noise_gate_keeps_a_cut_after_its_row(self):
+    def test_short_noise_gate_keeps_a_safe_cut(self):
         # A one-frame noise hit whose off rounds onto its own row used to
         # lose both its ED delay and the off, so the gate ran until the
-        # channel's next key-on much later. The note keeps its delay and the
-        # cut moves to the next row. 1102.5 samples/row is the measured
-        # Fantasy Zone shape: the hit starts two ticks into row 56 and ends
-        # ten ticks in, so both round onto row 56.
+        # channel's next key-on much later. Keep the cut on the note row, but
+        # only when ECxx lands after the delayed note starts (ECxx > EDxx).
+        # ECxx <= EDxx makes Furnace cut before the note sounds, the T6W28
+        # premature-cut bug. 1102.5 samples/row is the measured Fantasy Zone
+        # shape: the hit starts two ticks into row 56 and ends ten ticks in,
+        # so both round onto row 56.
         v = VgmFile(
             path=Path("synthetic.vgm"), buf=b"", version=0x161,
             total_samples=100000, loop_samples=0, loop_file_pos=None,
@@ -460,8 +462,10 @@ class TestPsgShortGateCut(unittest.TestCase):
             i for i, r in enumerate(rows)
             if r is not None and r.note not in (-1, NOTE_OFF)
         )
-        self.assertIn(0xED, {c for c, _v in rows[at].fx})
-        self.assertEqual(rows[at + 1].note, NOTE_OFF)
+        fx = dict(rows[at].fx)
+        self.assertIn(0xED, fx)
+        self.assertIn(0xEC, fx)
+        self.assertGreater(fx[0xEC], fx[0xED])
 
 
 class TestDualYm2151(unittest.TestCase):

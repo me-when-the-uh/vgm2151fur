@@ -2923,34 +2923,30 @@ def _build_patterns(song: Song, n_ch: int, pat_len_max: int, fx_cols: int,
                 if cmd == 0xED:
                     started = val
                     break
+            started_ev = note_ev.get((ev_ch, row))
             if cell.note < 0 or cell.note == NOTE_OFF:
                 cell.note = NOTE_OFF
                 if delay:
                     _add_fx(cell, 0xED, delay, fx_cols, stats)
-            elif delay > started:
-                if started:
-                    # Never put ECxx on the same line as EDxx: Furnace can
-                    # count the cut from the note start and cut the following
-                    # note. Keep the note's own delay and put the cut on the
-                    # next row. Dropping it instead let a short noise or drum
-                    # gate run until the channel's next key-on, which is up to
-                    # a whole phrase later. If that next row already starts a
-                    # note, its key-on ends this one and no cut is needed.
-                    target = row + 1
-                    ncell = grid[ev_ch].get(target) if target < total_rows else None
-                    if target < total_rows and (
-                        ncell is None or not (0 <= ncell.note < 180)
-                    ):
-                        if ncell is None:
-                            ncell = _blank_row()
-                            grid[ev_ch][target] = ncell
-                        ncell.note = NOTE_OFF
-                        _bump(stats, "cut_moved")
-                    else:
-                        _bump(stats, "off_swallowed")
+            elif (
+                started_ev is not None
+                and ev.sample > getattr(started_ev, "sample", -1)
+            ):
+                # This off belongs to the note on this row, even when both
+                # round onto the same tick (a gate shorter than one tick).
+                # The SN76489/T6W28 short-gate path needs ECxx > EDxx:
+                # EDxx greater than ECxx cut the note before it started
+                # (T6W28 premature-cut bug). Other platforms count ECxx
+                # from the delayed key-on, so the gate is ECxx ticks.
+                if getattr(started_ev, "tone_chip", 0) == 3:
+                    ec = max(started + 1, delay)
                 else:
-                    _add_fx(cell, 0xEC, delay, fx_cols, stats)
-            else:
+                    ec = max(1, delay - started)
+                _add_fx(cell, 0xEC, ec, fx_cols, stats)
+            elif delay > started:
+                # A release from the previous note that lands after this
+                # note's delayed start would cut the new note; keep the new
+                # note and let its own key-on own the row.
                 _bump(stats, "off_swallowed")
             continue
         if 0 <= cell.note < 180:
@@ -3316,16 +3312,23 @@ def _build_patterns(song: Song, n_ch: int, pat_len_max: int, fx_cols: int,
             _add_fx(cell, 0xE5, val, fx_cols, stats)
             cur_e5 = val
 
-    # ECxx and EDxx on one line interact badly in Furnace: the cut can be
-    # counted from the note start and silence the following note. Nothing is
-    # lost by dropping the cut there, because the next key-on already ends the
-    # note; this keeps every remaining EC on a line of its own.
+    # On the SN76489/T6W28 path ECxx must land after EDxx. When ECxx <= EDxx
+    # Furnace cut the note before it started (the T6W28 short-gate bug), so
+    # drop that cut and let the next key-on end the note. Other platforms
+    # count ECxx from the delayed key-on, where ECxx < EDxx is the short gate
+    # we actually want (a one-tick VSU noise hit, for example).
     for ch in range(n_ch):
-        for cell in grid[ch].values():
+        for row, cell in grid[ch].items():
             if not cell.fx:
                 continue
-            cmds = {c for c, _v in cell.fx}
-            if 0xEC in cmds and 0xED in cmds:
+            note = note_ev.get((ch, row))
+            if getattr(note, "tone_chip", 0) != 3:
+                continue
+            ed = next((v for c, v in cell.fx if c == 0xED), None)
+            if ed is None:
+                continue
+            ec = next((v for c, v in cell.fx if c == 0xEC), None)
+            if ec is not None and ec <= ed:
                 cell.fx = [(c, v) for c, v in cell.fx if c != 0xEC]
 
     # The pattern window: a whole musical phrase when the order budget

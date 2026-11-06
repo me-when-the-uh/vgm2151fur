@@ -56,13 +56,15 @@ channel is delayed, channel 0 gives up its delay to carry the jump.
 The short order before the loop ends with `D00`, which runs at tick 0. If the
 row before the boundary carries a note, the boundary moves one row later until
 that row is note-free; otherwise `D00` would jump before the note's `EDxx`
-delay and the note would never start. `ECxx` is never written on a row that
-also has `EDxx`: Furnace can count that cut from the note start, so the cut
-lands inside the following note. When a note-off and its note round onto the
-same row, the note keeps its `EDxx` and the cut moves to the next row. Dropping
-it instead let a one-frame noise or drum gate run until the channel's next
-key-on, which could be a whole phrase later. If that next row already starts a
-note, its key-on ends the previous one and no cut row is needed.
+delay and the note would never start. `ECxx` is row-relative, so it may share
+a row with `EDxx` only when the cut lands after the delayed key-on
+(`ECxx > EDxx`). When `ECxx <= EDxx` Furnace cuts before the note starts and
+the note never sounds (the T6W28 premature-cut bug), so that cut is dropped
+and the next key-on ends the note. A gate shorter than the row delay gets
+`ECxx = EDxx + 1`, the earliest safe cut. Keeping the cut on the note row is
+what stops a one-frame noise or drum gate from running until the channel's
+next key-on, which could be a whole phrase later; moving it to the next row
+fails when that row already starts the next note.
 
 `edit.py` patches both volume copies, so every reader agrees. The float
 triples are located from the payload tail, anchored on the ADIR pointers: the

@@ -1348,6 +1348,52 @@ def _plain_tone(spec: ToneIns, tone_chip: int) -> ToneIns:
     return ToneIns()
 
 
+def _tone_macro_close(
+    a: tuple[int, ...], b: tuple[int, ...], tol: int,
+) -> bool:
+    """True when two per-tick macros stay within `tol` of each other.
+
+    A shorter macro holds its last value after it runs out, so a longer one
+    may share it when its extra tail stays near that final value. This is
+    what lets envelopes that differ only in how long they hold silence merge.
+    """
+    if len(a) == len(b):
+        return all(abs(x - y) <= tol for x, y in zip(a, b))
+    if not a or not b:
+        return False
+    n = min(len(a), len(b))
+    if any(abs(a[i] - b[i]) > tol for i in range(n)):
+        return False
+    longer, shorter = (a, b) if len(a) > len(b) else (b, a)
+    return all(abs(v - shorter[-1]) <= tol for v in longer[n:])
+
+
+def _tone_close(a: ToneIns, b: ToneIns, tol: int) -> bool:
+    """Whether two tone instruments can share one macro set at `tol`.
+
+    Everything that is not the two continuous macros must be identical: a
+    different wave, noise mode, duty/envelope shape, register speed or loop
+    point is a different instrument, not a near-duplicate.
+    """
+    exact = (
+        "wave", "waves", "wave_speed", "wave_loop",
+        "pitch_speed", "pitch_loop",
+        "noise", "noise_speed", "noise_loop",
+        "vol_speed", "vol_loop",
+        "mode", "mode_speed", "mode_loop",
+        "env_shape", "env_shape_speed", "env_shape_loop",
+        "env_period", "env_period_speed", "env_period_loop",
+        "gb_soft_env", "gb_env_vol", "gb_env_dir", "gb_env_len",
+        "gb_sound_len", "gb_wave", "vsu_mod",
+    )
+    if any(getattr(a, f) != getattr(b, f) for f in exact):
+        return False
+    return (
+        _tone_macro_close(a.pitch, b.pitch, tol)
+        and _tone_macro_close(a.vol, b.vol, tol)
+    )
+
+
 def _take_tone(
     spec: ToneIns,
     mapping: dict[ToneIns, int],
@@ -1355,14 +1401,24 @@ def _take_tone(
     others: int,
     cap: int,
     tone_chip: int,
+    merge_tol: int = 0,
 ) -> tuple[int, ToneIns]:
     """Index of `spec` in `bucket`.
 
     Past the instrument cap, share a plain instrument of the same wave.
+    When the budget is tight, `merge_tol` lets a new note reuse an existing
+    instrument whose continuous macros are within that many register steps.
+    Envelope differences of one 0-15 level are inaudible next to the cost of
+    losing the macro entirely.
     """
     found = mapping.get(spec)
     if found is not None:
         return found, spec
+    if merge_tol > 0:
+        for i, existing in enumerate(bucket):
+            if _tone_close(spec, existing, merge_tol):
+                mapping[spec] = i
+                return i, existing
     if len(bucket) + others < cap:
         idx = len(bucket)
         mapping[spec] = idx
@@ -1408,14 +1464,18 @@ def _bind_tone_instruments(
     vsu_clock: int,
     hz: float,
     total_samples: int,
-) -> None:
+    merge_tol: int = 0,
+) -> int:
     """Fill `scc_ins` / `ay_ins` and point each tone note at one.
 
     Pitch, wave and AY register motion that changes during a note become
     macros. AY notes bind first. The stored indices follow the SCC list.
+    `merge_tol` > 0 lets near-identical continuous macros share an
+    instrument when the module is close to the instrument budget. Returns
+    the number of notes that reused an existing instrument this way.
     """
     if not any(e.tone_chip for e in events):
-        return
+        return 0
     tick_samples = VGM_RATE / hz if hz else VGM_RATE / 60.0
     track_end = total_samples or max((e.sample for e in events), default=0)
     scc_map: dict[ToneIns, int] = {}
@@ -1425,7 +1485,7 @@ def _bind_tone_instruments(
     huc6280_map: dict[ToneIns, int] = {}
     gb_map: dict[ToneIns, int] = {}
     vsu_map: dict[ToneIns, int] = {}
-    ins_cap = max(1, 250 - tone_ins_base)
+    ins_cap = max(1, INS_TARGET - tone_ins_base)
     # GB and VSU bind last. Reserve a share so a large SCC/AY/PCE list cannot
     # spend every slot before them; the surplus collapses to plain
     # per-wave/per-env instruments, the documented "fall back to columns"
@@ -1438,6 +1498,17 @@ def _bind_tone_instruments(
         families = len({e.tone_chip for e in events if e.on and e.tone_chip})
         early_cap = max(1, ins_cap - max(8, ins_cap // max(2, families)))
     bound: list[tuple[NoteEvent, int]] = []
+    merged = 0
+
+    def take(spec, mapping, bucket, others, cap, chip):
+        nonlocal merged
+        idx, kept = _take_tone(
+            spec, mapping, bucket, others, cap, chip, merge_tol,
+        )
+        if merge_tol > 0 and kept != spec:
+            merged += 1
+        return idx, kept
+
     tone_order = [e for e in events if e.on and e.tone_chip == 2]
     tone_order += [e for e in events if e.on and e.tone_chip == 1]
     tone_order += [e for e in events if e.on and e.tone_chip == 3]
@@ -1658,31 +1729,31 @@ def _bind_tone_instruments(
             vsu_mod=int(getattr(e, "tone_mod", 0)),
         )
         if e.tone_chip == 1:
-            idx, kept = _take_tone(spec, scc_map, scc_ins, len(ay_ins), early_cap, 1)
+            idx, kept = take(spec, scc_map, scc_ins, len(ay_ins), early_cap, 1)
         elif e.tone_chip == 3:
-            idx, kept = _take_tone(
+            idx, kept = take(
                 spec, psg_map, psg_ins, len(scc_ins) + len(ay_ins), early_cap, 3,
             )
         elif e.tone_chip == 4:
-            idx, kept = _take_tone(
+            idx, kept = take(
                 spec, nes_map, nes_ins,
                 len(scc_ins) + len(ay_ins) + len(psg_ins), early_cap, 4,
             )
         elif e.tone_chip == 5:
-            idx, kept = _take_tone(
+            idx, kept = take(
                 spec, huc6280_map, huc6280_ins,
                 len(scc_ins) + len(ay_ins) + len(psg_ins) + len(nes_ins),
                 early_cap, 5,
             )
         elif e.tone_chip == 6:
-            idx, kept = _take_tone(
+            idx, kept = take(
                 spec, gb_map, gb_ins,
                 len(scc_ins) + len(ay_ins) + len(psg_ins) + len(nes_ins)
                 + len(huc6280_ins),
                 ins_cap, 6,
             )
         elif e.tone_chip == 7:
-            idx, kept = _take_tone(
+            idx, kept = take(
                 spec, vsu_map, vsu_ins,
                 len(scc_ins) + len(ay_ins) + len(psg_ins) + len(nes_ins)
                 + len(huc6280_ins) + len(gb_ins),
@@ -1690,7 +1761,7 @@ def _bind_tone_instruments(
             )
         else:
             # AY runs first, so the SCC list is still empty and `others` is 0.
-            idx, kept = _take_tone(spec, ay_map, ay_ins, 0, early_cap, 2)
+            idx, kept = take(spec, ay_map, ay_ins, 0, early_cap, 2)
         bound.append((e, idx))
         if (
             e.tone_chip in (3, 7)
@@ -1776,6 +1847,7 @@ def _bind_tone_instruments(
             )
         else:
             event.ins = tone_ins_base + n_scc + idx
+    return merged
 
 
 def _tone_instrument_demand(
@@ -1816,6 +1888,13 @@ def _tone_instrument_demand(
 # that can be declared. 256 wraps to 0 and the reader then never consumes the
 # data block, reporting "invalid macro code" on the bytes after it.
 MACRO_MAX = 255
+
+# Instrument IDs are one byte, so 0xFF is the highest addressable instrument.
+# Furnace itself allows 256 entries, but a 256th would have no valid ID in a
+# pattern cell. The allocator targets 250 to keep a little headroom for the
+# passes that append copies; INS_HARD_LIMIT is the absolute ceiling.
+INS_TARGET = 250
+INS_HARD_LIMIT = 0xFF
 
 
 def _tick_values(
@@ -2526,6 +2605,7 @@ def _bind_opll_macros(
                 phase_loop=phase_loop if phase_loop is not None else 255,
                 uses=1,
                 name=f"{base.name}+T",
+                base_ins=ev.ins,
             )
             patches[key] = copy
             patch_order.append(key)
@@ -2708,6 +2788,7 @@ def _bind_fm_pitch(
                     pitch_loop=loop,
                     uses=1,
                     name=f"{base.name}+P",
+                    base_ins=e.ins,
                 )
                 patches[key] = copy
                 patch_order.append(key)
@@ -2796,7 +2877,7 @@ def _bind_op_macros(
                     fallbacks += 1
                     continue
                 copy = replace(base, op_tl_macro=tuple(entries), uses=1,
-                               name=f"{base.name}+lvl")
+                               name=f"{base.name}+lvl", base_ins=e.ins)
                 patches[key] = copy
                 patch_order.append(key)
                 idx = len(patch_order) - 1
@@ -2926,7 +3007,7 @@ def _bind_pms_macros(
             copy = replace(
                 base, fms_macro=pms_vals,
                 ams_macro=ams_vals, macro_speed=speed,
-                uses=1, name=f"{base.name}+pms",
+                uses=1, name=f"{base.name}+pms", base_ins=e.ins,
             )
             patches[key] = copy
             patch_order.append(key)
@@ -2944,11 +3025,47 @@ def _rebase_non_fm_ins(
 ) -> None:
     """Move sample/tone instrument indices after FM instruments are appended."""
     delta = new_count - old_count
-    if delta <= 0:
+    if delta == 0:
         return
     for e in events:
         if (e.dac or e.pcm or e.tone_chip) and e.ins >= old_count:
             e.ins += delta
+
+
+def _trim_fm_macro_copies(
+    events: list[NoteEvent], fm_patches: list[FMPatch], limit: int,
+) -> int:
+    """Fold trailing FM macro copies back onto their base voices.
+
+    The allocation passes reserve their slots, but a future pass or a mixed
+    log can still leave the final list over the one-byte instrument range.
+    Base voices are the timbre and stay; only copies created by a macro pass
+    (`base_ins >= 0`) are dropped, and the notes that used them return to the
+    voice they were copied from. Returns how many copies were removed.
+    """
+    removed: dict[int, int] = {}
+    while len(fm_patches) > max(1, limit):
+        idx = len(fm_patches) - 1
+        patch = fm_patches[idx]
+        base = patch.base_ins
+        if base < 0 or base >= idx:
+            break       # a base voice or a malformed copy: stop, do not lose timbre
+        removed[idx] = base
+        fm_patches.pop()
+    if not removed:
+        return 0
+    # A copy's base can itself be a copy that was removed later in the loop.
+    for idx in list(removed):
+        base = removed[idx]
+        seen: set[int] = set()
+        while base in removed and base not in seen:
+            seen.add(base)
+            base = removed[base]
+        removed[idx] = base
+    for e in events:
+        if e.ins in removed:
+            e.ins = removed[e.ins]
+    return len(removed)
 
 
 def _apply_opn_carrier_octave(
@@ -2988,7 +3105,7 @@ def _apply_opn_carrier_octave(
             # The same instrument also plays an Ext channel-3 operator
             # column. Give the relabelled channels their own copy. The
             # operator columns keep the unshifted patch.
-            patch = replace(patch, name=f"{patch.name} L")
+            patch = replace(patch, name=f"{patch.name} L", base_ins=ins)
             ins = len(fm_patches)
             fm_patches.append(patch)
             for e in notes:
@@ -5673,6 +5790,15 @@ def analyze(
         if ym2203_ext and ext_tl_notes:
             _bind_ext_levels(
                 events, patches, patch_order, ext_tl_notes, ext_tl_floors)
+
+        # A YM2203 note can walk its carriers louder than the level captured
+        # at key-on. The volume column can only attenuate, so open each such
+        # instrument to the loudest level it is ever asked for and hang every
+        # note off the column, exactly as the OPM path does. Without this the
+        # sustain stayed at the key-on TL and sounded much quieter than the
+        # source (Eternal Dream's first FM note steps $48/$4C from 28/32 to
+        # 1E/28 a few hundred samples in).
+        _bind_opm_levels(events, patches, patch_order)
 
         # A 0x00 that the driver writes immediately before the next key-on is
         # a retrigger, not a rest: keeping the note-off would cut the new
@@ -8912,13 +9038,14 @@ def analyze(
             psg_clock, nes_clock, huc6280_clock, gb_clock, vsu_clock,
             hz, vgm.total_samples,
         )
+    tone_demand_raw = tone_demand
     free_slots = max(
-        0, 250 - foreign_ins - len(patch_order) - tone_groups,
+        0, INS_TARGET - foreign_ins - len(patch_order) - tone_groups,
     )
     tone_demand = min(tone_demand, max(0, free_slots - 32))
     tone_reserve = tone_groups + tone_demand
     fm_ins_cap = max(
-        len(patch_order), 250 - foreign_ins - tone_reserve,
+        len(patch_order), INS_TARGET - foreign_ins - tone_reserve,
     )
     fm_before_pitch = len(patch_order)
     opll_macro_copies = 0
@@ -9003,8 +9130,15 @@ def analyze(
 
     # Tone-chip instruments, after the row rate is final. A macro advances
     # once per tick, so building it before condense (or before the musical
-    # row is chosen) plays the driver's trajectory at the wrong speed.
-    _bind_tone_instruments(
+    # row is chosen) plays the driver's trajectory at the wrong speed. When
+    # the raw demand would overrun the budget, let near-identical continuous
+    # macros share an instrument instead of falling all the way back to a
+    # plain voice. This is what keeps a large AY-heavy log inside the limit
+    # without losing every decay.
+    tone_merge_tol = (
+        1 if tone_ins_base + tone_demand_raw > INS_TARGET else 0
+    )
+    tone_merged = _bind_tone_instruments(
         events, scc_ins, ay_ins, psg_ins, nes_ins, huc6280_ins, gb_ins,
         vsu_ins,
         tone_ins_base,
@@ -9016,7 +9150,13 @@ def analyze(
         gb_clock,
         vsu_clock,
         hz, vgm.total_samples,
+        merge_tol=tone_merge_tol,
     )
+    if tone_merged:
+        warnings.append(
+            f"instrument limit: {tone_merged} tone note(s) shared a "
+            "near-identical instrument macro (1-step tolerance)"
+        )
     # SSG PCM instruments sit immediately before the tone list.
     for ev, idx in ssg_pcm_events:
         ev.ins = ssg_pcm_ins_base + idx // 120
@@ -9112,8 +9252,8 @@ def analyze(
     )
     _rebase_non_fm_ins(events, fm_before_octave, len(fm_list))
 
-    n_total_ins = (
-        len(fm_list) + n_dac_ins
+    non_fm_ins = (
+        n_dac_ins
         + (len(audible) if pcm else 0) + len(oki_samples) + n_adpcm_ins
         + len(spcm_audible) + len(c140_audible) + len(c352_audible)
         + len(k053260_audible) + n_ym2610_a_ins + n_ym2610_b_ins
@@ -9122,9 +9262,23 @@ def analyze(
         + n_ym2608_rhythm_ins + n_ym2608_b_ins
         + n_ssg_pcm + len(ymz_audible)
     )
-    if n_total_ins > 250:
+    # Absolute ceiling. The per-family caps target INS_TARGET, but a mixed
+    # log or a late copy pass can still land above the final hard limit.
+    # Fold only pass-created FM copies back onto their base voices; base
+    # voices carry the timbre and are never dropped here.
+    old_fm_count = len(fm_list)
+    fm_limit = max(1, INS_HARD_LIMIT - non_fm_ins)
+    dropped_copies = _trim_fm_macro_copies(events, fm_list, fm_limit)
+    if dropped_copies:
+        _rebase_non_fm_ins(events, old_fm_count, len(fm_list))
         warnings.append(
-            f"{n_total_ins} instruments exceed Furnace's 250-slot limit; "
+            f"instrument limit: folded {dropped_copies} FM macro copy/copies "
+            f"back onto their base voices to stay within {INS_HARD_LIMIT} slots"
+        )
+    n_total_ins = len(fm_list) + non_fm_ins
+    if n_total_ins > INS_HARD_LIMIT:
+        warnings.append(
+            f"{n_total_ins} instruments exceed the 0xFF instrument limit; "
             "the extra instruments cannot be addressed"
         )
     n_total_smp = (

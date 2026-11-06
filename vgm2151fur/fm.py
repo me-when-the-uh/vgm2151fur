@@ -215,6 +215,11 @@ class FMPatch:
     # scripted modulator level has no other path. Furnace reads these from
     # an O1..O4 feature (macro code 6, DIV_MACRO_OP_TL).
     op_tl_macro: tuple[tuple[int, tuple[int, ...], int], ...] = ()
+    # For an instrument copy made by a macro pass: the instrument this one
+    # was copied from, or -1 for a base voice. The final budget trim folds a
+    # copy back onto its base when the module would otherwise exceed the
+    # one-byte instrument index range.
+    base_ins: int = -1
 
     def identity(self) -> tuple:
         """Cluster key: full timbre including carrier TLs.

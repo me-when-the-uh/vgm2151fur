@@ -526,6 +526,41 @@ class TestYm2203Analyze(unittest.TestCase):
         self.assertGreater(delay, 0, "pick a step inside a row for this test")
         self.assertIn((0xED, delay), fx)
 
+    def test_rising_carrier_level_opens_the_instrument(self):
+        # The driver keys the voice with quiet carriers and then walks them
+        # louder while the note holds. The volume column can only attenuate,
+        # so the instrument must be opened to the loudest level and the note
+        # hung beneath it; otherwise the sustain stays at the key-on TL and
+        # sounds far too quiet (Eternal Dream's first FM note).
+        ws = _fm_note(4, 1204, off=60000)
+        ws = [w for w in ws if not (w.sample == 100 and w.reg == 0xB0)]
+        at = next(
+            i for i, w in enumerate(ws)
+            if w.sample == 100 and w.reg == 0x28
+        )
+        # alg 4: op3/op4 are the carriers. Park both at TL 0x28.
+        ws[at:at] = [
+            ChipWrite(100, "ym2203", 0, 0xB0, 0x34),
+            ChipWrite(100, "ym2203", 0, 0x48, 0x28),
+            ChipWrite(100, "ym2203", 0, 0x4C, 0x28),
+        ]
+        ws.append(ChipWrite(30000, "ym2203", 0, 0x48, 0x14))
+        song = analyze(_vgm(ws, ym2203_clock=CLOCK), speed=2)
+        ev = next(e for e in song.events if e.on)
+        patch = song.fm_patches[ev.ins]
+        self.assertEqual(patch.alg, 4)
+        self.assertEqual(
+            [patch.ops[i].tl & 0x7F for i in (2, 3)], [0x14, 0x14]
+        )
+        self.assertEqual(ev.vol_tl_base, 0x14)
+        self.assertEqual(ev.vol, 107)   # 127 - (0x28 - 0x14)
+        self.assertIn((30000, 0x14), ev.tl_pts)
+        mod = parse_fur(write_fur(song, include_pcm=False, include_fm=True))
+        rows = mod.patterns[(0, mod.orders[0][0])]
+        vols = [r.vol for r in rows if r is not None and r.vol != -1]
+        self.assertIn(107, vols)
+        self.assertIn(127, vols)
+
     def test_long_pitch_sweep_becomes_pitch_macro(self):
         ws = _fm_note(4, 1204, off=60000)
         for i, fnum in enumerate((1210, 1260) * 6):

@@ -223,6 +223,35 @@ class TestVsuModule(unittest.TestCase):
         self.assertGreater(fx[0x11], 0)  # noise tap
         self.assertGreater(fx[0x08], 0)  # pan
 
+    def test_short_noise_gate_keeps_a_safe_cut_beside_its_delay(self):
+        # A noise hit shorter than a pattern row must keep its cut. The VSU
+        # counts ECxx from the delayed key-on, so a short gate is ECxx much
+        # smaller than the note's EDxx. (The SN76489/T6W28 path is different
+        # and requires ECxx > EDxx, covered in test_vgm2151fur_t6w28.)
+        writes = _wave(0)
+        writes += _note(
+            66330, 5, fnum=0x700, vol=15, pan=0x88, ev1=0, off=67065,
+        )
+        song = analyze(_vgm(writes), speed=12, tick_samples=44100 / 480.0)
+        mod = parse_fur(write_fur(song, include_pcm=True))
+        self.assertEqual(song.vsu_ids, [0])
+        rows = at = None
+        for oi in mod.orders[5]:
+            rows = mod.patterns[(5, oi)]
+            at = next(
+                (i for i, row in enumerate(rows)
+                 if row is not None and 0 <= row.note < 180),
+                None,
+            )
+            if at is not None:
+                break
+        self.assertIsNotNone(at, "the noise note vanished")
+        fx = dict(rows[at].fx)
+        self.assertIn(0xED, fx)
+        self.assertIn(0xEC, fx)
+        self.assertGreaterEqual(fx[0xEC], 1)
+        self.assertLess(fx[0xEC], fx[0xED])
+
     def test_static_module_layout_and_master_volume(self):
         writes = _wave(0)
         writes += _note(1000, 0, vol=15, off=5000)
