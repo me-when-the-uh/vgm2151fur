@@ -2959,7 +2959,7 @@ def _build_patterns(song: Song, n_ch: int, pat_len_max: int, fx_cols: int,
                 # case: ED03 EC05 with the next note at the same tick).
                 speed_now = max(1, song.speed)
                 nxt = next(
-                    (n for n in next_on.get(ev_ch, ()) if n[0] > ev.sample),
+                    (n for n in next_on.get(ev_ch, ()) if n[0] >= ev.sample),
                     None,
                 )
                 if nxt is not None:
