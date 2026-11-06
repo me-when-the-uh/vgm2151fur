@@ -252,25 +252,28 @@ class TestHuc6280Tones(unittest.TestCase):
         note = [e for e in song.events if e.on and e.ch >= 8][0]
         attack, _pan = pce_effective(31, 0xCC)
         decay, _dpan = pce_effective(31, 0x99)
-        self.assertEqual(note.vol, attack)
-        self.assertTrue(note.vol_pts)
-        self.assertEqual(note.vol_pts[0][0], 1000)
-        self.assertEqual(note.vol_pts[0][1], decay)
+        # The envelope is now a tick-rate instrument macro; the column is
+        # its full-scale reference.
+        macro = next(it.vol for it in song.huc6280_ins if it.vol)
+        self.assertEqual(note.vol, 31)
+        self.assertFalse(note.vol_pts)
+        self.assertEqual(macro[0], attack)
+        self.assertIn(decay, macro)
 
-    def test_balance_envelope_kept_as_row_steps(self):
+    def test_balance_envelope_becomes_tick_macro(self):
         # LOX2-style drivers fade with the balance register while the control
-        # volume stays at 31.  Those steps must reach the pattern as 08xy,
-        # not be folded away by an empty volume macro.
+        # volume stays at 31. The envelope goes into the instrument's volume
+        # macro so it advances at tick rate; the pan ratio stays on the row.
         writes = _load_wave(_square(), sample=0)
         writes += [_w(5000, 0x00, 0), _w(5000, 0x05, 0x87)]
         song = analyze(_vgm(writes, huc6280_clock=3579545))
         note = [e for e in song.events if e.on and e.ch >= 8][0]
-        self.assertTrue(note.vol_pts)
-        # The balance 0x87 attenuates to an effective level of 16/31, carried
-        # on the volume column; the normalized L/R goes on 08xy.
-        self.assertEqual(note.vol_pts[-1][1], 16)
-        self.assertEqual(note.vol_pts[-1][2], 0xFE)
-        # And the module still writes (it would fail if the row steps were
+        macro = next(it.vol for it in song.huc6280_ins if it.vol)
+        self.assertEqual(note.vol, 31)
+        self.assertFalse(note.vol_pts)
+        # The balance 0x87 attenuates to an effective level of 16/31.
+        self.assertIn(16, macro)
+        # And the module still writes (it would fail if the envelope were
         # dropped and the empty macro left the note without a level).
         data = write_fur(song, include_pcm=True, include_fm=False)
         self.assertEqual(parse_fur(data).chips, [CHIP_PCE])

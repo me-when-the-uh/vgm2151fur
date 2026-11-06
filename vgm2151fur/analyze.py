@@ -1624,11 +1624,12 @@ def _bind_tone_instruments(
         vol_vals: tuple[int, ...] = ()
         vol_speed, vol_loop = 1, 255
         series: list[int] = []
-        if e.vol_pts and e.tone_chip not in (3, 5) and not (
+        if e.vol_pts and e.tone_chip not in (3,) and not (
                 e.tone_chip == 6 and e.tone_gb_wave):
             # PSG volume is the raw 4-bit register and the SMS platform reads
             # it straight from the column; a std.vol macro would scale it.
-            # The PCE likewise keeps its balance envelope as 08xy row steps.
+            # The PCE envelope benefits from the tick-rate macro: its balance
+            # writes can move several times inside one pattern row.
             pts = [(e.sample, max(0, e.vol))] + [
                 (t, max(0, v)) for t, v, _ in e.vol_pts
             ]
@@ -1793,9 +1794,16 @@ def _bind_tone_instruments(
             # would double it.
             e.sweep = ()
         if e.tone_chip == 5:
-            # The PCE column is the control volume; `vol_pts` carry the
-            # balance register and any control-volume steps as row effects.
-            e.vol = column_vol
+            # When the envelope became an instrument macro, the column is
+            # the macro's full-scale reference (31). Otherwise the PCE column
+            # is the control volume and `vol_pts` carry the balance/volume
+            # steps as row effects.
+            if kept.vol:
+                e.vol_pts = ()
+                e.vol = 31
+                e.vol_slide = 0
+            else:
+                e.vol = column_vol
         elif e.tone_chip == 3 or (e.tone_chip == 6 and e.tone_gb_wave):
             # The SMS column is the raw 4-bit register; keep vol_pts as
             # pattern steps rather than folding them into a volume macro.
@@ -8607,6 +8615,22 @@ def analyze(
                     tone_chip=5,
                 ))
                 huc6280_count += 1
+        # The PCE effective level is control volume + balance. Once the volume
+        # envelope moves into the instrument's tick-rate macro, the balance's
+        # left/right ratio is the only part left for the pattern. Split it out
+        # as 08xy points so the macro can be the register level.
+        for ev in events:
+            if ev.tone_chip != 5 or not ev.vol_pts:
+                continue
+            last_pan = ev.pan
+            pts: list[tuple[int, int, int | None]] = []
+            for t, value, pan in ev.vol_pts:
+                if pan is not None and pan != last_pan:
+                    channel_fx.append((t, ev.ch, 0x08, pan & 0xFF))
+                    last_pan = pan
+                pts.append((t, value, None))
+            ev.vol_pts = tuple(pts)
+
         for off in huc_offs:
             base = huc_at.get(off.chip_id)
             if base is None:
