@@ -203,11 +203,16 @@ def collect_sn76489(
                 # The high byte and the gate share one sample: the final
                 # period is the note.
                 hit.period = period
-            elif _jump_st(hit.period, period) > PSG_NOTE_JUMP_ST:
-                close(voice, t, emit_off=False)
-                open_hit(voice, t)
-                return
             else:
+                # Compare with the pitch the voice is on now, not the note's
+                # original period: a slow glide is many sub-semitone steps,
+                # and comparing against the start accumulated the drift and
+                # split it into a new note every semitone.
+                last = hit.pitch_pts[-1][1] if hit.pitch_pts else hit.period
+                if _jump_st(last, period) > PSG_NOTE_JUMP_ST:
+                    close(voice, t, emit_off=False)
+                    open_hit(voice, t)
+                    return
                 if not hit.pitch_pts or hit.pitch_pts[-1][1] != period:
                     hit.pitch_pts.append((t, period))
         if hit.vol != 15 - vol[voice]:

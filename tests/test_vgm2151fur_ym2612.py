@@ -262,6 +262,23 @@ class TestGenesisPsgDac(unittest.TestCase):
             self.assertEqual(samples[0].data[1], 0x10)
             self.assertEqual(plays[0].pan, expected)
 
+    def test_slow_glide_stays_one_note(self):
+        # Each period step is below a semitone, but the glide as a whole
+        # passes one. Comparing against the note's original period split it
+        # into a new note every semitone; compare with the current pitch.
+        ws = [ChipWrite(0, "sn76489", 0, 0, 0x96)]  # ch0 attenuation 6
+        t = 100
+        for period in (200, 202, 204, 206, 208, 210, 212, 214):
+            ws.append(ChipWrite(t, "sn76489", 0, 0, 0x80 | (period & 0x0F)))
+            ws.append(ChipWrite(t, "sn76489", 0, 0, (period >> 4) & 0x3F))
+            t += 100
+        ws.append(ChipWrite(t, "sn76489", 0, 0, 0x9F))
+        hits, _offs, _warn = collect_sn76489(
+            _vgm(ws, sn76489_clock=3579545),
+        )
+        self.assertEqual(len(hits), 1)
+        self.assertGreaterEqual(len(hits[0].pitch_pts), 6)
+
     def test_collect_psg_tone_noise_and_pitch(self):
         ws = [
             ChipWrite(0, "ym2612", 0, 0x22, 0),

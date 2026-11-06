@@ -1555,6 +1555,30 @@ def _bind_tone_instruments(
             # AY runs first, so the SCC list is still empty and `others` is 0.
             idx, kept = _take_tone(spec, ay_map, ay_ins, 0, early_cap, 2)
         bound.append((e, idx))
+        if (
+            e.tone_chip == 3
+            and not e.tone_noise
+            and kept != spec
+            and not kept.pitch
+            and e.tone_pitch_pts
+        ):
+            # The PSG instrument list is full, so this note fell back to the
+            # empty PSG instrument. Put the period trajectory on E5 row steps
+            # instead of silently dropping it.
+            steps = tuple(
+                (
+                    t,
+                    int(round(
+                        tbl.offset_for(
+                            e.note, per + e.tone_period_offset,
+                        ) - base_off
+                    )),
+                )
+                for t, per in e.tone_pitch_pts
+            )
+            steps = tuple((t, v) for t, v in steps if v)
+            if steps:
+                e.pitch_steps = steps
         if e.tone_chip == 4 and kept.pitch:
             # The instrument now carries the pitch trajectory; the row ramp
             # would double it.
