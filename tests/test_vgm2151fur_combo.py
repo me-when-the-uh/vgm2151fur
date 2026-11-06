@@ -285,6 +285,11 @@ class TestStreamCollection(unittest.TestCase):
 
     BANK = bytes(((i * 7) % 253) + 1 for i in range(4096))
 
+    @staticmethod
+    def _signed(data: bytes) -> bytes:
+        """The type-0x00 bank is unsigned; a module sample is signed."""
+        return bytes((x - 0x80) & 0xFF for x in data)
+
     def _file(self, plays: list[DacStreamPlay], *, total: int = 20000):
         v = _vgm(
             [ChipWrite(0, "ym2612", 0, 0x2B, 0x80)],
@@ -299,7 +304,10 @@ class TestStreamCollection(unittest.TestCase):
         v = self._file([_stream(0, 0, 128), _stream(9000, 256, 64)])
         samples, plays, warn, stats = collect_dac(v, slices=True)
         self.assertFalse(warn)
-        self.assertEqual([s.data for s in samples], [bank[:128], bank[256:320]])
+        self.assertEqual(
+            [s.data for s in samples],
+            [self._signed(bank[:128]), self._signed(bank[256:320])],
+        )
         self.assertEqual([p.onset for p in plays], [0, 9000])
         self.assertEqual(stats["dac_stream_plays"], 2)
 
@@ -308,7 +316,9 @@ class TestStreamCollection(unittest.TestCase):
         samples, _plays, _warn, stats = collect_dac(v, slices=False)
         self.assertGreater(len(samples), 1)
         self.assertLessEqual(len(samples), DAC_RELEASE_SAMPLES)
-        self.assertEqual(b"".join(s.data for s in samples), self.BANK)
+        self.assertEqual(
+            b"".join(s.data for s in samples), self._signed(self.BANK),
+        )
         self.assertEqual(stats["dac_stream_chunks"], len(samples))
 
     def test_a_long_stream_spreads_the_budget_over_its_length(self):
@@ -346,6 +356,20 @@ class TestStreamCollection(unittest.TestCase):
         _samples, _plays, _warn, stats = collect_dac(v)
         self.assertEqual(stats["dac_stream_second_chip"], 1)
 
+    def test_unsigned_bank_becomes_signed_pcm(self):
+        # Type 0x00 stores 0x80-centred bytes; a module sample is signed.
+        bank = bytes([0x00, 0x40, 0x80, 0xC0, 0xFF])
+        v = _vgm(
+            [ChipWrite(0, "ym2612", 0, 0x2B, 0x80)],
+            ym2612_clock=7670453, dac_data=bytearray(bank),
+            total_samples=20000,
+        )
+        v.dac_stream_plays = [_stream(0, 0, len(bank))]
+        samples, _plays, _warn, _stats = collect_dac(v, slices=True)
+        self.assertEqual(
+            samples[0].data, bytes([0x80, 0xC0, 0x00, 0x40, 0x7F]),
+        )
+
     def test_milliseconds_count_the_rate(self):
         v = self._file([_stream(0, 0, 100, mode=2)])
         samples, _plays, _warn, _stats = collect_dac(v, slices=True)
@@ -354,12 +378,12 @@ class TestStreamCollection(unittest.TestCase):
     def test_a_step_reads_every_nth_byte(self):
         v = self._file([_stream(0, 0, 64, step=2)])
         samples, _plays, _warn, _stats = collect_dac(v, slices=True)
-        self.assertEqual(samples[0].data, self.BANK[:64:2])
+        self.assertEqual(samples[0].data, self._signed(self.BANK[:64:2]))
 
     def test_reverse_walks_the_range_backwards(self):
         v = self._file([_stream(0, 0, 64, mode=0x11)])
         samples, _plays, _warn, _stats = collect_dac(v, slices=True)
-        self.assertEqual(samples[0].data, self.BANK[:64][::-1])
+        self.assertEqual(samples[0].data, self._signed(self.BANK[:64][::-1]))
 
 
 # ------------------------------------------------- who gets a system at all
