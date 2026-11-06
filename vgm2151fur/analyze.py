@@ -3401,6 +3401,14 @@ def _collect_opl(
     # from a hard pan to centre must get an explicit 0xFF; omitting it leaves
     # the old pan in force for every later row.
     pan_last: dict[tuple[int, int], int] = {}
+    # Row effects that changed a live operator field. Furnace only reloads an
+    # instrument when the instrument changes, so a reuse of the same voice
+    # would inherit the previous note's MULT/feedback/waveform. Keep the
+    # instrument's own value for each changed field and write it back on the
+    # next key-on of that same instrument.
+    pending_reset: dict[
+        tuple[int, int], tuple[int, dict[tuple[int, int], int]]
+    ] = {}
     pitch_pts: dict[tuple[int, int], list[tuple[int, int, int]]] = {}
     pitch_base: dict[tuple[int, int], tuple[int, int]] = {}
     # Mid-note pitch is compared with what the register holds *now*, not with the
@@ -3424,7 +3432,7 @@ def _collect_opl(
     stats = {
         "notes": 0, "drums": 0, "four_op": 0,
         "mode_midnote": 0, "lost_melodic": 0, "repeat_keyon": 0,
-        "midnote_ops": 0, "ins_reused": 0,
+        "ins_reused": 0,
     }
     warnings: list[str] = []
 
@@ -3456,6 +3464,63 @@ def _collect_opl(
         for i in carriers:
             ops[i] = replace(ops[i], tl=(ops[i].tl & 0x3F) - floor)
         return replace(patch, ops=tuple(ops)), 63 - min(floor, 63)  # type: ignore[arg-type]
+
+    def opl_base_effect(patch: FMPatch, cmd: int, e: int) -> int | None:
+        """The instrument's value for a live operator effect, encoded for the row.
+
+        `e` is the effect operator index (0-3). A four-operator voice maps it
+        through the platform's orderedOpsL; a two-operator voice uses it
+        directly. Returns None for a field the patch does not have.
+        """
+        if cmd == 0x11:
+            return patch.fb & 7
+        op = ORDERED_OPS_L[e] if patch.four else e
+        if not (0 <= op < len(patch.ops)):
+            return None
+        o = patch.ops[op]
+        if cmd == 0x16:
+            return ((e + 1) << 4) | (o.mult & 15)
+        if 0x1A <= cmd <= 0x1D:
+            return o.ar & 15
+        if 0x57 <= cmd <= 0x5A:
+            return o.dr & 15
+        if cmd == 0x50:
+            return ((e + 1) << 4) | (o.am & 1)
+        if cmd == 0x51:
+            return ((e + 1) << 4) | (o.sl & 15)
+        if cmd == 0x52:
+            return ((e + 1) << 4) | (o.rr & 15)
+        if cmd == 0x53:
+            return ((e + 1) << 4) | (o.vib & 1)
+        if cmd == 0x55:
+            return ((e + 1) << 4) | (o.sus & 1)
+        if cmd == 0x5B:
+            return ((e + 1) << 4) | (o.ksr & 1)
+        if cmd == 0x2A:
+            return ((e + 1) << 4) | (o.ws & 7)
+        return None
+
+    def live_op_fx(
+        key: tuple[int, int], ch: int, cmd: int, e: int,
+        value: int, sample: int,
+    ) -> None:
+        """Place one live operator effect and remember its base value."""
+        channel_fx.append((sample, ch, cmd, value))
+        idx = held.get(key)
+        if idx is None:
+            return
+        old_ins = events[idx].ins
+        if not (0 <= old_ins < len(patch_order)):
+            return
+        patch = patches.get(patch_order[old_ins])
+        if patch is None:
+            return
+        base = opl_base_effect(patch, cmd, e)
+        if base is None:
+            return
+        if key not in pending_reset:
+            pending_reset[key] = (old_ins, {})
+        pending_reset[key][1][(cmd, e)] = base
 
     # A Furnace module stores instrument indices as one byte, so 256 is the
     # hard ceiling. Leave room for the sample instruments the writer adds.
@@ -3615,6 +3680,17 @@ def _collect_opl(
         block, fnum = st.frequency(fch)
         note, e5 = opl_note_for(block, fnum, clock, opl3, freq_base)
         ins, vol = intern(cid, fch)
+        # A reused instrument is not reloaded by the platform. Restore the
+        # fields that the previous note changed with row effects, so this
+        # note starts on the instrument's own MULT/feedback/AR/... values.
+        resets = pending_reset.pop(key, None)
+        if resets is not None:
+            old_ins, fields = resets
+            if old_ins == ins:
+                for (cmd, e), base_val in fields.items():
+                    channel_fx.append((
+                        sample, base[cid] + fch, cmd, base_val,
+                    ))
         ev_pan = 0 if kit else st.pan_byte(fch)
         events.append(NoteEvent(
             sample=sample,
@@ -3808,6 +3884,16 @@ def _collect_opl(
                 key = (cid, fch)
                 if key not in held or (drums and fch > st.melodic):
                     continue
+                # Feedback is part of the timbre and a tracker can raise it
+                # mid-note. Keep the change as 11xx; the connection bit has no
+                # OPL row effect in Furnace and stays with the instrument.
+                old_fb = (prev_val >> 1) & 7
+                new_fb = (val >> 1) & 7
+                if new_fb != old_fb:
+                    live_op_fx(
+                        (cid, fch), base[cid] + fch, 0x11, 0,
+                        new_fb, w.sample,
+                    )
                 new_pan = st.pan_byte(fch)
                 if new_pan and new_pan != pan_last.get(key):
                     channel_fx.append((
@@ -3831,23 +3917,88 @@ def _collect_opl(
         if (r - slot) in (0x20, 0x40, 0x60, 0x80, 0xE0) and slot <= 0x15:
             # Operator page. A slot's registers share their low five bits:
             # 0x23, 0x43 and 0xE3 are one operator's AM/multiplier, level and
-            # waveform byte. Only the level can be followed by the volume
-            # column; an envelope or waveform write belongs to the instrument,
-            # and the next key-on takes it.
+            # waveform byte. The level rides the volume column (or an
+            # operator macro); every other field is a live voicing change and
+            # becomes a row effect, with the instrument's own value restored
+            # when the same voice starts the next note.
             owners = op_owners[cid].get((port << 8) | slot, ())
             if not owners:
                 continue
             if (r - slot) != 0x40:
                 if prev_val == val:
                     continue        # the driver re-wrote the same byte; no change
+                page = r - slot
                 for fch in owners:
-                    if (cid, fch) in held:
-                        # An envelope or waveform move belongs to the instrument,
-                        # and Furnace rebuilds a voice from it only at key-on.
-                        # The next note takes these. A level (`$4n`) move is not
-                        # counted: it travels as the operator macro recorded
-                        # below.
-                        stats["midnote_ops"] += 1
+                    if (cid, fch) not in held:
+                        continue
+                    if drums and fch > st.melodic:
+                        # A kit column is one operator and one shared patch;
+                        # a live per-operator write there has no unambiguous
+                        # effect column, so leave it on the instrument.
+                        continue
+                    oi = op_index[cid].get(((port << 8) | slot, fch))
+                    if oi is None:
+                        continue
+                    four = st.is_four_op(fch)
+                    # The platform walks a four-operator voice through
+                    # orderedOpsL; the two-operator row number is the column.
+                    fx_op = ORDERED_OPS_L[oi] if four else oi
+                    ch = base[cid] + fch
+                    if page == 0x20:
+                        # AM/VIB/EG/KSR/MULT. These are live voicing changes,
+                        # not just instrument state: a tracker may raise the
+                        # multiplier or flip a waveform mid-note. Furnace has a
+                        # row effect for each field, so keep them.
+                        for bit, cmd in (
+                            (7, 0x50), (6, 0x53), (5, 0x55), (4, 0x5B),
+                        ):
+                            if ((prev_val >> bit) & 1) != ((val >> bit) & 1):
+                                live_op_fx(
+                                    (cid, fch), ch, cmd, fx_op,
+                                    ((fx_op + 1) << 4) | ((val >> bit) & 1),
+                                    w.sample,
+                                )
+                        if (prev_val & 15) != (val & 15):
+                            live_op_fx(
+                                (cid, fch), ch, 0x16, fx_op,
+                                ((fx_op + 1) << 4) | (val & 15),
+                                w.sample,
+                            )
+                    elif page == 0x60:
+                        # Attack/decay.
+                        if ((prev_val >> 4) & 15) != ((val >> 4) & 15):
+                            live_op_fx(
+                                (cid, fch), ch, 0x1A + fx_op, fx_op,
+                                (val >> 4) & 15, w.sample,
+                            )
+                        if (prev_val & 15) != (val & 15):
+                            live_op_fx(
+                                (cid, fch), ch, 0x57 + fx_op, fx_op,
+                                val & 15, w.sample,
+                            )
+                    elif page == 0x80:
+                        # Sustain/release.
+                        if ((prev_val >> 4) & 15) != ((val >> 4) & 15):
+                            live_op_fx(
+                                (cid, fch), ch, 0x51, fx_op,
+                                ((fx_op + 1) << 4) | ((val >> 4) & 15),
+                                w.sample,
+                            )
+                        if (prev_val & 15) != (val & 15):
+                            live_op_fx(
+                                (cid, fch), ch, 0x52, fx_op,
+                                ((fx_op + 1) << 4) | (val & 15),
+                                w.sample,
+                            )
+                    elif page == 0xE0:
+                        # Waveform, 3 bits on OPL3 and 2 on OPL2.
+                        mask = 7 if st.opl3 else 3
+                        if (prev_val & mask) != (val & mask):
+                            live_op_fx(
+                                (cid, fch), ch, 0x2A, fx_op,
+                                ((fx_op + 1) << 4) | (val & mask),
+                                w.sample,
+                            )
                 continue
             for fch in owners:
                 key = (cid, fch)
@@ -3885,11 +4036,6 @@ def _collect_opl(
             "rhythm mode is on, so bank A's last FM channels are the kit"
             + (f"; {lost} melodic key-on(s) there had no column and "
                f"{cut} held note(s) stopped at a mode switch" if (lost or cut) else "")
-        )
-    if stats["midnote_ops"]:
-        warnings.append(
-            f"{stats['midnote_ops']} operator envelope or waveform write(s) "
-            "landed inside a held note; the next key-on picks them up"
         )
     if stats["repeat_keyon"]:
         warnings.append(

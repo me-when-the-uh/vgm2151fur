@@ -203,14 +203,20 @@ routes exist, and the converter picks by shape:
   is louder. The writer inverts (`furwrite._write_op_ma`). Everything above it,
   including `analyze`, keeps speaking `$4n`.
 
-The other operator codes live in `DivMacroTypeOp` - 0 AM, 1 AR, 2 DR, 3 MULT,
-4 RR, 5 SL, 6 TL, and 15 KSL, 16 SUS, 17 VIB, 18 WS, 19 KSR. Today only TL is
-driven. An operator **envelope or waveform** written inside a held note still
-applies at the next key-on, since Furnace rebuilds the voice from its instrument
-when the note starts; those writes are counted and reported ("N operator envelope
-or waveform write(s) landed inside a held note"), as is an `OPL3` mid-note
-waveform change (`2Axy`). Each of those codes needs its own measured polarity and
-mask before it can be trusted. The TL inversion is exactly that warning.
+The other live voicing fields now travel as row effects too. A mid-note `$20`
+write becomes `16xy` (MULT), `50xy` (AM), `53xy` (vibrato), `55xy` (sustain) or
+`5Bxy` (key-scale rate); `$60` becomes `1Axx`-`1Dxx` (attack) or
+`57xx`-`5Axx` (decay); `$80` becomes `51xy` (sustain level) or `52xy`
+(release); `$E0` becomes `2Axy` (waveform, 3 bits on OPL3); and a mid-note
+feedback change in `$C0` becomes `11xx`. Only the connection bit has no OPL row
+effect and stays with the instrument.
+
+Furnace reloads an instrument only when the instrument *index* changes, so a
+note that reuses the same voice would inherit the previous note's MULT,
+feedback, envelope or waveform. The analyzer records the instrument's own value
+for every field a row effect changed and writes those values back on the next
+key-on of that same instrument (`pending_reset`). A different instrument starts
+by loading itself and needs no reset.
 
 `analyze._collect_opl` records `$4n` per operator while a voice sounds
 (`NoteEvent.opl_op_tl`, primed from the instrument at key-on with the attack

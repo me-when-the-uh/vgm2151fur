@@ -473,6 +473,37 @@ class TestOplChannelMap(unittest.TestCase):
 
 
 class TestOplAnalyze(unittest.TestCase):
+    def test_mid_note_multiplier_and_feedback_survive_and_reset(self):
+        # A tracker can raise the multiplier and feedback while a note holds.
+        # Both are live timbre changes: keep them as 16xy/11xx row effects,
+        # and restore the instrument's own values when the same instrument
+        # starts the next note (Furnace does not reload an unchanged voice).
+        ops = [{"mult": 4}, {"mult": 1}]
+        addrs = voice_slots(KIND_OPL3, 14)
+        cm = OPLState(KIND_OPL3, False).chan_map[14]
+        ws = voice(1000, KIND_OPL3, 14, ops=ops, fb=2, off_time=5000)
+        ws += [
+            ChipWrite(3000, KIND_OPL3, 0,
+                      reg(KIND_OPL3, addrs[0] + 0x20), 0x01),
+            ChipWrite(3000, KIND_OPL3, 0,
+                      reg(KIND_OPL3, cm + 0xC0), 0x3E),
+        ]
+        ws += voice(6000, KIND_OPL3, 14, ops=ops, fb=2, off_time=10000)
+        song = analyze(_vgm(ws, kind=KIND_OPL3, total_samples=20000),
+                       speed=1)
+        mod = parse_fur(write_fur(song, include_pcm=False))
+        fx = {
+            (cmd, value)
+            for ch in range(mod.n_ch)
+            for oi in mod.orders[ch]
+            for row in mod.patterns[(ch, oi)]
+            for cmd, value in (row.fx or ())
+        }
+        self.assertIn((0x16, 0x11), fx)   # live MULT 4 -> 1
+        self.assertIn((0x11, 0x07), fx)   # live feedback 2 -> 7
+        self.assertIn((0x16, 0x14), fx)   # next note restores MULT 4
+        self.assertIn((0x11, 0x02), fx)   # next note restores feedback 2
+
     def test_two_operator_voice_and_instrument(self):
         song = analyze(_vgm(voice(100, KIND_OPL2, 3, block=4, fnum=580)
                             + heart()))
