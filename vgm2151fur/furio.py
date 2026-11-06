@@ -20,7 +20,7 @@ from vgm2151fur.furwrite import (
     CHIP_OPL3_DRUMS, CHIP_OPL_DRUMS, CHIP_RF5C68, CHIP_SEGAPCM, CHIP_VRC7,
     CHIP_YM2608, CHIP_YM2608_EXT,
     CHIP_YM2610, CHIP_YM2610B, CHIP_YM2612, CHIP_YM2612_CSM, CHIP_YM2612_EXT,
-    CHIP_YMZ280B,
+    CHIP_YMZ280B, CHIP_VBOY,
     FUR_MAGIC, decompress_fur,
 )
 
@@ -71,6 +71,7 @@ CHIP_CHANNELS = {
     CHIP_C352: 32,  # Namco C352
     CHIP_K053260: 4,  # Konami K053260
     CHIP_YMZ280B: 8,  # Yamaha YMZ280B (PCMD8)
+    CHIP_VBOY: 6,  # Virtual Boy VSU: five wave voices + noise
     CHIP_K051649: 5,  # Konami SCC
     CHIP_K052539: 5,  # Konami SCC+
     CHIP_AY8910: 3,  # AY-3-8910

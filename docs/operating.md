@@ -208,8 +208,8 @@ they can be run from anywhere.
 - `tools/pitch_shift.py <a.wav> <b.wav>`: the chroma-rotation table one pair
   of renders at a time, used by the soundcheck.
 - `tools/vgm_scan.py [root ...]`: which VGM packs use SegaPCM, C140, C352,
-  K053260, YMZ280B, C219, SCC/SCC+, AY-8910, YM2203 or YM2612 and at which
-  clock. C219 is a
+  K053260, YMZ280B, Virtual Boy VSU, C219, SCC/SCC+, AY-8910, YM2203 or
+  YM2612 and at which clock. C219 is a
   C140-family part the converter does not support; never batch-convert those
   into the C140 target. C352 converts as chip 0xD0; a Furnace build with a
   C352 core can play it. YM2203 converts as chip 0x8D (3 FM + 3 SSG voices

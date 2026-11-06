@@ -94,6 +94,8 @@ CHIP_C140 = 0xCE
 CHIP_K053260 = 0xCC
 # DIV_SYSTEM_YMZ280B: eight PCM/ADPCM sample voices.
 CHIP_YMZ280B = 0xB8
+# DIV_SYSTEM_VBOY: five wavetable voices and one noise voice.
+CHIP_VBOY = 0x9C
 # Furnace format.md reserves 0xD0 for Namco C352, 32 channels, and marks it
 # unavailable. 0.6.8.3 has no C352 core and no C352 instrument type.
 CHIP_C352 = 0xD0
@@ -256,6 +258,9 @@ INS_NES = 34
 # DIV_INS_GB: the Game Boy's hardware envelope plus an optional wave-synth
 # feature for the wavetable voice.
 INS_GB = 2
+# DIV_INS_VBOY: a wavetable instrument with the FD modulation table and the
+# wave-synth feature.  VSU wave changes ride the pattern as 10xx effects.
+INS_VBOY = 16
 SMP_DEPTH_DPCM = 1
 SMP_DEPTH_ADPCM_K = 7
 SMP_DEPTH_ADPCM_A = 5
@@ -289,7 +294,7 @@ _DEV_DEFAULT_VOLUME = {
     0x00: 0x80,
     0x03: 0x100, 0x04: 0x180, 0x08: 0x100, 0x12: 0x100, 0x16: 0x11E,
     0x18: 0x100, 0x19: 0xA0, 0x1C: 0x100, 0x1D: 0x100, 0x27: 0x40,
-    0x0F: 0x100,
+    0x0F: 0x100, 0x22: 0x100,  # VSU
 }
 _DEV_CORE_PATCH = {
     0x19: lambda v: v * 8 // 5,  # K051649 SCC core scale
@@ -307,12 +312,15 @@ _FURNACE_VOLUME_SCALE = {
     # MAME shifts the voice product by 6 bits, the Furnace core by 7, so the
     # module needs twice the player's system volume to reach the same level.
     0x1D: 2.0,
+    # VBOY's core has a 6x post-amp.  Measured against VGMPlay on Galactic
+    # Pinball and Jack Bros: the module is about 2.2x quieter at unity.
+    0x22: 2.2,
 }
 # MSM6258's player default is 0x11E; its Furnace core is 1.64x louder, so
 # 0.61 lands the sample at the source level. The MSM6295 (0x18) is unity.
 _CHIP_DEV = {CHIP_YM2151: 0x03, CHIP_SEGAPCM: 0x04, CHIP_MSM6295: 0x18,
              CHIP_MSM6258: 0x16, CHIP_C140: 0x1C, CHIP_C352: 0x27,
-             CHIP_K053260: 0x1D, CHIP_YMZ280B: 0x0F,
+             CHIP_K053260: 0x1D, CHIP_YMZ280B: 0x0F, CHIP_VBOY: 0x22,
              CHIP_SMS: 0x00, CHIP_K051649: 0x19, CHIP_K052539: 0x19,
              CHIP_AY8910: 0x12,
              CHIP_YM2610: 0x08, CHIP_YM2610B: 0x08}
@@ -979,6 +987,56 @@ def _write_ins_gb(b: Buf, name: str, ins) -> None:
         b.u8(0)  # param3
         b.u8(0)  # param4
         b.b[ws_size:ws_size + 2] = int(len(b.b) - ws_start).to_bytes(2, "little")
+    b.raw(b"EN")
+    b.end_block(size_off, start)
+
+
+def _write_ins_vsu(
+    b: Buf, name: str, ins, mod_table: bytes, wave_index: int = 0,
+) -> None:
+    """DIV_INS_VBOY: wavetable instrument plus the FD modulation table.
+
+    The five VSU wavetables are selected by ``10xx`` pattern effects, so the
+    instrument's wave-synth entry points at wave 0.  ``initModTableWithFirst
+    Wave`` makes the VBOY platform load the FD table when channel 4 starts a
+    note; Furnace's own VSU core then runs the sweep/modulation.
+    """
+    size_off, start = b.begin_block(b"INS2")
+    b.u16(FUR_VERSION)
+    b.u16(INS_VBOY)
+    b.raw(b"NA")
+    na_size = len(b.b)
+    b.u16(0)
+    na_start = len(b.b)
+    b.strz(name)
+    b.b[na_size:na_size + 2] = int(len(b.b) - na_start).to_bytes(2, "little")
+    b.raw(b"FD")
+    fd_size = len(b.b)
+    b.u16(0)
+    fd_start = len(b.b)
+    b.u32(0)  # modSpeed
+    b.u32(0)  # modDepth
+    b.u8(1)   # initModTableWithFirstWave: load on channel 4 note-on
+    table = bytes((mod_table + bytes(32))[:32])
+    b.raw(table)
+    b.b[fd_size:fd_size + 2] = int(len(b.b) - fd_start).to_bytes(2, "little")
+    b.raw(b"WS")
+    ws_size = len(b.b)
+    b.u16(0)
+    ws_start = len(b.b)
+    b.u32(max(0, int(wave_index)))  # wave1
+    b.u32(max(0, int(wave_index)))  # wave2
+    b.u8(1)   # rateDivider
+    b.u8(0)   # effect: none
+    b.u8(1)   # enabled
+    b.u8(0)   # global
+    b.u8(0)   # speed
+    b.u8(0)   # param1
+    b.u8(0)   # param2
+    b.u8(0)   # param3
+    b.u8(0)   # param4
+    b.b[ws_size:ws_size + 2] = int(len(b.b) - ws_start).to_bytes(2, "little")
+    _write_tone_macros(b, ins, wave=False)
     b.raw(b"EN")
     b.end_block(size_off, start)
 
@@ -2544,7 +2602,8 @@ def _place_chip_fx(
 
 
 def _build_patterns(song: Song, n_ch: int, pat_len_max: int, fx_cols: int,
-                    ch_offset: int = 0, stats: dict | None = None) -> tuple[
+                    ch_offset: int = 0, stats: dict | None = None,
+                    vsu_wave_base: int = 0) -> tuple[
     list[list[int]], list[tuple[int, int, list[Row | None]]], int, int
 ]:
     """Return (orders[ch][ord], patterns as (ch, idx, rows), loop_order, pat_len).
@@ -2724,6 +2783,15 @@ def _build_patterns(song: Song, n_ch: int, pat_len_max: int, fx_cols: int,
                 prev = note_delay.get(key)
                 note_delay[key] = dest_delay if prev is None else min(prev, dest_delay)
     for sample, ch, cmd, val in getattr(song, "channel_fx", ()) or ():
+        # VSU wave changes carry a sentinel index into the source wave list;
+        # resolve it against the module-wide block order now that the other
+        # families' waves are ahead of it.
+        if cmd == 0x10 and val >= 0x1000:
+            idx = vsu_wave_base + (val & 0x0FFF)
+            if idx > 0xFF:
+                _bump(stats, "vsu_wave_dropped")
+                continue
+            val = idx
         ch += ch_offset
         if ch < 0 or ch >= n_ch:
             continue
@@ -2906,7 +2974,8 @@ def _build_patterns(song: Song, n_ch: int, pat_len_max: int, fx_cols: int,
         # default (both full). FM pan 0 still means "no 08xx on this row".
         if ev.quad is not None:
             _add_quad_fx(cell, ev.quad, fx_cols, stats)
-        elif (ev.pcm or ev.pan) and not ev.no_pan:
+        elif (ev.pcm or ev.pan or ev.tone_chip == 7) and not ev.no_pan:
+            # VSU LRV 0 is "both sides off", not "leave the previous pan".
             _add_fx(cell, 0x08, ev.pan & 0xFF, fx_cols, stats)
 
     # A PCM note still sounding at the last content row gets an explicit off.
@@ -3709,6 +3778,7 @@ def write_fur(
         getattr(song, "scc_ids", ()) or getattr(song, "ay_ids", ())
         or getattr(song, "nes_ids", ()) or getattr(song, "huc6280_ids", ())
         or getattr(song, "gb_ids", ())
+        or getattr(song, "vsu_ids", ())
         or getattr(song, "psg_ids", ())
         # YMZ280B is a sample engine with real module columns; a YMZ-only log
         # must not gain an empty YM2151 placeholder above it.
@@ -3834,6 +3904,10 @@ def write_fur(
     gb_ids = list(getattr(song, "gb_ids", ()) or ())
     gb_waves = list(getattr(song, "gb_waves", ()) or ())
     gb_specs = list(getattr(song, "gb_ins", ()) or ())
+    vsu_ids = list(getattr(song, "vsu_ids", ()) or ())
+    vsu_waves = list(getattr(song, "vsu_waves", ()) or ())
+    vsu_mod_waves = list(getattr(song, "vsu_mod_waves", ()) or ())
+    vsu_specs = list(getattr(song, "vsu_ins", ()) or ())
     scc_chip = CHIP_K052539 if song.vgm.k051649_plus else CHIP_K051649
     n_scc = 5 * len(scc_ids)
     n_ay = 3 * len(ay_ids)
@@ -3841,6 +3915,7 @@ def write_fur(
     n_nes = 5 * len(nes_ids)
     n_huc6280 = 6 * len(huc6280_ids)
     n_gb = 4 * len(gb_ids)
+    n_vsu = 6 * len(vsu_ids)
     n_nes_dpcm_ins = len(nes_dpcm_smps)
     n_nes_pcm_ins = (len(nes_pcm_smps) + 119) // 120
     n_huc6280_pcm_ins = len(huc6280_pcm_smps)
@@ -3883,7 +3958,7 @@ def write_fur(
         + (16 if spcm_smps else 0) + n_rf5c
         + 24 * len(c140_ids) + 32 * len(c352_ids)
         + 4 * len(k053260_ids) + 8 * len(ymz_ids)
-        + n_scc + n_ay + n_nes + n_huc6280 + n_gb
+        + n_scc + n_ay + n_nes + n_huc6280 + n_gb + n_vsu
     )
     if n_ch == 0:
         raise ValueError("write_fur: need include_fm and/or include_pcm")
@@ -3906,7 +3981,7 @@ def write_fur(
         + n_nes_dpcm_ins + n_nes_pcm_ins + n_huc6280_pcm_ins
         + len(ymz_smps)
         + len(scc_specs) + len(ay_specs) + len(psg_specs) + len(nes_specs)
-        + len(huc6280_specs) + len(gb_specs)
+        + len(huc6280_specs) + len(gb_specs) + len(vsu_specs)
     )
     n_smp = (
         len(pcm_smps) + len(oki_smps) + len(adpcm_smps)
@@ -3918,7 +3993,12 @@ def write_fur(
         + len(nes_dpcm_smps) + len(nes_pcm_smps) + len(huc6280_pcm_smps)
         + len(ymz_smps)
     )
-    n_wav = len(scc_waves) + len(huc6280_waves) + len(gb_waves)
+    n_wav = (
+        len(scc_waves) + len(huc6280_waves) + len(gb_waves) + len(vsu_waves)
+    )
+    # The VSU's 10xx effects name a wavetable in the module-wide list.  Keep
+    # the block order in step with the index the patterns use.
+    vsu_wave_base = len(scc_waves) + len(huc6280_waves) + len(gb_waves)
 
     # Analysis numbers sample-chip channels after the FM block. With no FM
     # they shift down to stay inside n_ch.
@@ -3927,7 +4007,7 @@ def write_fur(
     orders, patterns, _loop_ord, pat_len = _build_patterns(
         song, n_ch, PAT_LEN_MAX, fx_cols,
         0 if fm_present else -fm_analysis_block,
-        stats=stats,
+        stats=stats, vsu_wave_base=vsu_wave_base,
     )
     effect_cols = _fit_fx_cols(patterns, n_ch)
 
@@ -4001,7 +4081,7 @@ def write_fur(
         + n_nes_dpcm_ins + n_nes_pcm_ins + n_huc6280_pcm_ins
         + len(ymz_smps)
         + len(scc_specs) + len(ay_specs) + len(psg_specs) + len(nes_specs)
-        + len(huc6280_specs) + len(gb_specs)
+        + len(huc6280_specs) + len(gb_specs) + len(vsu_specs)
     )
     n_smp = (
         len(pcm_smps) + len(oki_smps) + len(adpcm_smps)
@@ -4100,6 +4180,12 @@ def write_fur(
         for voice, (label, short) in enumerate(zip(gb_labels, gb_short)):
             names_long.append(f"{label} ({cid + 1})")
             names_short.append(f"{short}{cid + 1}" if cid else short)
+    vsu_labels = ("Voice 1", "Voice 2", "Voice 3", "Voice 4", "Voice 5", "Noise")
+    vsu_short = ("W1", "W2", "W3", "W4", "W5", "NO")
+    for cid in vsu_ids:
+        for label, short in zip(vsu_labels, vsu_short):
+            names_long.append(f"VB {label} ({cid + 1})")
+            names_short.append(f"{short}{cid + 1}" if cid else short)
 
     label_parts: list[str] = []
     if fm_present:
@@ -4165,6 +4251,8 @@ def write_fur(
         label_parts.append("PC Engine")
     if gb_ids:
         label_parts.append("Game Boy")
+    if vsu_ids:
+        label_parts.append("Virtual Boy")
     chip_label = " + ".join(label_parts) or "empty"
 
     comment = (
@@ -4445,6 +4533,16 @@ def write_fur(
         flags = "chipType=2"
         if abs(clock - 4194304) > 2:
             flags += f"\ncustomClock={clock}"
+        flag_texts.append(flags)
+    for cid in vsu_ids:
+        chips.append(CHIP_VBOY)
+        clock = song.vgm.vsu_clock or 5000000
+        flags = "" if clock == 5000000 else f"customClock={clock}"
+        if getattr(song, "vsu_dynamic", False):
+            # The source rewrites wave RAM while voices are keyed.  Furnace's
+            # default anti-click pass disables every voice around a wave
+            # upload; the log did not, so keep its intended behaviour.
+            flags = (flags + "\n" if flags else "") + "screwThis=true"
         flag_texts.append(flags)
     n_chips = len(chips)
 
@@ -4799,6 +4897,21 @@ def write_fur(
                 + ("+pitch" if spec.pitch else "")
             )
         _write_ins_gb(b, name, spec)
+    for i, spec in enumerate(vsu_specs):
+        ins_ptrs.append(len(b))
+        mod = (
+            vsu_mod_waves[spec.vsu_mod]
+            if 0 <= spec.vsu_mod < len(vsu_mod_waves) else bytes(32)
+        )
+        name = f"VSU {i:02d}"
+        if spec.pitch:
+            name += "+pitch"
+        if spec.vol:
+            name += "+vol"
+        _write_ins_vsu(
+            b, name, spec, mod,
+            vsu_wave_base + max(0, int(getattr(spec, "wave", 0))),
+        )
 
     smp_ptrs: list[int] = []
     for i, smp in enumerate(pcm_smps):
@@ -5015,6 +5128,12 @@ def write_fur(
         data = bytes(15 - (v & 0x0F) for v in wave)
         wave_ptrs.append(_write_wave(
             b, f"gb_wave_{_wave_label(wave)}", data, maximum=15,
+        ))
+    for wave in vsu_waves:
+        # The VSU wave RAM is 32 6-bit samples; the platform uploads them
+        # unchanged, so the wavetable height is 63.
+        wave_ptrs.append(_write_wave(
+            b, f"vsu_wave_{_wave_label(wave)}", bytes(wave), maximum=63,
         ))
 
     for i, p in enumerate(ins_ptrs):

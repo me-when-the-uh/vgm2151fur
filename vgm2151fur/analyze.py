@@ -210,6 +210,15 @@ from vgm2151fur.ymz280b import (
     ymz280b_rate,
     ymz_pan_fx,
 )
+from vgm2151fur.vsu import (
+    VSU_CHANNELS,
+    VSU_DEFAULT_CLOCK,
+    VSU_ENVELOPE_CLOCKS,
+    VSU_PITCH_DIVIDER,
+    VSU_WAVE_BURST,
+    collect_vsu,
+    vsu_note,
+)
 from vgm2151fur.ssgpcm import (
     SsgPcmHit,
     SsgPcmSample,
@@ -479,6 +488,9 @@ class NoteEvent:
     # Tone chip clock and divider: SCC 16, AY-8910 8, YM2203 SSG 16.
     tone_clock: int = 0
     tone_div: int = 8
+    # VSU channel 4: modulation-table image index for the instrument's FD
+    # feature (the wavetable itself is not a module WAVE block).
+    tone_mod: int = 0
     # Game Boy wavetable voice: the column carries NR32 levels as row steps,
     # so the binding must not fold them into a volume macro.
     tone_gb_wave: bool = False
@@ -569,6 +581,9 @@ class ToneIns:
     gb_env_len: int = 0
     gb_sound_len: int = 63
     gb_wave: bool = False
+    # VSU only: which modulation-table image the instrument's FD feature
+    # carries (channel 4).
+    vsu_mod: int = 0
 
 
 @dataclass(frozen=True)
@@ -834,6 +849,16 @@ class Song:
     gb_waves: list[bytes] = field(default_factory=list)
     gb_ins: list[ToneIns] = field(default_factory=list)
     gb_count: int = 0
+    # Virtual Boy VSU: five wavetable voices and one noise voice.  `vsu_waves`
+    # is the deduplicated 32x6-bit image list, `vsu_mod_waves` the 32-byte
+    # modulation tables, `vsu_ins` one instrument per distinct volume/pitch
+    # shape.  Wave changes ride the pattern as 10xx effects.
+    vsu_ids: list[int] = field(default_factory=list)
+    vsu_waves: list[bytes] = field(default_factory=list)
+    vsu_mod_waves: list[bytes] = field(default_factory=list)
+    vsu_ins: list[ToneIns] = field(default_factory=list)
+    vsu_count: int = 0
+    vsu_dynamic: bool = False
     # Genesis SN76489: four channels (three tone + noise) after the FM block.
     psg_ids: list[int] = field(default_factory=list)
     psg_ins: list[ToneIns] = field(default_factory=list)
@@ -1053,7 +1078,29 @@ def _tone_pitch_tick_scale(vgm: VgmFile, hz: float, speed: int) -> int:
     writes the period faster than the module tick would otherwise alias.
     """
     groups: dict[tuple[str, int, int], list[int]] = {}
+    vsu_env = 0.0
     for w in vgm.writes:
+        if w.chip == "vsu":
+            reg = w.reg
+            if reg < 0xA0:
+                # A wave rewrite is a burst; keep one time per settled image.
+                key = (w.chip, w.chip_id, reg >> 5)
+                times = groups.setdefault(key, [])
+                if not times or w.sample - times[-1] > VSU_WAVE_BURST:
+                    times.append(w.sample)
+            elif 0x100 <= reg < 0x160:
+                ch = (reg - 0x100) >> 4
+                r = (reg - 0x100) & 0x0F
+                if r == 2:
+                    groups.setdefault(
+                        ("vsu-freq", w.chip_id, ch), [],
+                    ).append(w.sample)
+                elif r in (4, 5):
+                    vsu_env = (
+                        VSU_ENVELOPE_CLOCKS * VGM_RATE
+                        / float(vgm.vsu_clock or VSU_DEFAULT_CLOCK)
+                    )
+            continue
         if w.chip in ("ym2203_ssg", "ay8910") and w.reg % 2 == 0 and w.reg < 6:
             key = (w.chip, w.chip_id, w.reg // 2)
         elif w.chip == "k051649" and w.reg % 2 == 0 and w.reg < 10:
@@ -1081,10 +1128,17 @@ def _tone_pitch_tick_scale(vgm: VgmFile, hz: float, speed: int) -> int:
         for a, b in zip(times, times[1:])
         if b - a >= 8
     ]
+    if vsu_env:
+        # The hardware envelope can step faster than the note-write lattice.
+        intervals += [max(1, int(round(vsu_env)))] * 8
     if len(intervals) < 8:
         return 1
     intervals.sort()
     median = intervals[len(intervals) // 2]
+    if vsu_env:
+        # The envelope step is a hard timing requirement, not just another
+        # note lattice: a 769-sample tick would miss a 1.3k-sample decay.
+        median = min(median, max(1, int(round(vsu_env))))
     if median <= 0:
         return 1
     k = int(math.ceil((VGM_RATE / hz) / median))
@@ -1238,11 +1292,38 @@ def _macro_if_moving(
     return _macro_series(_tick_values(pts, start, ticks, tick_samples))
 
 
+def _vsu_sw_effect(sweep: int, ev1: int) -> tuple[int, int]:
+    """Map VSU channel-4 SweepControl/EV1 to a Furnace VBOY effect.
+
+    EV1 bit 4 enables modulation, bit 5 resets its phase, bit 6 enables the
+    sweep/mod block.  ``14xy`` takes the modulation period in y and the
+    enable/reset flags in x; ``13xy`` writes the raw sweep byte.
+    """
+    mod = bool(ev1 & 0x10)
+    reset = bool(ev1 & 0x20)
+    sweep_on = bool(ev1 & 0x40)
+    period = (sweep >> 4) & 0x07
+    if period == 0:
+        return (0x13, 0)
+    if mod and sweep_on:
+        return (
+            0x14,
+            ((3 if reset else 1) << 4) | ((sweep >> 4) & 0x0F),
+        )
+    if sweep_on:
+        return (0x13, sweep & 0xFF)
+    return (0x13, 0)
+
+
 def _plain_tone(spec: ToneIns, tone_chip: int) -> ToneIns:
     """The same timbre with no per-note motion, so notes can share it."""
     if tone_chip in (1, 5):
         # SCC and PCE are wavetable chips: the wave is the timbre.
         return ToneIns(wave=spec.wave)
+    if tone_chip == 7:
+        # Keep the starting waveform and modulation table so a budget
+        # fallback is still audible; per-note motion is lost.
+        return ToneIns(wave=spec.wave, vsu_mod=spec.vsu_mod)
     if tone_chip == 6:
         # Game Boy: a wavetable voice keeps its waveform; a pulse/noise voice
         # keeps the hardware envelope (without the sample-level macros).
@@ -1306,6 +1387,7 @@ def _bind_tone_instruments(
     nes_ins: list[ToneIns],
     huc6280_ins: list[ToneIns],
     gb_ins: list[ToneIns],
+    vsu_ins: list[ToneIns],
     tone_ins_base: int,
     scc_clock: int,
     ay_clock: int,
@@ -1313,6 +1395,7 @@ def _bind_tone_instruments(
     nes_clock: int,
     huc6280_clock: int,
     gb_clock: int,
+    vsu_clock: int,
     hz: float,
     total_samples: int,
 ) -> None:
@@ -1331,13 +1414,17 @@ def _bind_tone_instruments(
     nes_map: dict[ToneIns, int] = {}
     huc6280_map: dict[ToneIns, int] = {}
     gb_map: dict[ToneIns, int] = {}
+    vsu_map: dict[ToneIns, int] = {}
     ins_cap = max(1, 250 - tone_ins_base)
-    # GB binds last. Reserve a share so a large SCC/AY/PCE list cannot spend
-    # every slot before it; the surplus collapses to plain per-wave/per-env
-    # instruments, which is the documented "fall back to columns" behavior.
-    has_gb = any(e.tone_chip == 6 and e.on for e in events)
+    # GB and VSU bind last. Reserve a share so a large SCC/AY/PCE list cannot
+    # spend every slot before them; the surplus collapses to plain
+    # per-wave/per-env instruments, the documented "fall back to columns"
+    # behavior.
+    has_late = any(
+        e.tone_chip in (6, 7) and e.on for e in events
+    )
     early_cap = ins_cap
-    if has_gb:
+    if has_late:
         families = len({e.tone_chip for e in events if e.on and e.tone_chip})
         early_cap = max(1, ins_cap - max(8, ins_cap // max(2, families)))
     bound: list[tuple[NoteEvent, int]] = []
@@ -1347,6 +1434,7 @@ def _bind_tone_instruments(
     tone_order += [e for e in events if e.on and e.tone_chip == 4]
     tone_order += [e for e in events if e.on and e.tone_chip == 5]
     tone_order += [e for e in events if e.on and e.tone_chip == 6]
+    tone_order += [e for e in events if e.on and e.tone_chip == 7]
     for e in tone_order:
         end = e.end or track_end
         # 255 macro values times the largest speed byte. Long SSG pads can
@@ -1385,6 +1473,13 @@ def _bind_tone_instruments(
             clock = e.tone_clock or gb_clock or GB_DEFAULT_CLOCK
             divider = GB_PITCH_DIVIDER
             maximum = 0x7FF
+        elif e.tone_chip == 7:
+            # The VBOY platform also has a 16x divider and writes
+            # ``2048 - tableValue``.  The analyzer stores the source
+            # ``2048 - Frequency`` value, so the table inverts it directly.
+            clock = e.tone_clock or vsu_clock or VSU_DEFAULT_CLOCK
+            divider = VSU_PITCH_DIVIDER
+            maximum = 0x7FF
         else:
             # AY and the YM2203's SSG share the instrument path but not the
             # clock or Furnace's divider (8 vs 16).
@@ -1393,7 +1488,7 @@ def _bind_tone_instruments(
             maximum = 0xFFF
         tbl = (
             pitch_table(float(clock), divider, maximum=maximum)
-            if e.tone_chip in (3, 4, 5, 6)
+            if e.tone_chip in (3, 4, 5, 6, 7)
             else pitch_table(module_clock(clock), divider)
         )
         base_off = (e.note << 7) + (e.e5 - E5_CENTER)
@@ -1549,6 +1644,7 @@ def _bind_tone_instruments(
             gb_env_len=int(getattr(e, "gb_env_len", 0)),
             gb_sound_len=int(getattr(e, "gb_sound_len", 63)),
             gb_wave=bool(e.tone_gb_wave),
+            vsu_mod=int(getattr(e, "tone_mod", 0)),
         )
         if e.tone_chip == 1:
             idx, kept = _take_tone(spec, scc_map, scc_ins, len(ay_ins), early_cap, 1)
@@ -1574,19 +1670,26 @@ def _bind_tone_instruments(
                 + len(huc6280_ins),
                 ins_cap, 6,
             )
+        elif e.tone_chip == 7:
+            idx, kept = _take_tone(
+                spec, vsu_map, vsu_ins,
+                len(scc_ins) + len(ay_ins) + len(psg_ins) + len(nes_ins)
+                + len(huc6280_ins) + len(gb_ins),
+                ins_cap, 7,
+            )
         else:
             # AY runs first, so the SCC list is still empty and `others` is 0.
             idx, kept = _take_tone(spec, ay_map, ay_ins, 0, early_cap, 2)
         bound.append((e, idx))
         if (
-            e.tone_chip == 3
+            e.tone_chip in (3, 7)
             and not e.tone_noise
             and kept != spec
             and not kept.pitch
             and e.tone_pitch_pts
         ):
-            # The PSG instrument list is full, so this note fell back to the
-            # empty PSG instrument. Put the period trajectory on E5 row steps
+            # The tone instrument list is full, so this note fell back to the
+            # plain instrument. Put the period trajectory on E5 row steps
             # instead of silently dropping it.
             steps = tuple(
                 (
@@ -1641,6 +1744,7 @@ def _bind_tone_instruments(
     n_psg = len(psg_ins)
     n_nes = len(nes_ins)
     n_huc = len(huc6280_ins)
+    n_gb = len(gb_ins)
     for event, idx in bound:
         if event.tone_chip == 1:
             event.ins = tone_ins_base + idx
@@ -1653,6 +1757,11 @@ def _bind_tone_instruments(
         elif event.tone_chip == 6:
             event.ins = (
                 tone_ins_base + n_scc + n_ay + n_psg + n_nes + n_huc + idx
+            )
+        elif event.tone_chip == 7:
+            event.ins = (
+                tone_ins_base + n_scc + n_ay + n_psg + n_nes + n_huc
+                + n_gb + idx
             )
         else:
             event.ins = tone_ins_base + n_scc + idx
@@ -8124,6 +8233,105 @@ def analyze(
                 note=180, ins=-1, vol=-1, e5=0x80, pan=0,
             ))
 
+    # Virtual Boy VSU: five wavetable voices and one noise voice, after the
+    # Game Boy block.  The driver may keep a voice keyed and articulate with
+    # EV0, or use key-on/key-off; the collector handles both.  Wave images
+    # become 10xx pattern effects (the sentinel 0x1000 is resolved once the
+    # module's wave list is known), and channel 4's sweep/modulation rides
+    # Furnace's native 13xx/14xy effects plus the instrument FD table.
+    vsu_ids: list[int] = []
+    vsu_waves: list[bytes] = []
+    vsu_mod_waves: list[bytes] = []
+    vsu_ins: list[ToneIns] = []
+    vsu_count = 0
+    vsu_clock = vgm.vsu_clock or VSU_DEFAULT_CLOCK
+    vsu_hits, vsu_offs, vsu_wave_list, vsu_mod_list, vsu_dynamic, vsu_warn = (
+        collect_vsu(vgm)
+    )
+    warnings.extend(vsu_warn)
+    if vsu_hits or vsu_offs:
+        vsu_ids = sorted({h.chip_id for h in vsu_hits})
+        vsu_waves = list(vsu_wave_list)
+        vsu_mod_waves = list(vsu_mod_list)
+        vsu_base = (
+            tone_base + SCC_VOICES * len(scc_ids) + AY_VOICES * len(ay_ids)
+            + (NES_CHANNELS if nes_ids else 0)
+            + (HUC6280_CHANNELS if huc6280_ids else 0)
+            + (4 * len(gb_ids))
+        )
+        vsu_at = {
+            cid: vsu_base + VSU_CHANNELS * i
+            for i, cid in enumerate(vsu_ids)
+        }
+        for h in vsu_hits:
+            ch = vsu_at.get(h.chip_id)
+            if ch is None:
+                continue
+            clock = vgm.vsu_clock or VSU_DEFAULT_CLOCK
+            note, e5 = vsu_note(clock, h.period)
+            vol_pts = tuple((t, v, None) for t, v in h.vol_pts)
+            ev = NoteEvent(
+                sample=h.sample_time,
+                ch=ch + h.voice,
+                on=True,
+                note=note,
+                ins=-1,
+                vol=h.vol,
+                e5=e5,
+                pan=h.pan,
+                end=h.off_sample,
+                vol_pts=vol_pts,
+                tone_pitch_pts=tuple(h.pitch_pts),
+                tone_clock=clock,
+                tone_div=VSU_PITCH_DIVIDER,
+                tone_period_offset=0,
+                tone_chip=7,
+                tone_wave=h.wave if h.voice != 5 else -1,
+                tone_mod=h.mod if h.voice == 4 else 0,
+            )
+            events.append(ev)
+            vsu_count += 1
+            chn = ch + h.voice
+            # The starting wave lives on the instrument's wave-synth entry;
+            # a 10xx on the note row would be undone by the note-on's wave
+            # reset.  Only mid-note changes ride the pattern.
+            if h.voice != 5:
+                for t, idx in h.wave_pts:
+                    channel_fx.append((
+                        t, chn, 0x10, 0x1000 | (idx & 0xFF),
+                    ))
+            # Direct 4-bit left/right levels: 08xy, no centre law.
+            for t, p in h.pan_pts:
+                channel_fx.append((t, chn, 0x08, p & 0xFF))
+            # Channel 5 noise tap (EV1 bits 4-6) is 11xx.
+            if h.voice == 5:
+                channel_fx.append((h.sample_time, chn, 0x11, h.tap & 7))
+                for t, tap in h.tap_pts:
+                    channel_fx.append((t, chn, 0x11, tap & 7))
+            # Channel 4 sweep/modulation.
+            if h.voice == 4:
+                effect = _vsu_sw_effect(h.sweep, h.ev1)
+                if effect is not None:
+                    channel_fx.append((h.sample_time, chn, *effect))
+                for t, sweep, ev1 in h.sw_pts:
+                    effect = _vsu_sw_effect(sweep, ev1)
+                    if effect is not None:
+                        channel_fx.append((t, chn, *effect))
+        for off in vsu_offs:
+            base = vsu_at.get(off.chip_id)
+            if base is None:
+                continue
+            events.append(NoteEvent(
+                sample=off.sample_time,
+                ch=base + off.voice,
+                on=False,
+                note=180,
+                ins=-1,
+                vol=-1,
+                e5=0x80,
+                pan=0,
+            ))
+
     # The YM2203 SSG rides in the same six-channel system: 0-2 FM, 3-5 PSG. Its
     # notes share the AY instrument list.
     ssg_pcm, ssg_pcm_hits = _ssg_pcm("ym2203_ssg")
@@ -8263,7 +8471,7 @@ def analyze(
         if grid is None and pcm_onsets:
             grid = _grid("pcm", onsets=pcm_onsets, label="sample-trigger lattice")
         if grid is not None:
-            tone_only = (scc_count or ay_count) and not keyon_times and not any(
+            tone_only = (scc_count or ay_count or vsu_count) and not keyon_times and not any(
                 e.on and e.pcm for e in events
             )
             if tone_only:
@@ -8550,6 +8758,7 @@ def analyze(
     # row is chosen) plays the driver's trajectory at the wrong speed.
     _bind_tone_instruments(
         events, scc_ins, ay_ins, psg_ins, nes_ins, huc6280_ins, gb_ins,
+        vsu_ins,
         tone_ins_base,
         vgm.k051649_clock or SCC_DEFAULT_CLOCK,
         ay_note_clock,
@@ -8557,6 +8766,7 @@ def analyze(
         nes_clock,
         huc6280_clock,
         gb_clock,
+        vsu_clock,
         hz, vgm.total_samples,
     )
     # SSG PCM instruments sit immediately before the tone list.
@@ -8660,6 +8870,7 @@ def analyze(
         + len(spcm_audible) + len(c140_audible) + len(c352_audible)
         + len(k053260_audible) + n_ym2610_a_ins + n_ym2610_b_ins
         + len(scc_ins) + len(ay_ins) + len(psg_ins)
+        + len(vsu_ins)
         + n_ym2608_rhythm_ins + n_ym2608_b_ins
         + n_ssg_pcm + len(ymz_audible)
     )
@@ -8774,6 +8985,12 @@ def analyze(
         gb_waves=gb_waves,
         gb_ins=gb_ins,
         gb_count=gb_count,
+        vsu_ids=vsu_ids,
+        vsu_waves=vsu_waves,
+        vsu_mod_waves=vsu_mod_waves,
+        vsu_ins=vsu_ins,
+        vsu_count=vsu_count,
+        vsu_dynamic=vsu_dynamic,
         fm_vol_max=_fm_vol_max(fm_systems, is_opll=is_opll, is_opl=is_opl),
         fm_notes=(
             opll_stats.get("notes", 0) if is_opll else
@@ -9084,6 +9301,14 @@ def format_report(song: Song) -> str:
             f"{len(song.gb_waves)} waveforms, {len(song.gb_ins)} instruments"
             f"{f', {sw} soft-envelope' if sw else ''}, "
             f"{song.vgm.gb_dmg_clock or 4194304} Hz)"
+        )
+    if song.vsu_ids:
+        lines.append(
+            f"VSU notes   {song.vsu_count}  ({len(song.vsu_ids)} chip"
+            f"{'s' if len(song.vsu_ids) > 1 else ''}, "
+            f"{len(song.vsu_waves)} waveforms, {len(song.vsu_ins)} instruments"
+            f"{', dynamic waves' if song.vsu_dynamic else ''}, "
+            f"{song.vgm.vsu_clock or VSU_DEFAULT_CLOCK} Hz)"
         )
     if song.ssg_pcm_samples:
         lines.append(

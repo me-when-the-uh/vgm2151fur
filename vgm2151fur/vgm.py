@@ -2,7 +2,8 @@
 
 Chips: YM2151, YM2203, YM2612, YM2610, YM3526 (OPL), YM3812 (OPL2),
 YMF262 (OPL3), RF5C68, RF5C164, K007232, MSM6295, MSM6258, SegaPCM, C140,
-C352, K053260, YMZ280B, AY-3-8910, K051649/K052539 (SCC).
+C352, K053260, YMZ280B, Nintendo Virtual Boy (VSU), AY-3-8910,
+K051649/K052539 (SCC).
 """
 
 from __future__ import annotations
@@ -102,6 +103,12 @@ CMD_SCC = 0xD2
 CMD_C140 = 0xD4
 CMD_C352 = 0xE1
 CMD_K053260 = 0xBA
+# 0xC7 mmll dd is the Virtual Boy VSU: the register is a 16-bit big-endian
+# *word index* (byte address / 4).  Furnace writes it as writeS_BE(addr>>2),
+# and the reference rips use the same form.  Bit 15 selects a second VSU in a
+# dual-chip log (Furnace's baseAddr2S rule).
+CMD_VSU = 0xC7
+VSU_DUAL_BIT = 0x8000
 CMD_DATA_BLOCK = 0x67
 CMD_END = 0x66
 CMD_STREAM_SETUP = 0x90
@@ -152,6 +159,7 @@ EXTRA_C140 = 0x1C
 EXTRA_K053260 = 0x1D
 EXTRA_C352 = 0x27
 EXTRA_K007232 = 0x2A
+EXTRA_VSU = 0x22  # Virtual Boy VSU (VGM chip-volume id 34)
 EXTRA_YMZ280B = 0x0F
 # Main-header clocks (VGMFile.h layout, spec v1.71). 0x98 is MSM6295, 0x90
 # MSM6258, 0x94 its flags. K007232 has no spec field; VGMPlay tools put it at
@@ -183,6 +191,11 @@ YMF278B_DEFAULT_CLOCK = 33868800
 YMZ280B_CLOCK_OFF = 0x68
 YMZ280B_DEFAULT_CLOCK = 16934400
 YMZ280B_DUAL_BIT = 0x40000000
+# Virtual Boy VSU clock at 0x68? No: VGM 1.71 puts it at 0xC4.  Bit 30 marks
+# a second chip, whose writes use register bit 15.  The usual clock is 5 MHz.
+VSU_CLOCK_OFF = 0xC4
+VSU_DEFAULT_CLOCK = 5_000_000
+VSU_HEADER_DUAL_BIT = 0x40000000
 # YM2612 clock at 0x2C.  Bit 30 is the dual-instance flag; 0xA2/0xA3 then
 # answer for the second chip.  The field predates the 1.50 data-offset header.
 YM2612_CLOCK_OFF = 0x2C
@@ -448,7 +461,7 @@ class ChipWrite:
     chip: str  # "ym2151" | "ym2203" | "ym2612" | "ym2610" | "opl" | "opl2" |
     #            "opl3" | "k007232" | "msm6295" | "msm6258" | "segapcm" |
     #            "c140" | "c352" | "k053260" | "ay8910" | "k051649" |
-    #            "ymz280b"
+    #            "ymz280b" | "vsu"
     chip_id: int
     reg: int
     val: int
@@ -588,6 +601,12 @@ class VgmFile:
     ymz280b_clock: int = 0
     ymz280b_clock_2: int = 0
     ymz280b_dual: bool = False
+    # Virtual Boy VSU header 0xC4 (VGM 1.71+).  Six voices: five 32-entry
+    # 6-bit wavetable channels and one noise channel.  Register writes arrive
+    # on 0xC7 as a 16-bit big-endian word index; bit 15 selects a second chip.
+    vsu_clock: int = 0
+    vsu_clock_2: int = 0
+    vsu_dual: bool = False
     # K053260 header 0xAC (VGM 1.61+); bit 7 of a 0xBA register selects the
     # second instance, which shares this clock.
     k053260_clock: int = 0
@@ -806,7 +825,7 @@ def chips_in_head(buf: bytes) -> set[str]:
 
     Names match the converter's chips: ym2151, ym2610, msm6295, segapcm, c140,
     c352, k053260, ay8910, k051649 (plus "scc_plus" for the K052539 variant),
-    k007232.
+    k007232, ymz280b and vsu (plus "vsu_dual").
     C219 is the C140-family part the converter does not support. It is reported
     apart from c140, and those packs should not be batch-converted. C352 is
     its own chip (32 voices); it is not folded into c140 or c219.
@@ -880,6 +899,12 @@ def chips_in_head(buf: bytes) -> set[str]:
             kinds.add("ymz280b")
             if ymz_raw & YMZ280B_DUAL_BIT:
                 kinds.add("ymz280b_dual")
+    if version >= 0x171 and _field_in_header(buf, VSU_CLOCK_OFF, 4):
+        vsu_raw = _header_raw(buf, VSU_CLOCK_OFF)
+        if 100_000 <= (vsu_raw & 0x3FFFFFFF) <= 40_000_000:
+            kinds.add("vsu")
+            if vsu_raw & VSU_HEADER_DUAL_BIT:
+                kinds.add("vsu_dual")
     if version >= 0x151 and 100_000 <= _header_clock(buf, AY8910_CLOCK_OFF) <= 40_000_000:
         kinds.add("ay8910")
     # The OPL family joined the header in 1.51. A YM3812 field with bit 30 set
@@ -1070,6 +1095,16 @@ def load_vgm(path: Path | str) -> VgmFile:
         ymz280b_clock_2 = _sane_clock(clocks.get(EXTRA_YMZ280B, 0))
     if not ymz280b_clock:
         ymz280b_clock = _sane_clock(clocks.get(EXTRA_YMZ280B, 0))
+    # Virtual Boy VSU clock 0xC4 (VGM 1.71+).  Furnace uses bit 30 for a
+    # second chip; the second chip's writes set bit 15 of the register word.
+    vsu_raw = _header_raw(buf, VSU_CLOCK_OFF) if ver >= 0x171 else 0
+    vsu_dual = bool(vsu_raw & VSU_HEADER_DUAL_BIT)
+    vsu_clock = _sane_clock(vsu_raw)
+    vsu_clock_2 = 0
+    if vsu_dual:
+        vsu_clock_2 = _sane_clock(clocks.get(EXTRA_VSU, 0))
+    if not vsu_clock:
+        vsu_clock = _sane_clock(clocks.get(EXTRA_VSU, 0))
     # Read the field for every version: the legacy System 21 rips carry
     # 21390 there even in 1.51 files, and players resolve it the same way.
     c140_raw = _header_raw(buf, C140_CLOCK_OFF) & 0x3FFFFFFF
@@ -1180,6 +1215,9 @@ def load_vgm(path: Path | str) -> VgmFile:
         ymz280b_clock=ymz280b_clock,
         ymz280b_clock_2=ymz280b_clock_2,
         ymz280b_dual=ymz280b_dual,
+        vsu_clock=vsu_clock,
+        vsu_clock_2=vsu_clock_2,
+        vsu_dual=vsu_dual,
         c140_clock=c140_clock,
         c140_type=c140_type,
         k053260_clock=k053260_clock,
@@ -1207,6 +1245,7 @@ def load_vgm(path: Path | str) -> VgmFile:
     stray_opll_second = False
     stray_opl2_second = False
     stray_ymz_second = False
+    stray_vsu_second = False
     saw_end = False
     saw_adpcm_compressed = False
     # stream id -> setup recorded by 0x90/0x91/0x92
@@ -1562,6 +1601,19 @@ def load_vgm(path: Path | str) -> VgmFile:
             vgm.writes.append(ChipWrite(sample, "y8950", 0, buf[pos + 1],
                                         buf[pos + 2]))
             pos += 3
+            continue
+        if cmd == CMD_VSU and pos + 4 <= n:
+            # 0xC7 mmll dd: 16-bit big-endian register *word* index.  Bit 15
+            # marks the second chip.  Wave RAM, the mod table and the channel
+            # registers all live in one flat index space.
+            reg = int.from_bytes(buf[pos + 1:pos + 3], "big")
+            cid = 1 if (reg & VSU_DUAL_BIT) else 0
+            if cid and not vsu_dual:
+                stray_vsu_second = True
+            vgm.writes.append(ChipWrite(
+                sample, "vsu", cid, reg & 0x7FFF, buf[pos + 3],
+            ))
+            pos += 4
             continue
         if cmd in (CMD_YMZ280B, CMD_YMZ280B_2) and pos + 3 <= n:
             # 0x5D is the first YMZ280B, 0xAD the second (YM-family +0x50).
@@ -1999,6 +2051,16 @@ def load_vgm(path: Path | str) -> VgmFile:
             "YMZ280B writes without a header clock; using 16934400 Hz"
         )
         vgm.ymz280b_clock = YMZ280B_DEFAULT_CLOCK
+    if stray_vsu_second:
+        vgm.warnings.append(
+            "0xC7 VSU writes with register bit 15 set but no dual-instance "
+            "header bit; they were treated as the second chip"
+        )
+    if any(w.chip == "vsu" for w in vgm.writes) and not vgm.vsu_clock:
+        vgm.warnings.append(
+            "VSU writes without a header clock; using 5000000 Hz"
+        )
+        vgm.vsu_clock = VSU_DEFAULT_CLOCK
     return vgm
 
 

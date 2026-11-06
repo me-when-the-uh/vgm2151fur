@@ -16,6 +16,8 @@ the hits per pack directory:
              0x1D). Four voices; Furnace 0.6.8.3 plays chip 0xCC.
     ymz280b  Yamaha YMZ280B at header 0x68 (VGM 1.51+, or extra-header id
              0x0F); bit 30 marks a second chip (0xAD writes). Eight voices.
+    vsu      Nintendo Virtual Boy VSU at header 0xC4 (VGM 1.71+); bit 30
+             marks a second chip. Five wavetable voices plus noise.
     c219     the C140-family ASIC (type byte 2). The converter does not
              support it; never batch-convert these into 0xCE.
     k051649  Konami SCC at header 0x9C; bit 31 of that field selects the
@@ -57,7 +59,7 @@ SKIP = {"output", "third_party", ".git", "__pycache__", ".commandcode",
         "node_modules", "soundcheck"}
 
 CENSUS_KINDS = {"segapcm", "c140", "c219", "c352", "k053260", "ymz280b",
-                "k051649",
+                "vsu", "vsu_dual", "k051649",
                 "scc_plus", "ay8910", "ym2203", "ym2612",
                 # The OPL family is FM rather than a sample chip, but a census
                 # without it hides most of the AdLib and sound-card logs.

@@ -526,7 +526,7 @@ def build_parser() -> argparse.ArgumentParser:
             "Transcribe YM2151 (OPM), YM2203 (OPN), YM2612 (OPN2), YM2610 and "
             "OPL-family (YM3526/YM3812/YMF262) + "
             "sample-chip (K007232, MSM6295, MSM6258, SegaPCM, C140, C352, "
-            "K053260, YMZ280B) "
+            "K053260, YMZ280B) + Nintendo Virtual Boy (VSU) "
             "VGMs into Furnace .fur files, and edit the result."
         ),
         epilog=EPILOG,

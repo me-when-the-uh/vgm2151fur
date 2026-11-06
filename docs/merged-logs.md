@@ -55,6 +55,13 @@ before SCC/AY/NES/PCE/Game Boy. A YMZ-only log suppresses the legacy YM2151
 placeholder, so `07 Stage4.vgm` becomes two `0xB8` systems and sixteen real
 columns (`docs/ymz280b.md`).
 
+Virtual Boy VSU is a pitched chip and comes after Game Boy: six columns per
+chip (`0x9C`). A VSU-only log likewise suppresses the placeholder, so the
+Jack Bros and Galactic Pinball references are six real columns
+(`docs/vsu.md`). Its wave changes use `10xx` effects, so a merged module
+keeps the VSU wave blocks after the SCC/PCE/GB blocks and drops a wave
+change that would land past index 255.
+
 ## Who is allowed to share
 
 `share_fm`: one arcade family plus one OPL-family system coexist when the
