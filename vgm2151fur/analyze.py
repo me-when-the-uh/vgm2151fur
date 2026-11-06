@@ -1625,6 +1625,7 @@ def _bind_tone_instruments(
                 _tick_values(pts, e.sample, ticks, tick_samples),
             )
         column_vol = e.vol
+        pce_peak = 0
         vol_vals: tuple[int, ...] = ()
         vol_speed, vol_loop = 1, 255
         series: list[int] = []
@@ -1638,6 +1639,11 @@ def _bind_tone_instruments(
                 (t, max(0, v)) for t, v, _ in e.vol_pts
             ]
             series = _tick_values(pts, e.sample, ticks, tick_samples)
+            if e.tone_chip == 5:
+                # Normalize the PCE envelope to its own peak. The note column
+                # then carries the peak level and the macro the decay shape,
+                # so notes with different starting volumes are not all 31.
+                pce_peak = max(1, series[0]) if series else 0
             if e.tone_chip == 6:
                 # The GB platform applies a software-envelope volume macro
                 # directly; a generic FA volume slide is not implemented there,
@@ -1645,12 +1651,16 @@ def _bind_tone_instruments(
                 # drops the trailing hold anyway, keeping decay macros short.
                 vol_vals, vol_speed, vol_loop = _macro_series(series)
             else:
-                folded = _fold_saw(series)
+                # PCE keeps the trajectory as a normalized macro: a slide
+                # would move the raw column at one unit per tick and lose the
+                # peak scaling.
+                folded = None if e.tone_chip == 5 else _fold_saw(series)
                 # Past 255 ticks a non-repeating series is stored as every Nth
                 # value. A one-level saw is played as a slide instead, so the
                 # ramp still moves on every tick.
                 thin = (
-                    folded is None
+                    e.tone_chip != 5
+                    and folded is None
                     and len(series) > MACRO_MAX
                     and _cycle(series) is None
                     and _unit_saw(series)
@@ -1662,6 +1672,13 @@ def _bind_tone_instruments(
                     e.vol_slide = _slide_open(series)
                 else:
                     vol_vals, vol_speed, vol_loop = _macro_series(series)
+                    if e.tone_chip == 5 and vol_vals and pce_peak:
+                        vol_vals = tuple(
+                            max(0, min(31, int(round(v * 31 / pce_peak))))
+                            for v in vol_vals
+                        )
+                        if vol_vals:
+                            vol_vals = (31,) + vol_vals[1:]
                     used = len(scc_ins) + len(ay_ins)
                     # AY volume is the 4-bit register. Step-2 / step-4 rounding
                     # is the SCC list getting long, and it stays on the SCC.
@@ -1804,7 +1821,7 @@ def _bind_tone_instruments(
             # steps as row effects.
             if kept.vol:
                 e.vol_pts = ()
-                e.vol = 31
+                e.vol = pce_peak if pce_peak else 31
                 e.vol_slide = 0
             else:
                 e.vol = column_vol

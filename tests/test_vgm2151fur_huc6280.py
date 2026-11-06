@@ -252,13 +252,13 @@ class TestHuc6280Tones(unittest.TestCase):
         note = [e for e in song.events if e.on and e.ch >= 8][0]
         attack, _pan = pce_effective(31, 0xCC)
         decay, _dpan = pce_effective(31, 0x99)
-        # The envelope is now a tick-rate instrument macro; the column is
-        # its full-scale reference.
+        # The envelope is a tick-rate instrument macro normalized to its peak;
+        # the note column carries the peak itself.
         macro = next(it.vol for it in song.huc6280_ins if it.vol)
-        self.assertEqual(note.vol, 31)
+        self.assertEqual(note.vol, attack)
         self.assertFalse(note.vol_pts)
-        self.assertEqual(macro[0], attack)
-        self.assertIn(decay, macro)
+        self.assertEqual(macro[0], 31)
+        self.assertIn(int(round(decay * 31 / attack)), macro)
 
     def test_balance_envelope_becomes_tick_macro(self):
         # LOX2-style drivers fade with the balance register while the control
@@ -293,9 +293,10 @@ class TestHuc6280Tones(unittest.TestCase):
         evs = [e for e in song.events if e.on and e.ch >= 8]
         self.assertEqual([e.sample for e in evs][:2], [0, 6000])
         self.assertEqual(evs[0].end, 6000)
+        self.assertEqual(evs[0].vol, 25)
         ins = song.huc6280_ins[evs[0].ins]
-        self.assertEqual(ins.vol[0], 25)
-        # One peak: the rest of the macro only holds or decays.
+        self.assertEqual(ins.vol[0], 31)
+        # One peak: the rest of the normalized macro only holds or decays.
         self.assertTrue(all(
             a >= b for a, b in zip(ins.vol, ins.vol[1:])
         ), ins.vol)
