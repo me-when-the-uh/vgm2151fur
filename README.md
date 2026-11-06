@@ -20,9 +20,7 @@ Supported chips:
 - Konami K007232 (experimental)
 - Konami K053260
 - Yamaha YMZ280B (PCMD8)
-- Nintendo Virtual Boy (VSU): five 32-entry 6-bit wavetable voices plus a
-  noise voice, with hardware envelopes, channel-4 sweep/modulation and live
-  wavetable updates
+- Nintendo Virtual Boy (VSU)
 - Konami SCC / SCC+ (K051649/K052539)
 - OKI MSM6295
 - OKI MSM6258 (Sharp X68000 ADPCM)
