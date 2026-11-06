@@ -228,6 +228,36 @@ class TestHuc6280Tones(unittest.TestCase):
         self.assertTrue(ins.pitch)
         self.assertGreater(len(set(ins.pitch)), 1)
 
+    def test_frame_rate_portamento_becomes_row_effects(self):
+        # A driver retuning every frame writes a stepped glide (2 semitones
+        # per step here), each held just under a 60 Hz frame. That is not a
+        # short blip to drop: it belongs on the pattern rows as E8/E9 plus E5,
+        # not in a per-note instrument macro and not as a new note every step.
+        writes = _load_wave(_square(), period=0x0D6, sample=0)
+        periods = (0x0BE, 0x0AA, 0x0A0, 0x08F, 0x07F, 0x078, 0x06B)
+        for i, period in enumerate(periods):
+            t = 1000 + i * 687
+            writes += [
+                _w(t, 0x02, period & 0xFF),
+                _w(t, 0x03, (period >> 8) & 0x0F),
+            ]
+        writes.append(_w(1000 + len(periods) * 687, 0x04, 0x00))
+        song = analyze(_vgm(writes, huc6280_clock=3579545))
+        evs = [e for e in song.events if e.on and e.tone_chip == 5]
+        self.assertEqual(len(evs), 1)
+        ev = evs[0]
+        self.assertFalse(ev.tone_pitch_pts)
+        self.assertGreaterEqual(len(ev.pitch_steps), len(periods))
+        self.assertEqual(song.huc6280_ins[ev.ins].pitch, ())
+        m = parse_fur(write_fur(song, include_pcm=True, include_fm=False))
+        fx = [
+            (code, value)
+            for (_ch, _pat), rows in m.patterns.items()
+            for row in rows for code, value in row.fx
+        ]
+        self.assertTrue(any(code == 0xE8 for code, _v in fx), fx)
+        self.assertTrue(any(code == 0xE5 for code, _v in fx), fx)
+
     def test_volume_and_balance(self):
         notes, _offs, _waves, _warn = collect_huc6280(
             _vgm(

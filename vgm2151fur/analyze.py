@@ -1579,6 +1579,29 @@ def _bind_tone_instruments(
             else pitch_table(module_clock(clock), divider)
         )
         base_off = (e.note << 7) + (e.e5 - E5_CENTER)
+        if e.tone_chip == 5 and e.tone_pitch_pts and not e.tone_noise:
+            # A PCE driver that retunes every frame writes a staircase, not a
+            # vibrato. When every step is at least 0.75 semitone, put the
+            # trajectory on the pattern rows as E8/E9 + E5 instead of hiding
+            # it in a per-note pitch macro. The delta is in 1/64-semitone
+            # units (the writer's pitch-step unit), hence the divide by two.
+            steps = tuple(
+                (
+                    t,
+                    int(round((
+                        tbl.offset_for(
+                            e.note, per + e.tone_period_offset,
+                        ) - base_off
+                    ) / 2.0)),
+                )
+                for t, per in e.tone_pitch_pts
+            )
+            if steps and all(abs(v) >= 48 for _t, v in steps):
+                e.pitch_steps = steps
+                e.tone_pitch_pts = ()
+                e.sweep_div = 2.0
+                e.e5_lo = 0x00
+                e.e5_hi = 0xFF
         pitch: tuple[int, ...] = ()
         pitch_speed, pitch_loop = 1, 255
         if e.tone_pitch_pts:
@@ -8684,7 +8707,7 @@ def analyze(
             # arbitrary pitch value (unstable, too-flat notes).
             segs = segment_periods(
                 seg_pts, gate_end, huc_clock, 32, 0,
-                merge_gap=_AY_MERGE_GAP,
+                merge_gap=_AY_MERGE_GAP, drop_short=False,
             )
             for i, (st, period, intra) in enumerate(segs):
                 nxt = segs[i + 1][0] if i + 1 < len(segs) else 0
