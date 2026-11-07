@@ -93,12 +93,24 @@ class TestAyVolumeOffsetMerge(unittest.TestCase):
         # effective = macro + column - 15 is unchanged.
         self.assertEqual([ev.vol for ev, _i in notes], [11, 13, 15])
 
-    def test_a_difference_over_four_stays_separate(self):
+    def test_a_full_range_offset_merges_when_the_column_allows(self):
         bucket = [
-            ToneIns(wave=1, vol=(10, 9)),
-            ToneIns(wave=1, vol=(15, 14)),
+            ToneIns(wave=1, vol=(0, 0)),
+            ToneIns(wave=1, vol=(15, 15)),
         ]
         notes = [(_ay_note(0), 0), (_ay_note(1), 1)]
+        mapping = _merge_ay_volume_offsets(bucket, notes)
+        self.assertEqual(len(bucket), 1)
+        self.assertEqual(mapping[0], mapping[1])
+        self.assertEqual(bucket[0].vol, (15, 15))
+        self.assertEqual([ev.vol for ev, _i in notes], [0, 15])
+
+    def test_the_column_floor_stops_a_large_offset(self):
+        bucket = [
+            ToneIns(wave=1, vol=(0, 0)),
+            ToneIns(wave=1, vol=(15, 15)),
+        ]
+        notes = [(_ay_note(0, 14), 0), (_ay_note(1), 1)]
         mapping = _merge_ay_volume_offsets(bucket, notes)
         self.assertEqual(len(bucket), 2)
         self.assertNotEqual(mapping[0], mapping[1])

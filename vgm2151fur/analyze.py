@@ -1532,11 +1532,14 @@ def _tone_vol_sig(spec: ToneIns) -> tuple:
     )
 
 
-_AY_VOL_SPREAD = 4
+# A macro level is 0-15, so 15 is the whole range. The note column is the
+# real floor: a quieter copy is skipped when its column cannot be lowered by
+# the full offset without going below 0.
+_AY_VOL_SPREAD = 15
 
 
 def _vol_offset(loud: ToneIns, quiet: ToneIns) -> int | None:
-    """Constant 1..4-level difference from `loud` to `quiet`, else None."""
+    """Constant 1..15-level difference from `loud` to `quiet`, else None."""
     a = tuple(loud.vol)
     b = tuple(quiet.vol)
     if (
@@ -1556,14 +1559,16 @@ def _vol_offset(loud: ToneIns, quiet: ToneIns) -> int | None:
 def _merge_ay_volume_offsets(
     bucket: list[ToneIns], notes: list[tuple[NoteEvent, int]],
 ) -> dict[int, int]:
-    """Share one AY/SSG volume macro when copies differ by up to four levels.
+    """Share one AY/SSG volume macro when copies differ by a constant offset.
 
     The AY platform adds the pattern column to the macro
     (``macro + column - 15``), so a quieter macro can ride the same
     instrument by lowering the note's column by the same constant. The
     difference has to be consistent at every macro step; a varying shape is
-    a different envelope, not a normalization. Keep the loudest macro so
-    every note still reaches the chip's maximum level.
+    a different envelope, not a normalization. There is no spread ceiling
+    below the macro's own 0-15 range: the note column is the floor, and a
+    copy is left alone when it cannot be lowered by the full offset. Keep
+    the loudest macro so every note still reaches the chip's maximum level.
     """
     if len(bucket) < 2:
         return {i: i for i in range(len(bucket))}
