@@ -259,7 +259,11 @@ def _emit(
     # rescale the mix, dropping the sample chip's level. The YM2203 SSG
     # belongs to the same system, and an SSG-only track keeps the chip.
     use_fm = include_fm and (
-        bool(song.fm_patches) or bool(getattr(song, "ym2203_ids", ()) or ())
+        bool(song.fm_patches)
+        or bool(getattr(song, "ym2203_ids", ()) or ())
+        # A Y8950's delta-T voice is a column of the Y8950 system, so a
+        # sample-only log still needs that chip and its ten columns.
+        or bool(pcm and (getattr(song, "y8950_b_samples", ()) or ()))
     )
     data = write_fur(song, include_pcm=pcm, include_fm=use_fm, stats=stats)
     out_path.parent.mkdir(parents=True, exist_ok=True)

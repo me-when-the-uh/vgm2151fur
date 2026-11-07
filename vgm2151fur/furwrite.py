@@ -4083,7 +4083,14 @@ def write_fur(
     elif ym_chip:
         fm_present = include_fm and bool(ym_ids)
     else:
-        fm_present = include_fm and (fm_source or not has_tone_chip)
+        # The Y8950 owns a delta-T column. Its samples require the chip
+        # entry even when the caller excluded FM notes.
+        has_y8950_pcm = bool(
+            include_pcm and (getattr(song, "y8950_b_samples", ()) or ())
+        )
+        fm_present = (include_fm or has_y8950_pcm) and (
+            fm_source or not has_tone_chip
+        )
     fm_ins = song.fm_patches if (fm_present and include_fm) else []
     
     pcm_smps = [s for s in song.pcm_samples if s.length >= 8] if include_pcm else []
