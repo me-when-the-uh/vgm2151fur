@@ -13,7 +13,7 @@ Supported chips:
 - Yamaha Y8950 (OPL with delta-T ADPCM voice)
 - Yamaha YMF278B (OPL4): OPL3 FM plus 24 wave channels. ROM wave samples are extracted into the module from a YRW801 image (`VGM2151FUR_YRW801`)
 - Yamaha YM2149 / General Instrument AY-3-8910 (PSG), including volume-register SSGPCM playback
-- Philips SAA1099 (Creative Music System / Game Blaster), including the dual-chip pair and both envelope generators
+- Philips SAA1099 (Creative Music System / Game Blaster)
 - Texas Instruments SN76489 (PSG), including dual-chip logs
 - Toshiba T6W28 (Neo Geo Pocket Color stereo SN76489 variant): one four-channel system with independent left/right attenuation
 - Konami K007232 (experimental), including dual-chip logs
@@ -59,7 +59,7 @@ With no arguments the tool opens a menu. Type a number, or paste a path to a VGM
  7  condense   write copies of tracks with 1x..4x lower BPM
 ```
 
-`packs` is the place to start. It scans a folder (remembered next time), lists the packs with track counts and chips, and opens a track list with a dash next to tracks that have no `.fur` yet. `c` converts all tracks or a selection (`2-6`, `1,4`, or a single number), `e` changes a chip volume on the converted tracks, and `r` renders one to WAV so you can hear it. Conversion asks `normalize/verify through Furnace? (y/N)`; the default is no, so the menu does not launch Furnace unless you ask it to. The menu stores its state in `~/.vgm2151fur.json`.
+`packs` is the place to start. It scans a folder (remembered next time), lists the packs with track counts and chips, and opens a track list with a dash next to tracks that have no `.fur` yet. `c` converts all tracks or a selection (`2-6`, `1,4`, or a single number), `e` changes a chip volume on the converted tracks, and `r` renders one to WAV so you can hear it. Conversion asks `optimise? (Y/n)`, then a separate `LFO looping optimization? (Y/n)` (both default yes), then `normalize/verify through Furnace? (y/N)`; the default is no, so the menu does not launch Furnace unless you ask it to. The LFO answer is remembered for pasted-path conversions. The menu stores its state in `~/.vgm2151fur.json`.
 
 ## Commands
 
@@ -75,7 +75,7 @@ python -m vgm2151fur compare "01 Track.vgz" out/01.Track.fur --channel 4
 python -m vgm2151fur render out/01.Track.fur --loops 2
 ```
 
-`convert` writes one zlib-compressed `.fur` per input. `-o` sets the output folder (the default is a `fur/` folder beside the input). `--speed N` pins ticks per row when the automatic grid estimate is wrong, `--workers N` sets how many tracks run at once, and `--melody-only` / `--pcm-only` restrict the chips. A folder of packs writes each pack to its own `fur/` folder, or to `-o/<pack>`. Every track prints its size, grid speed, instrument and sample counts, and any warnings.
+`convert` writes one zlib-compressed `.fur` per input. `-o` sets the output folder (the default is a `fur/` folder beside the input). `--speed N` pins ticks per row when the automatic grid estimate is wrong, `--workers N` sets how many tracks run at once, and `--melody-only` / `--pcm-only` restrict the chips. `--no-lfo-loop` skips the LFO/tail loop search for long pitch macros, which is faster but leaves those macros longer; exact first-cycle loops are still detected. A folder of packs writes each pack to its own `fur/` folder, or to `-o/<pack>`. Every track prints its size, grid speed, instrument and sample counts, and any warnings.
 
 `report` prints the analysis without writing anything. Use it to see which chips a VGM uses, how the grid was estimated, and what was skipped.
 

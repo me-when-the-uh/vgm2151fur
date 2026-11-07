@@ -245,6 +245,7 @@ def _convert(args) -> int:
             include_fm=include_fm,
             normalize=not args.no_normalize,
             loop_find=not args.no_loop_find,
+            lfo_loop=not args.no_lfo_loop,
             workers=args.workers,
             c352_quad=args.c352_quad,
         ):
@@ -508,6 +509,12 @@ def _add_convert_flags(parser: argparse.ArgumentParser, *, bare: bool) -> None:
         "--no-loop-find",
         action="store_true",
         help="keep the VGM loop offset instead of moving it onto the bar",
+    )
+    parser.add_argument(
+        "--no-lfo-loop",
+        action="store_true",
+        help="skip the LFO/tail loop search for long pitch macros (faster; "
+             "exact first-cycle loops are still detected)",
     )
     if bare:
         parser.add_argument("--list", action="store_true", help="with a .fur: print chip volumes")

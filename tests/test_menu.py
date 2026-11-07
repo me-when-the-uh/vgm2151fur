@@ -86,6 +86,14 @@ def _run_menu(answers, tmp: Path) -> str:
 
 
 class TestCli(unittest.TestCase):
+    def test_no_lfo_loop_flag_parses(self):
+        args = cli.build_parser().parse_args(
+            ["convert", "Track.vgm", "--no-lfo-loop"]
+        )
+        self.assertTrue(args.no_lfo_loop)
+        plain = cli.build_parser().parse_args(["convert", "Track.vgm"])
+        self.assertFalse(plain.no_lfo_loop)
+
     def test_convert_writes_a_fur(self):
         with tempfile.TemporaryDirectory() as tmp:
             src = Path(tmp) / "Song.vgz"
@@ -271,7 +279,8 @@ class TestMenu(unittest.TestCase):
             root = Path(tmp)
             pack = _make_pack(root)
             log = _run_menu(
-                ["1", str(root), "1", "c", "all", "", "", "n", "b", "", "q"], root
+                ["1", str(root), "1", "c", "all", "", "", "", "n", "b", "", "q"],
+                root,
             )
             self.assertTrue((pack / "fur" / "default" / "01 Song 1.fur").is_file())
             self.assertTrue((pack / "fur" / "default" / "03 Song 3.fur").is_file())
@@ -285,7 +294,7 @@ class TestMenu(unittest.TestCase):
             root = Path(tmp)
             pack = _make_pack(root)
             reader = Reader(
-                ["1", str(root), "1", "c", "1", "", "", "n", "b", "", "q"]
+                ["1", str(root), "1", "c", "1", "", "", "", "n", "b", "", "q"]
             )
             with redirect_stdout(io.StringIO()):
                 rc = run_menu(
@@ -303,7 +312,8 @@ class TestMenu(unittest.TestCase):
             root = Path(tmp)
             pack = _make_pack(root)
             _run_menu(
-                ["1", str(root), "1", "c", "1", "", "n", "b", "", "q"], root
+                ["1", str(root), "1", "c", "1", "", "n", "", "b", "", "q"],
+                root,
             )
             self.assertTrue((pack / "fur" / "03 Song 3.fur").is_file())
             self.assertFalse((pack / "fur" / "x2 optimised").exists())
@@ -315,7 +325,8 @@ class TestMenu(unittest.TestCase):
             # The playlist order is 3, 2, 1, so tracks 2-3 are "02 Song 2"
             # and "01 Song 1".
             _run_menu(
-                ["1", str(root), "1", "c", "2-3", "", "", "n", "b", "", "q"], root
+                ["1", str(root), "1", "c", "2-3", "", "", "", "n", "b", "", "q"],
+                root,
             )
             self.assertFalse((pack / "fur" / "default" / "03 Song 3.fur").exists())
             self.assertTrue((pack / "fur" / "default" / "02 Song 2.fur").is_file())
@@ -428,6 +439,62 @@ class TestMenu(unittest.TestCase):
                 rc = cli.main(["convert", "whatever.vgm"])
         self.assertEqual(rc, 130)
         self.assertIn("cancelled", err.getvalue())
+
+
+class TestLfoLoopPrompt(unittest.TestCase):
+    def test_prompt_defaults_to_yes(self):
+        prompts: list[str] = []
+
+        def read(prompt: str) -> str:
+            prompts.append(prompt)
+            return ""
+
+        self.assertTrue(menu._ask_lfo_loop(read))
+        self.assertIn("LFO looping", prompts[0])
+        self.assertIn("(Y/n)", prompts[0])
+
+    def test_no_disables_loop_search(self):
+        self.assertFalse(menu._ask_lfo_loop(lambda _prompt: "n"))
+
+    def test_pasted_path_uses_the_saved_setting(self):
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "a.vgm"
+            src.write_bytes(_music_vgm())
+            calls: list[dict] = []
+
+            def fake_convert(*_args, **kw):
+                calls.append(kw)
+                return 0
+
+            with mock.patch.object(menu, "_convert_now", fake_convert):
+                menu._open_typed_path(
+                    lambda _prompt: "", lambda _message: None,
+                    {"lfo_loop": False}, Path(tmp) / "state.json", str(src),
+                )
+            self.assertFalse(calls[0]["lfo_loop"])
+
+    def test_conversion_carries_the_flag(self):
+        from unittest import mock
+
+        calls: list[dict] = []
+
+        info = {
+            "dst": "out/a.fur", "bytes": 1, "speed": 1, "events": 1,
+            "gain": None, "loop": None, "warnings": [],
+        }
+
+        def fake_convert(files, dest, **kw):
+            calls.append(kw)
+            return iter([(files[0], info, None)])
+
+        with mock.patch.object(menu, "convert_folder", fake_convert):
+            menu._run_convert(
+                lambda _message: None, [Path("a.vgm")], Path("out"), None,
+                "none", lfo_loop=False,
+            )
+        self.assertFalse(calls[0]["lfo_loop"])
 
 
 class TestMenuFurnaceDefault(unittest.TestCase):

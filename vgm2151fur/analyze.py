@@ -1823,7 +1823,9 @@ def _merge_tone_prefixes(
     return mapping
 
 
-def _loop_saa_pitch_macros(bucket: list[ToneIns]) -> None:
+def _loop_saa_pitch_macros(
+    bucket: list[ToneIns], lfo_loop: bool = True,
+) -> None:
     """Loop a periodic SAA pitch macro independently of its other macros.
 
     Prefix grouping can keep a longer copy of a macro whose periodic prefix
@@ -1831,6 +1833,8 @@ def _loop_saa_pitch_macros(bucket: list[ToneIns]) -> None:
     detection does not depend on pan, envelope or mode macros being present.
     Step-length compression stays off: it would change the duty ratio.
     """
+    if not lfo_loop:
+        return
     for i, ins in enumerate(bucket):
         if not ins.pitch or ins.pitch_loop != 255:
             continue
@@ -1869,6 +1873,7 @@ def _bind_tone_instruments(
     total_samples: int,
     use_speed: int = 1,
     merge_tol: int = 0,
+    lfo_loop: bool = True,
 ) -> int:
     """Fill `scc_ins` / `ay_ins` and point each tone note at one.
 
@@ -2058,7 +2063,7 @@ def _bind_tone_instruments(
                     # an exact periodic tail.
                     pitch, pitch_speed, pitch_loop, pitch_delay = (
                         _macro_series_delay(
-                            series, tail_loop=True, step_compress=False,
+                            series, tail_loop=lfo_loop, step_compress=False,
                         )
                     )
                     if pitch_delay == 0:
@@ -2066,7 +2071,7 @@ def _bind_tone_instruments(
                 else:
                     pitch, pitch_speed, pitch_loop, pitch_delay = (
                         _macro_series_delay(
-                            series, tail_loop=True, step_compress=True,
+                            series, tail_loop=lfo_loop, step_compress=True,
                         )
                     )
                     # A delayed first value is held long enough to be a real
@@ -2474,7 +2479,7 @@ def _bind_tone_instruments(
         mapping = tone_maps.get(event.tone_chip)
         if mapping is not None:
             bound[i] = (event, mapping.get(idx, idx))
-    _loop_saa_pitch_macros(saa_ins)
+    _loop_saa_pitch_macros(saa_ins, lfo_loop)
     n_scc = len(scc_ins)
     n_ay = len(ay_ins)
     n_psg = len(psg_ins)
@@ -2622,6 +2627,7 @@ def _tone_instrument_demand(
     hz: float,
     total_samples: int,
     use_speed: int = 1,
+    lfo_loop: bool = True,
 ) -> int:
     """How many tone instruments the notes want with an unlimited budget.
 
@@ -2641,6 +2647,7 @@ def _tone_instrument_demand(
         -1000,
         scc_clock, ay_clock, psg_clock, nes_clock, huc6280_clock,
         gb_clock, vsu_clock, saa_clock, hz, total_samples, use_speed,
+        lfo_loop=lfo_loop,
     )
     return sum(
         len(bucket)
@@ -6398,12 +6405,15 @@ def analyze(
     grid_cache: dict | None = None,
     c352_quad: bool = False,
     dac_slices: bool = False,
+    lfo_loop: bool = True,
 ) -> Song:
     """Build the Song for one rendition of `vgm`.
 
     `grid_cache` memoises the grid estimate, which does not depend on
     `condense`. The caller owns it. `c352_quad` keeps the C352 rear pair on
-    its own outputs.
+    its own outputs. `lfo_loop` enables the LFO/tail loop search for long
+    pitch macros; turning it off keeps the exact first-cycle detection but
+    skips the expensive tail scan.
     """
     tick = TARGET_TICK_SAMPLES if tick_samples is None else float(tick_samples)
     row_floor = MIN_ROW_SAMPLES if min_row is None else float(min_row)
@@ -10978,6 +10988,7 @@ def analyze(
             events, vgm.k051649_clock or SCC_DEFAULT_CLOCK, ay_note_clock,
             psg_clock, nes_clock, huc6280_clock, gb_clock, vsu_clock,
             saa_clock, hz, vgm.total_samples, use_speed,
+            lfo_loop=lfo_loop,
         )
     tone_demand_raw = tone_demand
     free_slots = max(
@@ -11103,7 +11114,7 @@ def analyze(
         vsu_clock,
         saa_clock,
         hz, vgm.total_samples, use_speed,
-        merge_tol=tone_merge_tol,
+        merge_tol=tone_merge_tol, lfo_loop=lfo_loop,
     )
     if tone_merged:
         warnings.append(
