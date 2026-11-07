@@ -1532,6 +1532,42 @@ def _tone_macro_size(spec: ToneIns) -> int:
     return sum(len(getattr(spec, field)) for field in _TONE_MACRO_FIELDS)
 
 
+def _delay_leading_values(values, speed: int) -> tuple[tuple, int]:
+    """Collapse a leading run into one value plus a delay in ticks."""
+    values = tuple(values)
+    if not values:
+        return (), 0
+    run = 1
+    while run < len(values) and values[run] == values[0]:
+        run += 1
+    if run <= 1:
+        return values, 0
+    hold = run * max(1, speed)
+    if hold <= 256:
+        return (values[0],) + values[run:], hold - 1
+    extra = hold - 256
+    keep = 1 + (extra + speed - 1) // max(1, speed)
+    return (values[0],) * keep + values[run:], 255
+
+
+def _compress_tone_delays(bucket: list[ToneIns]) -> None:
+    """Make every leading-hold macro use the delay field before grouping."""
+    for i, spec in enumerate(bucket):
+        changes: dict[str, object] = {}
+        if spec.pitch and spec.pitch_loop == 255 and not spec.pitch_delay:
+            values, delay = _delay_leading_values(spec.pitch, spec.pitch_speed)
+            if delay:
+                changes["pitch"] = values
+                changes["pitch_delay"] = delay
+        if spec.vol and spec.vol_loop == 255 and not spec.vol_delay:
+            values, delay = _delay_leading_values(spec.vol, spec.vol_speed)
+            if delay:
+                changes["vol"] = values
+                changes["vol_delay"] = delay
+        if changes:
+            bucket[i] = replace(spec, **changes)
+
+
 def _tone_vol_sig(spec: ToneIns) -> tuple:
     """Everything about a tone instrument except its volume macro."""
     skip = {"vol", "vol_speed", "vol_loop", "vol_delay"}
@@ -2136,6 +2172,16 @@ def _bind_tone_instruments(
         else:
             e.vol = column_vol
             e.vol_pts = ()
+    # Re-apply the leading-delay compression to every final tone macro
+    # before grouping. A macro that was copied or shared can still carry the
+    # literal leading repeats; compressing here keeps the compact form and
+    # stops the grouping pass from choosing the longer, uncompressed copy.
+    for bucket in (
+        scc_ins, ay_ins, psg_ins, nes_ins, huc6280_ins, gb_ins,
+        vsu_ins,
+    ):
+        _compress_tone_delays(bucket)
+
     # AY/SSG volume envelopes that differ by a constant 1 or 2 can share the
     # loudest instrument; the quieter notes ride the volume column. This runs
     # before the generic prefix merge so the reduced volume list is what gets

@@ -16,7 +16,9 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from vgm2151fur.analyze import _macro_series_delay  # noqa: E402
+from vgm2151fur.analyze import (  # noqa: E402
+    ToneIns, _compress_tone_delays, _macro_series_delay,
+)
 from vgm2151fur.furwrite import Buf, _write_macro  # noqa: E402
 
 
@@ -45,6 +47,22 @@ class TestMacroDelay(unittest.TestCase):
         )
         self.assertEqual(delay, 0)
         self.assertEqual(values, (1, 1, 2, 1, 2))
+
+    def test_recompress_tone_macros_before_grouping(self):
+        bucket = [
+            ToneIns(
+                wave=1,
+                pitch=(0, 0, 0, 0, 0, 0, 5, 6),
+                vol=(3, 3, 3, 3, 2),
+                vol_speed=2,
+            ),
+        ]
+        _compress_tone_delays(bucket)
+        spec = bucket[0]
+        self.assertEqual(spec.pitch, (0, 5, 6))
+        self.assertEqual(spec.pitch_delay, 5)
+        self.assertEqual(spec.vol, (3, 2))
+        self.assertEqual(spec.vol_delay, 7)
 
     def test_writer_emits_the_delay_byte(self):
         b = Buf()
