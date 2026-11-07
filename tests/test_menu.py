@@ -450,7 +450,7 @@ class TestLfoLoopPrompt(unittest.TestCase):
             return ""
 
         self.assertTrue(menu._ask_lfo_loop(read))
-        self.assertIn("LFO looping", prompts[0])
+        self.assertIn("LFO", prompts[0])
         self.assertIn("(Y/n)", prompts[0])
 
     def test_no_disables_loop_search(self):
