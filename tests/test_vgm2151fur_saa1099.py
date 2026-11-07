@@ -299,9 +299,11 @@ class TestSaaFurEmission(unittest.TestCase):
         # macros.
         notes = [e for e in song.events if e.on and e.ch >= 8]
         self.assertEqual(len(notes), 1)
-        self.assertEqual(notes[0].vol, 15)
-        self.assertEqual(notes[0].pan, 0)
-        self.assertEqual(notes[0].tone_amp_pts[0], (notes[0].sample, 8, 8))
+        # The level is a normalized volume macro and the note column carries
+        # the segment peak; the balance is the note's 08xy state.
+        self.assertEqual(notes[0].vol, 8)
+        self.assertEqual(notes[0].pan, 0xFF)
+        self.assertEqual(song.saa_ins[notes[0].ins].vol, (15, 8))
 
     def test_dual_chip_module(self):
         song = self._song(dual=True)

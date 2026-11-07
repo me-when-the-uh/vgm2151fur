@@ -2077,6 +2077,30 @@ def _bind_tone_instruments(
                         # Folding a constant offset into E5 would be lost on
                         # a noise note: the register reads ``pitch2``.
                         pitch = _absorb_detune(e, pitch, pitch_speed)
+            if e.tone_chip == 8 and pitch and len(pitch) <= 8:
+                # The short residual bend after a legato split is the
+                # transition into the next note, not an instrument identity.
+                # Put it on the pattern rows (E8/E9 + E5) so the notes of a
+                # descent can share one volume/mode/envelope instrument.
+                steps = tuple(
+                    (
+                        t,
+                        int(round((
+                            tbl.offset_for(
+                                e.note, per + e.tone_period_offset,
+                            ) - base_off
+                        ) / 2.0)),
+                    )
+                    for t, per in e.tone_pitch_pts
+                )
+                steps = tuple((t, v) for t, v in steps if v)
+                if steps:
+                    e.pitch_steps = steps
+                    e.sweep_div = 2.0
+                    e.e5_lo = 0x00
+                    e.e5_hi = 0xFF
+                    pitch = ()
+                    pitch_speed, pitch_loop, pitch_delay = 1, 255, 0
         wave_vals: tuple[int, ...] = ()
         wave_speed, wave_loop = 1, 255
         if e.tone_wave_pts:
@@ -2086,6 +2110,7 @@ def _bind_tone_instruments(
             )
         column_vol = e.vol
         pce_peak = 0
+        saa_peak = 0
         vol_vals: tuple[int, ...] = ()
         vol_speed, vol_loop = 1, 255
         vol_delay = 0
@@ -2105,6 +2130,17 @@ def _bind_tone_instruments(
                 # then carries the peak level and the macro the decay shape,
                 # so notes with different starting volumes are not all 31.
                 pce_peak = max(1, series[0]) if series else 0
+            if e.tone_chip == 8:
+                # Same idea for the SAA level: the note column carries the
+                # segment's peak and the macro the normalized shape.  Notes
+                # of a descent then share one instrument, and only the pan
+                # (08xy) differs per note.
+                saa_peak = max(1, max(series)) if series else 0
+                if saa_peak:
+                    series = [
+                        max(0, min(15, int(round(v * 15.0 / saa_peak))))
+                        for v in series
+                    ]
             if e.tone_chip == 6:
                 # The GB platform applies a software-envelope volume macro
                 # directly; a generic FA volume slide is not implemented there,
@@ -2117,12 +2153,14 @@ def _bind_tone_instruments(
                 # PCE keeps the trajectory as a normalized macro: a slide
                 # would move the raw column at one unit per tick and lose the
                 # peak scaling.
-                folded = None if e.tone_chip == 5 else _fold_saw(series)
+                folded = (
+                    None if e.tone_chip in (5, 8) else _fold_saw(series)
+                )
                 # Past 255 ticks a non-repeating series is stored as every Nth
                 # value. A one-level saw is played as a slide instead, so the
                 # ramp still moves on every tick.
                 thin = (
-                    e.tone_chip != 5
+                    e.tone_chip not in (5, 8)
                     and folded is None
                     and len(series) > MACRO_MAX
                     and _cycle(series) is None
@@ -2342,17 +2380,7 @@ def _bind_tone_instruments(
             # The instrument now carries the pitch trajectory; the row ramp
             # would double it.
             e.sweep = ()
-        if e.tone_chip == 8:
-            # The panning macros carry the raw amplitude.  With a column of
-            # 15, applyPan(15, (left << 4) | right) is the source register
-            # exactly.  If the budget dropped them, keep the static opening
-            # amplitude and pan on the note instead.
-            if kept.panl or kept.panr:
-                e.vol = 15
-                e.pan = 0
-            e.vol_pts = ()
-            e.vol_slide = 0
-        elif e.tone_chip == 5:
+        if e.tone_chip == 5:
             # When the envelope became an instrument macro, the column is
             # the macro's full-scale reference (31). Otherwise the PCE column
             # is the control volume and `vol_pts` carry the balance/volume
@@ -2363,6 +2391,13 @@ def _bind_tone_instruments(
                 e.vol_slide = 0
             else:
                 e.vol = column_vol
+        elif e.tone_chip == 8:
+            # The SAA volume macro is normalized to its segment peak, so the
+            # note column carries that peak.  The balance is already the
+            # note's 08xy state, not part of the instrument.
+            e.vol_pts = ()
+            e.vol = saa_peak if (kept.vol and saa_peak) else column_vol
+            e.vol_slide = 0
         elif e.tone_chip == 3 or (e.tone_chip == 6 and e.tone_gb_wave):
             # The SMS column is the raw 4-bit register; keep vol_pts as
             # pattern steps rather than folding them into a volume macro.
@@ -3408,8 +3443,6 @@ def _emit_saa_notes(
         ch = base + h.voice
         st = h.sample_time
         gate_end = h.off_sample or (total_samples or st)
-        note, e5 = saa_period_note(clock, h.period)
-        steps = _tone_steps(list(h.freq_pts), st, 0, _AY_MERGE_GAP)
         if h.hidden:
             # Silent source notes for an envelope generator.  Split at every
             # period change so the note/E5 carries the source voice's exact
@@ -3440,70 +3473,100 @@ def _emit_saa_notes(
                 ))
                 count += 1
             continue
-        left, right = h.left, h.right
-        vol = max(left, right)
-        pan = pcm_pan_fx(left, right)
-        amp_pts: list[tuple[int, int, int]] = [(st, left, right)]
-        for pt in h.amp_pts:
-            if st < pt[0] < gate_end:
-                amp_pts.append(pt)
-        tone, noise = h.tone, h.noise
-        mode_pts: list[tuple[int, bool, bool]] = [(st, tone, noise)]
-        for pt in h.mode_pts:
-            if st < pt[0] < gate_end:
-                mode_pts.append(pt)
-        nf = h.noise_freq
-        noise_pts: list[tuple[int, int]] = [(st, nf)]
-        for pt in h.noise_pts:
-            if st < pt[0] < gate_end:
-                noise_pts.append(pt)
-        env = h.env
-        env_pts: list[tuple[int, int]] = [(st, env)]
-        for pt in h.env_pts:
-            if st < pt[0] < gate_end:
-                env_pts.append(pt)
+        # A large pitch step held for more than half a frame is a legato note,
+        # not a macro: split it so the instrument is shared across the notes
+        # of a descent.  Fast pseudo-duty detunes are small and stay on the
+        # pitch macro.  The amplitude/pan, mode, noise and envelope state at
+        # each split is carried into that note, the same way volume is.
+        segs = segment_periods(
+            [(h.sample_time, h.period), *h.freq_pts],
+            gate_end, clock, SAA_DIVIDER, 0,
+            merge_gap=_AY_MERGE_GAP,
+            min_hold=max(1, _NOTE_HOLD_SAMPLES // 2),
+            drop_short=False,
+        )
+        for i, (sst, period, intra) in enumerate(segs):
+            nxt = segs[i + 1][0] if i + 1 < len(segs) else 0
+            seg_end = nxt or h.off_sample
+            bound = nxt or gate_end
+            note, e5 = saa_period_note(clock, period)
+            steps = _tone_steps(list(intra), sst, 0, _AY_MERGE_GAP)
+            left, right = _saa_amp_at(h, sst)
+            vol = max(left, right)
+            pan = pcm_pan_fx(left, right)
+            # Volume is the macro (as on the other PSGs); the left/right
+            # balance is note/row state.  Keeping balance out of the
+            # instrument lets notes with the same level shape share one.
+            amp_pts: list[tuple[int, int, int]] = [(sst, left, right)]
+            for pt in h.amp_pts:
+                if sst < pt[0] < bound:
+                    amp_pts.append(pt)
+            vol_pts = tuple(
+                (t, max(l, r), None) for t, l, r in amp_pts[1:]
+            )
+            last_pan = pan
+            for t, l, r in amp_pts[1:]:
+                next_pan = pcm_pan_fx(l, r)
+                if next_pan != last_pan:
+                    channel_fx.append((t, ch, 0x08, next_pan))
+                    last_pan = next_pan
+            tone, noise = _saa_mode_at(h, sst)
+            mode_pts: list[tuple[int, bool, bool]] = [(sst, tone, noise)]
+            for pt in h.mode_pts:
+                if sst < pt[0] < bound:
+                    mode_pts.append(pt)
+            nf = _saa_noise_at(h, sst)
+            noise_pts: list[tuple[int, int]] = [(sst, nf)]
+            for pt in h.noise_pts:
+                if sst < pt[0] < bound:
+                    noise_pts.append(pt)
+            env = _saa_env_at(h, sst)
+            env_pts: list[tuple[int, int]] = [(sst, env)]
+            for pt in h.env_pts:
+                if sst < pt[0] < bound:
+                    env_pts.append(pt)
 
-        # Row effects for the opening state; the instrument macros carry any
-        # later motion.  The initial effects also keep a constant state when
-        # the budget falls back to a plain voice.
-        channel_fx.append((st, ch, 0x10, _saa_mode_effect(tone, noise)))
-        channel_fx.append((st, ch, 0x11, nf))
-        for t, to, no in mode_pts[1:]:
-            channel_fx.append((t, ch, 0x10, _saa_mode_effect(to, no)))
-        for t, value in noise_pts[1:]:
-            channel_fx.append((t, ch, 0x11, value))
-        if h.voice % 3 == 2:
-            channel_fx.append((st, ch, 0x12, env))
-            for t, value in env_pts[1:]:
-                channel_fx.append((t, ch, 0x12, value))
+            # Row effects for the opening state; the instrument macros carry
+            # any later motion.  The initial effects also keep a constant
+            # state when the budget falls back to a plain voice.
+            channel_fx.append((sst, ch, 0x10, _saa_mode_effect(tone, noise)))
+            channel_fx.append((sst, ch, 0x11, nf))
+            for t, to, no in mode_pts[1:]:
+                channel_fx.append((t, ch, 0x10, _saa_mode_effect(to, no)))
+            for t, value in noise_pts[1:]:
+                channel_fx.append((t, ch, 0x11, value))
+            if h.voice % 3 == 2:
+                channel_fx.append((sst, ch, 0x12, env))
+                for t, value in env_pts[1:]:
+                    channel_fx.append((t, ch, 0x12, value))
 
-        fx: list[tuple[int, int, int]] = [
-            (t, 0x10, _saa_mode_macro(to, no))
-            for t, to, no in mode_pts
-        ]
-        fx += [(t, 0x11, value) for t, value in noise_pts]
-        if h.voice % 3 == 2:
-            fx += [(t, 0x12, value) for t, value in env_pts]
+            fx: list[tuple[int, int, int]] = [
+                (t, 0x10, _saa_mode_macro(to, no))
+                for t, to, no in mode_pts
+            ]
+            fx += [(t, 0x11, value) for t, value in noise_pts]
+            if h.voice % 3 == 2:
+                fx += [(t, 0x12, value) for t, value in env_pts]
 
-        events.append(NoteEvent(
-            sample=st,
-            ch=ch,
-            on=True,
-            note=note,
-            ins=-1,
-            vol=vol,
-            e5=e5,
-            pan=pan,
-            end=h.off_sample,
-            tone_pitch_pts=tuple(steps),
-            tone_amp_pts=tuple(amp_pts),
-            tone_fx_pts=tuple(fx),
-            tone_chip=8,
-            tone_clock=clock,
-            tone_div=SAA_DIVIDER,
-            tone_period_offset=0,
-        ))
-        count += 1
+            events.append(NoteEvent(
+                sample=sst,
+                ch=ch,
+                on=True,
+                note=note,
+                ins=-1,
+                vol=vol,
+                e5=e5,
+                pan=pan,
+                end=seg_end,
+                vol_pts=vol_pts,
+                tone_pitch_pts=tuple(steps),
+                tone_fx_pts=tuple(fx),
+                tone_chip=8,
+                tone_clock=clock,
+                tone_div=SAA_DIVIDER,
+                tone_period_offset=0,
+            ))
+            count += 1
     for off in offs:
         base = at.get(off.chip_id)
         if base is None:
