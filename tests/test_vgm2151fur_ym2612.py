@@ -38,12 +38,15 @@ from vgm2151fur.ym2612 import (
 )
 from vgm2151fur.ym2612dac import (
     DAC_RELEASE_SAMPLES,
+    DAC_TARGET_SAMPLES,
+    DacPlay,
     DacSample,
     _cluster_similar_samples,
     _merge_one_shot_samples,
     _split_long_silence,
     _split_silent_runs,
     collect_dac,
+    group_dac_plays,
 )
 
 TMP = Path(tempfile.gettempdir()) / "vgm2151fur_ym2612"
@@ -1558,7 +1561,8 @@ class TestYm2612DacSourceSamples(unittest.TestCase):
         self.assertEqual(len(samples[0].data), 64)
         song = analyze(src, speed=6)
         # The 16-byte read reuses the 64-byte body and is cut by the next
-        # note; no separate 16-byte module sample is stored.
+        # note.  With only two bodies there is no reason to cluster further,
+        # so the distinct 8-byte one-shot keeps its own slot.
         self.assertEqual(len(song.dac_samples), 2)
         self.assertEqual(song.dac_count, 3)
 
@@ -1835,6 +1839,50 @@ class TestYm2612DacBanking(unittest.TestCase):
         self.assertEqual(len(plays), 2)
         self.assertEqual({p.sample for p in plays}, {0})
         self.assertEqual(stats.get("dac_attack_prefix_reused"), 1)
+
+
+class TestYm2612DacFragmentClustering(unittest.TestCase):
+    """A busy DAC map collapses to the hottest/longest sample anchors."""
+
+    @staticmethod
+    def _body(seed: int) -> bytes:
+        value = seed * 1234567 + 1
+        out = []
+        for _ in range(64):
+            value = (value * 1103515245 + 12345) & 0x7FFFFFFF
+            out.append((value >> 16) & 0xFF)
+        return bytes(out)
+
+    def test_sample_map_stays_within_the_target(self):
+        samples = [
+            DacSample(i, 64, self._body(i), 14700, i * 4410)
+            for i in range(40)
+        ]
+        plays = []
+        # Sample 0 is the hot drum: ten uses.  The rest are one-shots.
+        for hit in range(10):
+            plays.append(DacPlay(
+                hit * 4410, 0, (hit * 37) & 0xFF, 1000, False, True,
+            ))
+        for i in range(1, 40):
+            plays.append(DacPlay(
+                (10 + i) * 4410, i, (i * 53) & 0xFF, 1000, False, True,
+            ))
+        plays.sort(key=lambda p: p.onset)
+        out, notes, _offs, _pans, warn, stats = group_dac_plays(
+            samples, plays, hz=60.0, speed=6, total_samples=300000,
+            trim=False,
+        )
+        self.assertFalse(warn)
+        self.assertLessEqual(len(out), DAC_TARGET_SAMPLES)
+        self.assertEqual(len(notes), len(plays))
+        self.assertTrue(all(0 <= idx < len(out) for _t, idx, _p in notes))
+        # The ten-use body is one of the anchors.
+        self.assertIn(
+            bytes(samples[0].data),
+            {bytes(smp.data) for smp in out},
+        )
+        self.assertGreaterEqual(stats.get("dac_fragment_clustered", 0), 1)
 
 
 class TestYm2612DacLongHolds(unittest.TestCase):

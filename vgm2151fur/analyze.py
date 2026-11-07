@@ -10886,6 +10886,7 @@ def analyze(
             dac_samples, dac_plays, hz=hz, speed=use_speed, t0=t0,
             total_samples=vgm.total_samples or 0,
             drop_quiet=not dac_slices,
+            cluster_fragments=not dac_slices,
         )
         dac_stats.update(dac_group_stats)
         warnings.extend(dac_group_warn)
