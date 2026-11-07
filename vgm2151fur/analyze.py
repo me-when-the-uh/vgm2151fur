@@ -1601,17 +1601,27 @@ def _tone_macro_extends(a: ToneIns, b: ToneIns) -> bool:
 
 
 def _tone_macro_same_for(a: ToneIns, b: ToneIns, ticks: int) -> bool:
-    """Whether `a` and `b` play the same tone macros for `ticks` ticks."""
+    """Whether `a` and `b` play the same tone macros for `ticks` ticks.
+
+    Each side uses its own speed, loop and delay.  Evaluating the longer
+    macro with the shorter macro's timing made a fast looping tail look like
+    a slow prefix; notes then inherited a late pitch/LFO tail they never had.
+    """
     for field, speed_field, loop_field in _TONE_MACRO_TIMING:
-        speed = getattr(b, speed_field)
-        loop = getattr(b, loop_field)
-        delay = getattr(b, f"{field}_delay", 0)
         if (
             _macro_effective(
-                tuple(getattr(a, field)), speed, loop, ticks, delay,
+                tuple(getattr(a, field)),
+                getattr(a, speed_field),
+                getattr(a, loop_field),
+                ticks,
+                getattr(a, f"{field}_delay", 0),
             )
             != _macro_effective(
-                tuple(getattr(b, field)), speed, loop, ticks, delay,
+                tuple(getattr(b, field)),
+                getattr(b, speed_field),
+                getattr(b, loop_field),
+                ticks,
+                getattr(b, f"{field}_delay", 0),
             )
         ):
             return False

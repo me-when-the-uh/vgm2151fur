@@ -18,6 +18,7 @@ if str(ROOT) not in sys.path:
 
 from vgm2151fur.analyze import (  # noqa: E402
     ToneIns, _compress_tone_delays, _lfo_tail_cycle, _macro_series_delay,
+    _merge_tone_prefixes, _tone_macro_same_for,
 )
 from vgm2151fur.furwrite import Buf, _write_macro  # noqa: E402
 
@@ -108,6 +109,34 @@ class TestMacroDelay(unittest.TestCase):
         self.assertEqual(word, 0x81, "16-bit value encoding")
         self.assertEqual((delay, speed), (9, 1))
         self.assertEqual(struct.unpack_from("<hh", b.b, 8), (5, 6))
+
+
+class TestToneMacroTiming(unittest.TestCase):
+    """A fast looping tail must not look like a slow note's prefix."""
+
+    @staticmethod
+    def _pair() -> tuple[ToneIns, ToneIns]:
+        simple = ToneIns(
+            pitch=(0, 1), pitch_speed=28, pitch_loop=255, pitch_delay=22,
+        )
+        tail = ToneIns(
+            pitch=(0, 1, 1, 1, 1, 1, 1, 1, 1, 121, 121, 121, 129, 129),
+            pitch_speed=8, pitch_loop=10, pitch_delay=24,
+        )
+        return simple, tail
+
+    def test_each_macro_uses_its_own_timing(self):
+        simple, tail = self._pair()
+        self.assertFalse(_tone_macro_same_for(tail, simple, 335))
+        self.assertTrue(_tone_macro_same_for(tail, simple, 4))
+
+    def test_a_long_note_does_not_merge_into_the_tail_instrument(self):
+        simple, tail = self._pair()
+        bucket = [simple, tail]
+        mapping = _merge_tone_prefixes(
+            bucket, {0: [(0, 335 * 100)]}, 100.0, 1,
+        )
+        self.assertEqual(mapping, {0: 0, 1: 1})
 
 
 if __name__ == "__main__":
