@@ -868,6 +868,7 @@ def _write_tone_macros(b: Buf, ins, *, wave: bool, reset: bool = False) -> None:
     if ins.vol:
         _write_macro(
             b, 0, ins.vol, speed=ins.vol_speed, loop=ins.vol_loop,
+            delay=getattr(ins, "vol_delay", 0),
         )
     if ins.noise:
         # ay.cpp writes register 6 as ``31 - duty``. The values are already
@@ -895,7 +896,8 @@ def _write_tone_macros(b: Buf, ins, *, wave: bool, reset: bool = False) -> None:
         )
     if ins.pitch:
         _write_macro(
-            b, 4, ins.pitch, speed=ins.pitch_speed, loop=ins.pitch_loop, width=2,
+            b, 4, ins.pitch, speed=ins.pitch_speed, loop=ins.pitch_loop,
+            delay=getattr(ins, "pitch_delay", 0), width=2,
         )
     if ins.env_shape:
         _write_macro(

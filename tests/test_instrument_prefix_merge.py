@@ -143,7 +143,12 @@ class TestTonePrefixMerge(unittest.TestCase):
             ToneIns(wave=1, pitch=(10, 20, 30), vol=(5, 6, 7)),
             ToneIns(wave=2, pitch=(10, 20), vol=(5, 6)),
         ]
-        mapping = _merge_tone_prefixes(bucket)
+        notes = {
+            0: [(0, 500)],
+            1: [(1000, 1500)],
+            2: [(2000, 2500)],
+        }
+        mapping = _merge_tone_prefixes(bucket, notes, 1000)
         self.assertEqual(len(bucket), 2)
         self.assertEqual(mapping[0], mapping[1])
         self.assertNotEqual(mapping[2], mapping[0])

@@ -571,6 +571,8 @@ class ToneIns:
     pitch: tuple[int, ...] = ()
     pitch_speed: int = 1
     pitch_loop: int = 255
+    # Leading-hold delay for the first pitch value (ticks). Same for volume.
+    pitch_delay: int = 0
     waves: tuple[int, ...] = ()
     wave_speed: int = 1
     wave_loop: int = 255
@@ -579,6 +581,7 @@ class ToneIns:
     vol: tuple[int, ...] = ()
     vol_speed: int = 1
     vol_loop: int = 255
+    vol_delay: int = 0
     # AY register motion a pattern row would quantize away, read as the duty,
     # wave, ex2 and ex5 macros. Empty when the register stays put.
     noise: tuple[int, ...] = ()
@@ -1480,6 +1483,7 @@ _TONE_MACRO_TIMING = (
 def _tone_sig(spec: ToneIns) -> tuple:
     """Everything about a tone instrument except its macro values."""
     skip = set(_TONE_MACRO_FIELDS)
+    skip.update(("pitch_delay", "vol_delay"))
     for _field, speed, loop in _TONE_MACRO_TIMING:
         skip.add(speed)
         skip.add(loop)
@@ -1511,9 +1515,14 @@ def _tone_macro_same_for(a: ToneIns, b: ToneIns, ticks: int) -> bool:
     for field, speed_field, loop_field in _TONE_MACRO_TIMING:
         speed = getattr(b, speed_field)
         loop = getattr(b, loop_field)
+        delay = getattr(b, f"{field}_delay", 0) if field in ("pitch", "vol") else 0
         if (
-            _macro_effective(tuple(getattr(a, field)), speed, loop, ticks)
-            != _macro_effective(tuple(getattr(b, field)), speed, loop, ticks)
+            _macro_effective(
+                tuple(getattr(a, field)), speed, loop, ticks, delay,
+            )
+            != _macro_effective(
+                tuple(getattr(b, field)), speed, loop, ticks, delay,
+            )
         ):
             return False
     return True
@@ -1525,7 +1534,7 @@ def _tone_macro_size(spec: ToneIns) -> int:
 
 def _tone_vol_sig(spec: ToneIns) -> tuple:
     """Everything about a tone instrument except its volume macro."""
-    skip = {"vol", "vol_speed", "vol_loop"}
+    skip = {"vol", "vol_speed", "vol_loop", "vol_delay"}
     return tuple(
         (name, getattr(spec, name))
         for name in spec.__dataclass_fields__ if name not in skip
@@ -1543,15 +1552,25 @@ def _vol_offset(loud: ToneIns, quiet: ToneIns) -> int | None:
     a = tuple(loud.vol)
     b = tuple(quiet.vol)
     if (
-        not a or not b or len(a) != len(b)
+        not a or not b
         or loud.vol_speed != quiet.vol_speed
         or loud.vol_loop != quiet.vol_loop
     ):
         return None
-    delta = a[0] - b[0]
+    if loud.vol_loop != 255:
+        # A loop's phase is not worth reconciling here; equal macros are
+        # handled by the generic prefix merge.
+        return None
+    delay_a = getattr(loud, "vol_delay", 0)
+    delay_b = getattr(quiet, "vol_delay", 0)
+    speed = max(1, loud.vol_speed)
+    horizon = max(len(a), len(b)) * speed + max(delay_a, delay_b) + 1
+    ea = _macro_effective(a, speed, 255, horizon, delay_a)
+    eb = _macro_effective(b, speed, 255, horizon, delay_b)
+    delta = ea[0] - eb[0]
     if delta < 1 or delta > _AY_VOL_SPREAD:
         return None
-    if any(x - y != delta for x, y in zip(a, b)):
+    if any(x - y != delta for x, y in zip(ea, eb)):
         return None
     return delta
 
@@ -1641,9 +1660,10 @@ def _merge_tone_prefixes(
         groups.setdefault(_tone_sig(spec), []).append(i)
 
     def extends(j: int, i: int) -> bool:
-        if not _tone_macro_extends(bucket[j], bucket[i]):
+        notes = (notes_by_ins or {}).get(i, ())
+        if not notes:
             return False
-        for start, end in (notes_by_ins or {}).get(i, ()):
+        for start, end in notes:
             if end <= 0:
                 return False
             ticks = _macro_ticks(start, end, tick_samples)
@@ -1827,6 +1847,7 @@ def _bind_tone_instruments(
                 e.e5_hi = 0xFF
         pitch: tuple[int, ...] = ()
         pitch_speed, pitch_loop = 1, 255
+        pitch_delay = 0
         if e.tone_pitch_pts:
             pts = [(e.sample, 0)]
             if e.tone_noise:
@@ -1858,11 +1879,22 @@ def _bind_tone_instruments(
                 ]
             series = _tick_values(pts, e.sample, ticks, tick_samples)
             if any(series):
-                pitch, pitch_speed, pitch_loop = _macro_series(series)
-                if not e.tone_noise:
-                    # Folding a constant offset into E5 would be lost on a
-                    # noise note: the register reads ``pitch2``, not the note.
-                    pitch = _absorb_detune(e, pitch, pitch_speed)
+                if e.tone_noise:
+                    # A noise pitch is a register offset, not a tone bend;
+                    # leave its leading values uncollapsed.
+                    pitch, pitch_speed, pitch_loop = _macro_series(series)
+                else:
+                    pitch, pitch_speed, pitch_loop, pitch_delay = (
+                        _macro_series_delay(series)
+                    )
+                    # A delayed first value is held long enough to be a real
+                    # step, not an attack settle; folding its tail into E5
+                    # would drop the held level. Only absorb a settle when
+                    # there is no delay.
+                    if pitch_delay == 0:
+                        # Folding a constant offset into E5 would be lost on
+                        # a noise note: the register reads ``pitch2``.
+                        pitch = _absorb_detune(e, pitch, pitch_speed)
         wave_vals: tuple[int, ...] = ()
         wave_speed, wave_loop = 1, 255
         if e.tone_wave_pts:
@@ -1874,6 +1906,7 @@ def _bind_tone_instruments(
         pce_peak = 0
         vol_vals: tuple[int, ...] = ()
         vol_speed, vol_loop = 1, 255
+        vol_delay = 0
         series: list[int] = []
         if e.vol_pts and e.tone_chip not in (3,) and not (
                 e.tone_chip == 6 and e.tone_gb_wave):
@@ -1895,7 +1928,9 @@ def _bind_tone_instruments(
                 # directly; a generic FA volume slide is not implemented there,
                 # so never fold the trajectory into a slide. _macro_series
                 # drops the trailing hold anyway, keeping decay macros short.
-                vol_vals, vol_speed, vol_loop = _macro_series(series)
+                vol_vals, vol_speed, vol_loop, vol_delay = (
+                    _macro_series_delay(series)
+                )
             else:
                 # PCE keeps the trajectory as a normalized macro: a slide
                 # would move the raw column at one unit per tick and lose the
@@ -1917,7 +1952,9 @@ def _bind_tone_instruments(
                     e.vol = series[0]
                     e.vol_slide = _slide_open(series)
                 else:
-                    vol_vals, vol_speed, vol_loop = _macro_series(series)
+                    vol_vals, vol_speed, vol_loop, vol_delay = (
+                        _macro_series_delay(series)
+                    )
                     if e.tone_chip == 5 and vol_vals and pce_peak:
                         vol_vals = tuple(
                             max(0, min(31, int(round(v * 31 / pce_peak))))
@@ -1981,8 +2018,10 @@ def _bind_tone_instruments(
         spec = ToneIns(
             wave=max(0, e.tone_wave),
             pitch=pitch, pitch_speed=pitch_speed, pitch_loop=pitch_loop,
+            pitch_delay=pitch_delay,
             waves=wave_vals, wave_speed=wave_speed, wave_loop=wave_loop,
             vol=vol_vals, vol_speed=vol_speed, vol_loop=vol_loop,
+            vol_delay=vol_delay,
             noise=noise, noise_speed=noise_speed, noise_loop=noise_loop,
             mode=mode, mode_speed=mode_speed, mode_loop=mode_loop,
             env_shape=env_shape, env_shape_speed=env_shape_speed,
@@ -2367,6 +2406,44 @@ def _macro_series(series: list[int]) -> tuple[tuple[int, ...], int, int]:
     while len(series) > 1 and series[-1] == series[-2]:
         series = series[:-1]
     return tuple(series), speed, loop
+
+
+def _macro_series_delay(
+    series: list[int],
+) -> tuple[tuple[int, ...], int, int, int]:
+    """`_macro_series` plus a leading-hold delay.
+
+    A macro whose first value repeats can keep one copy and use the macro
+    delay to hold it for the same number of ticks. That shortens the stored
+    list (freeing room before the 255-entry cutoff) without changing the
+    played values. `_macro_series` still handles cycles and the trailing hold.
+    """
+    if not series:
+        return (), 1, 255, 0
+    first = series[0]
+    run = 1
+    while run < len(series) and series[run] == first:
+        run += 1
+    if run <= 1:
+        values, speed, loop = _macro_series(series)
+        return values, speed, loop, 0
+    # The delay holds the first value for delay+1 ticks. Anything beyond that
+    # needs copies in the value list; each later copy advances by one macro
+    # step (speed ticks).
+    if run <= 256:
+        short = [first] + list(series[run:])
+        delay = run - 1
+    else:
+        extra = run - 256
+        short = [first] * (1 + extra) + list(series[run:])
+        delay = 255
+    values, speed, loop = _macro_series(short)
+    # A cyclic macro must start at its cycle point; shortening the head would
+    # change the loop. Leave cycles (and the detune-only case) alone.
+    if loop != 255 or not values:
+        values, speed, loop = _macro_series(series)
+        return values, speed, loop, 0
+    return values, speed, loop, delay
 
 
 def _unit_saw(values: list[int] | tuple[int, ...]) -> bool:
@@ -3521,14 +3598,19 @@ def _macro_ticks(start: int, end: int, tick_samples: float) -> int:
 
 def _macro_effective(
     values: tuple[int, ...], speed: int, loop: int, ticks: int,
+    delay: int = 0,
 ) -> tuple[int, ...]:
-    """The value a macro plays on each tick, including its hold/loop tail."""
+    """The value a macro plays on each tick, including delay/hold/loop tails."""
     if not values:
         return ()
     speed = max(1, speed)
+    hold = max(0, delay) + 1
     out: list[int] = []
     for t in range(ticks):
-        pos = t // speed
+        if t < hold:
+            out.append(values[0])
+            continue
+        pos = 1 + (t - hold) // speed
         if pos < len(values):
             out.append(values[pos])
         elif 0 <= loop < len(values):
