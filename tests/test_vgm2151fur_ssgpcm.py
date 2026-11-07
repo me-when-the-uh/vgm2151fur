@@ -11,7 +11,9 @@ from vgm2151fur.furio import decompress_fur, iter_blocks, parse_fur
 from vgm2151fur.furwrite import INS_AY, write_fur
 from vgm2151fur.ssgpcm import (
     DAC_LOG_TABLE_AY,
+    SsgPcmHit,
     SsgPcmSample,
+    cluster_ssg_pcm,
     collect_ssg_pcm,
 )
 from vgm2151fur.vgm import (
@@ -439,6 +441,30 @@ class TestSsgPcmEmission(unittest.TestCase):
         self.assertEqual(
             [maps[e.note - 60] for e in pcm], [0, 1, 2],
         )
+
+
+class TestSsgPcmClustering(unittest.TestCase):
+    def test_cluster_folds_fragments_and_remaps_hits(self):
+        samples = [
+            SsgPcmSample(
+                name=f"pcm{i}",
+                data=bytes((i * 41 + j * 17) & 0xFF for j in range(32)),
+                rate=11025, start=i * 1000, end=i * 1000 + 32,
+            )
+            for i in range(40)
+        ]
+        hits = [
+            SsgPcmHit(
+                sample_time=i * 4410, end_time=0, voice=0, chip_id=0,
+                sample_index=i,
+            )
+            for i in range(40)
+        ]
+        before = len(samples)
+        out, out_hits = cluster_ssg_pcm(samples, hits)
+        self.assertLessEqual(len(out), 32)
+        self.assertEqual(len(out_hits), before)
+        self.assertTrue(all(0 <= h.sample_index < len(out) for h in out_hits))
 
 
 if __name__ == "__main__":

@@ -6,6 +6,7 @@ ramp has to carry the driver's reset to 0 or the vibrato never stops.
 
 from __future__ import annotations
 
+import math
 import sys
 import unittest
 from pathlib import Path
@@ -68,14 +69,20 @@ class TestPerNotePmsMacro(unittest.TestCase):
         writes.sort(key=lambda w: w.sample)
         return analyze(_synth.vgm(writes))
 
-    def test_constant_note_gets_its_own_zero_macro(self):
+    def test_constant_note_may_share_a_ramp_that_starts_later(self):
+        # The first note is constant; the second starts its ramp after the
+        # first has keyed off. Sharing the longer instrument is safe and saves
+        # a slot: the first note only plays the leading zeros.
         song = self._song()
         notes = [e for e in song.events if e.on and e.ch == 0]
         self.assertEqual(len(notes), 2)
         first, second = notes
-        self.assertEqual(song.fm_patches[first.ins].fms_macro, (0,))
-        self.assertEqual(song.fm_patches[first.ins].ams_macro, (0,))
-        self.assertNotEqual(first.ins, second.ins)
+        patch = song.fm_patches[first.ins]
+        tick = 44100 / song.hz
+        heard = max(1, math.ceil((first.end - first.sample) / tick))
+        self.assertTrue(all(v == 0 for v in patch.fms_macro[:heard]))
+        self.assertEqual(first.ins, second.ins)
+        self.assertEqual(max(song.fm_patches[second.ins].fms_macro), 7)
 
     def test_late_ramp_keeps_its_lead_in(self):
         song = self._song()

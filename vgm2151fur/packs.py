@@ -48,6 +48,7 @@ CHIP_LABELS = (
     ("scc_plus", "SCC+"),
     ("k051649", "SCC"),
     ("ay8910", "AY-8910"),
+    ("saa1099", "SAA1099"),
 )
 
 

@@ -259,7 +259,11 @@ def _emit(
     # rescale the mix, dropping the sample chip's level. The YM2203 SSG
     # belongs to the same system, and an SSG-only track keeps the chip.
     use_fm = include_fm and (
-        bool(song.fm_patches) or bool(getattr(song, "ym2203_ids", ()) or ())
+        bool(song.fm_patches)
+        or bool(getattr(song, "ym2203_ids", ()) or ())
+        # A Y8950's delta-T voice is a column of the Y8950 system, so a
+        # sample-only log still needs that chip and its ten columns.
+        or bool(pcm and (getattr(song, "y8950_b_samples", ()) or ()))
     )
     data = write_fur(song, include_pcm=pcm, include_fm=use_fm, stats=stats)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -304,10 +308,15 @@ def convert_vgm(
     normalize: bool = False,
     loop_find: bool = True,
     c352_quad: bool = False,
+    lfo_loop: bool = True,
+    lossy_samples: bool = False,
 ) -> dict:
     vgm = load_vgm(path)
-    song = analyze(vgm, speed=speed, pcm=pcm, tick_samples=tick_samples,
-                   min_row=min_row, condense=condense, c352_quad=c352_quad)
+    song = analyze(
+        vgm, speed=speed, pcm=pcm, tick_samples=tick_samples,
+        min_row=min_row, condense=condense, c352_quad=c352_quad,
+        lfo_loop=lfo_loop, lossy_samples=lossy_samples,
+    )
     loop_note = None
     if loop_find:
         loop_note = apply_loop(song)
@@ -354,6 +363,8 @@ def convert_vgm(
         "ym2608_ssg_notes": song.ym2608_ssg_count,
         "scc_notes": song.scc_count,
         "ay_notes": song.ay_count,
+        "saa_notes": song.saa_count,
+        "saa_chips": len(song.saa_ids),
         "ym2203_chips": len(song.ym2203_ids),
         "ym2203_ext": bool(getattr(song, "ym2203_ext", False)),
         "ym2203_ssg_notes": song.ym2203_ssg_count,
@@ -479,6 +490,8 @@ def convert_variants(
     verify: bool = False,
     layout: str = "flat",
     c352_quad: bool = False,
+    lfo_loop: bool = True,
+    lossy_samples: bool = False,
 ) -> list[dict]:
     """Write one .fur per condense factor and pick one.
 
@@ -494,8 +507,11 @@ def convert_variants(
     results: list[dict] = []
     shared_gain: float | None = None
     grid_cache: dict = {}
-    base = analyze(vgm, speed=speed, pcm=pcm, min_row=min_row, condense=1.0,
-                   grid_cache=grid_cache, c352_quad=c352_quad)
+    base = analyze(
+        vgm, speed=speed, pcm=pcm, min_row=min_row, condense=1.0,
+        grid_cache=grid_cache, c352_quad=c352_quad, lfo_loop=lfo_loop,
+        lossy_samples=lossy_samples,
+    )
     loop_note = apply_loop(base) if loop_find else None
     for f in factors:
         factor = float(f)
@@ -503,9 +519,12 @@ def convert_variants(
             song = base
             variant_loop = loop_note
         else:
-            song = analyze(vgm, speed=speed, pcm=pcm, min_row=min_row,
-                           condense=factor, grid_cache=grid_cache,
-                           c352_quad=c352_quad)
+            song = analyze(
+                vgm, speed=speed, pcm=pcm, min_row=min_row,
+                condense=factor, grid_cache=grid_cache,
+                c352_quad=c352_quad, lfo_loop=lfo_loop,
+                lossy_samples=lossy_samples,
+            )
             # A condensed grid has longer rows. Re-seat the loop on those
             # rows and recalibrate them. Copying the 1x sample points would
             # floor the start one row early and stretch the loop by a row.
@@ -735,13 +754,15 @@ _CFG: dict = {}
 def _variant_info(
     src: Path, out_dir: Path, *, factors, mode, speed, pcm, min_row,
     include_fm, normalize, loop_find, verify, layout, c352_quad=False,
+    lfo_loop=True, lossy_samples=False,
 ) -> dict:
     """Write the 1x/2x/3x/4x set and return the pick's info plus the set."""
     results = convert_variants(
         src, out_dir, factors=factors, mode=mode, speed=speed, pcm=pcm,
         min_row=min_row, include_fm=include_fm, normalize=normalize,
         loop_find=loop_find, verify=verify, layout=layout,
-        c352_quad=c352_quad,
+        c352_quad=c352_quad, lfo_loop=lfo_loop,
+        lossy_samples=lossy_samples,
     )
     pick = next(r for r in results if r["pick"])
     info = dict(pick)
@@ -765,6 +786,8 @@ def _worker(path_str: str) -> dict:
             include_fm=_CFG["include_fm"], normalize=_CFG["normalize"],
             loop_find=_CFG["loop_find"], verify=_CFG["verify"],
             layout=_CFG["layout"], c352_quad=_CFG.get("c352_quad", False),
+            lfo_loop=_CFG.get("lfo_loop", True),
+            lossy_samples=_CFG.get("lossy_samples", False),
         )
     return convert_vgm(
         src,
@@ -777,12 +800,15 @@ def _worker(path_str: str) -> dict:
         normalize=_CFG["normalize"],
         loop_find=_CFG["loop_find"],
         c352_quad=_CFG.get("c352_quad", False),
+        lfo_loop=_CFG.get("lfo_loop", True),
+        lossy_samples=_CFG.get("lossy_samples", False),
     )
 
 
 def _convert_serial(files, out_dir, *, speed, pcm, tick_samples, min_row,
                     variants, factors, optimize, include_fm, normalize, loop_find,
-                    verify, layout, c352_quad=False):
+                    verify, layout, c352_quad=False, lfo_loop=True,
+                    lossy_samples=False):
     for f in files:
         try:
             if variants:
@@ -791,6 +817,7 @@ def _convert_serial(files, out_dir, *, speed, pcm, tick_samples, min_row,
                     speed=speed, pcm=pcm, min_row=min_row,
                     include_fm=include_fm, normalize=normalize, loop_find=loop_find,
                     verify=verify, layout=layout, c352_quad=c352_quad,
+                    lfo_loop=lfo_loop, lossy_samples=lossy_samples,
                 )
             else:
                 info = convert_vgm(
@@ -804,6 +831,8 @@ def _convert_serial(files, out_dir, *, speed, pcm, tick_samples, min_row,
                     normalize=normalize,
                     loop_find=loop_find,
                     c352_quad=c352_quad,
+                    lfo_loop=lfo_loop,
+                    lossy_samples=lossy_samples,
                 )
         except Exception as exc:
             yield f, None, str(exc)
@@ -830,6 +859,8 @@ def convert_folder(
     layout: str = "flat",
     workers: int | None = None,
     c352_quad: bool = False,
+    lfo_loop: bool = True,
+    lossy_samples: bool = False,
     log=print,
 ) -> Iterator[tuple[Path, dict | None, str | None]]:
     """Convert every VGM/VGZ to `out_dir/<name>.fur`.
@@ -873,7 +904,8 @@ def convert_folder(
                     variants=variants, factors=factor_list, optimize=optimize,
                     include_fm=include_fm, normalize=normalize,
                     loop_find=loop_find, verify=verify, layout=layout,
-                    c352_quad=c352_quad,
+                    c352_quad=c352_quad, lfo_loop=lfo_loop,
+                    lossy_samples=lossy_samples,
                 ):
                     _note(result[0], result[1])
                     yield result
@@ -894,6 +926,8 @@ def convert_folder(
             "verify": verify,
             "layout": layout,
             "c352_quad": c352_quad,
+            "lfo_loop": lfo_loop,
+            "lossy_samples": lossy_samples,
         }
         pool = ProcessPoolExecutor(
             max_workers=n_workers,

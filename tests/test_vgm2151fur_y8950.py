@@ -184,6 +184,14 @@ class TestY8950Writer(unittest.TestCase):
         self.assertEqual(m.chips[-1], CHIP_Y8950_DRUMS)
         self.assertEqual(m.n_ch, 8 + 12)  # + 11 FM + 1 ADPCM
 
+    def test_sample_only_chip_survives_without_fm(self):
+        # The Y8950 delta-T voice is a column of the Y8950 system. A log with
+        # only that voice must still emit the chip when FM notes are excluded.
+        song = analyze(_vgm(_adpcm_note(1000), roms=[_rom(0x2000, _body())]))
+        m = parse_fur(write_fur(song, include_fm=False, include_pcm=True))
+        self.assertEqual(m.chips, [CHIP_Y8950])
+        self.assertEqual(m.n_ch, 10)
+
     def test_adpcm_instrument_type(self):
         song = self._song()
         types = [

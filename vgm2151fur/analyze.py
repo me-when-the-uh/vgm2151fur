@@ -98,6 +98,17 @@ from vgm2151fur.scc import (
     collect_scc,
     scc_note,
 )
+from vgm2151fur.saa1099 import (
+    SAA_DEFAULT_CLOCK,
+    SAA_DIVIDER,
+    SAA_PITCH_MAX,
+    SAA_VOICES,
+    collect_saa1099,
+    saa_module_clock,
+    saa_note,
+    saa_period_note,
+    saa_period_value,
+)
 from vgm2151fur.sn76489 import (
     PSG_DEFAULT_CLOCK,
     PSG_DIVIDER,
@@ -129,6 +140,7 @@ from vgm2151fur.nes import (
     NesPcmSample,
     _noise_note as nes_noise_note,
     _period_delta as nes_period_delta,
+    cluster_nes_pcm,
     collect_nes_dpcm,
     collect_nes_pcm,
     collect_nes_tones,
@@ -225,6 +237,7 @@ from vgm2151fur.vsu import (
 from vgm2151fur.ssgpcm import (
     SsgPcmHit,
     SsgPcmSample,
+    cluster_ssg_pcm,
     collect_ssg_pcm,
 )
 from vgm2151fur.ym2203 import (
@@ -449,6 +462,19 @@ class NoteEvent:
     # Mid-note carrier TL steps: (sample, absolute YM2151 carrier TL). The
     # writer maps them onto the volume column relative to the instrument.
     tl_pts: tuple[tuple[int, int], ...] = ()
+    # YM2151 only: mid-note DT1/MULT writes, (sample, operator, raw 0x40
+    # register byte). A driver that retunes an operator every frame inside a
+    # short staccato note has no row equivalent; a per-operator macro keeps
+    # the partial's fast pitch/timbre motion.
+    op_dtmul_pts: tuple[tuple[int, int, int], ...] = ()
+    # YM2151 only: MULT/DT1/DT2 changes that fit on pattern rows, as
+    # (sample, operator, engine value) for 16xy, 53xy and 55xy. Used
+    # instead of an operator macro whenever the steps land on rows.
+    op_mul_fx: tuple[tuple[int, int, int], ...] = ()
+    op_dt_fx: tuple[tuple[int, int, int], ...] = ()
+    op_dt2_fx: tuple[tuple[int, int, int], ...] = ()
+    # YM2151 only: mid-note DT2 writes, (sample, operator, 0-3).
+    op_dt2_pts: tuple[tuple[int, int, int], ...] = ()
     # Volume-column baseline override for `tl_pts` and this note's own level.
     # An Ext channel-3 column scales one operator, not the algorithm's carrier
     # set (`ym2203ext.cpp` DIV_CMD_VOLUME), so the writer cannot take the
@@ -480,9 +506,14 @@ class NoteEvent:
     # gate at volume peaks needs the pitch at each new note start, which the
     # note/E5 pair encodes only indirectly.
     tone_period: int = 0
-    # 0 = not a tone-chip note, 1 = SCC, 2 = AY. The phase-2 pass finds the
-    # instrument for these once the tick rate is known.
+    # 0 = not a tone-chip note, 1 = SCC, 2 = AY, 8 = SAA1099. The phase-2
+    # pass finds the instrument for these once the tick rate is known.
     tone_chip: int = 0
+    # SAA1099 only: (sample, left, right) raw amplitude nibbles after the
+    # opening.  The platform multiplies them through the panning macros, so
+    # keeping the pair (rather than a volume plus a balance) reproduces soft
+    # pan and a volume envelope exactly.
+    tone_amp_pts: tuple[tuple[int, int, int], ...] = ()
     # PCE noise-mode note: its "pitch" is the 0-31 noise register, which the
     # platform adds ``std.pitch`` to directly, not a period-table value.
     tone_noise: bool = False
@@ -558,6 +589,8 @@ class ToneIns:
     pitch: tuple[int, ...] = ()
     pitch_speed: int = 1
     pitch_loop: int = 255
+    # Leading-hold delay for the first pitch value (ticks). Same for volume.
+    pitch_delay: int = 0
     waves: tuple[int, ...] = ()
     wave_speed: int = 1
     wave_loop: int = 255
@@ -566,6 +599,7 @@ class ToneIns:
     vol: tuple[int, ...] = ()
     vol_speed: int = 1
     vol_loop: int = 255
+    vol_delay: int = 0
     # AY register motion a pattern row would quantize away, read as the duty,
     # wave, ex2 and ex5 macros. Empty when the register stays put.
     noise: tuple[int, ...] = ()
@@ -580,6 +614,25 @@ class ToneIns:
     env_period: tuple[int, ...] = ()
     env_period_speed: int = 1
     env_period_loop: int = 255
+    # SAA1099 only: the raw amplitude nibbles as panning macros.  Furnace's
+    # SAA platform writes the amplitude register as
+    # ``applyPan(outVol, pan)``, and ``applyPan(15, (left << 4) | right)`` is
+    # exactly the source byte, so a column of 15 plus these two macros carries
+    # volume and soft pan together without rounding.
+    panl: tuple[int, ...] = ()
+    panl_speed: int = 1
+    panl_loop: int = 255
+    panl_delay: int = 0
+    panr: tuple[int, ...] = ()
+    panr_speed: int = 1
+    panr_loop: int = 255
+    panr_delay: int = 0
+    # SAA1099 envelope control (register 0x18/0x19, the ex1 macro).  Written
+    # on the group's output voice; values are the raw control bytes.
+    env: tuple[int, ...] = ()
+    env_speed: int = 1
+    env_loop: int = 255
+    env_delay: int = 0
     # Game Boy: the DIV_INS_GB feature. A hardware-envelope note carries
     # env_vol/env_dir/env_len; a software ("zombie") envelope sets soft_env
     # and uses `vol` instead. `gb_wave` marks the wavetable voice, whose
@@ -871,6 +924,12 @@ class Song:
     vsu_ins: list[ToneIns] = field(default_factory=list)
     vsu_count: int = 0
     vsu_dynamic: bool = False
+    # Philips SAA1099: six square/noise voices per chip.  A CMS/Game Blaster
+    # log normally has two chips.  `saa_ins` holds the pitch, raw-amplitude
+    # panning and envelope macros.
+    saa_ids: list[int] = field(default_factory=list)
+    saa_ins: list[ToneIns] = field(default_factory=list)
+    saa_count: int = 0
     # Genesis SN76489: four channels (three tone + noise) after the FM block.
     psg_ids: list[int] = field(default_factory=list)
     psg_ins: list[ToneIns] = field(default_factory=list)
@@ -1086,6 +1145,41 @@ def _value_at(pts, start: int, default):
     return cur
 
 
+def _saa_tick_interval(vgm: VgmFile) -> float | None:
+    """Most common gap between SAA1099 writes, in samples.
+
+    A Furnace export writes its macros once per tick; the CMS rips do the
+    same at the driver's frame rate.  Using that gap as one row keeps the
+    macros and the pattern grid on the source's own clock instead of guessing
+    a 16th from the note onsets.
+    """
+    times = [w.sample for w in vgm.writes if w.chip == "saa1099"]
+    if len(times) < 16:
+        return None
+    intervals = [
+        b - a for a, b in zip(times, times[1:])
+        if 64 <= b - a <= 20_000
+    ]
+    if len(intervals) < 8:
+        return None
+    counts = Counter(intervals)
+    mode, hits = counts.most_common(1)[0]
+    if hits < 3:
+        return None
+    # Fold near neighbours (a driver that writes a register a sample or two
+    # after the tick) into the same bucket.
+    near = [
+        value for value in counts
+        if abs(value - mode) <= max(1, mode // 64)
+    ]
+    total = sum(counts[value] for value in near)
+    if total < 3:
+        return None
+    # Keep the fractional tick: a 60/72 Hz driver alternates 612/613-sample
+    # gaps, and rounding to the mode would drift by half a sample per tick.
+    return sum(value * counts[value] for value in near) / total
+
+
 def _tone_pitch_tick_scale(vgm: VgmFile, hz: float, speed: int) -> int:
     """Raise hz and speed until tone pitch macros see every write.
 
@@ -1118,6 +1212,10 @@ def _tone_pitch_tick_scale(vgm: VgmFile, hz: float, speed: int) -> int:
             continue
         if w.chip in ("ym2203_ssg", "ay8910") and w.reg % 2 == 0 and w.reg < 6:
             key = (w.chip, w.chip_id, w.reg // 2)
+        elif w.chip == "saa1099" and 8 <= w.reg <= 13:
+            key = (w.chip, w.chip_id, w.reg - 8)
+        elif w.chip == "saa1099" and 0x10 <= w.reg <= 0x12:
+            key = (w.chip, w.chip_id, w.reg)
         elif w.chip == "k051649" and w.reg % 2 == 0 and w.reg < 10:
             key = (w.chip, w.chip_id, w.reg // 2)
         elif (hz < 100 and w.chip == "ym2203"
@@ -1388,6 +1486,8 @@ def _tone_close(a: ToneIns, b: ToneIns, tol: int) -> bool:
         "mode", "mode_speed", "mode_loop",
         "env_shape", "env_shape_speed", "env_shape_loop",
         "env_period", "env_period_speed", "env_period_loop",
+        "panl_speed", "panl_loop", "panr_speed", "panr_loop",
+        "env", "env_speed", "env_loop",
         "gb_soft_env", "gb_env_vol", "gb_env_dir", "gb_env_len",
         "gb_sound_len", "gb_wave", "vsu_mod",
     )
@@ -1396,6 +1496,8 @@ def _tone_close(a: ToneIns, b: ToneIns, tol: int) -> bool:
     return (
         _tone_macro_close(a.pitch, b.pitch, tol)
         and _tone_macro_close(a.vol, b.vol, tol)
+        and _tone_macro_close(a.panl, b.panl, tol)
+        and _tone_macro_close(a.panr, b.panr, tol)
     )
 
 
@@ -1450,6 +1552,306 @@ def _take_tone(
     return 0, bucket[0]
 
 
+_TONE_MACRO_FIELDS = (
+    "pitch", "waves", "vol", "noise", "mode", "env_shape", "env_period",
+    "panl", "panr", "env",
+)
+_TONE_MACRO_TIMING = (
+    ("pitch", "pitch_speed", "pitch_loop"),
+    ("waves", "wave_speed", "wave_loop"),
+    ("vol", "vol_speed", "vol_loop"),
+    ("noise", "noise_speed", "noise_loop"),
+    ("mode", "mode_speed", "mode_loop"),
+    ("env_shape", "env_shape_speed", "env_shape_loop"),
+    ("env_period", "env_period_speed", "env_period_loop"),
+    ("panl", "panl_speed", "panl_loop"),
+    ("panr", "panr_speed", "panr_loop"),
+    ("env", "env_speed", "env_loop"),
+)
+
+
+def _tone_sig(spec: ToneIns) -> tuple:
+    """Everything about a tone instrument except its macro values."""
+    skip = set(_TONE_MACRO_FIELDS)
+    skip.update(("pitch_delay", "vol_delay"))
+    for _field, speed, loop in _TONE_MACRO_TIMING:
+        skip.add(speed)
+        skip.add(loop)
+    return tuple(
+        (name, getattr(spec, name))
+        for name in spec.__dataclass_fields__ if name not in skip
+    )
+
+
+def _tone_macro_extends(a: ToneIns, b: ToneIns) -> bool:
+    """True when every macro of `a` extends the matching macro of `b`."""
+    for field in _TONE_MACRO_FIELDS:
+        va = tuple(getattr(a, field))
+        vb = tuple(getattr(b, field))
+        if bool(va) != bool(vb) or len(va) < len(vb):
+            return False
+        if va[:len(vb)] != vb:
+            return False
+    for field, speed, loop in _TONE_MACRO_TIMING:
+        if getattr(a, field) or getattr(b, field):
+            if (getattr(a, speed) != getattr(b, speed)
+                    or getattr(a, loop) != getattr(b, loop)):
+                return False
+    return True
+
+
+def _tone_macro_same_for(a: ToneIns, b: ToneIns, ticks: int) -> bool:
+    """Whether `a` and `b` play the same tone macros for `ticks` ticks."""
+    for field, speed_field, loop_field in _TONE_MACRO_TIMING:
+        speed = getattr(b, speed_field)
+        loop = getattr(b, loop_field)
+        delay = getattr(b, f"{field}_delay", 0)
+        if (
+            _macro_effective(
+                tuple(getattr(a, field)), speed, loop, ticks, delay,
+            )
+            != _macro_effective(
+                tuple(getattr(b, field)), speed, loop, ticks, delay,
+            )
+        ):
+            return False
+    return True
+
+
+def _tone_macro_size(spec: ToneIns) -> int:
+    return sum(len(getattr(spec, field)) for field in _TONE_MACRO_FIELDS)
+
+
+def _delay_leading_values(values, speed: int) -> tuple[tuple, int]:
+    """Collapse a leading run into one value plus a delay in ticks."""
+    values = tuple(values)
+    if not values:
+        return (), 0
+    run = 1
+    while run < len(values) and values[run] == values[0]:
+        run += 1
+    if run <= 1:
+        return values, 0
+    hold = run * max(1, speed)
+    if hold <= 256:
+        return (values[0],) + values[run:], hold - 1
+    extra = hold - 256
+    keep = 1 + (extra + speed - 1) // max(1, speed)
+    return (values[0],) * keep + values[run:], 255
+
+
+def _compress_tone_delays(bucket: list[ToneIns]) -> None:
+    """Make every leading-hold macro use the delay field before grouping."""
+    for i, spec in enumerate(bucket):
+        if not (
+            spec.pitch or spec.vol or spec.panl or spec.panr or spec.env
+        ):
+            continue
+        changes: dict[str, object] = {}
+        for field, speed, loop in _TONE_MACRO_TIMING:
+            values = getattr(spec, field)
+            if not values or getattr(spec, loop) != 255:
+                continue
+            delay_field = f"{field}_delay"
+            if not hasattr(spec, delay_field) or getattr(spec, delay_field):
+                continue
+            short, delay = _delay_leading_values(values, getattr(spec, speed))
+            if delay:
+                changes[field] = short
+                changes[delay_field] = delay
+        if changes:
+            bucket[i] = replace(spec, **changes)
+
+
+def _tone_vol_sig(spec: ToneIns) -> tuple:
+    """Everything about a tone instrument except its volume macro."""
+    skip = {"vol", "vol_speed", "vol_loop", "vol_delay"}
+    return tuple(
+        (name, getattr(spec, name))
+        for name in spec.__dataclass_fields__ if name not in skip
+    )
+
+
+# A macro level is 0-15, so 15 is the whole range. The note column is the
+# real floor: a quieter copy is skipped when its column cannot be lowered by
+# the full offset without going below 0.
+_AY_VOL_SPREAD = 15
+
+
+def _vol_offset(loud: ToneIns, quiet: ToneIns) -> int | None:
+    """Constant 1..15-level difference from `loud` to `quiet`, else None."""
+    a = tuple(loud.vol)
+    b = tuple(quiet.vol)
+    if (
+        not a or not b
+        or loud.vol_speed != quiet.vol_speed
+        or loud.vol_loop != quiet.vol_loop
+    ):
+        return None
+    if loud.vol_loop != 255:
+        # A loop's phase is not worth reconciling here; equal macros are
+        # handled by the generic prefix merge.
+        return None
+    delay_a = getattr(loud, "vol_delay", 0)
+    delay_b = getattr(quiet, "vol_delay", 0)
+    speed = max(1, loud.vol_speed)
+    horizon = max(len(a), len(b)) * speed + max(delay_a, delay_b) + 1
+    ea = _macro_effective(a, speed, 255, horizon, delay_a)
+    eb = _macro_effective(b, speed, 255, horizon, delay_b)
+    delta = ea[0] - eb[0]
+    if delta < 1 or delta > _AY_VOL_SPREAD:
+        return None
+    if any(x - y != delta for x, y in zip(ea, eb)):
+        return None
+    return delta
+
+
+def _merge_ay_volume_offsets(
+    bucket: list[ToneIns], notes: list[tuple[NoteEvent, int]],
+) -> dict[int, int]:
+    """Share one AY/SSG volume macro when copies differ by a constant offset.
+
+    The AY platform adds the pattern column to the macro
+    (``macro + column - 15``), so a quieter macro can ride the same
+    instrument by lowering the note's column by the same constant. The
+    difference has to be consistent at every macro step; a varying shape is
+    a different envelope, not a normalization. There is no spread ceiling
+    below the macro's own 0-15 range: the note column is the floor, and a
+    copy is left alone when it cannot be lowered by the full offset. Keep
+    the loudest macro so every note still reaches the chip's maximum level.
+    """
+    if len(bucket) < 2:
+        return {i: i for i in range(len(bucket))}
+    groups: dict[tuple, list[int]] = {}
+    for i, spec in enumerate(bucket):
+        groups.setdefault(_tone_vol_sig(spec), []).append(i)
+    center_of: dict[int, int] = {i: i for i in range(len(bucket))}
+    volume_notes: dict[int, list[NoteEvent]] = {}
+    for event, idx in notes:
+        volume_notes.setdefault(idx, []).append(event)
+    for indexes in groups.values():
+        if len(indexes) < 2:
+            continue
+        # Keep the loudest macro: compensating columns only move down. The
+        # other direction would need a column above 15, which the platform
+        # cannot reach.
+        pending = sorted(
+            indexes, key=lambda i: (-sum(bucket[i].vol), i)
+        )
+        while pending:
+            center = pending.pop(0)
+            cluster = [center]
+            rest: list[int] = []
+            for i in pending:
+                if _vol_offset(bucket[center], bucket[i]) is not None:
+                    cluster.append(i)
+                else:
+                    rest.append(i)
+            pending = rest
+            if len(cluster) < 2:
+                continue
+            for i in cluster[1:]:
+                delta = _vol_offset(bucket[center], bucket[i])
+                assert delta is not None
+                if any(ev.vol < delta for ev in volume_notes.get(i, ())):
+                    continue
+                for ev in volume_notes.get(i, ()):
+                    ev.vol = max(0, min(15, ev.vol - delta))
+                center_of[i] = center
+    mapping: dict[int, int] = {}
+    kept: list[ToneIns] = []
+    for i in range(len(bucket)):
+        if center_of[i] == i:
+            mapping[i] = len(kept)
+            kept.append(bucket[i])
+    for i in range(len(bucket)):
+        mapping[i] = mapping[center_of[i]]
+    if len(kept) != len(bucket):
+        bucket[:] = kept
+    return mapping
+
+
+def _merge_tone_prefixes(
+    bucket: list[ToneIns],
+    notes_by_ins: dict[int, list[tuple[int, int]]] | None = None,
+    tick_samples: float = 0.0,
+    use_speed: int = 1,
+) -> dict[int, int]:
+    """Share the longest left-to-right-compatible tone macro.
+
+    Volume and pitch envelopes often differ only by how long they continue:
+    a short note's copy is the prefix of the sustained one. Keep the longer
+    and point every note at it; the next key-on cuts a short note before the
+    extra tail matters. Returns the old-index -> new-index map.
+    """
+    if len(bucket) < 2:
+        return {i: i for i in range(len(bucket))}
+    groups: dict[tuple, list[int]] = {}
+    for i, spec in enumerate(bucket):
+        groups.setdefault(_tone_sig(spec), []).append(i)
+
+    def extends(j: int, i: int) -> bool:
+        notes = (notes_by_ins or {}).get(i, ())
+        if not notes:
+            return False
+        for start, end in notes:
+            if end <= 0:
+                return False
+            ticks = _macro_ticks(start, end, tick_samples)
+            if not _tone_macro_same_for(bucket[j], bucket[i], ticks):
+                return False
+        return True
+
+    target = {i: i for i in range(len(bucket))}
+    for indexes in groups.values():
+        if len(indexes) > 1 and any(
+            _tone_macro_size(bucket[i]) > 0 for i in indexes
+        ):
+            target.update(_prefix_targets(
+                indexes,
+                lambda i: _tone_macro_size(bucket[i]),
+                extends,
+            ))
+    mapping: dict[int, int] = {}
+    kept: list[ToneIns] = []
+    for i in range(len(bucket)):
+        if target[i] == i:
+            mapping[i] = len(kept)
+            kept.append(bucket[i])
+    for i in range(len(bucket)):
+        mapping[i] = mapping[target[i]]
+    if len(kept) != len(bucket):
+        bucket[:] = kept
+    return mapping
+
+
+def _loop_saa_pitch_macros(
+    bucket: list[ToneIns], lfo_loop: bool = True,
+) -> None:
+    """Loop a periodic SAA pitch macro independently of its other macros.
+
+    Prefix grouping can keep a longer copy of a macro whose periodic prefix
+    was already a cycle.  Pseudo-duty detunes are pitch-only, so loop
+    detection does not depend on pan, envelope or mode macros being present.
+    Step-length compression stays off: it would change the duty ratio.
+    """
+    if not lfo_loop:
+        return
+    for i, ins in enumerate(bucket):
+        if not ins.pitch or ins.pitch_loop != 255:
+            continue
+        values, speed, loop = _macro_series(
+            list(ins.pitch), tail_loop=True,
+            initial_speed=ins.pitch_speed, tail_min=16,
+        )
+        if (
+            loop != 255
+            and speed == ins.pitch_speed
+            and len(values) < len(ins.pitch)
+        ):
+            bucket[i] = replace(ins, pitch=values, pitch_loop=loop)
+
+
 def _bind_tone_instruments(
     events: list[NoteEvent],
     scc_ins: list[ToneIns],
@@ -1459,6 +1861,7 @@ def _bind_tone_instruments(
     huc6280_ins: list[ToneIns],
     gb_ins: list[ToneIns],
     vsu_ins: list[ToneIns],
+    saa_ins: list[ToneIns],
     tone_ins_base: int,
     scc_clock: int,
     ay_clock: int,
@@ -1467,9 +1870,12 @@ def _bind_tone_instruments(
     huc6280_clock: int,
     gb_clock: int,
     vsu_clock: int,
+    saa_clock: int,
     hz: float,
     total_samples: int,
+    use_speed: int = 1,
     merge_tol: int = 0,
+    lfo_loop: bool = True,
 ) -> int:
     """Fill `scc_ins` / `ay_ins` and point each tone note at one.
 
@@ -1490,13 +1896,14 @@ def _bind_tone_instruments(
     huc6280_map: dict[ToneIns, int] = {}
     gb_map: dict[ToneIns, int] = {}
     vsu_map: dict[ToneIns, int] = {}
+    saa_map: dict[ToneIns, int] = {}
     ins_cap = max(1, INS_TARGET - tone_ins_base)
     # GB and VSU bind last. Reserve a share so a large SCC/AY/PCE list cannot
     # spend every slot before them; the surplus collapses to plain
     # per-wave/per-env instruments, the documented "fall back to columns"
     # behavior.
     has_late = any(
-        e.tone_chip in (6, 7) and e.on for e in events
+        e.tone_chip in (6, 7, 8) and e.on for e in events
     )
     early_cap = ins_cap
     if has_late:
@@ -1521,6 +1928,7 @@ def _bind_tone_instruments(
     tone_order += [e for e in events if e.on and e.tone_chip == 5]
     tone_order += [e for e in events if e.on and e.tone_chip == 6]
     tone_order += [e for e in events if e.on and e.tone_chip == 7]
+    tone_order += [e for e in events if e.on and e.tone_chip == 8]
     for e in tone_order:
         end = e.end or track_end
         # 255 macro values times the largest speed byte. Long SSG pads can
@@ -1567,17 +1975,27 @@ def _bind_tone_instruments(
             clock = e.tone_clock or vsu_clock or VSU_DEFAULT_CLOCK
             divider = VSU_PITCH_DIVIDER
             maximum = 0x7FF
+        elif e.tone_chip == 8:
+            # The SAA platform converts the pitch-table value into an 8-bit
+            # offset and 3-bit octave; the collector already handed us the
+            # midpoint of the bucket that maps back to the source pair.
+            clock = e.tone_clock or saa_clock or SAA_DEFAULT_CLOCK
+            divider = SAA_DIVIDER
+            maximum = SAA_PITCH_MAX
         else:
             # AY and the YM2203's SSG share the instrument path but not the
             # clock or Furnace's divider (8 vs 16).
             clock = e.tone_clock or ay_clock
             divider = e.tone_div or 8
             maximum = 0xFFF
-        tbl = (
-            pitch_table(float(clock), divider, maximum=maximum)
-            if e.tone_chip in (3, 4, 5, 6, 7)
-            else pitch_table(module_clock(clock), divider)
-        )
+        if e.tone_chip == 8:
+            tbl = pitch_table(saa_module_clock(clock), divider, maximum=maximum)
+        else:
+            tbl = (
+                pitch_table(float(clock), divider, maximum=maximum)
+                if e.tone_chip in (3, 4, 5, 6, 7)
+                else pitch_table(module_clock(clock), divider)
+            )
         base_off = (e.note << 7) + (e.e5 - E5_CENTER)
         if e.tone_chip == 5 and e.tone_pitch_pts and not e.tone_noise:
             # A PCE driver that retunes every frame writes a staircase, not a
@@ -1604,6 +2022,7 @@ def _bind_tone_instruments(
                 e.e5_hi = 0xFF
         pitch: tuple[int, ...] = ()
         pitch_speed, pitch_loop = 1, 255
+        pitch_delay = 0
         if e.tone_pitch_pts:
             pts = [(e.sample, 0)]
             if e.tone_noise:
@@ -1635,11 +2054,60 @@ def _bind_tone_instruments(
                 ]
             series = _tick_values(pts, e.sample, ticks, tick_samples)
             if any(series):
-                pitch, pitch_speed, pitch_loop = _macro_series(series)
-                if not e.tone_noise:
-                    # Folding a constant offset into E5 would be lost on a
-                    # noise note: the register reads ``pitch2``, not the note.
-                    pitch = _absorb_detune(e, pitch, pitch_speed)
+                if e.tone_noise:
+                    # A noise pitch is a register offset, not a tone bend;
+                    # leave its leading values uncollapsed.
+                    pitch, pitch_speed, pitch_loop = _macro_series(series)
+                elif e.tone_chip == 8:
+                    # A SAA1099 driver uses fast detunes as a pseudo-duty
+                    # cycle; thinning or step-compressing them changes the
+                    # duty ratio.  Keep the tick-exact series, but still loop
+                    # an exact periodic tail.
+                    pitch, pitch_speed, pitch_loop, pitch_delay = (
+                        _macro_series_delay(
+                            series, tail_loop=lfo_loop, step_compress=False,
+                        )
+                    )
+                    if pitch_delay == 0:
+                        pitch = _absorb_detune(e, pitch, pitch_speed)
+                else:
+                    pitch, pitch_speed, pitch_loop, pitch_delay = (
+                        _macro_series_delay(
+                            series, tail_loop=lfo_loop, step_compress=True,
+                        )
+                    )
+                    # A delayed first value is held long enough to be a real
+                    # step, not an attack settle; folding its tail into E5
+                    # would drop the held level. Only absorb a settle when
+                    # there is no delay.
+                    if pitch_delay == 0:
+                        # Folding a constant offset into E5 would be lost on
+                        # a noise note: the register reads ``pitch2``.
+                        pitch = _absorb_detune(e, pitch, pitch_speed)
+            if e.tone_chip == 8 and pitch and len(pitch) <= 8:
+                # The short residual bend after a legato split is the
+                # transition into the next note, not an instrument identity.
+                # Put it on the pattern rows (E8/E9 + E5) so the notes of a
+                # descent can share one volume/mode/envelope instrument.
+                steps = tuple(
+                    (
+                        t,
+                        int(round((
+                            tbl.offset_for(
+                                e.note, per + e.tone_period_offset,
+                            ) - base_off
+                        ) / 2.0)),
+                    )
+                    for t, per in e.tone_pitch_pts
+                )
+                steps = tuple((t, v) for t, v in steps if v)
+                if steps:
+                    e.pitch_steps = steps
+                    e.sweep_div = 2.0
+                    e.e5_lo = 0x00
+                    e.e5_hi = 0xFF
+                    pitch = ()
+                    pitch_speed, pitch_loop, pitch_delay = 1, 255, 0
         wave_vals: tuple[int, ...] = ()
         wave_speed, wave_loop = 1, 255
         if e.tone_wave_pts:
@@ -1649,8 +2117,10 @@ def _bind_tone_instruments(
             )
         column_vol = e.vol
         pce_peak = 0
+        saa_peak = 0
         vol_vals: tuple[int, ...] = ()
         vol_speed, vol_loop = 1, 255
+        vol_delay = 0
         series: list[int] = []
         if e.vol_pts and e.tone_chip not in (3,) and not (
                 e.tone_chip == 6 and e.tone_gb_wave):
@@ -1667,22 +2137,37 @@ def _bind_tone_instruments(
                 # then carries the peak level and the macro the decay shape,
                 # so notes with different starting volumes are not all 31.
                 pce_peak = max(1, series[0]) if series else 0
+            if e.tone_chip == 8:
+                # Same idea for the SAA level: the note column carries the
+                # segment's peak and the macro the normalized shape.  Notes
+                # of a descent then share one instrument, and only the pan
+                # (08xy) differs per note.
+                saa_peak = max(1, max(series)) if series else 0
+                if saa_peak:
+                    series = [
+                        max(0, min(15, int(round(v * 15.0 / saa_peak))))
+                        for v in series
+                    ]
             if e.tone_chip == 6:
                 # The GB platform applies a software-envelope volume macro
                 # directly; a generic FA volume slide is not implemented there,
                 # so never fold the trajectory into a slide. _macro_series
                 # drops the trailing hold anyway, keeping decay macros short.
-                vol_vals, vol_speed, vol_loop = _macro_series(series)
+                vol_vals, vol_speed, vol_loop, vol_delay = (
+                    _macro_series_delay(series)
+                )
             else:
                 # PCE keeps the trajectory as a normalized macro: a slide
                 # would move the raw column at one unit per tick and lose the
                 # peak scaling.
-                folded = None if e.tone_chip == 5 else _fold_saw(series)
+                folded = (
+                    None if e.tone_chip in (5, 8) else _fold_saw(series)
+                )
                 # Past 255 ticks a non-repeating series is stored as every Nth
                 # value. A one-level saw is played as a slide instead, so the
                 # ramp still moves on every tick.
                 thin = (
-                    e.tone_chip != 5
+                    e.tone_chip not in (5, 8)
                     and folded is None
                     and len(series) > MACRO_MAX
                     and _cycle(series) is None
@@ -1694,7 +2179,9 @@ def _bind_tone_instruments(
                     e.vol = series[0]
                     e.vol_slide = _slide_open(series)
                 else:
-                    vol_vals, vol_speed, vol_loop = _macro_series(series)
+                    vol_vals, vol_speed, vol_loop, vol_delay = (
+                        _macro_series_delay(series)
+                    )
                     if e.tone_chip == 5 and vol_vals and pce_peak:
                         vol_vals = tuple(
                             max(0, min(31, int(round(v * 31 / pce_peak))))
@@ -1718,7 +2205,51 @@ def _bind_tone_instruments(
         noise = mode = env_shape = env_period = ()
         noise_speed = mode_speed = env_shape_speed = env_period_speed = 1
         noise_loop = mode_loop = env_shape_loop = env_period_loop = 255
-        if e.tone_fx_pts:
+        panl = panr = env = ()
+        panl_speed = panr_speed = env_speed = 1
+        panl_loop = panr_loop = env_loop = 255
+        panl_delay = panr_delay = env_delay = 0
+        if e.tone_chip == 8:
+            # SAA1099: the amplitude register carries volume and soft pan
+            # together; put the raw nibbles on the two panning macros and
+            # leave the volume column at 15.
+            if e.tone_amp_pts:
+                pl = [(t, left) for t, left, _right in e.tone_amp_pts]
+                pr = [(t, right) for t, _left, right in e.tone_amp_pts]
+                pl_series = _tick_values(pl, e.sample, ticks, tick_samples)
+                pr_series = _tick_values(pr, e.sample, ticks, tick_samples)
+                panl, panl_speed, panl_loop, panl_delay = _macro_series_delay(
+                    pl_series,
+                )
+                panr, panr_speed, panr_loop, panr_delay = _macro_series_delay(
+                    pr_series,
+                )
+                # Both panning macros must be present: the platform starts
+                # from pan 0xFF, and a missing panL would leave the left
+                # nibble at 15 even when the source side is a constant zero.
+                if not panl and pl_series:
+                    panl, panl_speed, panl_loop, panl_delay = (
+                        (pl_series[0],), 1, 255, 0,
+                    )
+                if not panr and pr_series:
+                    panr, panr_speed, panr_loop, panr_delay = (
+                        (pr_series[0],), 1, 255, 0,
+                    )
+            noise, noise_speed, noise_loop = _macro_if_moving(
+                [(t, val) for t, cmd, val in e.tone_fx_pts if cmd == 0x11],
+                e.sample, ticks, tick_samples, merge_gap=_AY_MERGE_GAP,
+            )
+            mode, mode_speed, mode_loop = _macro_if_moving(
+                [(t, val & 3) for t, cmd, val in e.tone_fx_pts if cmd == 0x10],
+                e.sample, ticks, tick_samples, merge_gap=_AY_MERGE_GAP,
+            )
+            env, env_speed, env_loop, env_delay = _macro_series_delay(
+                _tick_values(
+                    [(t, val) for t, cmd, val in e.tone_fx_pts if cmd == 0x12],
+                    e.sample, ticks, tick_samples,
+                ),
+            )
+        elif e.tone_fx_pts:
             noise, noise_speed, noise_loop = _macro_if_moving(
                 [(t, val) for t, cmd, val in e.tone_fx_pts if cmd == FX_NOISE],
                 e.sample, ticks, tick_samples, merge_gap=_AY_MERGE_GAP,
@@ -1758,14 +2289,22 @@ def _bind_tone_instruments(
         spec = ToneIns(
             wave=max(0, e.tone_wave),
             pitch=pitch, pitch_speed=pitch_speed, pitch_loop=pitch_loop,
+            pitch_delay=pitch_delay,
             waves=wave_vals, wave_speed=wave_speed, wave_loop=wave_loop,
             vol=vol_vals, vol_speed=vol_speed, vol_loop=vol_loop,
+            vol_delay=vol_delay,
             noise=noise, noise_speed=noise_speed, noise_loop=noise_loop,
             mode=mode, mode_speed=mode_speed, mode_loop=mode_loop,
             env_shape=env_shape, env_shape_speed=env_shape_speed,
             env_shape_loop=env_shape_loop,
             env_period=env_period, env_period_speed=env_period_speed,
             env_period_loop=env_period_loop,
+            panl=panl, panl_speed=panl_speed, panl_loop=panl_loop,
+            panl_delay=panl_delay,
+            panr=panr, panr_speed=panr_speed, panr_loop=panr_loop,
+            panr_delay=panr_delay,
+            env=env, env_speed=env_speed, env_loop=env_loop,
+            env_delay=env_delay,
             gb_soft_env=bool(getattr(e, "gb_soft_env", False)),
             gb_env_vol=int(getattr(e, "gb_env_vol", 0)),
             gb_env_dir=int(getattr(e, "gb_env_dir", 0)),
@@ -1804,6 +2343,17 @@ def _bind_tone_instruments(
                 len(scc_ins) + len(ay_ins) + len(psg_ins) + len(nes_ins)
                 + len(huc6280_ins) + len(gb_ins),
                 ins_cap, 7,
+            )
+        elif e.tone_chip == 8:
+            # The SAA amplitude nibbles are only four bits wide, so a
+            # one-step near-identical merge is an audible level change.
+            # Keep the pan/volume macros exact; only the prefix merge below
+            # may share them.
+            idx, kept = _take_tone(
+                spec, saa_map, saa_ins,
+                len(scc_ins) + len(ay_ins) + len(psg_ins) + len(nes_ins)
+                + len(huc6280_ins) + len(gb_ins) + len(vsu_ins),
+                ins_cap, 8, 0,
             )
         else:
             # AY runs first, so the SCC list is still empty and `others` is 0.
@@ -1848,6 +2398,13 @@ def _bind_tone_instruments(
                 e.vol_slide = 0
             else:
                 e.vol = column_vol
+        elif e.tone_chip == 8:
+            # The SAA volume macro is normalized to its segment peak, so the
+            # note column carries that peak.  The balance is already the
+            # note's 08xy state, not part of the instrument.
+            e.vol_pts = ()
+            e.vol = saa_peak if (kept.vol and saa_peak) else column_vol
+            e.vol_slide = 0
         elif e.tone_chip == 3 or (e.tone_chip == 6 and e.tone_gb_wave):
             # The SMS column is the raw 4-bit register; keep vol_pts as
             # pattern steps rather than folding them into a volume macro.
@@ -1874,12 +2431,64 @@ def _bind_tone_instruments(
         else:
             e.vol = column_vol
             e.vol_pts = ()
+    # Re-apply the leading-delay compression to every final tone macro
+    # before grouping. A macro that was copied or shared can still carry the
+    # literal leading repeats; compressing here keeps the compact form and
+    # stops the grouping pass from choosing the longer, uncompressed copy.
+    for bucket in (
+        scc_ins, ay_ins, psg_ins, nes_ins, huc6280_ins, gb_ins,
+        vsu_ins, saa_ins,
+    ):
+        _compress_tone_delays(bucket)
+
+    # AY/SSG volume envelopes that differ by a constant 1 or 2 can share the
+    # loudest instrument; the quieter notes ride the volume column. This runs
+    # before the generic prefix merge so the reduced volume list is what gets
+    # compared.
+    ay_notes = [(ev, idx) for ev, idx in bound if ev.tone_chip == 2]
+    ay_vol_map = _merge_ay_volume_offsets(ay_ins, ay_notes)
+    if any(old != new for old, new in ay_vol_map.items()):
+        for i, (event, idx) in enumerate(bound):
+            if event.tone_chip == 2:
+                bound[i] = (event, ay_vol_map.get(idx, idx))
+
+    # Merge truncated macro copies before fixing the absolute indices. Each
+    # family has its own list, so shrinking one only moves that family's
+    # indices; the base offsets are computed from the final lengths below.
+    family_notes: dict[int, dict[int, list[tuple[int, int]]]] = {}
+    for event, idx in bound:
+        family_notes.setdefault(event.tone_chip, {}).setdefault(
+            idx, []).append((event.sample, event.end or track_end))
+    tone_maps = {
+        1: _merge_tone_prefixes(
+            scc_ins, family_notes.get(1), tick_samples, use_speed),
+        2: _merge_tone_prefixes(
+            ay_ins, family_notes.get(2), tick_samples, use_speed),
+        3: _merge_tone_prefixes(
+            psg_ins, family_notes.get(3), tick_samples, use_speed),
+        4: _merge_tone_prefixes(
+            nes_ins, family_notes.get(4), tick_samples, use_speed),
+        5: _merge_tone_prefixes(
+            huc6280_ins, family_notes.get(5), tick_samples, use_speed),
+        6: _merge_tone_prefixes(
+            gb_ins, family_notes.get(6), tick_samples, use_speed),
+        7: _merge_tone_prefixes(
+            vsu_ins, family_notes.get(7), tick_samples, use_speed),
+        8: _merge_tone_prefixes(
+            saa_ins, family_notes.get(8), tick_samples, use_speed),
+    }
+    for i, (event, idx) in enumerate(bound):
+        mapping = tone_maps.get(event.tone_chip)
+        if mapping is not None:
+            bound[i] = (event, mapping.get(idx, idx))
+    _loop_saa_pitch_macros(saa_ins, lfo_loop)
     n_scc = len(scc_ins)
     n_ay = len(ay_ins)
     n_psg = len(psg_ins)
     n_nes = len(nes_ins)
     n_huc = len(huc6280_ins)
     n_gb = len(gb_ins)
+    n_vsu = len(vsu_ins)
     for event, idx in bound:
         if event.tone_chip == 1:
             event.ins = tone_ins_base + idx
@@ -1897,6 +2506,11 @@ def _bind_tone_instruments(
             event.ins = (
                 tone_ins_base + n_scc + n_ay + n_psg + n_nes + n_huc
                 + n_gb + idx
+            )
+        elif event.tone_chip == 8:
+            event.ins = (
+                tone_ins_base + n_scc + n_ay + n_psg + n_nes + n_huc
+                + n_gb + n_vsu + idx
             )
         else:
             event.ins = tone_ins_base + n_scc + idx
@@ -2011,8 +2625,11 @@ def _tone_instrument_demand(
     huc6280_clock: int,
     gb_clock: int,
     vsu_clock: int,
+    saa_clock: int,
     hz: float,
     total_samples: int,
+    use_speed: int = 1,
+    lfo_loop: bool = True,
 ) -> int:
     """How many tone instruments the notes want with an unlimited budget.
 
@@ -2024,16 +2641,20 @@ def _tone_instrument_demand(
     tone = [replace(e) for e in events if e.on and e.tone_chip]
     if not tone:
         return 0
-    scc, ay, psg, nes, huc, gb, vsu = [], [], [], [], [], [], []
+    scc, ay, psg, nes, huc, gb, vsu, saa = [], [], [], [], [], [], [], []
     _bind_tone_instruments(
-        tone, scc, ay, psg, nes, huc, gb, vsu,
+        tone, scc, ay, psg, nes, huc, gb, vsu, saa,
         # A negative base leaves the instrument cap effectively unlimited, so
         # every distinct macro shape is counted.
         -1000,
         scc_clock, ay_clock, psg_clock, nes_clock, huc6280_clock,
-        gb_clock, vsu_clock, hz, total_samples,
+        gb_clock, vsu_clock, saa_clock, hz, total_samples, use_speed,
+        lfo_loop=lfo_loop,
     )
-    return sum(len(bucket) for bucket in (scc, ay, psg, nes, huc, gb, vsu))
+    return sum(
+        len(bucket)
+        for bucket in (scc, ay, psg, nes, huc, gb, vsu, saa)
+    )
 
 
 # The format stores a macro length in one byte, so 255 is the longest macro
@@ -2079,7 +2700,163 @@ def _cycle(values: list[int], limit: int = 128) -> int | None:
     return None
 
 
-def _macro_series(series: list[int]) -> tuple[tuple[int, ...], int, int]:
+def _tail_cycle(
+    values: list[int], limit: int = 128, window: int = 2048,
+    min_start: int = 0,
+) -> tuple[int, int] | None:
+    """Exact (loop start, period) for a periodic tail after a lead-in."""
+    offset = max(0, len(values) - window)
+    values = values[offset:]
+    n = len(values)
+    for start in range(max(0, min_start - offset), n - 1):
+        tail = values[start:]
+        p = _cycle(tail, limit)
+        if p is not None and len(set(tail[:p])) > 1:
+            return offset + start, p
+    return None
+
+
+def _lfo_tail_cycle(
+    values: list[int], limit: int = 128, tol: int = 1,
+    window: int = 2048, min_start: int = 0,
+) -> tuple[int, int] | None:
+    """Find a quantized LFO at the tail by walking its peaks backwards.
+
+    The last local maximum and minimum establish the top and bottom of the
+    LFO. Extrema are accepted backwards while they still match those peaks;
+    the first mismatch starts the range. Allow a few one-unit mismatches in
+    the period, since run lengths of a quantized LFO can vary by a tick.
+    """
+    offset = max(0, len(values) - window)
+    values = values[offset:]
+    n = len(values)
+    if n < 6:
+        return None
+    runs: list[tuple[int, int]] = []
+    i = 0
+    while i < n:
+        j = i + 1
+        while j < n and values[j] == values[i]:
+            j += 1
+        runs.append((i, values[i]))
+        i = j
+    extrema: list[tuple[int, int, int]] = []
+    for k in range(1, len(runs) - 1):
+        prev = runs[k - 1][1]
+        cur = runs[k][1]
+        nxt = runs[k + 1][1]
+        if cur > prev and cur > nxt:
+            extrema.append((runs[k][0], cur, 1))
+        elif cur < prev and cur < nxt:
+            extrema.append((runs[k][0], cur, -1))
+    if len(extrema) < 3:
+        return None
+    top = bottom = None
+    left = None
+    max_count = min_count = 0
+    for idx, value, kind in reversed(extrema):
+        if kind > 0:
+            if top is None:
+                top = value
+            elif abs(value - top) > tol:
+                break
+            max_count += 1
+        else:
+            if bottom is None:
+                bottom = value
+            elif abs(value - bottom) > tol:
+                break
+            min_count += 1
+        left = idx
+    if top is None or bottom is None or top == bottom:
+        return None
+    if max_count < 2 and min_count < 2:
+        return None
+    assert left is not None
+    # Extend over the peak run itself, but not over unrelated lead-in values.
+    while left > 0 and (
+        abs(values[left - 1] - top) <= tol
+        or abs(values[left - 1] - bottom) <= tol
+    ):
+        left -= 1
+    left = max(left, max(0, min_start - offset))
+    region = values[left:]
+    best: tuple[float, int, int] | None = None
+    for p in range(2, min(limit, len(region) // 2) + 1):
+        for shift in range(0, min(p, len(region) - 2 * p + 1)):
+            block = region[shift:shift + p]
+            if len(set(block)) < 2:
+                continue
+            directions = [
+                1 if b > a else -1
+                for a, b in zip(block, block[1:]) if b != a
+            ]
+            if not any(a != b for a, b in zip(directions, directions[1:])):
+                continue
+            errs = [
+                abs(region[i] - region[i - p])
+                for i in range(shift + p, len(region))
+            ]
+            if not errs:
+                continue
+            bad = sum(1 for err in errs if err > tol)
+            if bad > max(1, len(errs) // 10):
+                continue
+            score = bad / len(errs) + p * 0.0005 + shift * 0.0001
+            if best is None or score < best[0]:
+                best = (score, p, shift)
+    if best is None:
+        return None
+    return offset + left + best[2], best[1]
+
+
+def _step_compress(
+    series: list[int], max_speed: int = 32, ratio: float = 0.03,
+) -> tuple[list[int], int]:
+    """Shorten per-tick repeats by raising the macro's step length.
+
+    Runs of similar length are rounded to one value per step. The timing
+    error is bounded to a few percent of the macro's total; the caller keeps
+    the leading hold in ticks, so this only affects the moving part.
+    """
+    if len(series) < 4:
+        return series, 1
+    runs: list[tuple[int, int]] = []
+    i = 0
+    while i < len(series):
+        j = i + 1
+        while j < len(series) and series[j] == series[i]:
+            j += 1
+        runs.append((series[i], j - i))
+        i = j
+    if len(runs) == len(series):
+        return series, 1
+    total = len(series)
+    allowed = max(1, int(total * ratio))
+    best: tuple[int, int, list[int]] | None = None
+    for speed in range(2, min(max_speed, total // 2) + 1):
+        values: list[int] = []
+        error = 0
+        for value, length in runs:
+            count = max(1, int(round(length / speed)))
+            values.extend([value] * count)
+            error += abs(length - count * speed)
+        if len(values) >= total * 0.75 or len(values) > MACRO_MAX:
+            continue
+        if error > allowed:
+            continue
+        if best is None or len(values) < best[0] or (
+                len(values) == best[0] and speed > best[1]):
+            best = (len(values), speed, values)
+    if best is None:
+        return series, 1
+    return best[2], best[1]
+
+
+def _macro_series(
+    series: list[int], *, tail_loop: bool = False,
+    initial_speed: int = 1, loop_min: int = 0, tail_min: int = 16,
+) -> tuple[tuple[int, ...], int, int]:
     """(values, speed, loop) for one tone macro from a per-tick series.
 
     A constant series needs no macro at all; a periodic one becomes a single
@@ -2088,23 +2865,99 @@ def _macro_series(series: list[int]) -> tuple[tuple[int, ...], int, int]:
     not loop drops its trailing run of one value, since the engine holds the
     last value anyway - that is what lets two notes whose morph differs only
     in how long it lasts share one instrument.
+
+    `tail_loop` also keeps the first cycle of an LFO that starts after a
+    lead-in, setting the loop start where that cycle begins.
     """
     if not series or len(set(series)) == 1:
         return (), 1, 255
-    speed = 1
+    speed = max(1, initial_speed)
     loop = 255
     if len(series) > MACRO_MAX:
         p = _cycle(series)
-        if p is not None:
+        if p is not None and loop_min == 0:
             return tuple(series[:p]), 1, 0
+        if tail_loop and len(series) > tail_min:
+            cyc = _tail_cycle(series, min_start=loop_min)
+            if cyc is None:
+                cyc = _lfo_tail_cycle(series, min_start=loop_min)
+            if cyc is not None and cyc[0] + cyc[1] <= MACRO_MAX:
+                start, p = cyc
+                return tuple(series[:start + p]), 1, start
         speed = min(255, (len(series) + MACRO_MAX - 1) // MACRO_MAX)
         series = series[::speed]
     p = _cycle(series)
-    if p is not None and p < len(series):
+    if p is not None and p < len(series) and loop_min == 0:
         return tuple(series[:p]), speed, 0
+    if tail_loop and len(series) > tail_min:
+        cyc = _tail_cycle(series, min_start=loop_min)
+        if cyc is None:
+            cyc = _lfo_tail_cycle(series, min_start=loop_min)
+        if cyc is not None:
+            start, p = cyc
+            return tuple(series[:start + p]), speed, start
     while len(series) > 1 and series[-1] == series[-2]:
         series = series[:-1]
     return tuple(series), speed, loop
+
+
+def _macro_series_delay(
+    series: list[int], *, tail_loop: bool = False,
+    step_compress: bool = False,
+) -> tuple[tuple[int, ...], int, int, int]:
+    """`_macro_series` plus a leading-hold delay.
+
+    A macro whose first value repeats can keep one copy and use the macro
+    delay to hold it for the same number of ticks. That shortens the stored
+    list (freeing room before the 255-entry cutoff) without changing the
+    played values. `_macro_series` still handles cycles and the trailing hold.
+    """
+    if not series:
+        return (), 1, 255, 0
+    first = series[0]
+    run = 1
+    while run < len(series) and series[run] == first:
+        run += 1
+    if run <= 1:
+        speed = 1
+        body = series
+        use_tail = tail_loop and len(body) > 16
+        if step_compress and len(body) > 16:
+            body, speed = _step_compress(series)
+        values, out_speed, loop = _macro_series(
+            body, tail_loop=use_tail, initial_speed=speed, tail_min=0,
+        )
+        return values, out_speed, loop, 0
+    # The delay holds the first value for delay+1 ticks. Anything beyond that
+    # needs copies in the value list; each later copy advances by one macro
+    # step (speed ticks). Keep the leading hold exact in ticks while using a
+    # larger step length for the moving part.
+    speed = 1
+    body = list(series[run:])
+    use_tail = tail_loop and len(body) > 16
+    if step_compress and len(body) > 16:
+        body, speed = _step_compress(body)
+    if run <= 256:
+        short = [first] + body
+        delay = run - 1
+    else:
+        extra = run - 256
+        extra_copies = (extra + speed - 1) // max(1, speed)
+        short = [first] * (1 + extra_copies) + body
+        delay = 255
+    values, out_speed, loop = _macro_series(
+        short, tail_loop=use_tail, initial_speed=speed, loop_min=1,
+        tail_min=0,
+    )
+    speed = out_speed
+    # A loop that starts at the first value repeats the leading run on every
+    # cycle; collapsing it would remove that repeat. A loop later in the
+    # macro is unaffected by the initial hold, and the shortened value list
+    # already has its loop index shifted correctly.
+    if not values or loop == 0:
+        values, speed, loop = _macro_series(series, tail_loop=tail_loop)
+        return values, speed, loop, 0
+    return values, speed, loop, delay
 
 
 def _unit_saw(values: list[int] | tuple[int, ...]) -> bool:
@@ -2525,6 +3378,221 @@ def _emit_ay_notes(
     return count
 
 
+def _saa_amp_at(h, t: int) -> tuple[int, int]:
+    left, right = h.left, h.right
+    for pt in h.amp_pts:
+        if pt[0] <= t:
+            left, right = pt[1], pt[2]
+        else:
+            break
+    return left, right
+
+
+def _saa_mode_at(h, t: int) -> tuple[bool, bool]:
+    tone, noise = h.tone, h.noise
+    for pt in h.mode_pts:
+        if pt[0] <= t:
+            tone, noise = pt[1], pt[2]
+        else:
+            break
+    return tone, noise
+
+
+def _saa_noise_at(h, t: int) -> int:
+    value = h.noise_freq
+    for pt in h.noise_pts:
+        if pt[0] <= t:
+            value = pt[1]
+        else:
+            break
+    return value
+
+
+def _saa_env_at(h, t: int) -> int:
+    value = h.env
+    for pt in h.env_pts:
+        if pt[0] <= t:
+            value = pt[1]
+        else:
+            break
+    return value
+
+
+def _saa_mode_effect(tone: bool, noise: bool) -> int:
+    """Furnace 10xy: high nibble toggles noise, low nibble tone."""
+    return (0x10 if noise else 0) | (0x01 if tone else 0)
+
+
+def _saa_mode_macro(tone: bool, noise: bool) -> int:
+    """Platform psgMode: bit 0 tone, bit 1 noise."""
+    return (0x01 if tone else 0) | (0x02 if noise else 0)
+
+
+def _emit_saa_notes(
+    events: list[NoteEvent],
+    channel_fx: list[tuple[int, int, int, int]],
+    hits,
+    offs,
+    at: dict[int, int],
+    clock: int,
+    total_samples: int = 0,
+) -> int:
+    """Append notes and key-offs for one dual-chip SAA1099 stream.
+
+    The amplitude gate is the note delimiter.  Pitch writes inside a gate are
+    the source's pseudo-duty detunes, so they stay on the note's pitch macro
+    instead of becoming new notes.  The raw left/right amplitude nibbles go to
+    the panning macros; the note column is 15 when those macros are kept.
+    """
+    count = 0
+    for h in hits:
+        base = at.get(h.chip_id)
+        if base is None:
+            continue
+        ch = base + h.voice
+        st = h.sample_time
+        gate_end = h.off_sample or (total_samples or st)
+        if h.hidden:
+            # Silent source notes for an envelope generator.  Split at every
+            # period change so the note/E5 carries the source voice's exact
+            # frequency; one long macro would be thinned and would alias the
+            # envelope rate.  Volume 0 keeps these notes inaudible.
+            starts = [(st, h.period)] + list(h.freq_pts)
+            for i, (when, period) in enumerate(starts):
+                next_t = (
+                    starts[i + 1][0] if i + 1 < len(starts) else h.off_sample
+                )
+                src_note, src_e5 = saa_period_note(clock, period)
+                events.append(NoteEvent(
+                    sample=when,
+                    ch=ch,
+                    on=True,
+                    note=src_note,
+                    ins=-1,
+                    vol=0,
+                    e5=src_e5,
+                    pan=0,
+                    end=next_t,
+                    tone_amp_pts=(),
+                    tone_fx_pts=(),
+                    tone_chip=8,
+                    tone_clock=clock,
+                    tone_div=SAA_DIVIDER,
+                    tone_period_offset=0,
+                ))
+                count += 1
+            continue
+        # A large pitch step held for more than half a frame is a legato note,
+        # not a macro: split it so the instrument is shared across the notes
+        # of a descent.  Fast pseudo-duty detunes are small and stay on the
+        # pitch macro.  The amplitude/pan, mode, noise and envelope state at
+        # each split is carried into that note, the same way volume is.
+        segs = segment_periods(
+            [(h.sample_time, h.period), *h.freq_pts],
+            gate_end, clock, SAA_DIVIDER, 0,
+            merge_gap=_AY_MERGE_GAP,
+            min_hold=max(1, _NOTE_HOLD_SAMPLES // 2),
+            drop_short=False,
+        )
+        for i, (sst, period, intra) in enumerate(segs):
+            nxt = segs[i + 1][0] if i + 1 < len(segs) else 0
+            seg_end = nxt or h.off_sample
+            bound = nxt or gate_end
+            note, e5 = saa_period_note(clock, period)
+            steps = _tone_steps(list(intra), sst, 0, _AY_MERGE_GAP)
+            left, right = _saa_amp_at(h, sst)
+            vol = max(left, right)
+            pan = pcm_pan_fx(left, right)
+            # Volume is the macro (as on the other PSGs); the left/right
+            # balance is note/row state.  Keeping balance out of the
+            # instrument lets notes with the same level shape share one.
+            amp_pts: list[tuple[int, int, int]] = [(sst, left, right)]
+            for pt in h.amp_pts:
+                if sst < pt[0] < bound:
+                    amp_pts.append(pt)
+            vol_pts = tuple(
+                (t, max(l, r), None) for t, l, r in amp_pts[1:]
+            )
+            last_pan = pan
+            for t, l, r in amp_pts[1:]:
+                next_pan = pcm_pan_fx(l, r)
+                if next_pan != last_pan:
+                    channel_fx.append((t, ch, 0x08, next_pan))
+                    last_pan = next_pan
+            tone, noise = _saa_mode_at(h, sst)
+            mode_pts: list[tuple[int, bool, bool]] = [(sst, tone, noise)]
+            for pt in h.mode_pts:
+                if sst < pt[0] < bound:
+                    mode_pts.append(pt)
+            nf = _saa_noise_at(h, sst)
+            noise_pts: list[tuple[int, int]] = [(sst, nf)]
+            for pt in h.noise_pts:
+                if sst < pt[0] < bound:
+                    noise_pts.append(pt)
+            env = _saa_env_at(h, sst)
+            env_pts: list[tuple[int, int]] = [(sst, env)]
+            for pt in h.env_pts:
+                if sst < pt[0] < bound:
+                    env_pts.append(pt)
+
+            # Row effects for the opening state; the instrument macros carry
+            # any later motion.  The initial effects also keep a constant
+            # state when the budget falls back to a plain voice.
+            channel_fx.append((sst, ch, 0x10, _saa_mode_effect(tone, noise)))
+            channel_fx.append((sst, ch, 0x11, nf))
+            for t, to, no in mode_pts[1:]:
+                channel_fx.append((t, ch, 0x10, _saa_mode_effect(to, no)))
+            for t, value in noise_pts[1:]:
+                channel_fx.append((t, ch, 0x11, value))
+            if h.voice % 3 == 2:
+                channel_fx.append((sst, ch, 0x12, env))
+                for t, value in env_pts[1:]:
+                    channel_fx.append((t, ch, 0x12, value))
+
+            fx: list[tuple[int, int, int]] = [
+                (t, 0x10, _saa_mode_macro(to, no))
+                for t, to, no in mode_pts
+            ]
+            fx += [(t, 0x11, value) for t, value in noise_pts]
+            if h.voice % 3 == 2:
+                fx += [(t, 0x12, value) for t, value in env_pts]
+
+            events.append(NoteEvent(
+                sample=sst,
+                ch=ch,
+                on=True,
+                note=note,
+                ins=-1,
+                vol=vol,
+                e5=e5,
+                pan=pan,
+                end=seg_end,
+                vol_pts=vol_pts,
+                tone_pitch_pts=tuple(steps),
+                tone_fx_pts=tuple(fx),
+                tone_chip=8,
+                tone_clock=clock,
+                tone_div=SAA_DIVIDER,
+                tone_period_offset=0,
+            ))
+            count += 1
+    for off in offs:
+        base = at.get(off.chip_id)
+        if base is None:
+            continue
+        events.append(NoteEvent(
+            sample=off.sample_time,
+            ch=base + off.voice,
+            on=False,
+            note=180,
+            ins=-1,
+            vol=-1,
+            e5=0x80,
+            pan=0,
+        ))
+    return count
+
+
 def _emit_ssg_pcm_notes(
     events: list[NoteEvent],
     hits: list[SsgPcmHit],
@@ -2925,7 +3993,7 @@ def _bind_fm_pitch(
                         e.sweep = deltas
                         fallbacks += 1
                 continue
-            macro, speed, loop = _macro_series(vals)
+            macro, speed, loop = _macro_series(vals, tail_loop=True)
             if not macro:
                 continue
             base_key = patch_order[e.ins]
@@ -3184,6 +4252,247 @@ def _rebase_non_fm_ins(
             e.ins += delta
 
 
+# Macro fields of an FM instrument. Two instruments whose non-macro identity
+# matches may share one when every macro agrees from left to right; the longer
+# macro wins because a short note only plays the prefix before the next key-on.
+_FM_MACRO_FIELDS = (
+    "fms_macro", "ams_macro", "pitch_macro", "wave_macro", "vol_macro",
+    "phase_macro", "op_tl_macro", "op_dt_macro", "op_dt2_macro",
+    "op_mul_macro",
+)
+_FM_MACRO_SPEEDS = (
+    ("fms_macro", "macro_speed"),
+    ("pitch_macro", "pitch_speed"),
+    ("wave_macro", "wave_speed"),
+    ("vol_macro", "vol_speed"),
+    ("phase_macro", "phase_speed"),
+)
+_FM_MACRO_LOOPS = (
+    ("pitch_macro", "pitch_loop"),
+    ("wave_macro", "wave_loop"),
+    ("vol_macro", "vol_loop"),
+    ("phase_macro", "phase_loop"),
+)
+
+
+def _macro_extends(a, b) -> bool:
+    """True when `a` is `b` plus a (possibly empty) extra tail."""
+    a = tuple(a)
+    b = tuple(b)
+    if bool(a) != bool(b) or len(a) < len(b):
+        return False
+    return a[:len(b)] == b
+
+
+def _op_macro_extends(a, b) -> bool:
+    """Compare per-operator macros: `a` must extend `b` for every operator."""
+    da = {op: (tuple(values), speed) for op, values, speed in a}
+    db = {op: (tuple(values), speed) for op, values, speed in b}
+    if set(da) != set(db):
+        return False
+    for op in da:
+        values_a, speed_a = da[op]
+        values_b, speed_b = db[op]
+        if speed_a != speed_b or not _macro_extends(values_a, values_b):
+            return False
+    return True
+
+
+def _fm_macro_extends(a: FMPatch, b: FMPatch) -> bool:
+    """Whether `a` carries every macro of `b` plus a longer tail."""
+    for field in _FM_MACRO_FIELDS:
+        va = getattr(a, field)
+        vb = getattr(b, field)
+        if field.startswith("op_"):
+            if not _op_macro_extends(va, vb):
+                return False
+        elif not _macro_extends(va, vb):
+            return False
+    for field, speed in _FM_MACRO_SPEEDS:
+        if (getattr(a, field) or getattr(b, field)) and (
+                getattr(a, speed) != getattr(b, speed)):
+            return False
+    for field, loop in _FM_MACRO_LOOPS:
+        if (getattr(a, field) or getattr(b, field)) and (
+                getattr(a, loop) != getattr(b, loop)):
+            return False
+    return True
+
+
+def _macro_ticks(start: int, end: int, tick_samples: float) -> int:
+    if end <= start:
+        return 1
+    return max(1, int(math.ceil((end - start) / tick_samples)))
+
+
+def _macro_effective(
+    values: tuple[int, ...], speed: int, loop: int, ticks: int,
+    delay: int = 0,
+) -> tuple[int, ...]:
+    """The value a macro plays on each tick, including delay/hold/loop tails."""
+    if not values:
+        return ()
+    speed = max(1, speed)
+    hold = max(0, delay) + 1
+    out: list[int] = []
+    for t in range(ticks):
+        if t < hold:
+            out.append(values[0])
+            continue
+        pos = 1 + (t - hold) // speed
+        if pos < len(values):
+            out.append(values[pos])
+        elif 0 <= loop < len(values):
+            span = max(1, len(values) - loop)
+            out.append(values[loop + (pos - len(values)) % span])
+        else:
+            out.append(values[-1])
+    return tuple(out)
+
+
+def _fm_macro_same_for(a: FMPatch, b: FMPatch, ticks: int) -> bool:
+    """Whether `a` and `b` play the same macros for `ticks` ticks."""
+    speed_of = dict(_FM_MACRO_SPEEDS)
+    loop_of = dict(_FM_MACRO_LOOPS)
+    for field in _FM_MACRO_FIELDS:
+        va = getattr(a, field)
+        vb = getattr(b, field)
+        if field.startswith("op_"):
+            da = {op: (tuple(values), speed) for op, values, speed in va}
+            db = {op: (tuple(values), speed) for op, values, speed in vb}
+            for op in db:
+                if (
+                    _macro_effective(da[op][0], da[op][1], 255, ticks)
+                    != _macro_effective(db[op][0], db[op][1], 255, ticks)
+                ):
+                    return False
+        else:
+            speed = getattr(b, speed_of[field]) if field in speed_of else 1
+            loop = getattr(b, loop_of[field]) if field in loop_of else 255
+            if (
+                _macro_effective(tuple(va), speed, loop, ticks)
+                != _macro_effective(tuple(vb), speed, loop, ticks)
+            ):
+                return False
+    return True
+
+
+def _fm_macro_size(patch: FMPatch) -> int:
+    size = 0
+    for field in _FM_MACRO_FIELDS:
+        value = getattr(patch, field)
+        if field.startswith("op_"):
+            size += sum(len(values) for _op, values, _speed in value)
+        else:
+            size += len(value)
+    return size
+
+
+def _prefix_targets(indexes: list[int], size_of, prefix_of) -> dict[int, int]:
+    """Map each index to the longest compatible extension in its group.
+
+    Prefix chains are resolved to the final (largest) member. Equal-size
+    identical macros pick the lower index so the mapping is stable.
+    """
+    target: dict[int, int] = {i: i for i in indexes}
+    for i in indexes:
+        best: int | None = None
+        for j in indexes:
+            if j == i or not prefix_of(j, i):
+                continue
+            sj = size_of(j)
+            si = size_of(i)
+            if sj < si or (sj == si and j > i):
+                continue
+            if (
+                best is None
+                or sj > size_of(best)
+                or (sj == size_of(best) and j < best)
+            ):
+                best = j
+        if best is not None:
+            target[i] = best
+    for i in indexes:
+        cur = i
+        seen: set[int] = set()
+        while target[cur] != cur and cur not in seen:
+            seen.add(cur)
+            cur = target[cur]
+        target[i] = cur
+    return target
+
+
+def _merge_fm_prefix_macros(
+    events: list[NoteEvent], fm_patches: list[FMPatch],
+    tick_samples: float,
+) -> int:
+    """Share the longest left-to-right-compatible macro between instruments.
+
+    Short notes often produce a truncated copy of the same instrument macro.
+    When every macro agrees from the beginning and only one has a longer tail,
+    the longer instrument plays the short note identically (the next key-on
+    comes first). Keep the longest and drop the shorter copies. This runs just
+    before the hard-limit trim, so it can save slots without losing motion.
+    """
+    old_count = len(fm_patches)
+    if old_count < 2:
+        return 0
+    notes_by_ins: dict[int, list[tuple[int, int]]] = {}
+    for e in events:
+        if e.on and 0 <= e.ins < old_count:
+            notes_by_ins.setdefault(e.ins, []).append((e.sample, e.end))
+    groups: dict[tuple, list[int]] = {}
+    for i, patch in enumerate(fm_patches):
+        groups.setdefault(patch.identity(), []).append(i)
+
+    def extends(j: int, i: int) -> bool:
+        if not _fm_macro_extends(fm_patches[j], fm_patches[i]):
+            return False
+        for start, end in notes_by_ins.get(i, ()):
+            if end <= 0:
+                return False
+            ticks = _macro_ticks(start, end, tick_samples)
+            if not _fm_macro_same_for(fm_patches[j], fm_patches[i], ticks):
+                return False
+        return True
+
+    target = {i: i for i in range(old_count)}
+    for indexes in groups.values():
+        if len(indexes) > 1 and any(
+            _fm_macro_size(fm_patches[i]) > 0 for i in indexes
+        ):
+            target.update(_prefix_targets(
+                indexes,
+                lambda i: _fm_macro_size(fm_patches[i]),
+                extends,
+            ))
+    if all(target[i] == i for i in range(old_count)):
+        return 0
+    new_index: dict[int, int] = {}
+    kept: list[FMPatch] = []
+    for i in range(old_count):
+        if target[i] == i:
+            new_index[i] = len(kept)
+            kept.append(fm_patches[i])
+    for i in range(old_count):
+        new_index[i] = new_index[target[i]]
+    merged_patches: list[FMPatch] = []
+    for idx, patch in enumerate(kept):
+        base = (
+            new_index.get(patch.base_ins, -1)
+            if patch.base_ins >= 0 else -1
+        )
+        if base == idx:
+            base = -1             # the copy's base merged into this slot
+        merged_patches.append(replace(patch, base_ins=base))
+    fm_patches[:] = merged_patches
+    for e in events:
+        if 0 <= e.ins < old_count:
+            e.ins = new_index.get(e.ins, e.ins)
+    _rebase_non_fm_ins(events, old_count, len(fm_patches))
+    return old_count - len(fm_patches)
+
+
 def _trim_fm_macro_copies(
     events: list[NoteEvent], fm_patches: list[FMPatch], limit: int,
 ) -> int:
@@ -3410,6 +4719,186 @@ def _bind_opm_levels(
             ev.vol = max(0, min(127, 127 - (base - low)))
             rebased += 1
     return len(opened), rebased
+
+
+# YM2151 DT1 index -> Furnace's engine index (same table as the writer).
+_YM_DT_TO_FURNACE = (3, 4, 5, 6, 7, 2, 1, 0)
+
+
+def _bind_opm_dtmul_macros(
+    events: list["NoteEvent"], patches: dict[tuple, FMPatch],
+    patch_order: list[tuple], tick_samples: float, t0: int, use_speed: int,
+    cap: int = 250,
+) -> tuple[int, int]:
+    """Place a note's mid-note DT1/MULT/DT2 writes.
+
+    A YM2151 driver can retune one operator every frame inside a very short
+    staccato note (Magical Chase walks channel 1's third operator MULT
+    through 0..4, and later through long staircases). When the changes fit
+    on pattern rows, use the operator effects 16xy/53xy/55xy - the pattern
+    then shows the movement and no instrument copy is needed. Only motion
+    that collides inside one row falls back to a per-operator DT/MULT/DT2
+    macro.
+
+    Returns (notes given a copy, notes left on the base voice at the cap).
+    """
+    made = fallbacks = 0
+    idx_map: dict[tuple, int] = {}
+    if tick_samples <= 0:
+        return 0, 0
+    row_samples = tick_samples * max(1, use_speed)
+
+    def expand(marks: list[tuple[int, int]], start: int) -> tuple[int, ...]:
+        cur = start
+        mi = 0
+        values: list[int] = []
+        for slot in range(marks[-1][0] + 1):
+            while mi < len(marks) and marks[mi][0] <= slot:
+                cur = marks[mi][1]
+                mi += 1
+            values.append(cur)
+        return tuple(values)
+
+    def row_marks(
+        pts: list[tuple[int, int]], start: int,
+    ) -> tuple[list[tuple[int, int]], bool]:
+        """(sample, value) points that fit rows, and whether nothing is lost.
+
+        A row can carry one value per operator. If a row contains two
+        different values and the first is not what the previous row already
+        held, the intermediate transition is lost and the macro path is
+        needed instead.
+        """
+        groups: dict[int, list[tuple[int, int]]] = {}
+        for s, value in pts:
+            if ev.end and s >= ev.end:
+                continue
+            row = max(0, int((s - t0) // row_samples))
+            groups.setdefault(row, []).append((s, value))
+        carried = start
+        out: list[tuple[int, int]] = []
+        lossless = True
+        for row in sorted(groups):
+            vals = groups[row]
+            distinct: list[int] = []
+            for _s, value in vals:
+                if not distinct or distinct[-1] != value:
+                    distinct.append(value)
+            if len(distinct) > 1 and distinct[0] != carried:
+                lossless = False
+            if distinct[-1] != carried:
+                out.append((vals[-1][0], distinct[-1]))
+                carried = distinct[-1]
+        return out, lossless
+
+    def macro_values(
+        pts: list[tuple[int, int]], start: int,
+    ) -> tuple[int, ...]:
+        last_s = pts[-1][0]
+        span_end = ev.end if (ev.end and ev.end > last_s) else last_s
+        span_ticks = max(1.0, (span_end - ev.sample) / tick_samples)
+        speed = max(1, min(254, int(span_ticks // 240) + 1))
+        marks: list[tuple[int, int]] = []
+        for s, value in pts:
+            slot = max(0, int((s - ev.sample) // tick_samples)) // speed
+            if slot > 254:
+                break
+            if marks and marks[-1][0] == slot:
+                marks[-1] = (slot, value)
+            else:
+                marks.append((slot, value))
+        return expand(marks, start) if marks else ()
+
+    for e in events:
+        ev = e
+        if not ev.on or not (ev.op_dtmul_pts or ev.op_dt2_pts) or ev.pcm:
+            continue
+        if not (0 <= ev.ins < len(patch_order)):
+            continue
+        base = patches[patch_order[ev.ins]]
+        by_op: dict[int, list[tuple[int, int]]] = {}
+        for s, oi, raw in ev.op_dtmul_pts:
+            by_op.setdefault(oi, []).append((s, raw))
+        dt2_by_op: dict[int, list[tuple[int, int]]] = {}
+        for s, oi, dt2 in ev.op_dt2_pts:
+            dt2_by_op.setdefault(oi, []).append((s, dt2))
+        mul_entries: list[tuple[int, tuple[int, ...], int]] = []
+        dt_entries: list[tuple[int, tuple[int, ...], int]] = []
+        dt2_entries: list[tuple[int, tuple[int, ...], int]] = []
+        for oi in range(4):
+            raw_pts = by_op.get(oi, [])
+            dt2_pts = dt2_by_op.get(oi, [])
+            if not raw_pts and not dt2_pts:
+                continue
+            start_raw = base.ops[oi].dt_mul
+            start_mul = start_raw & 0x0F
+            start_dt = _YM_DT_TO_FURNACE[(start_raw >> 4) & 7]
+            start_dt2 = (base.ops[oi].dt2_d2r >> 6) & 3
+            if raw_pts:
+                mul_pts = [(s, raw & 0x0F) for s, raw in raw_pts]
+                marks, ok = row_marks(mul_pts, start_mul)
+                if ok:
+                    ev.op_mul_fx += tuple(
+                        (s, oi, value) for s, value in marks
+                    )
+                else:
+                    values = macro_values(mul_pts, start_mul)
+                    if len(set(values)) > 1 or values[0] != start_mul:
+                        mul_entries.append((oi, values, 1))
+                dt_pts = [
+                    (s, _YM_DT_TO_FURNACE[(raw >> 4) & 7])
+                    for s, raw in raw_pts
+                ]
+                marks, ok = row_marks(dt_pts, start_dt)
+                if ok:
+                    ev.op_dt_fx += tuple(
+                        (s, oi, value) for s, value in marks
+                    )
+                else:
+                    values = macro_values(dt_pts, start_dt)
+                    if len(set(values)) > 1 or values[0] != start_dt:
+                        dt_entries.append((oi, values, 1))
+            if dt2_pts:
+                marks, ok = row_marks(dt2_pts, start_dt2)
+                if ok:
+                    ev.op_dt2_fx += tuple(
+                        (s, oi, value) for s, value in marks
+                    )
+                else:
+                    values = macro_values(dt2_pts, start_dt2)
+                    if len(set(values)) > 1 or values[0] != start_dt2:
+                        dt2_entries.append((oi, values, 1))
+        if not mul_entries and not dt_entries and not dt2_entries:
+            continue
+        key = (
+            "op-dtmul", patch_order[ev.ins],
+            tuple(mul_entries), tuple(dt_entries), tuple(dt2_entries),
+        )
+        idx = idx_map.get(key)
+        if idx is None:
+            if len(patch_order) >= cap:
+                fallbacks += 1
+                continue
+            changes: dict[str, tuple] = {}
+            if mul_entries:
+                changes["op_mul_macro"] = tuple(mul_entries)
+            if dt_entries:
+                changes["op_dt_macro"] = tuple(dt_entries)
+            if dt2_entries:
+                changes["op_dt2_macro"] = tuple(dt2_entries)
+            copy = replace(
+                base, uses=1, name=f"{base.name}+mul", base_ins=ev.ins,
+                **changes,
+            )
+            patches[key] = copy
+            patch_order.append(key)
+            idx = len(patch_order) - 1
+            idx_map[key] = idx
+        else:
+            patches[patch_order[idx]].uses += 1
+        ev.ins = idx
+        made += 1
+    return made, fallbacks
 
 
 def _bind_ext_levels(
@@ -4918,12 +6407,16 @@ def analyze(
     grid_cache: dict | None = None,
     c352_quad: bool = False,
     dac_slices: bool = False,
+    lfo_loop: bool = True,
+    lossy_samples: bool = False,
 ) -> Song:
     """Build the Song for one rendition of `vgm`.
 
     `grid_cache` memoises the grid estimate, which does not depend on
     `condense`. The caller owns it. `c352_quad` keeps the C352 rear pair on
-    its own outputs.
+    its own outputs. `lfo_loop` enables the LFO/tail loop search for long
+    pitch macros; turning it off keeps the exact first-cycle detection but
+    skips the expensive tail scan.
     """
     tick = TARGET_TICK_SAMPLES if tick_samples is None else float(tick_samples)
     row_floor = MIN_ROW_SAMPLES if min_row is None else float(min_row)
@@ -5447,6 +6940,14 @@ def analyze(
     tl_pts: list[list[tuple[int, int]]] = [[] for _ in range(8)]
     tl_ev: list[int | None] = [None] * 8
     tl_last = [0x7F] * 8
+    # Mid-note DT1/MULT writes per held note (fast operator pitch tracking).
+    dtmul_pts: list[list[tuple[int, int, int]]] = [[] for _ in range(8)]
+    dtmul_last = [[0] * 4 for _ in range(8)]
+    dtmul_ev: list[int | None] = [None] * 8
+    # Mid-note DT2 changes per held note.
+    dt2_pts: list[list[tuple[int, int, int]]] = [[] for _ in range(8)]
+    dt2_last = [[0] * 4 for _ in range(8)]
+    dt2_ev: list[int | None] = [None] * 8
     # Last KON operator mask per channel: key state is per operator, and an
     # envelope restarts only on a 0->1 transition of its bit.
     op_mask = [0] * 8
@@ -5473,6 +6974,18 @@ def analyze(
         if idx is not None and tl_pts[ch]:
             events[idx].tl_pts = tuple(tl_pts[ch])
         tl_ev[ch] = None
+
+    def close_dtmul(ch: int) -> None:
+        idx = dtmul_ev[ch]
+        if idx is not None and dtmul_pts[ch]:
+            events[idx].op_dtmul_pts = tuple(dtmul_pts[ch])
+        dtmul_ev[ch] = None
+
+    def close_dt2(ch: int) -> None:
+        idx = dt2_ev[ch]
+        if idx is not None and dt2_pts[ch]:
+            events[idx].op_dt2_pts = tuple(dt2_pts[ch])
+        dt2_ev[ch] = None
 
     def intern_patch(ch: int, mask: int = 0xF) -> int:
         snap = ym.snapshot(ch)
@@ -5563,6 +7076,25 @@ def analyze(
                     continue
                 ym.write(w2.reg, w2.val)
 
+        def settle_burst_dtmul(idx: int, ch: int, sample: int) -> None:
+            """Fold a key-on burst's DT1/MULT writes into the instrument.
+
+            Drivers commonly send the voice's operator bytes just after the
+            key-on. Those describe the attack timbre, not a move inside the
+            note. Anything after the short burst is a real mid-note change.
+            """
+            for j in range(idx + 1, len(vgm.writes)):
+                w2 = vgm.writes[j]
+                if w2.sample - sample > _OPM_BURST_LOAD_SAMPLES:
+                    break
+                if (w2.chip != "ym2151" or w2.chip_id != opm_cid
+                        or not (0x40 <= w2.reg <= 0x5F
+                                or 0xC0 <= w2.reg <= 0xDF)):
+                    continue
+                if (w2.reg & 7) != ch:
+                    continue
+                ym.write(w2.reg, w2.val)
+
         for wi, w in enumerate(vgm.writes):
             if not convert_opm or w.chip != "ym2151" or w.chip_id != opm_cid:
                 continue
@@ -5631,6 +7163,25 @@ def analyze(
                         if cur != tl_last[ch]:
                             tl_pts[ch].append((w.sample, cur))
                             tl_last[ch] = cur
+                elif 0x40 <= w.reg <= 0x5F:
+                    # DT1/MULT writes while the note sounds: the driver uses
+                    # them as a very fast per-operator pitch/timbre slide.
+                    ch = w.reg & 7
+                    op = (w.reg >> 3) & 3
+                    if ym.kon[ch] and dtmul_ev[ch] is not None:
+                        cur = ym.ops[ch][op].dt_mul
+                        if cur != dtmul_last[ch][op]:
+                            dtmul_pts[ch].append((w.sample, op, cur))
+                            dtmul_last[ch][op] = cur
+                elif 0xC0 <= w.reg <= 0xDF:
+                    # DT2 changes while the note sounds.
+                    ch = w.reg & 7
+                    op = (w.reg >> 3) & 3
+                    if ym.kon[ch] and dt2_ev[ch] is not None:
+                        cur = (ym.ops[ch][op].dt2_d2r >> 6) & 3
+                        if cur != dt2_last[ch][op]:
+                            dt2_pts[ch].append((w.sample, op, cur))
+                            dt2_last[ch][op] = cur
                 continue
             ch = w.val & 7
             mask = (w.val & 0x78) >> 3
@@ -5641,10 +7192,13 @@ def analyze(
                 close_pms(ch)
                 close_sweep(ch)
                 close_tl(ch)
+                close_dtmul(ch)
+                close_dt2(ch)
                 if ym.carrier_tl(ch) >= 0x7F:
                     # Nothing in this voice can sound yet: the driver loads the
                     # real levels at the tail of this same burst.
                     settle_burst_tl(wi, ch, w.sample)
+                settle_burst_dtmul(wi, ch, w.sample)
                 ins = intern_patch(ch, mask)
                 note = kc_to_furnace_note(ym.kc[ch])
                 events.append(NoteEvent(
@@ -5666,6 +7220,14 @@ def analyze(
                 tl_pts[ch] = []
                 tl_last[ch] = ym.carrier_tl(ch)
                 tl_ev[ch] = len(events) - 1
+                dtmul_pts[ch] = []
+                dtmul_last[ch] = [ym.ops[ch][i].dt_mul for i in range(4)]
+                dtmul_ev[ch] = len(events) - 1
+                dt2_pts[ch] = []
+                dt2_last[ch] = [
+                    (ym.ops[ch][i].dt2_d2r >> 6) & 3 for i in range(4)
+                ]
+                dt2_ev[ch] = len(events) - 1
                 keyon_times.append(w.sample)
                 last_keyon_sample[ch] = w.sample
                 ym.kon[ch] = True
@@ -5686,6 +7248,8 @@ def analyze(
                     close_sweep(ch)
                 close_pms(ch)
                 close_tl(ch)
+                close_dtmul(ch)
+                close_dt2(ch)
                 ym.kon[ch] = False
                 held_ins[ch] = -1
 
@@ -5693,6 +7257,8 @@ def analyze(
             close_pms(ch)
             close_sweep(ch)
             close_tl(ch)
+            close_dtmul(ch)
+            close_dt2(ch)
 
         # A crescendo walks the carriers *down* through the TL range while the note
         # sounds. The volume column can only attenuate what the instrument stores, so
@@ -8186,6 +9752,16 @@ def analyze(
             vgm, nes_clock,
         )
         warnings.extend(nes_warn)
+        if lossy_samples:
+            before = len(nes_pcm_samples)
+            nes_pcm_samples, nes_pcm_hits = cluster_nes_pcm(
+                nes_pcm_samples, nes_pcm_hits,
+            )
+            if len(nes_pcm_samples) < before:
+                warnings.append(
+                    f"NES raw PCM: lossy sample clustering {before} -> "
+                    f"{len(nes_pcm_samples)} bodies"
+                )
     else:
         nes_tones, nes_offs = [], []
         nes_dpcm_samples, nes_dpcm_hits = [], []
@@ -8368,6 +9944,14 @@ def analyze(
             return [], []
         got, got_hits, got_warn = collect_ssg_pcm(vgm, chip=chip_name)
         warnings.extend(got_warn)
+        if lossy_samples:
+            before = len(got)
+            got, got_hits = cluster_ssg_pcm(got, got_hits)
+            if len(got) < before:
+                warnings.append(
+                    f"{chip_name}: lossy sample clustering {before} -> "
+                    f"{len(got)} bodies"
+                )
         return got, got_hits
 
     def _emit_pcm(got, got_hits, at) -> None:
@@ -9030,6 +10614,37 @@ def analyze(
                 pan=0,
             ))
 
+    # Philips SAA1099: six square/noise voices per chip, after the VSU block.
+    # A CMS/Game Blaster log normally carries two chips; each becomes its own
+    # Furnace 0x97 system, which Furnace names Creative Music System.
+    saa_ids: list[int] = []
+    saa_ins: list[ToneIns] = []
+    saa_count = 0
+    saa_clock = vgm.saa1099_clock or SAA_DEFAULT_CLOCK
+    saa_hits, saa_offs, saa_warn = collect_saa1099(vgm)
+    warnings.extend(saa_warn)
+    if saa_hits or saa_offs:
+        saa_ids = sorted({
+            w.chip_id for w in vgm.writes if w.chip == "saa1099"
+        })
+        if not saa_ids:
+            saa_ids = sorted({h.chip_id for h in saa_hits})
+        saa_base = (
+            tone_base + SCC_VOICES * len(scc_ids) + AY_VOICES * len(ay_ids)
+            + (NES_CHANNELS if nes_ids else 0)
+            + (HUC6280_CHANNELS if huc6280_ids else 0)
+            + (4 * len(gb_ids))
+            + VSU_CHANNELS * len(vsu_ids)
+        )
+        saa_at = {
+            cid: saa_base + SAA_VOICES * i
+            for i, cid in enumerate(saa_ids)
+        }
+        saa_count = _emit_saa_notes(
+            events, channel_fx, saa_hits, saa_offs, saa_at, saa_clock,
+            vgm.total_samples or 0,
+        )
+
     # The YM2203 SSG rides in the same six-channel system: 0-2 FM, 3-5 PSG. Its
     # notes share the AY instrument list.
     ssg_pcm, ssg_pcm_hits = _ssg_pcm("ym2203_ssg")
@@ -9169,15 +10784,28 @@ def analyze(
         if grid is None and pcm_onsets:
             grid = _grid("pcm", onsets=pcm_onsets, label="sample-trigger lattice")
         if grid is not None:
-            tone_only = (scc_count or ay_count or vsu_count) and not keyon_times and not any(
+            tone_only = (
+                scc_count or ay_count or vsu_count or saa_count
+            ) and not keyon_times and not any(
                 e.on and e.pcm for e in events
             )
             if tone_only:
-                hz, use_speed, row_subdiv, grid_note = _musical_row(grid)
-                hz, use_speed, row_subdiv, grid_note = _fit_tone_subdivision(
-                    hz, use_speed, events, grid_note,
-                )
-                tone_hilight = True
+                saa_tick = _saa_tick_interval(vgm) if saa_count else None
+                if saa_tick:
+                    hz = VGM_RATE / saa_tick
+                    use_speed = 1
+                    row_subdiv = 1.0
+                    grid_note = (
+                        f"SAA1099 write lattice ({saa_tick:g} samples/tick), "
+                        "row = 1 write tick"
+                    )
+                    tone_hilight = True
+                else:
+                    hz, use_speed, row_subdiv, grid_note = _musical_row(grid)
+                    hz, use_speed, row_subdiv, grid_note = _fit_tone_subdivision(
+                        hz, use_speed, events, grid_note,
+                    )
+                    tone_hilight = True
             else:
                 hz = grid.hz
                 use_speed = grid.speed
@@ -9261,6 +10889,7 @@ def analyze(
     if pcm and is_opn2:
         dac_samples, dac_plays, dac_warn, dac_stats = collect_dac(
             vgm, slices=dac_slices, grid=(hz, use_speed, t0),
+            lossy_samples=lossy_samples,
         )
         warnings.extend(dac_warn)
         if (
@@ -9278,9 +10907,17 @@ def analyze(
         ) = group_dac_plays(
             dac_samples, dac_plays, hz=hz, speed=use_speed, t0=t0,
             total_samples=vgm.total_samples or 0,
+            drop_quiet=not dac_slices,
+            cluster_fragments=lossy_samples and not dac_slices,
         )
         dac_stats.update(dac_group_stats)
         warnings.extend(dac_group_warn)
+        if lossy_samples and dac_group_stats.get("dac_fragment_clustered"):
+            warnings.append(
+                "YM2612 DAC: lossy sample clustering folded "
+                f"{dac_group_stats['dac_fragment_clustered']} bodies into "
+                f"{len(dac_samples)} slots"
+            )
         n_dac_ins = (len(dac_samples) + 119) // 120
         if n_dac_ins:
             _rebase_non_fm_ins(events, dac_base, dac_base + n_dac_ins)
@@ -9373,11 +11010,15 @@ def analyze(
         + n_huc6280_pcm_ins + n_opl4_wave_ins
     )
     tone_demand = 0
-    if scc_ids or ay_ids or psg_ids or nes_ids or huc6280_ids or gb_ids or vsu_ids:
+    if (
+        scc_ids or ay_ids or psg_ids or nes_ids or huc6280_ids
+        or gb_ids or vsu_ids or saa_ids
+    ):
         tone_demand = _tone_instrument_demand(
             events, vgm.k051649_clock or SCC_DEFAULT_CLOCK, ay_note_clock,
             psg_clock, nes_clock, huc6280_clock, gb_clock, vsu_clock,
-            hz, vgm.total_samples,
+            saa_clock, hz, vgm.total_samples, use_speed,
+            lfo_loop=lfo_loop,
         )
     tone_demand_raw = tone_demand
     free_slots = max(
@@ -9411,6 +11052,12 @@ def analyze(
         quant=4 if is_opll else 0,
         opll=is_opll,
     )
+    opm_dtmul_copies = opm_dtmul_lost = 0
+    if convert_opm:
+        opm_dtmul_copies, opm_dtmul_lost = _bind_opm_dtmul_macros(
+            events, patches, patch_order, VGM_RATE / hz,
+            t0, use_speed, cap=fm_ins_cap,
+        )
     # An operator level the driver scripted while its note sounded. The volume
     # column reaches only a KVS operator. The rest travel as instrument macros.
     op_tl_copies = op_tl_lost = 0
@@ -9468,6 +11115,11 @@ def analyze(
             f"{op_tl_lost} OPL note(s) scripted a modulator level that stayed "
             "flat on the base instrument: operator macro limit"
         )
+    if opm_dtmul_lost:
+        warnings.append(
+            f"{opm_dtmul_lost} YM2151 note(s) retuned an operator inside the "
+            "note but stayed on the base instrument: operator macro limit"
+        )
 
     # Tone-chip instruments, after the row rate is final. A macro advances
     # once per tick, so building it before condense (or before the musical
@@ -9481,7 +11133,7 @@ def analyze(
     )
     tone_merged = _bind_tone_instruments(
         events, scc_ins, ay_ins, psg_ins, nes_ins, huc6280_ins, gb_ins,
-        vsu_ins,
+        vsu_ins, saa_ins,
         tone_ins_base,
         vgm.k051649_clock or SCC_DEFAULT_CLOCK,
         ay_note_clock,
@@ -9490,8 +11142,9 @@ def analyze(
         huc6280_clock,
         gb_clock,
         vsu_clock,
-        hz, vgm.total_samples,
-        merge_tol=tone_merge_tol,
+        saa_clock,
+        hz, vgm.total_samples, use_speed,
+        merge_tol=tone_merge_tol, lfo_loop=lfo_loop,
     )
     if tone_merged:
         warnings.append(
@@ -9543,6 +11196,7 @@ def analyze(
         or huc_pcm_samples or ymz_audible
         or any(s.length >= 8 for s in pcm_samples)
         or scc_waves or ay_count or dac_samples or psg_count
+        or saa_ids or saa_count
     )
     if not fm_list:
         chip_name = {
@@ -9603,6 +11257,11 @@ def analyze(
         + n_ym2608_rhythm_ins + n_ym2608_b_ins
         + n_ssg_pcm + len(ymz_audible)
     )
+    # Before trimming anything for the hard limit, share an instrument whose
+    # macros only differ by a longer tail with its shorter copies. A short
+    # note keyed off before the extra tail is reached plays exactly the same.
+    _merge_fm_prefix_macros(events, fm_list, VGM_RATE / hz)
+
     # Absolute ceiling. The per-family caps target INS_TARGET, but a mixed
     # log or a late copy pass can still land above the final hard limit.
     # Fold only pass-created FM copies back onto their base voices; base
@@ -9738,6 +11397,9 @@ def analyze(
         vsu_ins=vsu_ins,
         vsu_count=vsu_count,
         vsu_dynamic=vsu_dynamic,
+        saa_ids=saa_ids,
+        saa_ins=saa_ins,
+        saa_count=saa_count,
         fm_vol_max=_fm_vol_max(fm_systems, is_opll=is_opll, is_opl=is_opl),
         fm_notes=(
             opll_stats.get("notes", 0) if is_opll else
@@ -9990,6 +11652,13 @@ def format_report(song: Song) -> str:
                 f", {song.dac_stats.get('dac_source_runs', 0)} bank runs"
                 f", {song.dac_stats.get('dac_source_runs_reused', 0)} reused"
             )
+        elif mode == "attacks":
+            shape = f"{len(song.dac_samples)} PCM hits"
+            extra = (
+                f", {song.dac_stats.get('dac_attack_segments', 0)} attacks"
+                f", {song.dac_stats.get('dac_attack_prefix_reused', 0)} "
+                "prefix-shared"
+            )
         elif mode == "chunks":
             shape = f"{len(song.dac_samples)} PCM chunks"
             extra = (
@@ -10031,6 +11700,13 @@ def format_report(song: Song) -> str:
         lines.append(
             f"AY notes    {song.ay_count}  ({len(song.ay_ids)} chip"
             f"{'s' if len(song.ay_ids) > 1 else ''}, {song.vgm.ay8910_clock} Hz)"
+        )
+    if song.saa_ids:
+        lines.append(
+            f"SAA notes   {song.saa_count}  ({len(song.saa_ids)} chip"
+            f"{'s' if len(song.saa_ids) > 1 else ''}, "
+            f"{song.vgm.saa1099_clock or SAA_DEFAULT_CLOCK} Hz, "
+            f"{len(song.saa_ins)} instruments)"
         )
     if song.huc6280_ids or song.huc6280_pcm_samples:
         lines.append(
