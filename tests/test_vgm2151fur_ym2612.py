@@ -468,8 +468,10 @@ class TestYm2612DacSlices(unittest.TestCase):
         # chunk used to take the phrase's trailing zero as its own tail, so
         # every chunk stretched to the phrase end and the overlapping group
         # doubled its playback rate (44.1 kHz became 88.2 kHz).
-        events = [(i, 2, 0x40) for i in range(60000)]
-        events += [(70000 + i, 2, 0x20) for i in range(10000)]
+        # Vary the bytes: a constant level is a flat DC line and the collector
+        # now drops it before it reaches the sample map.
+        events = [(i, 2, 0x40 + (i % 7)) for i in range(60000)]
+        events += [(70000 + i, 2, 0x20 + (i % 5)) for i in range(10000)]
         src = _vgm(
             self._marker() + [ChipWrite(0, "ym2612", 0, 0x2B, 0x80)],
             dac_events=events, total_samples=90000,
@@ -1650,8 +1652,10 @@ class TestYm2612DacSourceSamples(unittest.TestCase):
         events = []
         t = 0
         for k in range(10):
+            # Vary the bytes inside each hit: a constant body is a flat DC
+            # line and is now dropped before the sample map.
             events += [
-                (t + i * 4, 2, 0x91 + (k % 7)) for i in range(20)
+                (t + i * 4, 2, 0x91 + ((k + i) % 7)) for i in range(20)
             ]
             t += 20 * 4 + 3000
         src = _vgm(
@@ -1661,8 +1665,13 @@ class TestYm2612DacSourceSamples(unittest.TestCase):
         with patch.object(dac, "DAC_RELEASE_SAMPLES", 4):
             samples, plays, warn, stats = dac.collect_dac(src)
         self.assertLessEqual(len(samples), 4)
-        self.assertEqual(stats.get("dac_release_merged_tail"), 7)
-        self.assertEqual(len(plays), 4)
+        # The ten hits share seven distinct bodies (the body repeats every
+        # seven hits); three stay exact and the four distinct tail bodies
+        # join the final sample instead of being dropped.
+        self.assertEqual(stats.get("dac_release_merged_tail"), 4)
+        self.assertFalse(stats.get("dac_release_trimmed"))
+        self.assertLessEqual(len(plays), 10)
+        self.assertTrue(plays)
         self.assertTrue(any(
             "joined into the final sample" in w for w in warn
         ))
@@ -1723,6 +1732,109 @@ class TestYm2612DacBudgetReuse(unittest.TestCase):
         self.assertLessEqual(len(song.dac_samples), DAC_RELEASE_SAMPLES)
         self.assertFalse(song.dac_stats.get("dac_release_trimmed"))
         self.assertFalse(any("dropped to stay inside" in w for w in song.warnings))
+
+
+class TestYm2612DacBanking(unittest.TestCase):
+    """Bank bodies keep the longest read and drop unusable candidate slots."""
+
+    @staticmethod
+    def _bank_events(spec):
+        """``dac_events`` for ``[(time, offset, count, wait)]``.
+
+        Each entry points the bank cursor at ``offset`` and reads ``count``
+        bytes from that fixed address, so the same bank body is deliberately
+        read at two different cadences.
+        """
+        events: list[tuple[int, int, int]] = []
+        for t, offset, count, wait in spec:
+            events.append((t, 0, offset))
+            events += [(t + i * wait, 1, wait) for i in range(count)]
+        return events
+
+    @staticmethod
+    def _marker() -> list[ChipWrite]:
+        return [ChipWrite(0, "ym2612", 0, 0x2B, 0x80)]
+
+    def test_cadence_jitter_shares_the_longest_bank_body(self):
+        # The same bank offset is read long at a 5-sample wait and short at a
+        # 4-sample wait.  A median-wait key used to store two bodies; the
+        # longest read must serve both and the short note is cut later.
+        body = bytes(0x80 + (i % 37 + 1) for i in range(64))
+        events = self._bank_events([
+            (0, 0, 64, 5),
+            (20000, 0, 16, 4),
+        ])
+        src = _vgm(
+            self._marker(), dac_data=bytearray(body),
+            dac_events=events, total_samples=40000,
+        )
+        samples, plays, warn, stats = collect_dac(src)
+        self.assertFalse(warn)
+        self.assertEqual(stats["dac_mode"], "source")
+        self.assertEqual(len(samples), 1)
+        self.assertEqual(len(plays), 2)
+        self.assertEqual({p.sample for p in plays}, {0})
+        self.assertEqual(stats["dac_source_runs_reused"], 1)
+
+    def test_flatline_and_near_silent_bodies_take_no_slot(self):
+        bank = bytearray()
+        bank += bytes(0x80 + (i % 29 + 1) for i in range(16))  # audible
+        bank += bytes([0x90]) * 16                             # flat DC
+        bank += bytes(0x80 + (i % 2) for i in range(16))       # peak 1
+        events: list[tuple[int, int, int]] = []
+        events += [(0, 0, 0)] + [(i * 4, 1, 4) for i in range(16)]
+        events += [(10000, 0, 16)]
+        events += [(10000 + i * 4, 1, 4) for i in range(16)]
+        events += [(20000, 0, 32)]
+        events += [(20000 + i * 4, 1, 4) for i in range(16)]
+        src = _vgm(
+            self._marker(), dac_data=bank, dac_events=events,
+            total_samples=30000,
+        )
+        samples, plays, _warn, stats = collect_dac(src)
+        self.assertEqual(stats["dac_mode"], "source")
+        self.assertEqual(len(samples), 1)
+        self.assertEqual(len(plays), 1)
+        self.assertGreater(stats.get("dac_source_quiet_runs", 0), 0)
+
+    def test_attack_fallback_reuses_repeated_hits(self):
+        # Direct 0x2A writes, so there is no bank offset to bank on.  The
+        # fallback still has to split at the rests and store the repeated hit
+        # once instead of cutting the whole stream into time chunks.
+        hit = bytes(0x90 + (i % 7) for i in range(20))
+        events: list[tuple[int, int, int]] = []
+        t = 0
+        for _ in range(6):
+            events += [(t + i * 4, 2, hit[i]) for i in range(len(hit))]
+            t += len(hit) * 4 + 4000
+        src = _vgm(
+            self._marker(), dac_events=events, total_samples=t + 1000,
+        )
+        samples, plays, warn, stats = collect_dac(src)
+        self.assertFalse(warn)
+        self.assertEqual(stats["dac_mode"], "attacks")
+        self.assertEqual(len(samples), 1)
+        self.assertEqual(len(plays), 6)
+        self.assertEqual(stats.get("dac_attack_segments"), 6)
+
+    def test_attack_fallback_prefers_a_longer_prefix_body(self):
+        # The first hit is a prefix of the second at the same rate; the short
+        # play must point at the longer body and be cut by its own span.
+        body = bytes(0x90 + (i % 7) for i in range(32))
+        events: list[tuple[int, int, int]] = []
+        t = 0
+        for length in (16, 32):
+            events += [(t + i * 4, 2, body[i]) for i in range(length)]
+            t += length * 4 + 4000
+        src = _vgm(
+            self._marker(), dac_events=events, total_samples=t + 1000,
+        )
+        samples, plays, _warn, stats = collect_dac(src)
+        self.assertEqual(stats["dac_mode"], "attacks")
+        self.assertEqual(len(samples), 1)
+        self.assertEqual(len(plays), 2)
+        self.assertEqual({p.sample for p in plays}, {0})
+        self.assertEqual(stats.get("dac_attack_prefix_reused"), 1)
 
 
 class TestYm2612DacLongHolds(unittest.TestCase):

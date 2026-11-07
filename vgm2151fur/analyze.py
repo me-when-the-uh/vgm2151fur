@@ -10885,6 +10885,7 @@ def analyze(
         ) = group_dac_plays(
             dac_samples, dac_plays, hz=hz, speed=use_speed, t0=t0,
             total_samples=vgm.total_samples or 0,
+            drop_quiet=not dac_slices,
         )
         dac_stats.update(dac_group_stats)
         warnings.extend(dac_group_warn)
@@ -11621,6 +11622,13 @@ def format_report(song: Song) -> str:
             extra = (
                 f", {song.dac_stats.get('dac_source_runs', 0)} bank runs"
                 f", {song.dac_stats.get('dac_source_runs_reused', 0)} reused"
+            )
+        elif mode == "attacks":
+            shape = f"{len(song.dac_samples)} PCM hits"
+            extra = (
+                f", {song.dac_stats.get('dac_attack_segments', 0)} attacks"
+                f", {song.dac_stats.get('dac_attack_prefix_reused', 0)} "
+                "prefix-shared"
             )
         elif mode == "chunks":
             shape = f"{len(song.dac_samples)} PCM chunks"
