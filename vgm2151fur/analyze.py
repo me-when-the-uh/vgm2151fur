@@ -1921,7 +1921,9 @@ def _bind_tone_instruments(
                     pitch, pitch_speed, pitch_loop = _macro_series(series)
                 else:
                     pitch, pitch_speed, pitch_loop, pitch_delay = (
-                        _macro_series_delay(series)
+                        _macro_series_delay(
+                            series, tail_loop=True, step_compress=True,
+                        )
                     )
                     # A delayed first value is held long enough to be a real
                     # step, not an attack settle; folding its tail into E5
@@ -2426,7 +2428,163 @@ def _cycle(values: list[int], limit: int = 128) -> int | None:
     return None
 
 
-def _macro_series(series: list[int]) -> tuple[tuple[int, ...], int, int]:
+def _tail_cycle(
+    values: list[int], limit: int = 128, window: int = 2048,
+    min_start: int = 0,
+) -> tuple[int, int] | None:
+    """Exact (loop start, period) for a periodic tail after a lead-in."""
+    offset = max(0, len(values) - window)
+    values = values[offset:]
+    n = len(values)
+    for start in range(max(0, min_start - offset), n - 1):
+        tail = values[start:]
+        p = _cycle(tail, limit)
+        if p is not None and len(set(tail[:p])) > 1:
+            return offset + start, p
+    return None
+
+
+def _lfo_tail_cycle(
+    values: list[int], limit: int = 128, tol: int = 1,
+    window: int = 2048, min_start: int = 0,
+) -> tuple[int, int] | None:
+    """Find a quantized LFO at the tail by walking its peaks backwards.
+
+    The last local maximum and minimum establish the top and bottom of the
+    LFO. Extrema are accepted backwards while they still match those peaks;
+    the first mismatch starts the range. Allow a few one-unit mismatches in
+    the period, since run lengths of a quantized LFO can vary by a tick.
+    """
+    offset = max(0, len(values) - window)
+    values = values[offset:]
+    n = len(values)
+    if n < 6:
+        return None
+    runs: list[tuple[int, int]] = []
+    i = 0
+    while i < n:
+        j = i + 1
+        while j < n and values[j] == values[i]:
+            j += 1
+        runs.append((i, values[i]))
+        i = j
+    extrema: list[tuple[int, int, int]] = []
+    for k in range(1, len(runs) - 1):
+        prev = runs[k - 1][1]
+        cur = runs[k][1]
+        nxt = runs[k + 1][1]
+        if cur > prev and cur > nxt:
+            extrema.append((runs[k][0], cur, 1))
+        elif cur < prev and cur < nxt:
+            extrema.append((runs[k][0], cur, -1))
+    if len(extrema) < 3:
+        return None
+    top = bottom = None
+    left = None
+    max_count = min_count = 0
+    for idx, value, kind in reversed(extrema):
+        if kind > 0:
+            if top is None:
+                top = value
+            elif abs(value - top) > tol:
+                break
+            max_count += 1
+        else:
+            if bottom is None:
+                bottom = value
+            elif abs(value - bottom) > tol:
+                break
+            min_count += 1
+        left = idx
+    if top is None or bottom is None or top == bottom:
+        return None
+    if max_count < 2 and min_count < 2:
+        return None
+    assert left is not None
+    # Extend over the peak run itself, but not over unrelated lead-in values.
+    while left > 0 and (
+        abs(values[left - 1] - top) <= tol
+        or abs(values[left - 1] - bottom) <= tol
+    ):
+        left -= 1
+    left = max(left, max(0, min_start - offset))
+    region = values[left:]
+    best: tuple[float, int, int] | None = None
+    for p in range(2, min(limit, len(region) // 2) + 1):
+        for shift in range(0, min(p, len(region) - 2 * p + 1)):
+            block = region[shift:shift + p]
+            if len(set(block)) < 2:
+                continue
+            directions = [
+                1 if b > a else -1
+                for a, b in zip(block, block[1:]) if b != a
+            ]
+            if not any(a != b for a, b in zip(directions, directions[1:])):
+                continue
+            errs = [
+                abs(region[i] - region[i - p])
+                for i in range(shift + p, len(region))
+            ]
+            if not errs:
+                continue
+            bad = sum(1 for err in errs if err > tol)
+            if bad > max(1, len(errs) // 10):
+                continue
+            score = bad / len(errs) + p * 0.0005 + shift * 0.0001
+            if best is None or score < best[0]:
+                best = (score, p, shift)
+    if best is None:
+        return None
+    return offset + left + best[2], best[1]
+
+
+def _step_compress(
+    series: list[int], max_speed: int = 32, ratio: float = 0.03,
+) -> tuple[list[int], int]:
+    """Shorten per-tick repeats by raising the macro's step length.
+
+    Runs of similar length are rounded to one value per step. The timing
+    error is bounded to a few percent of the macro's total; the caller keeps
+    the leading hold in ticks, so this only affects the moving part.
+    """
+    if len(series) < 4:
+        return series, 1
+    runs: list[tuple[int, int]] = []
+    i = 0
+    while i < len(series):
+        j = i + 1
+        while j < len(series) and series[j] == series[i]:
+            j += 1
+        runs.append((series[i], j - i))
+        i = j
+    if len(runs) == len(series):
+        return series, 1
+    total = len(series)
+    allowed = max(1, int(total * ratio))
+    best: tuple[int, int, list[int]] | None = None
+    for speed in range(2, min(max_speed, total // 2) + 1):
+        values: list[int] = []
+        error = 0
+        for value, length in runs:
+            count = max(1, int(round(length / speed)))
+            values.extend([value] * count)
+            error += abs(length - count * speed)
+        if len(values) >= total * 0.75 or len(values) > MACRO_MAX:
+            continue
+        if error > allowed:
+            continue
+        if best is None or len(values) < best[0] or (
+                len(values) == best[0] and speed > best[1]):
+            best = (len(values), speed, values)
+    if best is None:
+        return series, 1
+    return best[2], best[1]
+
+
+def _macro_series(
+    series: list[int], *, tail_loop: bool = False,
+    initial_speed: int = 1, loop_min: int = 0,
+) -> tuple[tuple[int, ...], int, int]:
     """(values, speed, loop) for one tone macro from a per-tick series.
 
     A constant series needs no macro at all; a periodic one becomes a single
@@ -2435,27 +2593,45 @@ def _macro_series(series: list[int]) -> tuple[tuple[int, ...], int, int]:
     not loop drops its trailing run of one value, since the engine holds the
     last value anyway - that is what lets two notes whose morph differs only
     in how long it lasts share one instrument.
+
+    `tail_loop` also keeps the first cycle of an LFO that starts after a
+    lead-in, setting the loop start where that cycle begins.
     """
     if not series or len(set(series)) == 1:
         return (), 1, 255
-    speed = 1
+    speed = max(1, initial_speed)
     loop = 255
     if len(series) > MACRO_MAX:
         p = _cycle(series)
-        if p is not None:
+        if p is not None and loop_min == 0:
             return tuple(series[:p]), 1, 0
+        if tail_loop:
+            cyc = _tail_cycle(series, min_start=loop_min)
+            if cyc is None:
+                cyc = _lfo_tail_cycle(series, min_start=loop_min)
+            if cyc is not None and cyc[0] + cyc[1] <= MACRO_MAX:
+                start, p = cyc
+                return tuple(series[:start + p]), 1, start
         speed = min(255, (len(series) + MACRO_MAX - 1) // MACRO_MAX)
         series = series[::speed]
     p = _cycle(series)
-    if p is not None and p < len(series):
+    if p is not None and p < len(series) and loop_min == 0:
         return tuple(series[:p]), speed, 0
+    if tail_loop:
+        cyc = _tail_cycle(series, min_start=loop_min)
+        if cyc is None:
+            cyc = _lfo_tail_cycle(series, min_start=loop_min)
+        if cyc is not None:
+            start, p = cyc
+            return tuple(series[:start + p]), speed, start
     while len(series) > 1 and series[-1] == series[-2]:
         series = series[:-1]
     return tuple(series), speed, loop
 
 
 def _macro_series_delay(
-    series: list[int],
+    series: list[int], *, tail_loop: bool = False,
+    step_compress: bool = False,
 ) -> tuple[tuple[int, ...], int, int, int]:
     """`_macro_series` plus a leading-hold delay.
 
@@ -2471,23 +2647,40 @@ def _macro_series_delay(
     while run < len(series) and series[run] == first:
         run += 1
     if run <= 1:
-        values, speed, loop = _macro_series(series)
-        return values, speed, loop, 0
+        speed = 1
+        body = series
+        if step_compress:
+            body, speed = _step_compress(series)
+        values, out_speed, loop = _macro_series(
+            body, tail_loop=tail_loop, initial_speed=speed,
+        )
+        return values, out_speed, loop, 0
     # The delay holds the first value for delay+1 ticks. Anything beyond that
     # needs copies in the value list; each later copy advances by one macro
-    # step (speed ticks).
+    # step (speed ticks). Keep the leading hold exact in ticks while using a
+    # larger step length for the moving part.
+    speed = 1
+    body = list(series[run:])
+    if step_compress:
+        body, speed = _step_compress(body)
     if run <= 256:
-        short = [first] + list(series[run:])
+        short = [first] + body
         delay = run - 1
     else:
         extra = run - 256
-        short = [first] * (1 + extra) + list(series[run:])
+        extra_copies = (extra + speed - 1) // max(1, speed)
+        short = [first] * (1 + extra_copies) + body
         delay = 255
-    values, speed, loop = _macro_series(short)
-    # A cyclic macro must start at its cycle point; shortening the head would
-    # change the loop. Leave cycles (and the detune-only case) alone.
-    if loop != 255 or not values:
-        values, speed, loop = _macro_series(series)
+    values, out_speed, loop = _macro_series(
+        short, tail_loop=tail_loop, initial_speed=speed, loop_min=1,
+    )
+    speed = out_speed
+    # A loop that starts at the first value repeats the leading run on every
+    # cycle; collapsing it would remove that repeat. A loop later in the
+    # macro is unaffected by the initial hold, and the shortened value list
+    # already has its loop index shifted correctly.
+    if not values or loop == 0:
+        values, speed, loop = _macro_series(series, tail_loop=tail_loop)
         return values, speed, loop, 0
     return values, speed, loop, delay
 
@@ -3310,7 +3503,7 @@ def _bind_fm_pitch(
                         e.sweep = deltas
                         fallbacks += 1
                 continue
-            macro, speed, loop = _macro_series(vals)
+            macro, speed, loop = _macro_series(vals, tail_loop=True)
             if not macro:
                 continue
             base_key = patch_order[e.ins]

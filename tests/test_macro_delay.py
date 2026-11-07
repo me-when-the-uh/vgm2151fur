@@ -17,9 +17,40 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from vgm2151fur.analyze import (  # noqa: E402
-    ToneIns, _compress_tone_delays, _macro_series_delay,
+    ToneIns, _compress_tone_delays, _lfo_tail_cycle, _macro_series_delay,
 )
 from vgm2151fur.furwrite import Buf, _write_macro  # noqa: E402
+
+
+class TestPitchLfoLoop(unittest.TestCase):
+    def test_an_lfo_tail_loops_at_its_first_cycle(self):
+        pattern = [10, 10, 10, 20, 20, 20, 20, 10, 10, 10, 10, 20, 20, 20]
+        self.assertEqual(_lfo_tail_cycle([0] * 20 + pattern + pattern),
+                         (20, len(pattern)))
+
+    def test_the_delay_and_loop_are_kept_together(self):
+        pattern = [10, 10, 10, 20, 20, 20, 20, 10, 10, 10, 10, 20, 20, 20]
+        series = [0] * 20 + pattern + pattern
+        values, _speed, loop, delay = _macro_series_delay(
+            series, tail_loop=True,
+        )
+        self.assertEqual(delay, 19)
+        self.assertEqual(loop, 1)
+        self.assertEqual(values, (0,) + tuple(pattern))
+
+    def test_a_monotonic_tail_is_not_an_lfo(self):
+        self.assertIsNone(_lfo_tail_cycle([0] * 5 + list(range(20))))
+
+    def test_step_length_compresses_a_long_hold(self):
+        pattern = [10] * 8 + [20] * 8
+        series = [0] * 300 + pattern + pattern
+        values, speed, loop, delay = _macro_series_delay(
+            series, tail_loop=True, step_compress=True,
+        )
+        self.assertEqual(delay, 255)
+        self.assertGreater(speed, 1)
+        self.assertLess(len(values), 20)
+        self.assertEqual(loop, values.index(10))
 
 
 class TestMacroDelay(unittest.TestCase):
@@ -39,14 +70,16 @@ class TestMacroDelay(unittest.TestCase):
         self.assertEqual(values.count(5), 45)
         self.assertEqual(values[-1], 6)
 
-    def test_a_cycle_is_not_shortened(self):
-        # Shortening would turn the head into a cycle the original did not
-        # have, so the full sequence stays and no delay is used.
-        values, _speed, _loop, delay = _macro_series_delay(
+    def test_a_cycle_is_not_turned_into_a_loop(self):
+        # The shortened values happen to be cyclic, but the original did not
+        # loop; the delay reproduces the held first tick and the macro ends
+        # on its last value.
+        values, _speed, loop, delay = _macro_series_delay(
             [1, 1, 2, 1, 2]
         )
-        self.assertEqual(delay, 0)
-        self.assertEqual(values, (1, 1, 2, 1, 2))
+        self.assertEqual(delay, 1)
+        self.assertEqual(loop, 255)
+        self.assertEqual(values, (1, 2, 1, 2))
 
     def test_recompress_tone_macros_before_grouping(self):
         bucket = [
