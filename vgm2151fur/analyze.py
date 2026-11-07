@@ -98,6 +98,17 @@ from vgm2151fur.scc import (
     collect_scc,
     scc_note,
 )
+from vgm2151fur.saa1099 import (
+    SAA_DEFAULT_CLOCK,
+    SAA_DIVIDER,
+    SAA_PITCH_MAX,
+    SAA_VOICES,
+    collect_saa1099,
+    saa_module_clock,
+    saa_note,
+    saa_period_note,
+    saa_period_value,
+)
 from vgm2151fur.sn76489 import (
     PSG_DEFAULT_CLOCK,
     PSG_DIVIDER,
@@ -493,9 +504,14 @@ class NoteEvent:
     # gate at volume peaks needs the pitch at each new note start, which the
     # note/E5 pair encodes only indirectly.
     tone_period: int = 0
-    # 0 = not a tone-chip note, 1 = SCC, 2 = AY. The phase-2 pass finds the
-    # instrument for these once the tick rate is known.
+    # 0 = not a tone-chip note, 1 = SCC, 2 = AY, 8 = SAA1099. The phase-2
+    # pass finds the instrument for these once the tick rate is known.
     tone_chip: int = 0
+    # SAA1099 only: (sample, left, right) raw amplitude nibbles after the
+    # opening.  The platform multiplies them through the panning macros, so
+    # keeping the pair (rather than a volume plus a balance) reproduces soft
+    # pan and a volume envelope exactly.
+    tone_amp_pts: tuple[tuple[int, int, int], ...] = ()
     # PCE noise-mode note: its "pitch" is the 0-31 noise register, which the
     # platform adds ``std.pitch`` to directly, not a period-table value.
     tone_noise: bool = False
@@ -596,6 +612,25 @@ class ToneIns:
     env_period: tuple[int, ...] = ()
     env_period_speed: int = 1
     env_period_loop: int = 255
+    # SAA1099 only: the raw amplitude nibbles as panning macros.  Furnace's
+    # SAA platform writes the amplitude register as
+    # ``applyPan(outVol, pan)``, and ``applyPan(15, (left << 4) | right)`` is
+    # exactly the source byte, so a column of 15 plus these two macros carries
+    # volume and soft pan together without rounding.
+    panl: tuple[int, ...] = ()
+    panl_speed: int = 1
+    panl_loop: int = 255
+    panl_delay: int = 0
+    panr: tuple[int, ...] = ()
+    panr_speed: int = 1
+    panr_loop: int = 255
+    panr_delay: int = 0
+    # SAA1099 envelope control (register 0x18/0x19, the ex1 macro).  Written
+    # on the group's output voice; values are the raw control bytes.
+    env: tuple[int, ...] = ()
+    env_speed: int = 1
+    env_loop: int = 255
+    env_delay: int = 0
     # Game Boy: the DIV_INS_GB feature. A hardware-envelope note carries
     # env_vol/env_dir/env_len; a software ("zombie") envelope sets soft_env
     # and uses `vol` instead. `gb_wave` marks the wavetable voice, whose
@@ -887,6 +922,12 @@ class Song:
     vsu_ins: list[ToneIns] = field(default_factory=list)
     vsu_count: int = 0
     vsu_dynamic: bool = False
+    # Philips SAA1099: six square/noise voices per chip.  A CMS/Game Blaster
+    # log normally has two chips.  `saa_ins` holds the pitch, raw-amplitude
+    # panning and envelope macros.
+    saa_ids: list[int] = field(default_factory=list)
+    saa_ins: list[ToneIns] = field(default_factory=list)
+    saa_count: int = 0
     # Genesis SN76489: four channels (three tone + noise) after the FM block.
     psg_ids: list[int] = field(default_factory=list)
     psg_ins: list[ToneIns] = field(default_factory=list)
@@ -1102,6 +1143,41 @@ def _value_at(pts, start: int, default):
     return cur
 
 
+def _saa_tick_interval(vgm: VgmFile) -> float | None:
+    """Most common gap between SAA1099 writes, in samples.
+
+    A Furnace export writes its macros once per tick; the CMS rips do the
+    same at the driver's frame rate.  Using that gap as one row keeps the
+    macros and the pattern grid on the source's own clock instead of guessing
+    a 16th from the note onsets.
+    """
+    times = [w.sample for w in vgm.writes if w.chip == "saa1099"]
+    if len(times) < 16:
+        return None
+    intervals = [
+        b - a for a, b in zip(times, times[1:])
+        if 64 <= b - a <= 20_000
+    ]
+    if len(intervals) < 8:
+        return None
+    counts = Counter(intervals)
+    mode, hits = counts.most_common(1)[0]
+    if hits < 3:
+        return None
+    # Fold near neighbours (a driver that writes a register a sample or two
+    # after the tick) into the same bucket.
+    near = [
+        value for value in counts
+        if abs(value - mode) <= max(1, mode // 64)
+    ]
+    total = sum(counts[value] for value in near)
+    if total < 3:
+        return None
+    # Keep the fractional tick: a 60/72 Hz driver alternates 612/613-sample
+    # gaps, and rounding to the mode would drift by half a sample per tick.
+    return sum(value * counts[value] for value in near) / total
+
+
 def _tone_pitch_tick_scale(vgm: VgmFile, hz: float, speed: int) -> int:
     """Raise hz and speed until tone pitch macros see every write.
 
@@ -1134,6 +1210,10 @@ def _tone_pitch_tick_scale(vgm: VgmFile, hz: float, speed: int) -> int:
             continue
         if w.chip in ("ym2203_ssg", "ay8910") and w.reg % 2 == 0 and w.reg < 6:
             key = (w.chip, w.chip_id, w.reg // 2)
+        elif w.chip == "saa1099" and 8 <= w.reg <= 13:
+            key = (w.chip, w.chip_id, w.reg - 8)
+        elif w.chip == "saa1099" and 0x10 <= w.reg <= 0x12:
+            key = (w.chip, w.chip_id, w.reg)
         elif w.chip == "k051649" and w.reg % 2 == 0 and w.reg < 10:
             key = (w.chip, w.chip_id, w.reg // 2)
         elif (hz < 100 and w.chip == "ym2203"
@@ -1404,6 +1484,8 @@ def _tone_close(a: ToneIns, b: ToneIns, tol: int) -> bool:
         "mode", "mode_speed", "mode_loop",
         "env_shape", "env_shape_speed", "env_shape_loop",
         "env_period", "env_period_speed", "env_period_loop",
+        "panl_speed", "panl_loop", "panr_speed", "panr_loop",
+        "env", "env_speed", "env_loop",
         "gb_soft_env", "gb_env_vol", "gb_env_dir", "gb_env_len",
         "gb_sound_len", "gb_wave", "vsu_mod",
     )
@@ -1412,6 +1494,8 @@ def _tone_close(a: ToneIns, b: ToneIns, tol: int) -> bool:
     return (
         _tone_macro_close(a.pitch, b.pitch, tol)
         and _tone_macro_close(a.vol, b.vol, tol)
+        and _tone_macro_close(a.panl, b.panl, tol)
+        and _tone_macro_close(a.panr, b.panr, tol)
     )
 
 
@@ -1468,6 +1552,7 @@ def _take_tone(
 
 _TONE_MACRO_FIELDS = (
     "pitch", "waves", "vol", "noise", "mode", "env_shape", "env_period",
+    "panl", "panr", "env",
 )
 _TONE_MACRO_TIMING = (
     ("pitch", "pitch_speed", "pitch_loop"),
@@ -1477,6 +1562,9 @@ _TONE_MACRO_TIMING = (
     ("mode", "mode_speed", "mode_loop"),
     ("env_shape", "env_shape_speed", "env_shape_loop"),
     ("env_period", "env_period_speed", "env_period_loop"),
+    ("panl", "panl_speed", "panl_loop"),
+    ("panr", "panr_speed", "panr_loop"),
+    ("env", "env_speed", "env_loop"),
 )
 
 
@@ -1515,7 +1603,7 @@ def _tone_macro_same_for(a: ToneIns, b: ToneIns, ticks: int) -> bool:
     for field, speed_field, loop_field in _TONE_MACRO_TIMING:
         speed = getattr(b, speed_field)
         loop = getattr(b, loop_field)
-        delay = getattr(b, f"{field}_delay", 0) if field in ("pitch", "vol") else 0
+        delay = getattr(b, f"{field}_delay", 0)
         if (
             _macro_effective(
                 tuple(getattr(a, field)), speed, loop, ticks, delay,
@@ -1553,19 +1641,22 @@ def _delay_leading_values(values, speed: int) -> tuple[tuple, int]:
 def _compress_tone_delays(bucket: list[ToneIns]) -> None:
     """Make every leading-hold macro use the delay field before grouping."""
     for i, spec in enumerate(bucket):
-        if not spec.pitch and not spec.vol:
+        if not (
+            spec.pitch or spec.vol or spec.panl or spec.panr or spec.env
+        ):
             continue
         changes: dict[str, object] = {}
-        if spec.pitch and spec.pitch_loop == 255 and not spec.pitch_delay:
-            values, delay = _delay_leading_values(spec.pitch, spec.pitch_speed)
+        for field, speed, loop in _TONE_MACRO_TIMING:
+            values = getattr(spec, field)
+            if not values or getattr(spec, loop) != 255:
+                continue
+            delay_field = f"{field}_delay"
+            if not hasattr(spec, delay_field) or getattr(spec, delay_field):
+                continue
+            short, delay = _delay_leading_values(values, getattr(spec, speed))
             if delay:
-                changes["pitch"] = values
-                changes["pitch_delay"] = delay
-        if spec.vol and spec.vol_loop == 255 and not spec.vol_delay:
-            values, delay = _delay_leading_values(spec.vol, spec.vol_speed)
-            if delay:
-                changes["vol"] = values
-                changes["vol_delay"] = delay
+                changes[field] = short
+                changes[delay_field] = delay
         if changes:
             bucket[i] = replace(spec, **changes)
 
@@ -1732,6 +1823,29 @@ def _merge_tone_prefixes(
     return mapping
 
 
+def _loop_saa_pitch_macros(bucket: list[ToneIns]) -> None:
+    """Loop a periodic SAA pitch macro independently of its other macros.
+
+    Prefix grouping can keep a longer copy of a macro whose periodic prefix
+    was already a cycle.  Pseudo-duty detunes are pitch-only, so loop
+    detection does not depend on pan, envelope or mode macros being present.
+    Step-length compression stays off: it would change the duty ratio.
+    """
+    for i, ins in enumerate(bucket):
+        if not ins.pitch or ins.pitch_loop != 255:
+            continue
+        values, speed, loop = _macro_series(
+            list(ins.pitch), tail_loop=True,
+            initial_speed=ins.pitch_speed, tail_min=16,
+        )
+        if (
+            loop != 255
+            and speed == ins.pitch_speed
+            and len(values) < len(ins.pitch)
+        ):
+            bucket[i] = replace(ins, pitch=values, pitch_loop=loop)
+
+
 def _bind_tone_instruments(
     events: list[NoteEvent],
     scc_ins: list[ToneIns],
@@ -1741,6 +1855,7 @@ def _bind_tone_instruments(
     huc6280_ins: list[ToneIns],
     gb_ins: list[ToneIns],
     vsu_ins: list[ToneIns],
+    saa_ins: list[ToneIns],
     tone_ins_base: int,
     scc_clock: int,
     ay_clock: int,
@@ -1749,6 +1864,7 @@ def _bind_tone_instruments(
     huc6280_clock: int,
     gb_clock: int,
     vsu_clock: int,
+    saa_clock: int,
     hz: float,
     total_samples: int,
     use_speed: int = 1,
@@ -1773,13 +1889,14 @@ def _bind_tone_instruments(
     huc6280_map: dict[ToneIns, int] = {}
     gb_map: dict[ToneIns, int] = {}
     vsu_map: dict[ToneIns, int] = {}
+    saa_map: dict[ToneIns, int] = {}
     ins_cap = max(1, INS_TARGET - tone_ins_base)
     # GB and VSU bind last. Reserve a share so a large SCC/AY/PCE list cannot
     # spend every slot before them; the surplus collapses to plain
     # per-wave/per-env instruments, the documented "fall back to columns"
     # behavior.
     has_late = any(
-        e.tone_chip in (6, 7) and e.on for e in events
+        e.tone_chip in (6, 7, 8) and e.on for e in events
     )
     early_cap = ins_cap
     if has_late:
@@ -1804,6 +1921,7 @@ def _bind_tone_instruments(
     tone_order += [e for e in events if e.on and e.tone_chip == 5]
     tone_order += [e for e in events if e.on and e.tone_chip == 6]
     tone_order += [e for e in events if e.on and e.tone_chip == 7]
+    tone_order += [e for e in events if e.on and e.tone_chip == 8]
     for e in tone_order:
         end = e.end or track_end
         # 255 macro values times the largest speed byte. Long SSG pads can
@@ -1850,17 +1968,27 @@ def _bind_tone_instruments(
             clock = e.tone_clock or vsu_clock or VSU_DEFAULT_CLOCK
             divider = VSU_PITCH_DIVIDER
             maximum = 0x7FF
+        elif e.tone_chip == 8:
+            # The SAA platform converts the pitch-table value into an 8-bit
+            # offset and 3-bit octave; the collector already handed us the
+            # midpoint of the bucket that maps back to the source pair.
+            clock = e.tone_clock or saa_clock or SAA_DEFAULT_CLOCK
+            divider = SAA_DIVIDER
+            maximum = SAA_PITCH_MAX
         else:
             # AY and the YM2203's SSG share the instrument path but not the
             # clock or Furnace's divider (8 vs 16).
             clock = e.tone_clock or ay_clock
             divider = e.tone_div or 8
             maximum = 0xFFF
-        tbl = (
-            pitch_table(float(clock), divider, maximum=maximum)
-            if e.tone_chip in (3, 4, 5, 6, 7)
-            else pitch_table(module_clock(clock), divider)
-        )
+        if e.tone_chip == 8:
+            tbl = pitch_table(saa_module_clock(clock), divider, maximum=maximum)
+        else:
+            tbl = (
+                pitch_table(float(clock), divider, maximum=maximum)
+                if e.tone_chip in (3, 4, 5, 6, 7)
+                else pitch_table(module_clock(clock), divider)
+            )
         base_off = (e.note << 7) + (e.e5 - E5_CENTER)
         if e.tone_chip == 5 and e.tone_pitch_pts and not e.tone_noise:
             # A PCE driver that retunes every frame writes a staircase, not a
@@ -1923,6 +2051,18 @@ def _bind_tone_instruments(
                     # A noise pitch is a register offset, not a tone bend;
                     # leave its leading values uncollapsed.
                     pitch, pitch_speed, pitch_loop = _macro_series(series)
+                elif e.tone_chip == 8:
+                    # A SAA1099 driver uses fast detunes as a pseudo-duty
+                    # cycle; thinning or step-compressing them changes the
+                    # duty ratio.  Keep the tick-exact series, but still loop
+                    # an exact periodic tail.
+                    pitch, pitch_speed, pitch_loop, pitch_delay = (
+                        _macro_series_delay(
+                            series, tail_loop=True, step_compress=False,
+                        )
+                    )
+                    if pitch_delay == 0:
+                        pitch = _absorb_detune(e, pitch, pitch_speed)
                 else:
                     pitch, pitch_speed, pitch_loop, pitch_delay = (
                         _macro_series_delay(
@@ -2020,7 +2160,51 @@ def _bind_tone_instruments(
         noise = mode = env_shape = env_period = ()
         noise_speed = mode_speed = env_shape_speed = env_period_speed = 1
         noise_loop = mode_loop = env_shape_loop = env_period_loop = 255
-        if e.tone_fx_pts:
+        panl = panr = env = ()
+        panl_speed = panr_speed = env_speed = 1
+        panl_loop = panr_loop = env_loop = 255
+        panl_delay = panr_delay = env_delay = 0
+        if e.tone_chip == 8:
+            # SAA1099: the amplitude register carries volume and soft pan
+            # together; put the raw nibbles on the two panning macros and
+            # leave the volume column at 15.
+            if e.tone_amp_pts:
+                pl = [(t, left) for t, left, _right in e.tone_amp_pts]
+                pr = [(t, right) for t, _left, right in e.tone_amp_pts]
+                pl_series = _tick_values(pl, e.sample, ticks, tick_samples)
+                pr_series = _tick_values(pr, e.sample, ticks, tick_samples)
+                panl, panl_speed, panl_loop, panl_delay = _macro_series_delay(
+                    pl_series,
+                )
+                panr, panr_speed, panr_loop, panr_delay = _macro_series_delay(
+                    pr_series,
+                )
+                # Both panning macros must be present: the platform starts
+                # from pan 0xFF, and a missing panL would leave the left
+                # nibble at 15 even when the source side is a constant zero.
+                if not panl and pl_series:
+                    panl, panl_speed, panl_loop, panl_delay = (
+                        (pl_series[0],), 1, 255, 0,
+                    )
+                if not panr and pr_series:
+                    panr, panr_speed, panr_loop, panr_delay = (
+                        (pr_series[0],), 1, 255, 0,
+                    )
+            noise, noise_speed, noise_loop = _macro_if_moving(
+                [(t, val) for t, cmd, val in e.tone_fx_pts if cmd == 0x11],
+                e.sample, ticks, tick_samples, merge_gap=_AY_MERGE_GAP,
+            )
+            mode, mode_speed, mode_loop = _macro_if_moving(
+                [(t, val & 3) for t, cmd, val in e.tone_fx_pts if cmd == 0x10],
+                e.sample, ticks, tick_samples, merge_gap=_AY_MERGE_GAP,
+            )
+            env, env_speed, env_loop, env_delay = _macro_series_delay(
+                _tick_values(
+                    [(t, val) for t, cmd, val in e.tone_fx_pts if cmd == 0x12],
+                    e.sample, ticks, tick_samples,
+                ),
+            )
+        elif e.tone_fx_pts:
             noise, noise_speed, noise_loop = _macro_if_moving(
                 [(t, val) for t, cmd, val in e.tone_fx_pts if cmd == FX_NOISE],
                 e.sample, ticks, tick_samples, merge_gap=_AY_MERGE_GAP,
@@ -2070,6 +2254,12 @@ def _bind_tone_instruments(
             env_shape_loop=env_shape_loop,
             env_period=env_period, env_period_speed=env_period_speed,
             env_period_loop=env_period_loop,
+            panl=panl, panl_speed=panl_speed, panl_loop=panl_loop,
+            panl_delay=panl_delay,
+            panr=panr, panr_speed=panr_speed, panr_loop=panr_loop,
+            panr_delay=panr_delay,
+            env=env, env_speed=env_speed, env_loop=env_loop,
+            env_delay=env_delay,
             gb_soft_env=bool(getattr(e, "gb_soft_env", False)),
             gb_env_vol=int(getattr(e, "gb_env_vol", 0)),
             gb_env_dir=int(getattr(e, "gb_env_dir", 0)),
@@ -2109,6 +2299,17 @@ def _bind_tone_instruments(
                 + len(huc6280_ins) + len(gb_ins),
                 ins_cap, 7,
             )
+        elif e.tone_chip == 8:
+            # The SAA amplitude nibbles are only four bits wide, so a
+            # one-step near-identical merge is an audible level change.
+            # Keep the pan/volume macros exact; only the prefix merge below
+            # may share them.
+            idx, kept = _take_tone(
+                spec, saa_map, saa_ins,
+                len(scc_ins) + len(ay_ins) + len(psg_ins) + len(nes_ins)
+                + len(huc6280_ins) + len(gb_ins) + len(vsu_ins),
+                ins_cap, 8, 0,
+            )
         else:
             # AY runs first, so the SCC list is still empty and `others` is 0.
             idx, kept = take(spec, ay_map, ay_ins, 0, early_cap, 2)
@@ -2141,7 +2342,17 @@ def _bind_tone_instruments(
             # The instrument now carries the pitch trajectory; the row ramp
             # would double it.
             e.sweep = ()
-        if e.tone_chip == 5:
+        if e.tone_chip == 8:
+            # The panning macros carry the raw amplitude.  With a column of
+            # 15, applyPan(15, (left << 4) | right) is the source register
+            # exactly.  If the budget dropped them, keep the static opening
+            # amplitude and pan on the note instead.
+            if kept.panl or kept.panr:
+                e.vol = 15
+                e.pan = 0
+            e.vol_pts = ()
+            e.vol_slide = 0
+        elif e.tone_chip == 5:
             # When the envelope became an instrument macro, the column is
             # the macro's full-scale reference (31). Otherwise the PCE column
             # is the control volume and `vol_pts` carry the balance/volume
@@ -2184,7 +2395,7 @@ def _bind_tone_instruments(
     # stops the grouping pass from choosing the longer, uncompressed copy.
     for bucket in (
         scc_ins, ay_ins, psg_ins, nes_ins, huc6280_ins, gb_ins,
-        vsu_ins,
+        vsu_ins, saa_ins,
     ):
         _compress_tone_delays(bucket)
 
@@ -2221,17 +2432,21 @@ def _bind_tone_instruments(
             gb_ins, family_notes.get(6), tick_samples, use_speed),
         7: _merge_tone_prefixes(
             vsu_ins, family_notes.get(7), tick_samples, use_speed),
+        8: _merge_tone_prefixes(
+            saa_ins, family_notes.get(8), tick_samples, use_speed),
     }
     for i, (event, idx) in enumerate(bound):
         mapping = tone_maps.get(event.tone_chip)
         if mapping is not None:
             bound[i] = (event, mapping.get(idx, idx))
+    _loop_saa_pitch_macros(saa_ins)
     n_scc = len(scc_ins)
     n_ay = len(ay_ins)
     n_psg = len(psg_ins)
     n_nes = len(nes_ins)
     n_huc = len(huc6280_ins)
     n_gb = len(gb_ins)
+    n_vsu = len(vsu_ins)
     for event, idx in bound:
         if event.tone_chip == 1:
             event.ins = tone_ins_base + idx
@@ -2249,6 +2464,11 @@ def _bind_tone_instruments(
             event.ins = (
                 tone_ins_base + n_scc + n_ay + n_psg + n_nes + n_huc
                 + n_gb + idx
+            )
+        elif event.tone_chip == 8:
+            event.ins = (
+                tone_ins_base + n_scc + n_ay + n_psg + n_nes + n_huc
+                + n_gb + n_vsu + idx
             )
         else:
             event.ins = tone_ins_base + n_scc + idx
@@ -2363,6 +2583,7 @@ def _tone_instrument_demand(
     huc6280_clock: int,
     gb_clock: int,
     vsu_clock: int,
+    saa_clock: int,
     hz: float,
     total_samples: int,
     use_speed: int = 1,
@@ -2377,16 +2598,19 @@ def _tone_instrument_demand(
     tone = [replace(e) for e in events if e.on and e.tone_chip]
     if not tone:
         return 0
-    scc, ay, psg, nes, huc, gb, vsu = [], [], [], [], [], [], []
+    scc, ay, psg, nes, huc, gb, vsu, saa = [], [], [], [], [], [], [], []
     _bind_tone_instruments(
-        tone, scc, ay, psg, nes, huc, gb, vsu,
+        tone, scc, ay, psg, nes, huc, gb, vsu, saa,
         # A negative base leaves the instrument cap effectively unlimited, so
         # every distinct macro shape is counted.
         -1000,
         scc_clock, ay_clock, psg_clock, nes_clock, huc6280_clock,
-        gb_clock, vsu_clock, hz, total_samples, use_speed,
+        gb_clock, vsu_clock, saa_clock, hz, total_samples, use_speed,
     )
-    return sum(len(bucket) for bucket in (scc, ay, psg, nes, huc, gb, vsu))
+    return sum(
+        len(bucket)
+        for bucket in (scc, ay, psg, nes, huc, gb, vsu, saa)
+    )
 
 
 # The format stores a macro length in one byte, so 255 is the longest macro
@@ -3106,6 +3330,193 @@ def _emit_ay_notes(
         events.append(NoteEvent(
             sample=off.sample_time, ch=base + off.voice, on=False, note=180,
             ins=-1, vol=-1, e5=0x80, pan=0,
+        ))
+    return count
+
+
+def _saa_amp_at(h, t: int) -> tuple[int, int]:
+    left, right = h.left, h.right
+    for pt in h.amp_pts:
+        if pt[0] <= t:
+            left, right = pt[1], pt[2]
+        else:
+            break
+    return left, right
+
+
+def _saa_mode_at(h, t: int) -> tuple[bool, bool]:
+    tone, noise = h.tone, h.noise
+    for pt in h.mode_pts:
+        if pt[0] <= t:
+            tone, noise = pt[1], pt[2]
+        else:
+            break
+    return tone, noise
+
+
+def _saa_noise_at(h, t: int) -> int:
+    value = h.noise_freq
+    for pt in h.noise_pts:
+        if pt[0] <= t:
+            value = pt[1]
+        else:
+            break
+    return value
+
+
+def _saa_env_at(h, t: int) -> int:
+    value = h.env
+    for pt in h.env_pts:
+        if pt[0] <= t:
+            value = pt[1]
+        else:
+            break
+    return value
+
+
+def _saa_mode_effect(tone: bool, noise: bool) -> int:
+    """Furnace 10xy: high nibble toggles noise, low nibble tone."""
+    return (0x10 if noise else 0) | (0x01 if tone else 0)
+
+
+def _saa_mode_macro(tone: bool, noise: bool) -> int:
+    """Platform psgMode: bit 0 tone, bit 1 noise."""
+    return (0x01 if tone else 0) | (0x02 if noise else 0)
+
+
+def _emit_saa_notes(
+    events: list[NoteEvent],
+    channel_fx: list[tuple[int, int, int, int]],
+    hits,
+    offs,
+    at: dict[int, int],
+    clock: int,
+    total_samples: int = 0,
+) -> int:
+    """Append notes and key-offs for one dual-chip SAA1099 stream.
+
+    The amplitude gate is the note delimiter.  Pitch writes inside a gate are
+    the source's pseudo-duty detunes, so they stay on the note's pitch macro
+    instead of becoming new notes.  The raw left/right amplitude nibbles go to
+    the panning macros; the note column is 15 when those macros are kept.
+    """
+    count = 0
+    for h in hits:
+        base = at.get(h.chip_id)
+        if base is None:
+            continue
+        ch = base + h.voice
+        st = h.sample_time
+        gate_end = h.off_sample or (total_samples or st)
+        note, e5 = saa_period_note(clock, h.period)
+        steps = _tone_steps(list(h.freq_pts), st, 0, _AY_MERGE_GAP)
+        if h.hidden:
+            # Silent source notes for an envelope generator.  Split at every
+            # period change so the note/E5 carries the source voice's exact
+            # frequency; one long macro would be thinned and would alias the
+            # envelope rate.  Volume 0 keeps these notes inaudible.
+            starts = [(st, h.period)] + list(h.freq_pts)
+            for i, (when, period) in enumerate(starts):
+                next_t = (
+                    starts[i + 1][0] if i + 1 < len(starts) else h.off_sample
+                )
+                src_note, src_e5 = saa_period_note(clock, period)
+                events.append(NoteEvent(
+                    sample=when,
+                    ch=ch,
+                    on=True,
+                    note=src_note,
+                    ins=-1,
+                    vol=0,
+                    e5=src_e5,
+                    pan=0,
+                    end=next_t,
+                    tone_amp_pts=(),
+                    tone_fx_pts=(),
+                    tone_chip=8,
+                    tone_clock=clock,
+                    tone_div=SAA_DIVIDER,
+                    tone_period_offset=0,
+                ))
+                count += 1
+            continue
+        left, right = h.left, h.right
+        vol = max(left, right)
+        pan = pcm_pan_fx(left, right)
+        amp_pts: list[tuple[int, int, int]] = [(st, left, right)]
+        for pt in h.amp_pts:
+            if st < pt[0] < gate_end:
+                amp_pts.append(pt)
+        tone, noise = h.tone, h.noise
+        mode_pts: list[tuple[int, bool, bool]] = [(st, tone, noise)]
+        for pt in h.mode_pts:
+            if st < pt[0] < gate_end:
+                mode_pts.append(pt)
+        nf = h.noise_freq
+        noise_pts: list[tuple[int, int]] = [(st, nf)]
+        for pt in h.noise_pts:
+            if st < pt[0] < gate_end:
+                noise_pts.append(pt)
+        env = h.env
+        env_pts: list[tuple[int, int]] = [(st, env)]
+        for pt in h.env_pts:
+            if st < pt[0] < gate_end:
+                env_pts.append(pt)
+
+        # Row effects for the opening state; the instrument macros carry any
+        # later motion.  The initial effects also keep a constant state when
+        # the budget falls back to a plain voice.
+        channel_fx.append((st, ch, 0x10, _saa_mode_effect(tone, noise)))
+        channel_fx.append((st, ch, 0x11, nf))
+        for t, to, no in mode_pts[1:]:
+            channel_fx.append((t, ch, 0x10, _saa_mode_effect(to, no)))
+        for t, value in noise_pts[1:]:
+            channel_fx.append((t, ch, 0x11, value))
+        if h.voice % 3 == 2:
+            channel_fx.append((st, ch, 0x12, env))
+            for t, value in env_pts[1:]:
+                channel_fx.append((t, ch, 0x12, value))
+
+        fx: list[tuple[int, int, int]] = [
+            (t, 0x10, _saa_mode_macro(to, no))
+            for t, to, no in mode_pts
+        ]
+        fx += [(t, 0x11, value) for t, value in noise_pts]
+        if h.voice % 3 == 2:
+            fx += [(t, 0x12, value) for t, value in env_pts]
+
+        events.append(NoteEvent(
+            sample=st,
+            ch=ch,
+            on=True,
+            note=note,
+            ins=-1,
+            vol=vol,
+            e5=e5,
+            pan=pan,
+            end=h.off_sample,
+            tone_pitch_pts=tuple(steps),
+            tone_amp_pts=tuple(amp_pts),
+            tone_fx_pts=tuple(fx),
+            tone_chip=8,
+            tone_clock=clock,
+            tone_div=SAA_DIVIDER,
+            tone_period_offset=0,
+        ))
+        count += 1
+    for off in offs:
+        base = at.get(off.chip_id)
+        if base is None:
+            continue
+        events.append(NoteEvent(
+            sample=off.sample_time,
+            ch=base + off.voice,
+            on=False,
+            note=180,
+            ins=-1,
+            vol=-1,
+            e5=0x80,
+            pan=0,
         ))
     return count
 
@@ -10109,6 +10520,37 @@ def analyze(
                 pan=0,
             ))
 
+    # Philips SAA1099: six square/noise voices per chip, after the VSU block.
+    # A CMS/Game Blaster log normally carries two chips; each becomes its own
+    # Furnace 0x97 system, which Furnace names Creative Music System.
+    saa_ids: list[int] = []
+    saa_ins: list[ToneIns] = []
+    saa_count = 0
+    saa_clock = vgm.saa1099_clock or SAA_DEFAULT_CLOCK
+    saa_hits, saa_offs, saa_warn = collect_saa1099(vgm)
+    warnings.extend(saa_warn)
+    if saa_hits or saa_offs:
+        saa_ids = sorted({
+            w.chip_id for w in vgm.writes if w.chip == "saa1099"
+        })
+        if not saa_ids:
+            saa_ids = sorted({h.chip_id for h in saa_hits})
+        saa_base = (
+            tone_base + SCC_VOICES * len(scc_ids) + AY_VOICES * len(ay_ids)
+            + (NES_CHANNELS if nes_ids else 0)
+            + (HUC6280_CHANNELS if huc6280_ids else 0)
+            + (4 * len(gb_ids))
+            + VSU_CHANNELS * len(vsu_ids)
+        )
+        saa_at = {
+            cid: saa_base + SAA_VOICES * i
+            for i, cid in enumerate(saa_ids)
+        }
+        saa_count = _emit_saa_notes(
+            events, channel_fx, saa_hits, saa_offs, saa_at, saa_clock,
+            vgm.total_samples or 0,
+        )
+
     # The YM2203 SSG rides in the same six-channel system: 0-2 FM, 3-5 PSG. Its
     # notes share the AY instrument list.
     ssg_pcm, ssg_pcm_hits = _ssg_pcm("ym2203_ssg")
@@ -10248,15 +10690,28 @@ def analyze(
         if grid is None and pcm_onsets:
             grid = _grid("pcm", onsets=pcm_onsets, label="sample-trigger lattice")
         if grid is not None:
-            tone_only = (scc_count or ay_count or vsu_count) and not keyon_times and not any(
+            tone_only = (
+                scc_count or ay_count or vsu_count or saa_count
+            ) and not keyon_times and not any(
                 e.on and e.pcm for e in events
             )
             if tone_only:
-                hz, use_speed, row_subdiv, grid_note = _musical_row(grid)
-                hz, use_speed, row_subdiv, grid_note = _fit_tone_subdivision(
-                    hz, use_speed, events, grid_note,
-                )
-                tone_hilight = True
+                saa_tick = _saa_tick_interval(vgm) if saa_count else None
+                if saa_tick:
+                    hz = VGM_RATE / saa_tick
+                    use_speed = 1
+                    row_subdiv = 1.0
+                    grid_note = (
+                        f"SAA1099 write lattice ({saa_tick:g} samples/tick), "
+                        "row = 1 write tick"
+                    )
+                    tone_hilight = True
+                else:
+                    hz, use_speed, row_subdiv, grid_note = _musical_row(grid)
+                    hz, use_speed, row_subdiv, grid_note = _fit_tone_subdivision(
+                        hz, use_speed, events, grid_note,
+                    )
+                    tone_hilight = True
             else:
                 hz = grid.hz
                 use_speed = grid.speed
@@ -10452,11 +10907,14 @@ def analyze(
         + n_huc6280_pcm_ins + n_opl4_wave_ins
     )
     tone_demand = 0
-    if scc_ids or ay_ids or psg_ids or nes_ids or huc6280_ids or gb_ids or vsu_ids:
+    if (
+        scc_ids or ay_ids or psg_ids or nes_ids or huc6280_ids
+        or gb_ids or vsu_ids or saa_ids
+    ):
         tone_demand = _tone_instrument_demand(
             events, vgm.k051649_clock or SCC_DEFAULT_CLOCK, ay_note_clock,
             psg_clock, nes_clock, huc6280_clock, gb_clock, vsu_clock,
-            hz, vgm.total_samples, use_speed,
+            saa_clock, hz, vgm.total_samples, use_speed,
         )
     tone_demand_raw = tone_demand
     free_slots = max(
@@ -10571,7 +11029,7 @@ def analyze(
     )
     tone_merged = _bind_tone_instruments(
         events, scc_ins, ay_ins, psg_ins, nes_ins, huc6280_ins, gb_ins,
-        vsu_ins,
+        vsu_ins, saa_ins,
         tone_ins_base,
         vgm.k051649_clock or SCC_DEFAULT_CLOCK,
         ay_note_clock,
@@ -10580,6 +11038,7 @@ def analyze(
         huc6280_clock,
         gb_clock,
         vsu_clock,
+        saa_clock,
         hz, vgm.total_samples, use_speed,
         merge_tol=tone_merge_tol,
     )
@@ -10633,6 +11092,7 @@ def analyze(
         or huc_pcm_samples or ymz_audible
         or any(s.length >= 8 for s in pcm_samples)
         or scc_waves or ay_count or dac_samples or psg_count
+        or saa_ids or saa_count
     )
     if not fm_list:
         chip_name = {
@@ -10833,6 +11293,9 @@ def analyze(
         vsu_ins=vsu_ins,
         vsu_count=vsu_count,
         vsu_dynamic=vsu_dynamic,
+        saa_ids=saa_ids,
+        saa_ins=saa_ins,
+        saa_count=saa_count,
         fm_vol_max=_fm_vol_max(fm_systems, is_opll=is_opll, is_opl=is_opl),
         fm_notes=(
             opll_stats.get("notes", 0) if is_opll else
@@ -11126,6 +11589,13 @@ def format_report(song: Song) -> str:
         lines.append(
             f"AY notes    {song.ay_count}  ({len(song.ay_ids)} chip"
             f"{'s' if len(song.ay_ids) > 1 else ''}, {song.vgm.ay8910_clock} Hz)"
+        )
+    if song.saa_ids:
+        lines.append(
+            f"SAA notes   {song.saa_count}  ({len(song.saa_ids)} chip"
+            f"{'s' if len(song.saa_ids) > 1 else ''}, "
+            f"{song.vgm.saa1099_clock or SAA_DEFAULT_CLOCK} Hz, "
+            f"{len(song.saa_ins)} instruments)"
         )
     if song.huc6280_ids or song.huc6280_pcm_samples:
         lines.append(

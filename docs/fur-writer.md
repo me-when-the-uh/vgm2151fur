@@ -80,7 +80,8 @@ triples start 31 bytes plus 12 per chip before the first ADIR pointer.
   `0xAA` MSM6295, `0xAB` MSM6258,
   `0x9B` SegaPCM, `0xCE` C140, `0xCC` Konami K053260, `0xD0` C352,
   `0xA1` Konami SCC (K051649),
-  `0xB4` Konami SCC+ (K052539), `0x80` AY-3-8910, `0x9D` Konami VRC7,
+  `0xB4` Konami SCC+ (K052539), `0x80` AY-3-8910, `0x97` SAA1099,
+  `0x9D` Konami VRC7,
   `0x06` NES APU (five channels: two pulses, triangle, noise, DPCM). A module lists
   the chips the source had usable samples for: a melody-only track opens with
   the YM2151 alone, with no K007232 pair and no PCM channels it never plays.
@@ -229,6 +230,23 @@ code 14) - the chip restarts its hardware envelope only when the shape
 register is written, and Furnace's platform skips a write whose value did not
 change, so a drum hit reusing the previous shape would keep the stale
 envelope state - plus the pitch macro when the note's driver wrote one.
+
+The SAA1099 instrument (`DIV_INS_SAA1099`, type 9) is a standard macro
+instrument.  Its amplitude register has one 4-bit level per side; the writer
+puts the raw left and right nibbles on the **panning macros** (file codes 12
+and 13) and keeps the volume column at 15.  Furnace's platform writes the
+register as `applyPan(outVol, pan)`, and `applyPan(15, (left << 4) | right)`
+is exactly the source byte, so soft pan and the volume envelope stay exact.
+The hardware envelope control byte is the **ex1 macro** (code 5).  A note on
+channel 3 or 6 (0-based 2/5) carries it; the envelope is internally clocked by
+the channel 2/5 frequency, so a silent **source note** on channel 2/5 (0-based
+1/4) is emitted at volume 0 whenever an envelope is enabled and that voice is
+otherwise idle.  Without it the source oscillator would stay at reset and the
+envelope rate would be wrong.  SAA1099 effects are `10xy` (high nibble noise,
+low nibble tone), `11xx` (noise generator frequency), `12xx` (envelope
+control) and `08xy` (pan, when a fixed balance is needed).  A pair of `0x97`
+systems is the Creative Music System / Game Blaster; the second chip answers
+to bit 7 of the `0xBD` register byte.
 
 ## Pitch units
 

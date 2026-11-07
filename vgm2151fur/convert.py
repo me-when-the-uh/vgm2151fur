@@ -358,6 +358,8 @@ def convert_vgm(
         "ym2608_ssg_notes": song.ym2608_ssg_count,
         "scc_notes": song.scc_count,
         "ay_notes": song.ay_count,
+        "saa_notes": song.saa_count,
+        "saa_chips": len(song.saa_ids),
         "ym2203_chips": len(song.ym2203_ids),
         "ym2203_ext": bool(getattr(song, "ym2203_ext", False)),
         "ym2203_ssg_notes": song.ym2203_ssg_count,

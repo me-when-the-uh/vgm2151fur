@@ -121,6 +121,7 @@ CMD_K053260 = 0xBA
 # and the reference rips use the same form.  Bit 15 selects a second VSU in a
 # dual-chip log (Furnace's baseAddr2S rule).
 CMD_VSU = 0xC7
+CMD_SAA1099 = 0xBD
 VSU_DUAL_BIT = 0x8000
 CMD_DATA_BLOCK = 0x67
 CMD_END = 0x66
@@ -290,6 +291,12 @@ K051649_CLOCK_OFF = 0x9C
 K007232_EXTRA_CLOCK_OFF = 0xE8
 C140_CLOCK_OFF = 0xA8
 C140_TYPE_OFF = 0x96
+# Philips SAA1099 header 0xC8 (VGM 1.71+).  6 square/noise voices with two
+# 3-channel noise generators; bit 30 marks a second chip, which shares the
+# clock and selects itself with bit 7 of the 0xBD register byte.
+SAA1099_CLOCK_OFF = 0xC8
+SAA1099_DEFAULT_CLOCK = 8_000_000
+SAA1099_DUAL_BIT = 0x40000000
 K053260_CLOCK_OFF = 0xAC  # VGM 1.61+, one clock for both instances
 K053260_DEFAULT_CLOCK = 3579545
 C352_CLOCK_OFF = 0xDC  # VGM 1.71 crystal; bit 31 mutes the rear pair
@@ -645,6 +652,13 @@ class VgmFile:
     vsu_clock: int = 0
     vsu_clock_2: int = 0
     vsu_dual: bool = False
+    # Philips SAA1099 header 0xC8 (VGM 1.71+).  Bit 30 marks a second chip;
+    # both share the clock.  Writes arrive on 0xBD, with bit 7 of the register
+    # selecting the second instance.  The audible state is entirely in the
+    # registers: amplitude (with one 4-bit level per side), frequency/octave,
+    # tone/noise enables, two noise generators and two envelope generators.
+    saa1099_clock: int = 0
+    saa1099_dual: bool = False
     # K053260 header 0xAC (VGM 1.61+); bit 7 of a 0xBA register selects the
     # second instance, which shares this clock.
     k053260_clock: int = 0
@@ -969,6 +983,12 @@ def chips_in_head(buf: bytes) -> set[str]:
             kinds.add("vsu")
             if vsu_raw & VSU_HEADER_DUAL_BIT:
                 kinds.add("vsu_dual")
+    if version >= 0x171 and _field_in_header(buf, SAA1099_CLOCK_OFF, 4):
+        saa_raw = _header_raw(buf, SAA1099_CLOCK_OFF)
+        if 100_000 <= (saa_raw & 0x3FFFFFFF) <= 40_000_000:
+            kinds.add("saa1099")
+            if saa_raw & SAA1099_DUAL_BIT:
+                kinds.add("saa1099_dual")
     if version >= 0x151 and _field_in_header(buf, AY8910_CLOCK_OFF, 4):
         raw = _header_raw(buf, AY8910_CLOCK_OFF)
         if 100_000 <= (raw & 0x3FFFFFFF) <= 40_000_000:
@@ -1236,6 +1256,11 @@ def load_vgm(path: Path | str) -> VgmFile:
         vsu_clock_2 = _sane_clock(clocks.get(EXTRA_VSU, 0))
     if not vsu_clock:
         vsu_clock = _sane_clock(clocks.get(EXTRA_VSU, 0))
+    # Philips SAA1099 clock 0xC8 (VGM 1.71+).  The second chip shares the
+    # clock; bit 30 only announces that it is present.
+    saa_raw = _header_raw(buf, SAA1099_CLOCK_OFF) if ver >= 0x171 else 0
+    saa1099_dual = bool(saa_raw & SAA1099_DUAL_BIT)
+    saa1099_clock = _sane_clock(saa_raw)
     # Read the field for every version: the legacy System 21 rips carry
     # 21390 there even in 1.51 files, and players resolve it the same way.
     c140_header = _header_raw(buf, C140_CLOCK_OFF)
@@ -1369,6 +1394,8 @@ def load_vgm(path: Path | str) -> VgmFile:
         vsu_clock=vsu_clock,
         vsu_clock_2=vsu_clock_2,
         vsu_dual=vsu_dual,
+        saa1099_clock=saa1099_clock,
+        saa1099_dual=saa1099_dual,
         c140_clock=c140_clock,
         c140_type=c140_type,
         c140_dual=c140_dual,
@@ -1413,6 +1440,7 @@ def load_vgm(path: Path | str) -> VgmFile:
     stray_k053260_second = False
     stray_ay_second = False
     stray_scc_second = False
+    stray_saa_second = False
     stray_ymz_second = False
     stray_vsu_second = False
     stray_msm6258_second = False
@@ -1959,6 +1987,20 @@ def load_vgm(path: Path | str) -> VgmFile:
             vgm.writes.append(ChipWrite(sample, "ay8910", cid, rr & 0x7F, buf[pos + 2]))
             pos += 3
             continue
+        if cmd == CMD_SAA1099 and pos + 3 <= n:
+            # 0xBD: register, then data.  The SAA1099 register file is five
+            # bits wide; bit 7 of the register byte selects the second chip
+            # (Dual Chip Support #2).  The upper bits are not part of the
+            # address.
+            rr = buf[pos + 1]
+            cid = (rr >> 7) & 1
+            if cid and not saa1099_dual:
+                stray_saa_second = True
+            vgm.writes.append(ChipWrite(
+                sample, "saa1099", cid, rr & 0x1F, buf[pos + 2],
+            ))
+            pos += 3
+            continue
         if cmd in (CMD_MSM6295, CMD_MSM6258) and pos + 3 <= n:
             aa = buf[pos + 1]
             name = "msm6295" if cmd == CMD_MSM6295 else "msm6258"
@@ -2416,6 +2458,16 @@ def load_vgm(path: Path | str) -> VgmFile:
             "VSU writes without a header clock; using 5000000 Hz"
         )
         vgm.vsu_clock = VSU_DEFAULT_CLOCK
+    if stray_saa_second:
+        vgm.warnings.append(
+            "0xBD SAA1099 register bit 7 selects a second chip without the "
+            "dual-instance header bit; it was still treated as chip 1"
+        )
+    if any(w.chip == "saa1099" for w in vgm.writes) and not vgm.saa1099_clock:
+        vgm.warnings.append(
+            "SAA1099 writes without a header clock; using 8000000 Hz"
+        )
+        vgm.saa1099_clock = SAA1099_DEFAULT_CLOCK
     return vgm
 
 

@@ -26,6 +26,9 @@ from vgm2151fur.opl import (
 )
 from vgm2151fur.pcm import pcm7_to_s8, scale_pcm7
 from vgm2151fur.pitch import FURNACE_CLOCK_DEFAULT, module_clock
+from vgm2151fur.saa1099 import (
+    SAA_CLOCK_8M, SAA_CLOCK_NTSC, SAA_CLOCK_PAL, SAA_DEFAULT_CLOCK,
+)
 from vgm2151fur.ym2608 import (
     RHYTHM_VOICES,
     YM2608_DEFAULT_CLOCK,
@@ -108,6 +111,9 @@ CHIP_C352 = 0xD0
 CHIP_K051649 = 0xA1
 CHIP_K052539 = 0xB4
 CHIP_AY8910 = 0x80
+# DIV_SYSTEM_SAA1099: six square/noise voices, no software timers.  A pair of
+# these is the Creative Music System / Game Blaster.
+CHIP_SAA1099 = 0x97
 # The OPL family. Furnace gives the rhythm mode its own system: the drums
 # layout turns the last melodic channels into kick, snare, tom, cymbal and
 # hi-hat columns (9 -> 11 channels on OPL/OPL2, 18 -> 20 on OPL3).
@@ -253,6 +259,9 @@ INS_C352 = 4
 INS_AY = 6
 INS_STD = 0
 INS_SCC = 18
+# DIV_INS_SAA1099: standard macros, with the raw amplitude carried by the
+# pan-left/pan-right macros and the envelope by ex1.
+INS_SAA = 9
 # DIV_INS_PCE: the HuC6280's 32x5-bit wavetable, through the same wave synth
 # as the SCC. Its direct-D/A bodies use DIV_INS_AMIGA (INS_C352 above).
 INS_PCE = 5
@@ -847,15 +856,20 @@ def _write_ins_pce(b: Buf, name: str, ins) -> None:
     b.end_block(size_off, start)
 
 
-def _write_tone_macros(b: Buf, ins, *, wave: bool, reset: bool = False) -> None:
-    """MA feature for an SCC/AY instrument.
+def _write_tone_macros(
+    b: Buf, ins, *, wave: bool, reset: bool = False,
+    ay_compat: bool = True,
+) -> None:
+    """MA feature for an SCC/AY/SAA instrument.
 
-    File codes: 0 volume, 2 duty, 3 wave, 4 pitch, 6 ex2, 14 phase reset,
-    16 ex5. Volume is the register level. The AY column is 15.
+    File codes: 0 volume, 2 duty, 3 wave, 4 pitch, 5 ex1, 6 ex2, 12 panL,
+    13 panR, 14 phase reset, 16 ex5.  The SAA1099 uses the panning macros for
+    its raw amplitude nibbles and ex1 for the envelope control byte.
     """
     moving = (
         ins.vol or ins.pitch or (wave and ins.waves) or ins.noise or ins.mode
-        or ins.env_shape or ins.env_period or reset
+        or ins.env_shape or ins.env_period or ins.panl or ins.panr or ins.env
+        or reset
     )
     if not moving:
         _write_ma(b)
@@ -889,10 +903,25 @@ def _write_tone_macros(b: Buf, ins, *, wave: bool, reset: bool = False) -> None:
         # is one step off: tone+env (5) would become noise+env (6) and a drum
         # body would play as noise.
         mode = ins.mode
-        if FUR_VERSION < 193:
+        if ay_compat and FUR_VERSION < 193:
             mode = tuple((value - 1) & 0xFF for value in mode)
         _write_macro(
             b, 3, mode, speed=ins.mode_speed, loop=ins.mode_loop,
+        )
+    if ins.panl:
+        _write_macro(
+            b, 12, ins.panl, speed=ins.panl_speed, loop=ins.panl_loop,
+            delay=getattr(ins, "panl_delay", 0),
+        )
+    if ins.panr:
+        _write_macro(
+            b, 13, ins.panr, speed=ins.panr_speed, loop=ins.panr_loop,
+            delay=getattr(ins, "panr_delay", 0),
+        )
+    if getattr(ins, "env", ()):
+        _write_macro(
+            b, 5, ins.env, speed=ins.env_speed, loop=ins.env_loop,
+            delay=getattr(ins, "env_delay", 0),
         )
     if ins.pitch:
         _write_macro(
@@ -958,6 +987,27 @@ def _write_ins_ay(b: Buf, name: str, ins=None) -> None:
     if ins is None:
         ins = ToneIns()
     _write_tone_macros(b, ins, wave=False, reset=True)
+    b.raw(b"EN")
+    b.end_block(size_off, start)
+
+
+def _write_ins_saa(b: Buf, name: str, ins=None) -> None:
+    """DIV_INS_SAA1099: standard macros plus the raw pan pair and ex1.
+
+    The volume column is 15 while the panning macros are present, so
+    ``applyPan(15, (left << 4) | right)`` reproduces the source amplitude
+    register exactly.
+    """
+    size_off, start = b.begin_block(b"INS2")
+    b.u16(FUR_VERSION)
+    b.u16(INS_SAA)
+    b.raw(b"NA")
+    na_size = len(b.b)
+    b.u16(0)
+    na_start = len(b.b)
+    b.strz(name)
+    b.b[na_size:na_size + 2] = int(len(b.b) - na_start).to_bytes(2, "little")
+    _write_tone_macros(b, ins or ToneIns(), wave=False, ay_compat=False)
     b.raw(b"EN")
     b.end_block(size_off, start)
 
@@ -1451,6 +1501,21 @@ def ay8910_flag_text(
     if module_clock(clock) != FURNACE_CLOCK_DEFAULT:
         parts.append(f"customClock={clock}")
     return "\n".join(parts)
+
+
+def saa1099_flag_text(clock: int) -> str:
+    """SAA1099 system flags: one of Furnace's three clock presets or a clock.
+
+    clockSel 0 = 8 MHz (the Game Blaster/typical value), 1 = COLOR_NTSC*2
+    and 2 = COLOR_PAL*8/5 (SAM Coupe).  Anything else rides as customClock.
+    """
+    clk = float(clock or SAA_DEFAULT_CLOCK)
+    for sel, preset in enumerate(
+        (SAA_CLOCK_8M, SAA_CLOCK_NTSC, SAA_CLOCK_PAL)
+    ):
+        if abs(clk - preset) <= 2:
+            return f"clockSel={sel}"
+    return f"customClock={int(round(clk))}"
 
 
 def k051649_flag_text(clock: int) -> str:
@@ -2842,7 +2907,7 @@ def _build_patterns(song: Song, n_ch: int, pat_len_max: int, fx_cols: int,
             group.sort(key=lambda item: item[0].sample)
             for (prev, _pdelay), (ev, _edelay) in zip(group, group[1:]):
                 if (
-                    getattr(prev, "tone_chip", 0) not in (1, 2, 3, 4, 5)
+                    getattr(prev, "tone_chip", 0) not in (1, 2, 3, 4, 5, 8)
                     or prev.vol_pts
                     or not prev.end
                     or prev.end > ev.sample
@@ -3076,7 +3141,7 @@ def _build_patterns(song: Song, n_ch: int, pat_len_max: int, fx_cols: int,
             # free; the body keeps its own timing and cuts the attack.
             if (
                 prev is not None
-                and getattr(prev, "tone_chip", 0) == 2  # AY/SSG percussion
+                and getattr(prev, "tone_chip", 0) in (2, 8)  # PSG percussion
                 and not prev.vol_pts
                 and prev.end
                 and prev.end <= ev.sample
@@ -4069,6 +4134,7 @@ def write_fur(
         or getattr(song, "nes_ids", ()) or getattr(song, "huc6280_ids", ())
         or getattr(song, "gb_ids", ())
         or getattr(song, "vsu_ids", ())
+        or getattr(song, "saa_ids", ())
         or getattr(song, "psg_ids", ())
         # YMZ280B is a sample engine with real module columns; a YMZ-only log
         # must not gain an empty YM2151 placeholder above it.
@@ -4207,6 +4273,8 @@ def write_fur(
     vsu_waves = list(getattr(song, "vsu_waves", ()) or ())
     vsu_mod_waves = list(getattr(song, "vsu_mod_waves", ()) or ())
     vsu_specs = list(getattr(song, "vsu_ins", ()) or ())
+    saa_ids = list(getattr(song, "saa_ids", ()) or ())
+    saa_specs = list(getattr(song, "saa_ins", ()) or ())
     scc_chip = CHIP_K052539 if song.vgm.k051649_plus else CHIP_K051649
     n_scc = 5 * len(scc_ids)
     n_ay = 3 * len(ay_ids)
@@ -4215,6 +4283,7 @@ def write_fur(
     n_huc6280 = 6 * len(huc6280_ids)
     n_gb = 4 * len(gb_ids)
     n_vsu = 6 * len(vsu_ids)
+    n_saa = 6 * len(saa_ids)
     n_nes_dpcm_ins = len(nes_dpcm_smps)
     n_nes_pcm_ins = (len(nes_pcm_smps) + 119) // 120
     n_huc6280_pcm_ins = len(huc6280_pcm_smps)
@@ -4259,7 +4328,7 @@ def write_fur(
         + 16 * len(spcm_ids) + n_rf5c
         + 24 * len(c140_ids) + 32 * len(c352_ids)
         + 4 * len(k053260_ids) + 8 * len(ymz_ids)
-        + n_scc + n_ay + n_nes + n_huc6280 + n_gb + n_vsu
+        + n_scc + n_ay + n_nes + n_huc6280 + n_gb + n_vsu + n_saa
     )
     if n_ch == 0:
         raise ValueError("write_fur: need include_fm and/or include_pcm")
@@ -4283,6 +4352,7 @@ def write_fur(
         + len(ymz_smps)
         + len(scc_specs) + len(ay_specs) + len(psg_specs) + len(nes_specs)
         + len(huc6280_specs) + len(gb_specs) + len(vsu_specs)
+        + len(saa_specs)
     )
     n_smp = (
         len(pcm_smps) + len(oki_smps) + len(adpcm_smps)
@@ -4383,6 +4453,7 @@ def write_fur(
         + len(ymz_smps)
         + len(scc_specs) + len(ay_specs) + len(psg_specs) + len(nes_specs)
         + len(huc6280_specs) + len(gb_specs) + len(vsu_specs)
+        + len(saa_specs)
     )
     n_smp = (
         len(pcm_smps) + len(oki_smps) + len(adpcm_smps)
@@ -4495,6 +4566,10 @@ def write_fur(
         for label, short in zip(vsu_labels, vsu_short):
             names_long.append(f"VB {label} ({cid + 1})")
             names_short.append(f"{short}{cid + 1}" if cid else short)
+    for cid in saa_ids:
+        for voice in range(6):
+            names_long.append(f"SAA1099 {cid + 1}-{voice + 1}")
+            names_short.append(f"A{cid + 1}-{voice + 1}")
 
     label_parts: list[str] = []
     if fm_present:
@@ -4570,6 +4645,10 @@ def write_fur(
         label_parts.append("Game Boy")
     if vsu_ids:
         label_parts.append("Virtual Boy")
+    if saa_ids:
+        label_parts.append(
+            "SAA1099 x2" if len(saa_ids) > 1 else "SAA1099"
+        )
     chip_label = " + ".join(label_parts) or "empty"
 
     comment = (
@@ -4601,6 +4680,20 @@ def write_fur(
             f"\nAY-8910 at {song.vgm.ay8910_clock or 1789772} Hz; noise, "
             "channel mode and the hardware envelope are pattern effects "
             "(20xx/21xx/22xy/23xx/24xx).\n"
+        )
+    if saa_ids:
+        dual = (
+            " (Creative Music System / Game Blaster)"
+            if len(saa_ids) > 1 else ""
+        )
+        comment += (
+            f"\nPhilips SAA1099 at "
+            f"{song.vgm.saa1099_clock or SAA_DEFAULT_CLOCK} Hz{dual}; each "
+            "chip has six square/noise voices and two 3-channel noise "
+            "generators. 10xy selects noise/tone, 11xx the noise generator "
+            "and 12xx the envelope. The raw amplitude nibbles ride the "
+            "instrument's pan-left/pan-right macros with a volume column of "
+            "15, so soft pan and the volume envelope stay exact.\n"
         )
     if ym2612:
         comment += (
@@ -4883,6 +4976,9 @@ def write_fur(
             # upload; the log did not, so keep its intended behaviour.
             flags = (flags + "\n" if flags else "") + "screwThis=true"
         flag_texts.append(flags)
+    for _cid in saa_ids:
+        chips.append(CHIP_SAA1099)
+        flag_texts.append(saa1099_flag_text(song.vgm.saa1099_clock))
     n_chips = len(chips)
 
     info_size_off, info_start = b.begin_block(b"INFO")
@@ -5258,6 +5354,20 @@ def write_fur(
             b, name, spec, mod,
             vsu_wave_base + max(0, int(getattr(spec, "wave", 0))),
         )
+    for i, spec in enumerate(saa_specs):
+        ins_ptrs.append(len(b))
+        name = f"SAA {i:02d}"
+        if spec.pitch:
+            name += "+pitch"
+        if spec.panl or spec.panr:
+            name += "+pan"
+        if spec.env:
+            name += "+env"
+        if spec.mode:
+            name += "+mode"
+        if spec.noise:
+            name += "+noise"
+        _write_ins_saa(b, name, spec)
 
     smp_ptrs: list[int] = []
     for i, smp in enumerate(pcm_smps):
