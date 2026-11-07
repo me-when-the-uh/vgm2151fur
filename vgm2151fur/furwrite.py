@@ -26,6 +26,9 @@ from vgm2151fur.opl import (
 )
 from vgm2151fur.pcm import pcm7_to_s8, scale_pcm7
 from vgm2151fur.pitch import FURNACE_CLOCK_DEFAULT, module_clock
+from vgm2151fur.saa1099 import (
+    SAA_CLOCK_8M, SAA_CLOCK_NTSC, SAA_CLOCK_PAL, SAA_DEFAULT_CLOCK,
+)
 from vgm2151fur.ym2608 import (
     RHYTHM_VOICES,
     YM2608_DEFAULT_CLOCK,
@@ -108,6 +111,9 @@ CHIP_C352 = 0xD0
 CHIP_K051649 = 0xA1
 CHIP_K052539 = 0xB4
 CHIP_AY8910 = 0x80
+# DIV_SYSTEM_SAA1099: six square/noise voices, no software timers.  A pair of
+# these is the Creative Music System / Game Blaster.
+CHIP_SAA1099 = 0x97
 # The OPL family. Furnace gives the rhythm mode its own system: the drums
 # layout turns the last melodic channels into kick, snare, tom, cymbal and
 # hi-hat columns (9 -> 11 channels on OPL/OPL2, 18 -> 20 on OPL3).
@@ -253,6 +259,9 @@ INS_C352 = 4
 INS_AY = 6
 INS_STD = 0
 INS_SCC = 18
+# DIV_INS_SAA1099: standard macros, with the raw amplitude carried by the
+# pan-left/pan-right macros and the envelope by ex1.
+INS_SAA = 9
 # DIV_INS_PCE: the HuC6280's 32x5-bit wavetable, through the same wave synth
 # as the SCC. Its direct-D/A bodies use DIV_INS_AMIGA (INS_C352 above).
 INS_PCE = 5
@@ -619,15 +628,19 @@ def _write_ma(b: Buf, patch=None) -> None:
     b.b[size_off:size_off + 2] = int(len(b.b) - start).to_bytes(2, "little")
 
 
-def _write_op_ma(b: Buf, op_index: int, values: tuple[int, ...],
-                 speed: int) -> None:
+def _write_op_group(
+    b: Buf, op_index: int,
+    entries: list[tuple[int, tuple[int, ...], int, bool, int]],
+) -> None:
     """An ``O1``..``O4`` feature: the macro list of one operator.
 
-    Furnace reads these in ``DivInstrument::readFeatureOx`` and applies code
-    6 (``DIV_MACRO_OP_TL``). An operator macro has no delay: it runs from
-    the key-on, and entry 0 is the level the note attacks with.
+    Furnace reads these in ``DivInstrument::readFeatureOx``. Each entry is
+    (macro code, values, speed, invert_to_level, value mask). Code 6 is
+    ``DIV_MACRO_OP_TL``, code 3 MULT and code 9 DT1. An operator macro has
+    no delay: it runs from the key-on, and entry 0 is the value the note
+    attacks with.
 
-    The stored byte is a level in Furnace's seven-bit domain, not the
+    For TL the stored byte is a level in Furnace's seven-bit domain, not the
     attenuation: the chip receives ``$4n = 63 - (S & 63)`` and an editor
     shows ``127 - S``. The model speaks ``$4n``. The writer therefore stores
     ``127 - $4n``, which puts the register and the editor both in range.
@@ -636,16 +649,21 @@ def _write_op_ma(b: Buf, op_index: int, values: tuple[int, ...],
     Measured polarity, masks and hold behaviour are in "Operator macros" in
     ``docs/opl.md``.
     """
-    if not values:
+    entries = [e for e in entries if e[1]]
+    if not entries:
         return
-    stored = [127 - (v & 0x3F) for v in values]
     b.raw(f"O{op_index + 1}".encode("ascii"))
     size_off = len(b.b)
     b.u16(0)
     start = len(b.b)
     # if you update the macro header, update this length as well (Furnace: 8)
     b.u16(8)
-    _write_macro(b, 6, stored, speed=speed)
+    for code, values, speed, to_level, mask in entries:
+        stored = (
+            [127 - (v & mask) for v in values]
+            if to_level else [v & mask for v in values]
+        )
+        _write_macro(b, code, stored, speed=speed)
     b.u8(255)  # stop
     b.b[size_off:size_off + 2] = int(len(b.b) - start).to_bytes(2, "little")
 
@@ -672,8 +690,26 @@ def _write_ins_opm(b: Buf, name: str, patch) -> None:
     b.b[na_size:na_size + 2] = int(len(b.b) - na_start).to_bytes(2, "little")
     _write_fm_feature(b, patch)
     _write_ma(b, patch)
+    # One O1..O4 feature per operator carries every macro that operator
+    # needs. Separate features for TL and MULT would both target the same
+    # operator and make the file order-dependent.
+    op_entries: dict[
+        int, list[tuple[int, tuple[int, ...], int, bool, int]]
+    ] = {}
     for oi, values, speed in getattr(patch, "op_tl_macro", ()) or ():
-        _write_op_ma(b, oi, values, speed)
+        op_entries.setdefault(oi, []).append(
+            (6, tuple(values), speed, True, 0x3F))
+    for oi, values, speed in getattr(patch, "op_mul_macro", ()) or ():
+        op_entries.setdefault(oi, []).append(
+            (3, tuple(values), speed, False, 0x0F))
+    for oi, values, speed in getattr(patch, "op_dt_macro", ()) or ():
+        op_entries.setdefault(oi, []).append(
+            (9, tuple(values), speed, False, 0x07))
+    for oi, values, speed in getattr(patch, "op_dt2_macro", ()) or ():
+        op_entries.setdefault(oi, []).append(
+            (7, tuple(values), speed, False, 0x03))
+    for oi in sorted(op_entries):
+        _write_op_group(b, oi, op_entries[oi])
     b.raw(b"EN")
     b.end_block(size_off, start)
 
@@ -820,15 +856,20 @@ def _write_ins_pce(b: Buf, name: str, ins) -> None:
     b.end_block(size_off, start)
 
 
-def _write_tone_macros(b: Buf, ins, *, wave: bool, reset: bool = False) -> None:
-    """MA feature for an SCC/AY instrument.
+def _write_tone_macros(
+    b: Buf, ins, *, wave: bool, reset: bool = False,
+    ay_compat: bool = True,
+) -> None:
+    """MA feature for an SCC/AY/SAA instrument.
 
-    File codes: 0 volume, 2 duty, 3 wave, 4 pitch, 6 ex2, 14 phase reset,
-    16 ex5. Volume is the register level. The AY column is 15.
+    File codes: 0 volume, 2 duty, 3 wave, 4 pitch, 5 ex1, 6 ex2, 12 panL,
+    13 panR, 14 phase reset, 16 ex5.  The SAA1099 uses the panning macros for
+    its raw amplitude nibbles and ex1 for the envelope control byte.
     """
     moving = (
         ins.vol or ins.pitch or (wave and ins.waves) or ins.noise or ins.mode
-        or ins.env_shape or ins.env_period or reset
+        or ins.env_shape or ins.env_period or ins.panl or ins.panr or ins.env
+        or reset
     )
     if not moving:
         _write_ma(b)
@@ -841,6 +882,7 @@ def _write_tone_macros(b: Buf, ins, *, wave: bool, reset: bool = False) -> None:
     if ins.vol:
         _write_macro(
             b, 0, ins.vol, speed=ins.vol_speed, loop=ins.vol_loop,
+            delay=getattr(ins, "vol_delay", 0),
         )
     if ins.noise:
         # ay.cpp writes register 6 as ``31 - duty``. The values are already
@@ -861,14 +903,30 @@ def _write_tone_macros(b: Buf, ins, *, wave: bool, reset: bool = False) -> None:
         # is one step off: tone+env (5) would become noise+env (6) and a drum
         # body would play as noise.
         mode = ins.mode
-        if FUR_VERSION < 193:
+        if ay_compat and FUR_VERSION < 193:
             mode = tuple((value - 1) & 0xFF for value in mode)
         _write_macro(
             b, 3, mode, speed=ins.mode_speed, loop=ins.mode_loop,
         )
+    if ins.panl:
+        _write_macro(
+            b, 12, ins.panl, speed=ins.panl_speed, loop=ins.panl_loop,
+            delay=getattr(ins, "panl_delay", 0),
+        )
+    if ins.panr:
+        _write_macro(
+            b, 13, ins.panr, speed=ins.panr_speed, loop=ins.panr_loop,
+            delay=getattr(ins, "panr_delay", 0),
+        )
+    if getattr(ins, "env", ()):
+        _write_macro(
+            b, 5, ins.env, speed=ins.env_speed, loop=ins.env_loop,
+            delay=getattr(ins, "env_delay", 0),
+        )
     if ins.pitch:
         _write_macro(
-            b, 4, ins.pitch, speed=ins.pitch_speed, loop=ins.pitch_loop, width=2,
+            b, 4, ins.pitch, speed=ins.pitch_speed, loop=ins.pitch_loop,
+            delay=getattr(ins, "pitch_delay", 0), width=2,
         )
     if ins.env_shape:
         _write_macro(
@@ -929,6 +987,27 @@ def _write_ins_ay(b: Buf, name: str, ins=None) -> None:
     if ins is None:
         ins = ToneIns()
     _write_tone_macros(b, ins, wave=False, reset=True)
+    b.raw(b"EN")
+    b.end_block(size_off, start)
+
+
+def _write_ins_saa(b: Buf, name: str, ins=None) -> None:
+    """DIV_INS_SAA1099: standard macros plus the raw pan pair and ex1.
+
+    The volume column is 15 while the panning macros are present, so
+    ``applyPan(15, (left << 4) | right)`` reproduces the source amplitude
+    register exactly.
+    """
+    size_off, start = b.begin_block(b"INS2")
+    b.u16(FUR_VERSION)
+    b.u16(INS_SAA)
+    b.raw(b"NA")
+    na_size = len(b.b)
+    b.u16(0)
+    na_start = len(b.b)
+    b.strz(name)
+    b.b[na_size:na_size + 2] = int(len(b.b) - na_start).to_bytes(2, "little")
+    _write_tone_macros(b, ins or ToneIns(), wave=False, ay_compat=False)
     b.raw(b"EN")
     b.end_block(size_off, start)
 
@@ -1424,6 +1503,21 @@ def ay8910_flag_text(
     return "\n".join(parts)
 
 
+def saa1099_flag_text(clock: int) -> str:
+    """SAA1099 system flags: one of Furnace's three clock presets or a clock.
+
+    clockSel 0 = 8 MHz (the Game Blaster/typical value), 1 = COLOR_NTSC*2
+    and 2 = COLOR_PAL*8/5 (SAM Coupe).  Anything else rides as customClock.
+    """
+    clk = float(clock or SAA_DEFAULT_CLOCK)
+    for sel, preset in enumerate(
+        (SAA_CLOCK_8M, SAA_CLOCK_NTSC, SAA_CLOCK_PAL)
+    ):
+        if abs(clk - preset) <= 2:
+            return f"clockSel={sel}"
+    return f"customClock={int(round(clk))}"
+
+
 def k051649_flag_text(clock: int) -> str:
     """SCC custom clock, or "" for Furnace's COLOR_NTSC/2 default."""
     if module_clock(clock) != FURNACE_CLOCK_DEFAULT:
@@ -1740,6 +1834,69 @@ def _traj_at(pts: list[tuple[int, int]], t: int) -> int:
             break
         v = d
     return v
+
+
+def _emit_op_fx(
+    grid: list[dict[int, Row]],
+    song: Song,
+    ev,
+    points: tuple[tuple[int, int, int], ...],
+    code: int,
+    fx_cols: int,
+    total_rows: int,
+    chan: int | None = None,
+    stats: dict | None = None,
+    note_row: int | None = None,
+) -> None:
+    """Place an operator MULT/DT/DT2 change as a pattern effect.
+
+    ``points`` are (sample, operator, value) already in the effect's own
+    value domain. One row can carry one value per operator; a later write at
+    the same row wins. The effect is allowed on the note's own row so the
+    attack value is not delayed by a row.
+    """
+    if chan is not None and chan != ev.ch:
+        ev = replace(ev, ch=chan)
+    ch = ev.ch
+    if ch >= len(grid) or not points:
+        return
+    if note_row is None:
+        note_row = song.place(ev.sample, stats)[0]
+    limit_row = total_rows
+    if ev.end:
+        limit_row = min(
+            total_rows, max(note_row + 1, song.place(ev.end, stats)[0] + 1),
+        )
+    by_row: dict[tuple[int, int], tuple[int, int]] = {}
+    for sample, op, value in points:
+        row, delay = song.place(sample, stats)
+        if row < note_row:
+            row = note_row
+        if not (0 <= row < limit_row):
+            continue
+        by_row[(row, op)] = (delay, value)
+    # The OPM platform walks the effect's operator nibble through
+    # orderedOps = {0,2,1,3} (fmsharedbase.h), while the instrument and the
+    # logged registers use plain register order. Convert the register index
+    # back to the effect's operator number, or 16xx/53xx/55xx hit the wrong
+    # slot (op2's $50 becomes op1's $48).
+    effect_ops = (0, 2, 1, 3)
+    for (row, op), (delay, value) in sorted(by_row.items()):
+        cell = grid[ch].get(row)
+        if cell is None:
+            cell = _blank_row()
+            grid[ch][row] = cell
+        if 0 <= cell.note < 180 and row != note_row:
+            continue          # a later note's key-on reloads the operator
+        if row == note_row:
+            delay = 0          # never delay the note that owns this row
+        if delay > 0 and not any(c == 0xED for c, _v in (cell.fx or ())):
+            _add_fx(cell, 0xED, delay, fx_cols, stats)
+        x = effect_ops[op & 3] if code in (0x16, 0x53, 0x55) else op
+        _add_fx(
+            cell, code, (((x + 1) & 0x0F) << 4) | (value & 0x0F),
+            fx_cols, stats,
+        )
 
 
 def _emit_steps(
@@ -2750,7 +2907,7 @@ def _build_patterns(song: Song, n_ch: int, pat_len_max: int, fx_cols: int,
             group.sort(key=lambda item: item[0].sample)
             for (prev, _pdelay), (ev, _edelay) in zip(group, group[1:]):
                 if (
-                    getattr(prev, "tone_chip", 0) not in (1, 2, 3, 4, 5)
+                    getattr(prev, "tone_chip", 0) not in (1, 2, 3, 4, 5, 8)
                     or prev.vol_pts
                     or not prev.end
                     or prev.end > ev.sample
@@ -2984,7 +3141,7 @@ def _build_patterns(song: Song, n_ch: int, pat_len_max: int, fx_cols: int,
             # free; the body keeps its own timing and cuts the attack.
             if (
                 prev is not None
-                and getattr(prev, "tone_chip", 0) == 2  # AY/SSG percussion
+                and getattr(prev, "tone_chip", 0) in (2, 8)  # PSG percussion
                 and not prev.vol_pts
                 and prev.end
                 and prev.end <= ev.sample
@@ -3156,6 +3313,33 @@ def _build_patterns(song: Song, n_ch: int, pat_len_max: int, fx_cols: int,
                     _emit_steps(
                         grid, song, ev, fx_cols, total_rows, sweep_e5,
                         stats=stats, note_row=placed_note_row(ev),
+                    )
+    if song.events:
+        for ev in song.events:
+            if not (
+                ev.on
+                and 0 <= ev.ch + ch_offset < n_ch
+                and (ev.op_mul_fx or ev.op_dt_fx or ev.op_dt2_fx)
+                and (content_cut is None or ev.sample < content_cut)
+            ):
+                continue
+            note_row = placed_note_row(ev)
+            if note_row < 0:
+                continue
+            chan = ev.ch + ch_offset if ch_offset else None
+            for points, code in (
+                (ev.op_mul_fx, 0x16),
+                (ev.op_dt_fx, 0x53),
+                (ev.op_dt2_fx, 0x55),
+            ):
+                if content_cut is not None:
+                    points = tuple(
+                        p for p in points if p[0] < content_cut
+                    )
+                if points:
+                    _emit_op_fx(
+                        grid, song, ev, points, code, fx_cols, total_rows,
+                        chan=chan, stats=stats, note_row=note_row,
                     )
     if song.events:
         for ev in song.events:
@@ -3950,6 +4134,7 @@ def write_fur(
         or getattr(song, "nes_ids", ()) or getattr(song, "huc6280_ids", ())
         or getattr(song, "gb_ids", ())
         or getattr(song, "vsu_ids", ())
+        or getattr(song, "saa_ids", ())
         or getattr(song, "psg_ids", ())
         # YMZ280B is a sample engine with real module columns; a YMZ-only log
         # must not gain an empty YM2151 placeholder above it.
@@ -3964,7 +4149,14 @@ def write_fur(
     elif ym_chip:
         fm_present = include_fm and bool(ym_ids)
     else:
-        fm_present = include_fm and (fm_source or not has_tone_chip)
+        # The Y8950 owns a delta-T column. Its samples require the chip
+        # entry even when the caller excluded FM notes.
+        has_y8950_pcm = bool(
+            include_pcm and (getattr(song, "y8950_b_samples", ()) or ())
+        )
+        fm_present = (include_fm or has_y8950_pcm) and (
+            fm_source or not has_tone_chip
+        )
     fm_ins = song.fm_patches if (fm_present and include_fm) else []
     
     pcm_smps = [s for s in song.pcm_samples if s.length >= 8] if include_pcm else []
@@ -4081,6 +4273,8 @@ def write_fur(
     vsu_waves = list(getattr(song, "vsu_waves", ()) or ())
     vsu_mod_waves = list(getattr(song, "vsu_mod_waves", ()) or ())
     vsu_specs = list(getattr(song, "vsu_ins", ()) or ())
+    saa_ids = list(getattr(song, "saa_ids", ()) or ())
+    saa_specs = list(getattr(song, "saa_ins", ()) or ())
     scc_chip = CHIP_K052539 if song.vgm.k051649_plus else CHIP_K051649
     n_scc = 5 * len(scc_ids)
     n_ay = 3 * len(ay_ids)
@@ -4089,6 +4283,7 @@ def write_fur(
     n_huc6280 = 6 * len(huc6280_ids)
     n_gb = 4 * len(gb_ids)
     n_vsu = 6 * len(vsu_ids)
+    n_saa = 6 * len(saa_ids)
     n_nes_dpcm_ins = len(nes_dpcm_smps)
     n_nes_pcm_ins = (len(nes_pcm_smps) + 119) // 120
     n_huc6280_pcm_ins = len(huc6280_pcm_smps)
@@ -4133,7 +4328,7 @@ def write_fur(
         + 16 * len(spcm_ids) + n_rf5c
         + 24 * len(c140_ids) + 32 * len(c352_ids)
         + 4 * len(k053260_ids) + 8 * len(ymz_ids)
-        + n_scc + n_ay + n_nes + n_huc6280 + n_gb + n_vsu
+        + n_scc + n_ay + n_nes + n_huc6280 + n_gb + n_vsu + n_saa
     )
     if n_ch == 0:
         raise ValueError("write_fur: need include_fm and/or include_pcm")
@@ -4157,6 +4352,7 @@ def write_fur(
         + len(ymz_smps)
         + len(scc_specs) + len(ay_specs) + len(psg_specs) + len(nes_specs)
         + len(huc6280_specs) + len(gb_specs) + len(vsu_specs)
+        + len(saa_specs)
     )
     n_smp = (
         len(pcm_smps) + len(oki_smps) + len(adpcm_smps)
@@ -4257,6 +4453,7 @@ def write_fur(
         + len(ymz_smps)
         + len(scc_specs) + len(ay_specs) + len(psg_specs) + len(nes_specs)
         + len(huc6280_specs) + len(gb_specs) + len(vsu_specs)
+        + len(saa_specs)
     )
     n_smp = (
         len(pcm_smps) + len(oki_smps) + len(adpcm_smps)
@@ -4369,6 +4566,10 @@ def write_fur(
         for label, short in zip(vsu_labels, vsu_short):
             names_long.append(f"VB {label} ({cid + 1})")
             names_short.append(f"{short}{cid + 1}" if cid else short)
+    for cid in saa_ids:
+        for voice in range(6):
+            names_long.append(f"SAA1099 {cid + 1}-{voice + 1}")
+            names_short.append(f"A{cid + 1}-{voice + 1}")
 
     label_parts: list[str] = []
     if fm_present:
@@ -4444,6 +4645,10 @@ def write_fur(
         label_parts.append("Game Boy")
     if vsu_ids:
         label_parts.append("Virtual Boy")
+    if saa_ids:
+        label_parts.append(
+            "SAA1099 x2" if len(saa_ids) > 1 else "SAA1099"
+        )
     chip_label = " + ".join(label_parts) or "empty"
 
     comment = (
@@ -4475,6 +4680,20 @@ def write_fur(
             f"\nAY-8910 at {song.vgm.ay8910_clock or 1789772} Hz; noise, "
             "channel mode and the hardware envelope are pattern effects "
             "(20xx/21xx/22xy/23xx/24xx).\n"
+        )
+    if saa_ids:
+        dual = (
+            " (Creative Music System / Game Blaster)"
+            if len(saa_ids) > 1 else ""
+        )
+        comment += (
+            f"\nPhilips SAA1099 at "
+            f"{song.vgm.saa1099_clock or SAA_DEFAULT_CLOCK} Hz{dual}; each "
+            "chip has six square/noise voices and two 3-channel noise "
+            "generators. 10xy selects noise/tone, 11xx the noise generator "
+            "and 12xx the envelope. The raw amplitude nibbles ride the "
+            "instrument's pan-left/pan-right macros with a volume column of "
+            "15, so soft pan and the volume envelope stay exact.\n"
         )
     if ym2612:
         comment += (
@@ -4757,6 +4976,9 @@ def write_fur(
             # upload; the log did not, so keep its intended behaviour.
             flags = (flags + "\n" if flags else "") + "screwThis=true"
         flag_texts.append(flags)
+    for _cid in saa_ids:
+        chips.append(CHIP_SAA1099)
+        flag_texts.append(saa1099_flag_text(song.vgm.saa1099_clock))
     n_chips = len(chips)
 
     info_size_off, info_start = b.begin_block(b"INFO")
@@ -5132,6 +5354,20 @@ def write_fur(
             b, name, spec, mod,
             vsu_wave_base + max(0, int(getattr(spec, "wave", 0))),
         )
+    for i, spec in enumerate(saa_specs):
+        ins_ptrs.append(len(b))
+        name = f"SAA {i:02d}"
+        if spec.pitch:
+            name += "+pitch"
+        if spec.panl or spec.panr:
+            name += "+pan"
+        if spec.env:
+            name += "+env"
+        if spec.mode:
+            name += "+mode"
+        if spec.noise:
+            name += "+noise"
+        _write_ins_saa(b, name, spec)
 
     smp_ptrs: list[int] = []
     for i, smp in enumerate(pcm_smps):

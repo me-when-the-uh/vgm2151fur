@@ -21,8 +21,10 @@ the source level reproduces the source register stream exactly.
 
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass
 
+from vgm2151fur.samplecluster import cluster_fragments
 from vgm2151fur.vgm import VgmFile
 
 # Furnace's AY sample DAC table (platform/ay.cpp).  Index is the sample byte
@@ -598,3 +600,33 @@ def collect_ssg_pcm(
             f"{label}: {stream_loops} looping DAC stream(s) played once"
         )
     return samples, hits, warnings
+
+
+def cluster_ssg_pcm(
+    samples: list[SsgPcmSample],
+    hits: list[SsgPcmHit],
+    *,
+    target: int = 32,
+    hot: int = 16,
+) -> tuple[list[SsgPcmSample], list[SsgPcmHit]]:
+    """Optionally fold short SSG PCM bodies into the hottest/longest ones.
+
+    This is the same lossy reduction the YM2612 DAC offers.  A hit keeps its
+    time and cut; only its sample index changes.
+    """
+    if len(samples) <= target:
+        return samples, hits
+    uses: Counter[int] = Counter(hit.sample_index for hit in hits)
+    keep, remap = cluster_fragments(
+        [smp.data for smp in samples],
+        [smp.rate for smp in samples],
+        dict(uses),
+        target=target,
+        hot=hot,
+    )
+    if len(keep) == len(samples):
+        return samples, hits
+    new_samples = [samples[i] for i in keep]
+    for hit in hits:
+        hit.sample_index = remap[hit.sample_index]
+    return new_samples, hits

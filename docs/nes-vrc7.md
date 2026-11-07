@@ -88,6 +88,12 @@ note `60 + slot` selects the chunk and every slot plays at C-4 at the body's
 stored rate, so a small tracker/sample-rate error can only drift inside one
 chunk instead of across the song. `18xx = 00` selects PCM mode.
 
+The experimental `lossy_samples` option (menu prompt or
+`--lossy-sample-clustering`) additionally reduces the final NES raw-PCM map to
+about 32 bodies using the same loose prefix clustering as the YM2612 DAC.  It
+is off by default; a hit keeps its time and cut but may play a similar
+long/hot body instead of its exact fragment.
+
 ## Famicom AY = Sunsoft 5B
 
 A Famicom expansion AY is a Sunsoft 5B with its SEL pin tied low, so the chip

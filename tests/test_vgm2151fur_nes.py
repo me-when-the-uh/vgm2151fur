@@ -13,6 +13,7 @@ from vgm2151fur.furwrite import (
     CHIP_NES, CHIP_VRC7, INS_C352, INS_NES, SMP_DEPTH_DPCM, write_fur,
 )
 from vgm2151fur.nes import (
+    NesPcmHit, NesPcmSample, cluster_nes_pcm,
     collect_nes_dpcm, collect_nes_pcm, collect_nes_tones, nes_note,
 )
 from vgm2151fur.vgm import ChipWrite, RomSlice, VgmFile, load_vgm
@@ -681,6 +682,29 @@ class TestNesDpcmWriter(unittest.TestCase):
         self.assertEqual(mod.samples[0].depth, SMP_DEPTH_DPCM)
         # $4013 = 0x01 is 17 bytes (16*1+1), i.e. 136 DPCM bits.
         self.assertEqual(mod.samples[0].n_frames, 17 * 8)
+
+
+class TestNesPcmClustering(unittest.TestCase):
+    def test_cluster_folds_fragments_and_remaps_hits(self):
+        samples = [
+            NesPcmSample(
+                name=f"pcm{i}",
+                data=bytes((i * 53 + j * 11) & 0xFF for j in range(32)),
+                rate=11025, start=i * 1000, end=i * 1000 + 32,
+            )
+            for i in range(40)
+        ]
+        hits = [
+            NesPcmHit(
+                sample_time=i * 4410, end_time=0, sample_index=i,
+            )
+            for i in range(40)
+        ]
+        before = len(samples)
+        out, out_hits = cluster_nes_pcm(samples, hits)
+        self.assertLessEqual(len(out), 32)
+        self.assertEqual(len(out_hits), before)
+        self.assertTrue(all(0 <= h.sample_index < len(out) for h in out_hits))
 
 
 if __name__ == "__main__":

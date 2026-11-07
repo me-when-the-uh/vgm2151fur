@@ -245,6 +245,8 @@ def _convert(args) -> int:
             include_fm=include_fm,
             normalize=not args.no_normalize,
             loop_find=not args.no_loop_find,
+            lfo_loop=not args.no_lfo_loop,
+            lossy_samples=args.lossy_sample_clustering,
             workers=args.workers,
             c352_quad=args.c352_quad,
         ):
@@ -509,6 +511,19 @@ def _add_convert_flags(parser: argparse.ArgumentParser, *, bare: bool) -> None:
         action="store_true",
         help="keep the VGM loop offset instead of moving it onto the bar",
     )
+    parser.add_argument(
+        "--no-lfo-loop",
+        action="store_true",
+        help="skip the LFO/tail loop search for long pitch macros (faster; "
+             "exact first-cycle loops are still detected)",
+    )
+    parser.add_argument(
+        "--lossy-sample-clustering",
+        action="store_true",
+        help="experimental, lossy: reduce the YM2612 DAC, SSG PCM and NES "
+             "raw PCM maps to about 32 bodies by mapping short fragments to "
+             "similar long/hot samples",
+    )
     if bare:
         parser.add_argument("--list", action="store_true", help="with a .fur: print chip volumes")
         parser.add_argument("--chip", default=None, help="with a .fur: chip number, name, or all")
@@ -526,7 +541,8 @@ def build_parser() -> argparse.ArgumentParser:
             "Transcribe YM2151 (OPM), YM2203 (OPN), YM2612 (OPN2), YM2610 and "
             "OPL-family (YM3526/YM3812/YMF262) + "
             "sample-chip (K007232, MSM6295, MSM6258, SegaPCM, C140, C352, "
-            "K053260, YMZ280B) + Nintendo Virtual Boy (VSU) "
+            "K053260, YMZ280B) + Nintendo Virtual Boy (VSU) + Philips "
+            "SAA1099 (Creative Music System / Game Blaster) "
             "VGMs into Furnace .fur files, and edit the result."
         ),
         epilog=EPILOG,

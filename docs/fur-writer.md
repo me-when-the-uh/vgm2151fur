@@ -80,7 +80,8 @@ triples start 31 bytes plus 12 per chip before the first ADIR pointer.
   `0xAA` MSM6295, `0xAB` MSM6258,
   `0x9B` SegaPCM, `0xCE` C140, `0xCC` Konami K053260, `0xD0` C352,
   `0xA1` Konami SCC (K051649),
-  `0xB4` Konami SCC+ (K052539), `0x80` AY-3-8910, `0x9D` Konami VRC7,
+  `0xB4` Konami SCC+ (K052539), `0x80` AY-3-8910, `0x97` SAA1099,
+  `0x9D` Konami VRC7,
   `0x06` NES APU (five channels: two pulses, triangle, noise, DPCM). A module lists
   the chips the source had usable samples for: a melody-only track opens with
   the YM2151 alone, with no K007232 pair and no PCM channels it never plays.
@@ -146,7 +147,7 @@ the OPN sustain rate (0x70) and SSG-EG (0x90) instead of DT2. A per-note pitch
 macro (code 4) on an instrument copy reproduces later f-num writes; the note's
 E5 carries the key-on remainder.
 
-YM2612 instruments use the same type 1 and OPN operator layout. They also carry the channel's PMS/AMS in the FM feature, and the carrier TLs are stored relative to the loudest carrier while the note's volume column carries the absolute level (Furnace's `newVolumeScaling` makes that exact). The DAC uses `DIV_INS_AMIGA` sample maps of 120 slots with `first_sample=0`; pattern note `60+slot` selects a bank source sample (or a release-capped PCM chunk when the source representation cannot fit). A longer source body can serve a shorter prefix because the next note cuts it, and a note-off cuts a body at the run's real end when a gap follows. `collect_dac(..., slices=True)` is the explicit per-run slice mode. The SN76489 uses a plain `DIV_INS_STD` instrument (pitch macro only), a 0-15 volume column, and effect `20xy` for noise mode; its system volume defaults to 0.500, and an absolute extra-header volume entry overrides it. The FM feature's four operator columns of the Ext system share one timbre instrument. Column `ch` (channels 2-5) plays `ops[orderedOps[ch]]`, and `orderedOps` is `{0,2,1,3}` (`fmsharedbase.h`), so channel 3 plays `ops[2]` - the twist is a different axis from the `$08` key-on bits and `OPN_ORDERED_OPS` carries it. The instrument cache deliberately ignores TL so one voice stays one instrument, therefore each column's level must ride its own volume: `DIV_CMD_VOLUME` in `ym2203ext.cpp` answers unconditionally with `TL = 127 - vol + op.tl`, so `_bind_ext_levels` parks that operator's lowest requested TL in the instrument and gives every note `vol = 127 - (its TL - floor)`. A column that never moves sits at `vol 127`; one the driver walks (`01 Exit Logo` runs `$4A` through `06-2D`) reproduces every step. Mask writes are edges: a 0->1 bit opens a column, a 1->0 bit closes it, and a held bit whose f-num changes is a pitch point rather than a retrigger. A driver's release sequence (0xF -> 0xD -> 0x9 -> 0x1 while loading the next note) must not re-attack the released columns. The block/high and low halves of an f-num are written up to ~1.5 ms apart; they collapse onto the final pair, and a mid-row pitch step carries an `EDxx` delay so it lands on the driver's tick.
+YM2612 instruments use the same type 1 and OPN operator layout. They also carry the channel's PMS/AMS in the FM feature, and the carrier TLs are stored relative to the loudest carrier while the note's volume column carries the absolute level (Furnace's `newVolumeScaling` makes that exact). The DAC uses `DIV_INS_AMIGA` sample maps of 120 slots with `first_sample=0`; pattern note `60+slot` selects a bank source sample (or a clustered fragment body when the optional lossy map reduction is enabled). A longer source body can serve a shorter prefix because the next note cuts it, and a note-off cuts a body at the run's real end when a gap follows. `collect_dac(..., slices=True)` is the explicit per-run slice mode. The SN76489 uses a plain `DIV_INS_STD` instrument (pitch macro only), a 0-15 volume column, and effect `20xy` for noise mode; its system volume defaults to 0.500, and an absolute extra-header volume entry overrides it. The FM feature's four operator columns of the Ext system share one timbre instrument. Column `ch` (channels 2-5) plays `ops[orderedOps[ch]]`, and `orderedOps` is `{0,2,1,3}` (`fmsharedbase.h`), so channel 3 plays `ops[2]` - the twist is a different axis from the `$08` key-on bits and `OPN_ORDERED_OPS` carries it. The instrument cache deliberately ignores TL so one voice stays one instrument, therefore each column's level must ride its own volume: `DIV_CMD_VOLUME` in `ym2203ext.cpp` answers unconditionally with `TL = 127 - vol + op.tl`, so `_bind_ext_levels` parks that operator's lowest requested TL in the instrument and gives every note `vol = 127 - (its TL - floor)`. A column that never moves sits at `vol 127`; one the driver walks (`01 Exit Logo` runs `$4A` through `06-2D`) reproduces every step. Mask writes are edges: a 0->1 bit opens a column, a 1->0 bit closes it, and a held bit whose f-num changes is a pitch point rather than a retrigger. A driver's release sequence (0xF -> 0xD -> 0x9 -> 0x1 while loading the next note) must not re-attack the released columns. The block/high and low halves of an f-num are written up to ~1.5 ms apart; they collapse onto the final pair, and a mid-row pitch step carries an `EDxx` delay so it lands on the driver's tick.
 
 OPL-family instruments are `DIV_INS_OPL` (type 14) for a voice and
 `DIV_INS_OPL_DRUMS` (type 32) for a single-operator percussion column, both with
@@ -229,6 +230,23 @@ code 14) - the chip restarts its hardware envelope only when the shape
 register is written, and Furnace's platform skips a write whose value did not
 change, so a drum hit reusing the previous shape would keep the stale
 envelope state - plus the pitch macro when the note's driver wrote one.
+
+The SAA1099 instrument (`DIV_INS_SAA1099`, type 9) is a standard macro
+instrument.  Its amplitude register has one 4-bit level per side; the writer
+puts the raw left and right nibbles on the **panning macros** (file codes 12
+and 13) and keeps the volume column at 15.  Furnace's platform writes the
+register as `applyPan(outVol, pan)`, and `applyPan(15, (left << 4) | right)`
+is exactly the source byte, so soft pan and the volume envelope stay exact.
+The hardware envelope control byte is the **ex1 macro** (code 5).  A note on
+channel 3 or 6 (0-based 2/5) carries it; the envelope is internally clocked by
+the channel 2/5 frequency, so a silent **source note** on channel 2/5 (0-based
+1/4) is emitted at volume 0 whenever an envelope is enabled and that voice is
+otherwise idle.  Without it the source oscillator would stay at reset and the
+envelope rate would be wrong.  SAA1099 effects are `10xy` (high nibble noise,
+low nibble tone), `11xx` (noise generator frequency), `12xx` (envelope
+control) and `08xy` (pan, when a fixed balance is needed).  A pair of `0x97`
+systems is the Creative Music System / Game Blaster; the second chip answers
+to bit 7 of the `0xBD` register byte.
 
 ## Pitch units
 

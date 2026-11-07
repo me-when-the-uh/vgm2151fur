@@ -836,7 +836,10 @@ class TestToneMacros(unittest.TestCase):
             tick = 44100.0 / song.hz
             for i, value in enumerate(spec.vol):
                 if value == level:
-                    return i * spec.vol_speed * tick
+                    pos = 0 if i == 0 else (
+                        spec.vol_delay + 1 + (i - 1) * spec.vol_speed
+                    )
+                    return pos * tick
             self.fail(f"level {level} missing from {spec.vol}")
 
         for factor in (1, 4):

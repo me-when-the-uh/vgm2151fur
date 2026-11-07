@@ -68,6 +68,12 @@ the log's ±1 Hz rate jitter from resampling the same source into separate
 arrays.  On the Rusty title rip this cuts 104 bodies to 34 without changing
 the 758 hits.
 
+The experimental `lossy_samples` option (menu prompt or
+`--lossy-sample-clustering`) additionally reduces the final SSG PCM map to
+about 32 bodies with the same prefix clustering as the YM2612 DAC.  It is off
+by default because the reduction is lossy; a hit keeps its time and cut but
+may play a similar long/hot body instead of its exact source fragment.
+
 Before a body is stored, `_trim_dc` drops a mostly-constant tail: a stream
 play often declares a long length whose remainder is just the held register
 level, so the body is a short peak followed by a flat DC line.  The rule only
