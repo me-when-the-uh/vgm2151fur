@@ -42,6 +42,7 @@ from vgm2151fur.ym2612dac import (
     DacPlay,
     DacSample,
     _cluster_similar_samples,
+    _collect_source,
     _merge_one_shot_samples,
     _split_long_silence,
     _split_silent_runs,
@@ -1760,20 +1761,34 @@ class TestYm2612DacBanking(unittest.TestCase):
         return [ChipWrite(0, "ym2612", 0, 0x2B, 0x80)]
 
     def test_cadence_jitter_shares_the_longest_bank_body(self):
-        # The same bank offset is read long at a 5-sample wait and short at a
-        # 4-sample wait.  A median-wait key used to store two bodies; the
-        # longest read must serve both and the short note is cut later.
+        # The same bank offset is read long and short, both at the same
+        # nominal cadence with the usual 4/5-sample wait jitter.  The trimmed
+        # mean keeps them one cluster; the longest read must serve both and
+        # the short note is cut later.
         body = bytes(0x80 + (i % 37 + 1) for i in range(64))
-        events = self._bank_events([
-            (0, 0, 64, 5),
-            (20000, 0, 16, 4),
-        ])
+        events: list[tuple[int, int, int]] = [(0, 0, 0)]
+        t = 0
+        for i in range(64):
+            wait = 4 if i % 2 == 0 else 5
+            events.append((t, 1, wait))
+            t += wait
+        events.append((20000, 0, 0))
+        t = 20000
+        for i in range(16):
+            wait = 5 if i % 2 == 0 else 4
+            events.append((t, 1, wait))
+            t += wait
         src = _vgm(
             self._marker(), dac_data=bytearray(body),
             dac_events=events, total_samples=40000,
         )
         samples, plays, warn, stats = collect_dac(src)
-        self.assertFalse(warn)
+        # Mixed 4/5 waits necessarily collide on a 4-sample frame grid; that
+        # is the rate-exact layout warning, not a clustering failure.
+        self.assertFalse([
+            message for message in warn
+            if "rounded to an already-written" not in message
+        ])
         self.assertEqual(stats["dac_mode"], "source")
         self.assertEqual(len(samples), 1)
         self.assertEqual(len(plays), 2)
@@ -1898,6 +1913,43 @@ class TestYm2612DacFragmentClustering(unittest.TestCase):
         self.assertFalse(warn)
         self.assertGreater(len(out), DAC_TARGET_SAMPLES)
         self.assertEqual(len(notes), len(plays))
+
+
+class TestYm2612DacPitchClusters(unittest.TestCase):
+    """One bank offset used at several real rates gets several samples."""
+
+    @staticmethod
+    def _run(t: int, waits: list[int], seed: int) -> dict:
+        times = [t]
+        for wait in waits:
+            times.append(times[-1] + wait)
+        return {
+            "t": t,
+            "off": 1515,
+            "bytes": [
+                (0x80 + (seed * 17 + i * 7) % 61)
+                for i in range(len(waits) + 1)
+            ],
+            "times": times,
+            "fresh": False,
+        }
+
+    def test_jitter_merges_but_a_real_pitch_step_splits(self):
+        runs = [
+            self._run(0, [4, 5] * 8, 1),
+            self._run(10_000, [5, 4] * 8, 2),
+            self._run(20_000, [6, 7] * 8, 3),
+            self._run(30_000, [7, 6] * 8, 4),
+        ]
+        samples, plays = _collect_source(runs, {}, [])
+        self.assertEqual(len(samples), 2)
+        self.assertEqual(
+            [p.sample for p in sorted(plays, key=lambda p: p.onset)],
+            [0, 0, 1, 1],
+        )
+        self.assertEqual(
+            {samples[0].c4_rate, samples[1].c4_rate}, {11025, 7350},
+        )
 
 
 class TestYm2612DacLongHolds(unittest.TestCase):

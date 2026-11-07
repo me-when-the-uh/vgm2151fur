@@ -23,6 +23,10 @@ DAC_MIN_SAMPLES = 8
 DAC_MAP_CAPACITY = 120
 # A pause over this starts another phrase.
 DAC_RUN_GAP = 2048
+# Two runs at one bank offset whose trimmed mean byte interval differ by more
+# than this are genuinely repitched and get their own sample.  4/5-wait
+# quantisation jitter at one nominal rate stays inside this window.
+DAC_WAIT_CLUSTER = 0.5
 DAC_TIMELINE_RATE = 22050
 # Keep the module below release Furnace's sample-count limit.
 DAC_RELEASE_SAMPLES = 240
@@ -932,6 +936,41 @@ def _source_pitch(run: dict) -> int:
     ))
 
 
+def _run_wait(run: dict) -> float:
+    """Typical byte interval of a run, ignoring held-silence outliers.
+
+    Drivers quantise one nominal cadence to a mix of four- and five-sample
+    waits.  The trimmed mean keeps that jitter near 4.5 while a genuinely
+    repitched play lands on a different cadence.
+    """
+    times = run["times"]
+    waits = [b - a for a, b in zip(times, times[1:]) if b > a]
+    if not waits:
+        return 1.0
+    median = statistics.median(waits)
+    cap = max(median * 2.0, median + 3.0)
+    kept = [wait for wait in waits if wait <= cap]
+    return sum(kept) / len(kept) if kept else median
+
+
+def _wait_clusters(items: list[dict]) -> list[list[dict]]:
+    """Split one offset's runs into pitch clusters by trimmed mean wait."""
+    ordered = sorted(items, key=_run_wait)
+    clusters: list[list[dict]] = []
+    current: list[dict] = []
+    previous = None
+    for run in ordered:
+        wait = _run_wait(run)
+        if current and previous is not None and wait - previous > DAC_WAIT_CLUSTER:
+            clusters.append(current)
+            current = []
+        current.append(run)
+        previous = wait
+    if current:
+        clusters.append(current)
+    return clusters
+
+
 def _split_silent_run(run: dict) -> list[dict] | None:
     """Split one bank run at a long held-silence gap.
 
@@ -999,15 +1038,17 @@ def _collect_source(
     stats: dict,
     pan_timeline: list[tuple[int, int]],
 ) -> tuple[list[DacSample], list[DacPlay]]:
-    """One sample per bank offset and one play per audible run.
+    """One sample per bank offset and pitch cluster, one play per run.
 
-    The longest read at an offset is the stored body.  Every shorter read at
-    that offset is a prefix of it: the next note or the explicit note-off cuts
-    it, so a one-frame hit and a full drum share one module sample.  The byte
-    cadence is deliberately not part of the key.  Drivers alternate four- and
-    five-sample waits at one nominal rate, and a median-wait key split the same
-    bank body into several near-identical samples.  The longest read keeps its
-    own rate; shorter reads play the same body through the same cut.
+    The longest read in a cluster is the stored body.  Every shorter read there
+    is a prefix of it: the next note or the explicit note-off cuts it, so a
+    one-frame hit and a full drum share one module sample.
+
+    Runs at one offset are grouped by their trimmed mean byte interval rather
+    than by exact cadence.  Drivers alternate four- and five-sample waits at
+    one nominal rate, so the trimmed mean keeps that jitter together.  A
+    genuinely repitched play moves the mean by more than ``DAC_WAIT_CLUSTER``
+    and gets its own sample, which lets the pattern play it at its real pitch.
 
     Silent, flat-line and near-silent reads take no sample slot.  They are
     rests between hits, and storing them as samples only burns the release
@@ -1050,40 +1091,44 @@ def _collect_source(
         groups.setdefault(run["off"], []).append(run)
 
     samples: list[DacSample] = []
-    sample_of: dict[int, int] = {}
+    sample_of: dict[tuple[int, int], int] = {}
     for off, items in groups.items():
-        rep = max(items, key=lambda r: (
-            len(r["bytes"]), r["times"][-1] - r["times"][0],
-        ))
-        duration = rep["times"][-1] - rep["times"][0]
-        n = len(rep["bytes"])
-        waits = [
-            b - a for a, b in zip(rep["times"], rep["times"][1:]) if b > a
-        ]
-        if waits and len(set(waits)) == 1:
-            # A uniform cadence is exact: N bytes at one wait occupy N frames
-            # of VGM_RATE/wait, not (N-1).
-            dense = VGM_RATE / waits[0]
-        else:
-            dense = n * VGM_RATE / duration if duration > 0 else VGM_RATE
-        # The fastest interval must still have its own frame or its byte is
-        # overwritten when the body is laid out.
-        fastest = VGM_RATE / min(waits) if waits else float(VGM_RATE)
-        rate = max(1, min(
-            DAC_RATE_MAX, max(int(round(dense)), int(round(fastest))),
-        ))
-        body = _frames_from_times(
-            [(t, b, 0) for t, b in zip(rep["times"], rep["bytes"])],
-            rate, stats,
-        )
-        sample_of[off] = len(samples)
-        samples.append(DacSample(
-            off, len(body), body, rate, rep["t"],
-        ))
+        for cluster_i, cluster in enumerate(_wait_clusters(items)):
+            for run in cluster:
+                run["cluster"] = cluster_i
+            rep = max(cluster, key=lambda r: (
+                len(r["bytes"]), r["times"][-1] - r["times"][0],
+            ))
+            duration = rep["times"][-1] - rep["times"][0]
+            n = len(rep["bytes"])
+            waits = [
+                b - a
+                for a, b in zip(rep["times"], rep["times"][1:]) if b > a
+            ]
+            if waits and len(set(waits)) == 1:
+                # A uniform cadence is exact: N bytes at one wait occupy N
+                # frames of VGM_RATE/wait, not (N-1).
+                dense = VGM_RATE / waits[0]
+            else:
+                dense = n * VGM_RATE / duration if duration > 0 else VGM_RATE
+            # The fastest interval must still have its own frame or its byte
+            # is overwritten when the body is laid out.
+            fastest = VGM_RATE / min(waits) if waits else float(VGM_RATE)
+            rate = max(1, min(
+                DAC_RATE_MAX, max(int(round(dense)), int(round(fastest))),
+            ))
+            body = _frames_from_times(
+                [(t, b, 0) for t, b in zip(rep["times"], rep["bytes"])],
+                rate, stats,
+            )
+            sample_of[(off, cluster_i)] = len(samples)
+            samples.append(DacSample(
+                off, len(body), body, rate, rep["t"],
+            ))
 
     plays: list[DacPlay] = []
     for run in audible:
-        idx = sample_of[run["off"]]
+        idx = sample_of[(run["off"], run["cluster"])]
         plays.append(DacPlay(
             run["t"], idx, _pan_at(pan_timeline, run["t"]),
             run["times"][-1] - run["t"], False, True,
