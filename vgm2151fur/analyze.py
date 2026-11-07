@@ -1463,6 +1463,117 @@ def _take_tone(
     return 0, bucket[0]
 
 
+_TONE_MACRO_FIELDS = (
+    "pitch", "waves", "vol", "noise", "mode", "env_shape", "env_period",
+)
+_TONE_MACRO_TIMING = (
+    ("pitch", "pitch_speed", "pitch_loop"),
+    ("waves", "wave_speed", "wave_loop"),
+    ("vol", "vol_speed", "vol_loop"),
+    ("noise", "noise_speed", "noise_loop"),
+    ("mode", "mode_speed", "mode_loop"),
+    ("env_shape", "env_shape_speed", "env_shape_loop"),
+    ("env_period", "env_period_speed", "env_period_loop"),
+)
+
+
+def _tone_sig(spec: ToneIns) -> tuple:
+    """Everything about a tone instrument except its macro values."""
+    skip = set(_TONE_MACRO_FIELDS)
+    for _field, speed, loop in _TONE_MACRO_TIMING:
+        skip.add(speed)
+        skip.add(loop)
+    return tuple(
+        (name, getattr(spec, name))
+        for name in spec.__dataclass_fields__ if name not in skip
+    )
+
+
+def _tone_macro_extends(a: ToneIns, b: ToneIns) -> bool:
+    """True when every macro of `a` extends the matching macro of `b`."""
+    for field in _TONE_MACRO_FIELDS:
+        va = tuple(getattr(a, field))
+        vb = tuple(getattr(b, field))
+        if bool(va) != bool(vb) or len(va) < len(vb):
+            return False
+        if va[:len(vb)] != vb:
+            return False
+    for field, speed, loop in _TONE_MACRO_TIMING:
+        if getattr(a, field) or getattr(b, field):
+            if (getattr(a, speed) != getattr(b, speed)
+                    or getattr(a, loop) != getattr(b, loop)):
+                return False
+    return True
+
+
+def _tone_macro_same_for(a: ToneIns, b: ToneIns, ticks: int) -> bool:
+    """Whether `a` and `b` play the same tone macros for `ticks` ticks."""
+    for field, speed_field, loop_field in _TONE_MACRO_TIMING:
+        speed = getattr(b, speed_field)
+        loop = getattr(b, loop_field)
+        if (
+            _macro_effective(tuple(getattr(a, field)), speed, loop, ticks)
+            != _macro_effective(tuple(getattr(b, field)), speed, loop, ticks)
+        ):
+            return False
+    return True
+
+
+def _tone_macro_size(spec: ToneIns) -> int:
+    return sum(len(getattr(spec, field)) for field in _TONE_MACRO_FIELDS)
+
+
+def _merge_tone_prefixes(
+    bucket: list[ToneIns],
+    notes_by_ins: dict[int, list[tuple[int, int]]] | None = None,
+    tick_samples: float = 0.0,
+    use_speed: int = 1,
+) -> dict[int, int]:
+    """Share the longest left-to-right-compatible tone macro.
+
+    Volume and pitch envelopes often differ only by how long they continue:
+    a short note's copy is the prefix of the sustained one. Keep the longer
+    and point every note at it; the next key-on cuts a short note before the
+    extra tail matters. Returns the old-index -> new-index map.
+    """
+    if len(bucket) < 2:
+        return {i: i for i in range(len(bucket))}
+    groups: dict[tuple, list[int]] = {}
+    for i, spec in enumerate(bucket):
+        groups.setdefault(_tone_sig(spec), []).append(i)
+
+    def extends(j: int, i: int) -> bool:
+        if not _tone_macro_extends(bucket[j], bucket[i]):
+            return False
+        for start, end in (notes_by_ins or {}).get(i, ()):
+            if end <= 0:
+                return False
+            ticks = _macro_ticks(start, end, tick_samples)
+            if not _tone_macro_same_for(bucket[j], bucket[i], ticks):
+                return False
+        return True
+
+    target = {i: i for i in range(len(bucket))}
+    for indexes in groups.values():
+        if len(indexes) > 1:
+            target.update(_prefix_targets(
+                indexes,
+                lambda i: _tone_macro_size(bucket[i]),
+                extends,
+            ))
+    mapping: dict[int, int] = {}
+    kept: list[ToneIns] = []
+    for i in range(len(bucket)):
+        if target[i] == i:
+            mapping[i] = len(kept)
+            kept.append(bucket[i])
+    for i in range(len(bucket)):
+        mapping[i] = mapping[target[i]]
+    if len(kept) != len(bucket):
+        bucket[:] = kept
+    return mapping
+
+
 def _bind_tone_instruments(
     events: list[NoteEvent],
     scc_ins: list[ToneIns],
@@ -1482,6 +1593,7 @@ def _bind_tone_instruments(
     vsu_clock: int,
     hz: float,
     total_samples: int,
+    use_speed: int = 1,
     merge_tol: int = 0,
 ) -> int:
     """Fill `scc_ins` / `ay_ins` and point each tone note at one.
@@ -1887,6 +1999,33 @@ def _bind_tone_instruments(
         else:
             e.vol = column_vol
             e.vol_pts = ()
+    # Merge truncated macro copies before fixing the absolute indices. Each
+    # family has its own list, so shrinking one only moves that family's
+    # indices; the base offsets are computed from the final lengths below.
+    family_notes: dict[int, dict[int, list[tuple[int, int]]]] = {}
+    for event, idx in bound:
+        family_notes.setdefault(event.tone_chip, {}).setdefault(
+            idx, []).append((event.sample, event.end or track_end))
+    tone_maps = {
+        1: _merge_tone_prefixes(
+            scc_ins, family_notes.get(1), tick_samples, use_speed),
+        2: _merge_tone_prefixes(
+            ay_ins, family_notes.get(2), tick_samples, use_speed),
+        3: _merge_tone_prefixes(
+            psg_ins, family_notes.get(3), tick_samples, use_speed),
+        4: _merge_tone_prefixes(
+            nes_ins, family_notes.get(4), tick_samples, use_speed),
+        5: _merge_tone_prefixes(
+            huc6280_ins, family_notes.get(5), tick_samples, use_speed),
+        6: _merge_tone_prefixes(
+            gb_ins, family_notes.get(6), tick_samples, use_speed),
+        7: _merge_tone_prefixes(
+            vsu_ins, family_notes.get(7), tick_samples, use_speed),
+    }
+    for i, (event, idx) in enumerate(bound):
+        mapping = tone_maps.get(event.tone_chip)
+        if mapping is not None:
+            bound[i] = (event, mapping.get(idx, idx))
     n_scc = len(scc_ins)
     n_ay = len(ay_ins)
     n_psg = len(psg_ins)
@@ -2026,6 +2165,7 @@ def _tone_instrument_demand(
     vsu_clock: int,
     hz: float,
     total_samples: int,
+    use_speed: int = 1,
 ) -> int:
     """How many tone instruments the notes want with an unlimited budget.
 
@@ -2044,7 +2184,7 @@ def _tone_instrument_demand(
         # every distinct macro shape is counted.
         -1000,
         scc_clock, ay_clock, psg_clock, nes_clock, huc6280_clock,
-        gb_clock, vsu_clock, hz, total_samples,
+        gb_clock, vsu_clock, hz, total_samples, use_speed,
     )
     return sum(len(bucket) for bucket in (scc, ay, psg, nes, huc, gb, vsu))
 
@@ -3195,6 +3335,240 @@ def _rebase_non_fm_ins(
     for e in events:
         if (e.dac or e.pcm or e.tone_chip) and e.ins >= old_count:
             e.ins += delta
+
+
+# Macro fields of an FM instrument. Two instruments whose non-macro identity
+# matches may share one when every macro agrees from left to right; the longer
+# macro wins because a short note only plays the prefix before the next key-on.
+_FM_MACRO_FIELDS = (
+    "fms_macro", "ams_macro", "pitch_macro", "wave_macro", "vol_macro",
+    "phase_macro", "op_tl_macro", "op_dt_macro", "op_dt2_macro",
+    "op_mul_macro",
+)
+_FM_MACRO_SPEEDS = (
+    ("fms_macro", "macro_speed"),
+    ("pitch_macro", "pitch_speed"),
+    ("wave_macro", "wave_speed"),
+    ("vol_macro", "vol_speed"),
+    ("phase_macro", "phase_speed"),
+)
+_FM_MACRO_LOOPS = (
+    ("pitch_macro", "pitch_loop"),
+    ("wave_macro", "wave_loop"),
+    ("vol_macro", "vol_loop"),
+    ("phase_macro", "phase_loop"),
+)
+
+
+def _macro_extends(a, b) -> bool:
+    """True when `a` is `b` plus a (possibly empty) extra tail."""
+    a = tuple(a)
+    b = tuple(b)
+    if bool(a) != bool(b) or len(a) < len(b):
+        return False
+    return a[:len(b)] == b
+
+
+def _op_macro_extends(a, b) -> bool:
+    """Compare per-operator macros: `a` must extend `b` for every operator."""
+    da = {op: (tuple(values), speed) for op, values, speed in a}
+    db = {op: (tuple(values), speed) for op, values, speed in b}
+    if set(da) != set(db):
+        return False
+    for op in da:
+        values_a, speed_a = da[op]
+        values_b, speed_b = db[op]
+        if speed_a != speed_b or not _macro_extends(values_a, values_b):
+            return False
+    return True
+
+
+def _fm_macro_extends(a: FMPatch, b: FMPatch) -> bool:
+    """Whether `a` carries every macro of `b` plus a longer tail."""
+    for field in _FM_MACRO_FIELDS:
+        va = getattr(a, field)
+        vb = getattr(b, field)
+        if field.startswith("op_"):
+            if not _op_macro_extends(va, vb):
+                return False
+        elif not _macro_extends(va, vb):
+            return False
+    for field, speed in _FM_MACRO_SPEEDS:
+        if (getattr(a, field) or getattr(b, field)) and (
+                getattr(a, speed) != getattr(b, speed)):
+            return False
+    for field, loop in _FM_MACRO_LOOPS:
+        if (getattr(a, field) or getattr(b, field)) and (
+                getattr(a, loop) != getattr(b, loop)):
+            return False
+    return True
+
+
+def _macro_ticks(start: int, end: int, tick_samples: float) -> int:
+    if end <= start:
+        return 1
+    return max(1, int(math.ceil((end - start) / tick_samples)))
+
+
+def _macro_effective(
+    values: tuple[int, ...], speed: int, loop: int, ticks: int,
+) -> tuple[int, ...]:
+    """The value a macro plays on each tick, including its hold/loop tail."""
+    if not values:
+        return ()
+    speed = max(1, speed)
+    out: list[int] = []
+    for t in range(ticks):
+        pos = t // speed
+        if pos < len(values):
+            out.append(values[pos])
+        elif 0 <= loop < len(values):
+            span = max(1, len(values) - loop)
+            out.append(values[loop + (pos - len(values)) % span])
+        else:
+            out.append(values[-1])
+    return tuple(out)
+
+
+def _fm_macro_same_for(a: FMPatch, b: FMPatch, ticks: int) -> bool:
+    """Whether `a` and `b` play the same macros for `ticks` ticks."""
+    speed_of = dict(_FM_MACRO_SPEEDS)
+    loop_of = dict(_FM_MACRO_LOOPS)
+    for field in _FM_MACRO_FIELDS:
+        va = getattr(a, field)
+        vb = getattr(b, field)
+        if field.startswith("op_"):
+            da = {op: (tuple(values), speed) for op, values, speed in va}
+            db = {op: (tuple(values), speed) for op, values, speed in vb}
+            for op in db:
+                if (
+                    _macro_effective(da[op][0], da[op][1], 255, ticks)
+                    != _macro_effective(db[op][0], db[op][1], 255, ticks)
+                ):
+                    return False
+        else:
+            speed = getattr(b, speed_of[field]) if field in speed_of else 1
+            loop = getattr(b, loop_of[field]) if field in loop_of else 255
+            if (
+                _macro_effective(tuple(va), speed, loop, ticks)
+                != _macro_effective(tuple(vb), speed, loop, ticks)
+            ):
+                return False
+    return True
+
+
+def _fm_macro_size(patch: FMPatch) -> int:
+    size = 0
+    for field in _FM_MACRO_FIELDS:
+        value = getattr(patch, field)
+        if field.startswith("op_"):
+            size += sum(len(values) for _op, values, _speed in value)
+        else:
+            size += len(value)
+    return size
+
+
+def _prefix_targets(indexes: list[int], size_of, prefix_of) -> dict[int, int]:
+    """Map each index to the longest compatible extension in its group.
+
+    Prefix chains are resolved to the final (largest) member. Equal-size
+    identical macros pick the lower index so the mapping is stable.
+    """
+    target: dict[int, int] = {i: i for i in indexes}
+    for i in indexes:
+        best: int | None = None
+        for j in indexes:
+            if j == i or not prefix_of(j, i):
+                continue
+            sj = size_of(j)
+            si = size_of(i)
+            if sj < si or (sj == si and j > i):
+                continue
+            if (
+                best is None
+                or sj > size_of(best)
+                or (sj == size_of(best) and j < best)
+            ):
+                best = j
+        if best is not None:
+            target[i] = best
+    for i in indexes:
+        cur = i
+        seen: set[int] = set()
+        while target[cur] != cur and cur not in seen:
+            seen.add(cur)
+            cur = target[cur]
+        target[i] = cur
+    return target
+
+
+def _merge_fm_prefix_macros(
+    events: list[NoteEvent], fm_patches: list[FMPatch],
+    tick_samples: float,
+) -> int:
+    """Share the longest left-to-right-compatible macro between instruments.
+
+    Short notes often produce a truncated copy of the same instrument macro.
+    When every macro agrees from the beginning and only one has a longer tail,
+    the longer instrument plays the short note identically (the next key-on
+    comes first). Keep the longest and drop the shorter copies. This runs just
+    before the hard-limit trim, so it can save slots without losing motion.
+    """
+    old_count = len(fm_patches)
+    if old_count < 2:
+        return 0
+    notes_by_ins: dict[int, list[tuple[int, int]]] = {}
+    for e in events:
+        if e.on and 0 <= e.ins < old_count:
+            notes_by_ins.setdefault(e.ins, []).append((e.sample, e.end))
+    groups: dict[tuple, list[int]] = {}
+    for i, patch in enumerate(fm_patches):
+        groups.setdefault(patch.identity(), []).append(i)
+
+    def extends(j: int, i: int) -> bool:
+        if not _fm_macro_extends(fm_patches[j], fm_patches[i]):
+            return False
+        for start, end in notes_by_ins.get(i, ()):
+            if end <= 0:
+                return False
+            ticks = _macro_ticks(start, end, tick_samples)
+            if not _fm_macro_same_for(fm_patches[j], fm_patches[i], ticks):
+                return False
+        return True
+
+    target = {i: i for i in range(old_count)}
+    for indexes in groups.values():
+        if len(indexes) > 1:
+            target.update(_prefix_targets(
+                indexes,
+                lambda i: _fm_macro_size(fm_patches[i]),
+                extends,
+            ))
+    if all(target[i] == i for i in range(old_count)):
+        return 0
+    new_index: dict[int, int] = {}
+    kept: list[FMPatch] = []
+    for i in range(old_count):
+        if target[i] == i:
+            new_index[i] = len(kept)
+            kept.append(fm_patches[i])
+    for i in range(old_count):
+        new_index[i] = new_index[target[i]]
+    merged_patches: list[FMPatch] = []
+    for idx, patch in enumerate(kept):
+        base = (
+            new_index.get(patch.base_ins, -1)
+            if patch.base_ins >= 0 else -1
+        )
+        if base == idx:
+            base = -1             # the copy's base merged into this slot
+        merged_patches.append(replace(patch, base_ins=base))
+    fm_patches[:] = merged_patches
+    for e in events:
+        if 0 <= e.ins < old_count:
+            e.ins = new_index.get(e.ins, e.ins)
+    _rebase_non_fm_ins(events, old_count, len(fm_patches))
+    return old_count - len(fm_patches)
 
 
 def _trim_fm_macro_copies(
@@ -9643,7 +10017,7 @@ def analyze(
         tone_demand = _tone_instrument_demand(
             events, vgm.k051649_clock or SCC_DEFAULT_CLOCK, ay_note_clock,
             psg_clock, nes_clock, huc6280_clock, gb_clock, vsu_clock,
-            hz, vgm.total_samples,
+            hz, vgm.total_samples, use_speed,
         )
     tone_demand_raw = tone_demand
     free_slots = max(
@@ -9767,7 +10141,7 @@ def analyze(
         huc6280_clock,
         gb_clock,
         vsu_clock,
-        hz, vgm.total_samples,
+        hz, vgm.total_samples, use_speed,
         merge_tol=tone_merge_tol,
     )
     if tone_merged:
@@ -9880,6 +10254,11 @@ def analyze(
         + n_ym2608_rhythm_ins + n_ym2608_b_ins
         + n_ssg_pcm + len(ymz_audible)
     )
+    # Before trimming anything for the hard limit, share an instrument whose
+    # macros only differ by a longer tail with its shorter copies. A short
+    # note keyed off before the extra tail is reached plays exactly the same.
+    _merge_fm_prefix_macros(events, fm_list, VGM_RATE / hz)
+
     # Absolute ceiling. The per-family caps target INS_TARGET, but a mixed
     # log or a late copy pass can still land above the final hard limit.
     # Fold only pass-created FM copies back onto their base voices; base
