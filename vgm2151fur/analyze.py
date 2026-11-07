@@ -1553,6 +1553,8 @@ def _delay_leading_values(values, speed: int) -> tuple[tuple, int]:
 def _compress_tone_delays(bucket: list[ToneIns]) -> None:
     """Make every leading-hold macro use the delay field before grouping."""
     for i, spec in enumerate(bucket):
+        if not spec.pitch and not spec.vol:
+            continue
         changes: dict[str, object] = {}
         if spec.pitch and spec.pitch_loop == 255 and not spec.pitch_delay:
             values, delay = _delay_leading_values(spec.pitch, spec.pitch_speed)
@@ -1709,7 +1711,9 @@ def _merge_tone_prefixes(
 
     target = {i: i for i in range(len(bucket))}
     for indexes in groups.values():
-        if len(indexes) > 1:
+        if len(indexes) > 1 and any(
+            _tone_macro_size(bucket[i]) > 0 for i in indexes
+        ):
             target.update(_prefix_targets(
                 indexes,
                 lambda i: _tone_macro_size(bucket[i]),
@@ -2583,7 +2587,7 @@ def _step_compress(
 
 def _macro_series(
     series: list[int], *, tail_loop: bool = False,
-    initial_speed: int = 1, loop_min: int = 0,
+    initial_speed: int = 1, loop_min: int = 0, tail_min: int = 16,
 ) -> tuple[tuple[int, ...], int, int]:
     """(values, speed, loop) for one tone macro from a per-tick series.
 
@@ -2605,7 +2609,7 @@ def _macro_series(
         p = _cycle(series)
         if p is not None and loop_min == 0:
             return tuple(series[:p]), 1, 0
-        if tail_loop:
+        if tail_loop and len(series) > tail_min:
             cyc = _tail_cycle(series, min_start=loop_min)
             if cyc is None:
                 cyc = _lfo_tail_cycle(series, min_start=loop_min)
@@ -2617,7 +2621,7 @@ def _macro_series(
     p = _cycle(series)
     if p is not None and p < len(series) and loop_min == 0:
         return tuple(series[:p]), speed, 0
-    if tail_loop:
+    if tail_loop and len(series) > tail_min:
         cyc = _tail_cycle(series, min_start=loop_min)
         if cyc is None:
             cyc = _lfo_tail_cycle(series, min_start=loop_min)
@@ -2649,10 +2653,11 @@ def _macro_series_delay(
     if run <= 1:
         speed = 1
         body = series
-        if step_compress:
+        use_tail = tail_loop and len(body) > 16
+        if step_compress and len(body) > 16:
             body, speed = _step_compress(series)
         values, out_speed, loop = _macro_series(
-            body, tail_loop=tail_loop, initial_speed=speed,
+            body, tail_loop=use_tail, initial_speed=speed, tail_min=0,
         )
         return values, out_speed, loop, 0
     # The delay holds the first value for delay+1 ticks. Anything beyond that
@@ -2661,7 +2666,8 @@ def _macro_series_delay(
     # larger step length for the moving part.
     speed = 1
     body = list(series[run:])
-    if step_compress:
+    use_tail = tail_loop and len(body) > 16
+    if step_compress and len(body) > 16:
         body, speed = _step_compress(body)
     if run <= 256:
         short = [first] + body
@@ -2672,7 +2678,8 @@ def _macro_series_delay(
         short = [first] * (1 + extra_copies) + body
         delay = 255
     values, out_speed, loop = _macro_series(
-        short, tail_loop=tail_loop, initial_speed=speed, loop_min=1,
+        short, tail_loop=use_tail, initial_speed=speed, loop_min=1,
+        tail_min=0,
     )
     speed = out_speed
     # A loop that starts at the first value repeats the leading run on every
@@ -3968,7 +3975,9 @@ def _merge_fm_prefix_macros(
 
     target = {i: i for i in range(old_count)}
     for indexes in groups.values():
-        if len(indexes) > 1:
+        if len(indexes) > 1 and any(
+            _fm_macro_size(fm_patches[i]) > 0 for i in indexes
+        ):
             target.update(_prefix_targets(
                 indexes,
                 lambda i: _fm_macro_size(fm_patches[i]),
