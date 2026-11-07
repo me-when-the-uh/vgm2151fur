@@ -560,6 +560,22 @@ class TestLossySamplesPrompt(unittest.TestCase):
         plain = cli.build_parser().parse_args(["convert", "Track.vgm"])
         self.assertFalse(plain.lossy_sample_clustering)
 
+    def test_latch_is_not_persisted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "state.json"
+            path.write_text(
+                json.dumps({"lossy_samples": True, "browse_root": "x"}),
+                encoding="utf-8",
+            )
+            state = menu._load_state(path)
+            self.assertNotIn("lossy_samples", state)
+            self.assertEqual(state["browse_root"], "x")
+
+            menu._save_state(path, {"lossy_samples": True, "browse_root": "x"})
+            saved = json.loads(path.read_text(encoding="utf-8"))
+            self.assertNotIn("lossy_samples", saved)
+            self.assertEqual(saved["browse_root"], "x")
+
 
 class TestMenuFurnaceDefault(unittest.TestCase):
     """The menu must not launch Furnace unless the user asks for it."""

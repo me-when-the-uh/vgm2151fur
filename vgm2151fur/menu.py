@@ -167,14 +167,21 @@ def _dispatch(read, out, state, state_path, raw: str, key: str):
 
 def _load_state(path: Path) -> dict:
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        state = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return {}
+    # The experimental lossy clustering choice is a session-only latch.
+    # Pasting a path later in the same menu run may reuse the answer, but a
+    # new session must default back to the normal (non-lossy) conversion.
+    state.pop("lossy_samples", None)
+    return state
 
 
 def _save_state(path: Path, state: dict) -> None:
     try:
-        path.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+        payload = dict(state)
+        payload.pop("lossy_samples", None)
+        path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
     except OSError:
         pass
 
