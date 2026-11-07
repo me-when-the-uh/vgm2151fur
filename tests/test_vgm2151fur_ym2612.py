@@ -1853,9 +1853,10 @@ class TestYm2612DacFragmentClustering(unittest.TestCase):
             out.append((value >> 16) & 0xFF)
         return bytes(out)
 
-    def test_sample_map_stays_within_the_target(self):
+    @classmethod
+    def _song(cls):
         samples = [
-            DacSample(i, 64, self._body(i), 14700, i * 4410)
+            DacSample(i, 64, cls._body(i), 14700, i * 4410)
             for i in range(40)
         ]
         plays = []
@@ -1869,9 +1870,13 @@ class TestYm2612DacFragmentClustering(unittest.TestCase):
                 (10 + i) * 4410, i, (i * 53) & 0xFF, 1000, False, True,
             ))
         plays.sort(key=lambda p: p.onset)
+        return samples, plays
+
+    def test_sample_map_stays_within_the_target_when_enabled(self):
+        samples, plays = self._song()
         out, notes, _offs, _pans, warn, stats = group_dac_plays(
             samples, plays, hz=60.0, speed=6, total_samples=300000,
-            trim=False,
+            trim=False, cluster_fragments=True,
         )
         self.assertFalse(warn)
         self.assertLessEqual(len(out), DAC_TARGET_SAMPLES)
@@ -1883,6 +1888,16 @@ class TestYm2612DacFragmentClustering(unittest.TestCase):
             {bytes(smp.data) for smp in out},
         )
         self.assertGreaterEqual(stats.get("dac_fragment_clustered", 0), 1)
+
+    def test_clustering_is_off_by_default(self):
+        samples, plays = self._song()
+        out, notes, _offs, _pans, warn, _stats = group_dac_plays(
+            samples, plays, hz=60.0, speed=6, total_samples=300000,
+            trim=False,
+        )
+        self.assertFalse(warn)
+        self.assertGreater(len(out), DAC_TARGET_SAMPLES)
+        self.assertEqual(len(notes), len(plays))
 
 
 class TestYm2612DacLongHolds(unittest.TestCase):

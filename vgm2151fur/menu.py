@@ -208,6 +208,15 @@ def _ask_lfo_loop(read) -> bool:
     return answer not in ("n", "no")
 
 
+def _ask_lossy_samples(read) -> bool:
+    """Optional aggressive sample clustering. Defaults to no."""
+    answer = _ask(
+        read, "experimental aggressive (lossy) sample clustering? (y/N)",
+        "n",
+    ).lower()
+    return answer in ("y", "yes")
+
+
 def _ask_existing(read, out, prompt: str) -> list[Path] | None:
     """Paths that exist. Blank cancels. Quotes and globs are accepted."""
     while True:
@@ -439,14 +448,17 @@ def _pack_view(read, out, pack: Pack, state: dict, state_path: Path) -> str:
 def _run_convert(
     out, files: list[Path], dest: Path, speed: int | None,
     optimize: str = "all", verify: bool = False, lfo_loop: bool = True,
+    lossy_samples: bool = False,
 ) -> int:
     if optimize != "none":
         return _run_variants(
             out, files, dest, 4, optimize, verify, lfo_loop=lfo_loop,
+            lossy_samples=lossy_samples,
         )
     done = rc = 0
     for src, info, error in convert_folder(
         files, dest, speed=speed, normalize=verify, lfo_loop=lfo_loop,
+        lossy_samples=lossy_samples,
         log=lambda message: out(f"  {message}"),
     ):
         if error is not None:
@@ -475,6 +487,7 @@ def _run_convert(
 def _run_variants(
     out, files: list[Path], dest: Path, factor: int, mode: str,
     verify: bool = False, layout: str = "dirs", lfo_loop: bool = True,
+    lossy_samples: bool = False,
 ) -> int:
     done = rc = 0
     use_verify = verify and mode != "all"
@@ -483,6 +496,7 @@ def _run_variants(
     for src, info, error in convert_folder(
         files, dest, variants=True, condense=factor, optimize=mode,
         verify=verify, layout=layout, normalize=verify, lfo_loop=lfo_loop,
+        lossy_samples=lossy_samples,
         log=lambda message: out(f"  {message}"),
     ):
         if error is not None:
@@ -519,13 +533,15 @@ def cmd_condense(read, out, state, state_path):
     factor = _ask(read, "max condense factor (2-4)", "4")
     mode = _ask_optimise(read)
     lfo_loop = _ask_lfo_loop(read)
+    lossy_samples = _ask_lossy_samples(read)
     verify = _ask(
         read, "normalize/verify through Furnace? (y/N)", "n"
     ).lower() in ("y", "yes")
     state["lfo_loop"] = lfo_loop
+    state["lossy_samples"] = lossy_samples
     rc = _run_variants(
         out, vgms, dst, int(factor) if factor.isdigit() else 4, mode, verify,
-        lfo_loop=lfo_loop,
+        lfo_loop=lfo_loop, lossy_samples=lossy_samples,
     )
     state.setdefault("out_dirs", {})[str(vgms[0].parent)] = str(dst)
     _save_state(state_path, state)
@@ -542,13 +558,15 @@ def _pack_convert(read, out, pack, tracks, default_dir: Path, state, state_path)
     dst = Path(_ask(read, "output folder", str(default_dir)))
     optimize = _ask_optimise(read)
     lfo_loop = _ask_lfo_loop(read)
+    lossy_samples = _ask_lossy_samples(read)
     verify = _ask(
         read, "normalize/verify through Furnace? (y/N)", "n"
     ).lower() in ("y", "yes")
     state["lfo_loop"] = lfo_loop
+    state["lossy_samples"] = lossy_samples
     _run_convert(
         out, [tracks[i] for i in picks], dst, None, optimize, verify,
-        lfo_loop,
+        lfo_loop, lossy_samples,
     )
     state.setdefault("out_dirs", {})[str(pack.path)] = str(dst)
     state["pack"] = str(pack.path)
@@ -617,9 +635,11 @@ def _pack_render(read, out, tracks, fur_dir: Path, *, spec: str | None = None) -
 def _convert_now(
     out, files: list[Path], dest: Path, speed: int | None,
     optimize: str = "all", verify: bool = False, lfo_loop: bool = True,
+    lossy_samples: bool = False,
 ) -> int:
     return _run_convert(
         out, files, dest, speed, optimize, verify, lfo_loop=lfo_loop,
+        lossy_samples=lossy_samples,
     )
 
 
@@ -654,14 +674,16 @@ def cmd_convert_file(read, out, state, state_path):
     speed = _ask(read, "ticks per row (blank = auto)")
     optimize = _ask_optimise(read)
     lfo_loop = _ask_lfo_loop(read)
+    lossy_samples = _ask_lossy_samples(read)
     verify = _ask(
         read, "normalize/verify through Furnace? (y/N)", "n"
     ).lower() in ("y", "yes")
     state["lfo_loop"] = lfo_loop
+    state["lossy_samples"] = lossy_samples
     _save_state(state_path, state)
     return _convert_now(
         out, vgms, dst, int(speed) if speed.isdigit() else None, optimize,
-        verify, lfo_loop=lfo_loop,
+        verify, lfo_loop=lfo_loop, lossy_samples=lossy_samples,
     )
 
 
@@ -821,6 +843,7 @@ def _open_typed_path(read, out, state, state_path, raw: str):
         _convert_now(
             out, dedupe(vgms), vgms[0].parent / FUR_FOLDER, None,
             lfo_loop=bool(state.get("lfo_loop", True)),
+            lossy_samples=bool(state.get("lossy_samples", False)),
         )
         return None
     if furs and not vgms:

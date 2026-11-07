@@ -140,6 +140,7 @@ from vgm2151fur.nes import (
     NesPcmSample,
     _noise_note as nes_noise_note,
     _period_delta as nes_period_delta,
+    cluster_nes_pcm,
     collect_nes_dpcm,
     collect_nes_pcm,
     collect_nes_tones,
@@ -236,6 +237,7 @@ from vgm2151fur.vsu import (
 from vgm2151fur.ssgpcm import (
     SsgPcmHit,
     SsgPcmSample,
+    cluster_ssg_pcm,
     collect_ssg_pcm,
 )
 from vgm2151fur.ym2203 import (
@@ -6406,6 +6408,7 @@ def analyze(
     c352_quad: bool = False,
     dac_slices: bool = False,
     lfo_loop: bool = True,
+    lossy_samples: bool = False,
 ) -> Song:
     """Build the Song for one rendition of `vgm`.
 
@@ -9749,6 +9752,16 @@ def analyze(
             vgm, nes_clock,
         )
         warnings.extend(nes_warn)
+        if lossy_samples:
+            before = len(nes_pcm_samples)
+            nes_pcm_samples, nes_pcm_hits = cluster_nes_pcm(
+                nes_pcm_samples, nes_pcm_hits,
+            )
+            if len(nes_pcm_samples) < before:
+                warnings.append(
+                    f"NES raw PCM: lossy sample clustering {before} -> "
+                    f"{len(nes_pcm_samples)} bodies"
+                )
     else:
         nes_tones, nes_offs = [], []
         nes_dpcm_samples, nes_dpcm_hits = [], []
@@ -9931,6 +9944,14 @@ def analyze(
             return [], []
         got, got_hits, got_warn = collect_ssg_pcm(vgm, chip=chip_name)
         warnings.extend(got_warn)
+        if lossy_samples:
+            before = len(got)
+            got, got_hits = cluster_ssg_pcm(got, got_hits)
+            if len(got) < before:
+                warnings.append(
+                    f"{chip_name}: lossy sample clustering {before} -> "
+                    f"{len(got)} bodies"
+                )
         return got, got_hits
 
     def _emit_pcm(got, got_hits, at) -> None:
@@ -10868,6 +10889,7 @@ def analyze(
     if pcm and is_opn2:
         dac_samples, dac_plays, dac_warn, dac_stats = collect_dac(
             vgm, slices=dac_slices, grid=(hz, use_speed, t0),
+            lossy_samples=lossy_samples,
         )
         warnings.extend(dac_warn)
         if (
@@ -10886,10 +10908,16 @@ def analyze(
             dac_samples, dac_plays, hz=hz, speed=use_speed, t0=t0,
             total_samples=vgm.total_samples or 0,
             drop_quiet=not dac_slices,
-            cluster_fragments=not dac_slices,
+            cluster_fragments=lossy_samples and not dac_slices,
         )
         dac_stats.update(dac_group_stats)
         warnings.extend(dac_group_warn)
+        if lossy_samples and dac_group_stats.get("dac_fragment_clustered"):
+            warnings.append(
+                "YM2612 DAC: lossy sample clustering folded "
+                f"{dac_group_stats['dac_fragment_clustered']} bodies into "
+                f"{len(dac_samples)} slots"
+            )
         n_dac_ins = (len(dac_samples) + 119) // 120
         if n_dac_ins:
             _rebase_non_fm_ins(events, dac_base, dac_base + n_dac_ins)

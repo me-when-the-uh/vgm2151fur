@@ -497,6 +497,70 @@ class TestLfoLoopPrompt(unittest.TestCase):
         self.assertFalse(calls[0]["lfo_loop"])
 
 
+class TestLossySamplesPrompt(unittest.TestCase):
+    def test_prompt_defaults_to_no(self):
+        prompts: list[str] = []
+
+        def read(prompt: str) -> str:
+            prompts.append(prompt)
+            return ""
+
+        self.assertFalse(menu._ask_lossy_samples(read))
+        self.assertIn("lossy", prompts[0])
+        self.assertIn("(y/N)", prompts[0])
+
+    def test_yes_enables_it(self):
+        self.assertTrue(menu._ask_lossy_samples(lambda _prompt: "y"))
+
+    def test_pasted_path_uses_the_saved_setting(self):
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "a.vgm"
+            src.write_bytes(_music_vgm())
+            calls: list[dict] = []
+
+            def fake_convert(*_args, **kw):
+                calls.append(kw)
+                return 0
+
+            with mock.patch.object(menu, "_convert_now", fake_convert):
+                menu._open_typed_path(
+                    lambda _prompt: "", lambda _message: None,
+                    {"lossy_samples": True}, Path(tmp) / "state.json",
+                    str(src),
+                )
+            self.assertTrue(calls[0]["lossy_samples"])
+
+    def test_conversion_carries_the_flag(self):
+        from unittest import mock
+
+        calls: list[dict] = []
+        info = {
+            "dst": "out/a.fur", "bytes": 1, "speed": 1, "events": 1,
+            "gain": None, "loop": None, "warnings": [],
+        }
+
+        def fake_convert(files, dest, **kw):
+            calls.append(kw)
+            return iter([(files[0], info, None)])
+
+        with mock.patch.object(menu, "convert_folder", fake_convert):
+            menu._run_convert(
+                lambda _message: None, [Path("a.vgm")], Path("out"), None,
+                "none", lossy_samples=True,
+            )
+        self.assertTrue(calls[0]["lossy_samples"])
+
+    def test_cli_flag_parses(self):
+        args = cli.build_parser().parse_args(
+            ["convert", "Track.vgm", "--lossy-sample-clustering"]
+        )
+        self.assertTrue(args.lossy_sample_clustering)
+        plain = cli.build_parser().parse_args(["convert", "Track.vgm"])
+        self.assertFalse(plain.lossy_sample_clustering)
+
+
 class TestMenuFurnaceDefault(unittest.TestCase):
     """The menu must not launch Furnace unless the user asks for it."""
 

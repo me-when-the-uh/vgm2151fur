@@ -7,10 +7,12 @@ slice representation; `timeline=True` is the old comparison body.
 from __future__ import annotations
 
 import bisect
-import math
 import statistics
 from dataclasses import dataclass
 
+from vgm2151fur.samplecluster import (
+    DEFAULT_HOT, DEFAULT_TARGET, cluster_fragments as cluster_bodies,
+)
 from vgm2151fur.timing import place_tick
 from vgm2151fur.vgm import (
     VGM_RATE, DAC_STREAM_YM2612, DacStreamPlay, VgmFile,
@@ -65,18 +67,10 @@ DAC_ATTACK_MIN_FRAMES = 2
 DAC_ATTACK_QUIET_PEAK = 4
 DAC_ATTACK_JUMP = 24
 DAC_ATTACK_QUIET_SAMPLES = 32
-# Keep the result inside this many sample-map slots.  Samples always start at
-# frame 0, so a short fragment can only reuse a body whose opening frames
-# sound like it.  The first DAC_HOT_ANCHORS most-used bodies always stay; the
-# remaining slots go to the longest bodies, so a long one-shot beats a pile
-# of micro-fragments.  Everything else maps to the closest anchor by a
-# deliberately loose prefix comparison: these are fragments the row grid
-# cannot resolve anyway, and the note's own span still cuts the shared body
-# at the right time.
-DAC_TARGET_SAMPLES = 32
-DAC_HOT_ANCHORS = 16
-DAC_FRAGMENT_LIMIT = 128
-DAC_FRAGMENT_SHIFT = 8
+# Optional aggressive (lossy) clustering target.  This is off by default;
+# `lossy_samples=True` asks for it.  See samplecluster.py for the rule.
+DAC_TARGET_SAMPLES = DEFAULT_TARGET
+DAC_HOT_ANCHORS = DEFAULT_HOT
 
 
 @dataclass(frozen=True)
@@ -1537,6 +1531,7 @@ def _collect_packed(
     vgm: VgmFile,
     *,
     grid: tuple[float, int, int] | None = None,
+    lossy_samples: bool = False,
 ) -> tuple[list[DacSample], list[DacPlay], list[str], dict]:
     """Build source-segment samples, or release-capped chunks as a fallback.
 
@@ -1584,6 +1579,7 @@ def _collect_packed(
             preview, *_rest = group_dac_plays(
                 samples, plays, hz=grid[0], speed=grid[1], t0=grid[2],
                 total_samples=vgm.total_samples or 0, trim=False,
+                cluster_fragments=lossy_samples,
             )
             estimate = len(preview)
         else:
@@ -1735,6 +1731,7 @@ def _collect_packed(
 def collect_dac(
     vgm: VgmFile, *, slices: bool = False, timeline: bool = False,
     grid: tuple[float, int, int] | None = None,
+    lossy_samples: bool = False,
 ) -> tuple[list[DacSample], list[DacPlay], list[str], dict]:
     """Return (samples, plays, warnings, stats).
 
@@ -1748,7 +1745,7 @@ def collect_dac(
         return _collect_timeline(vgm)
     if slices:
         return _collect_slices(vgm)
-    return _collect_packed(vgm, grid=grid)
+    return _collect_packed(vgm, grid=grid, lossy_samples=lossy_samples)
 
 
 def _play_frames(samples: list[DacSample], p: DacPlay) -> int:
@@ -2224,53 +2221,6 @@ def _compact_samples(
     ]
 
 
-def _prefix_mad(a: bytes, b: bytes, shift: int, limit: int) -> float | None:
-    """Mean absolute difference of ``a`` against ``b`` shifted by ``shift``."""
-    n = min(len(a), len(b) - shift, limit)
-    if n <= 0:
-        return None
-    return sum(
-        abs((a[i] if a[i] < 128 else a[i] - 256)
-            - (b[i + shift] if b[i + shift] < 128 else b[i + shift] - 256))
-        for i in range(n)
-    ) / n
-
-
-def _fragment_anchors(
-    samples: list[DacSample],
-    uses: dict[int, int],
-    target: int,
-) -> list[int]:
-    """The hottest bodies, then the longest/hottest ones, up to ``target``."""
-    if len(samples) <= target:
-        return list(range(len(samples)))
-    by_uses = sorted(
-        range(len(samples)),
-        key=lambda i: (uses.get(i, 0), len(samples[i].data)),
-        reverse=True,
-    )
-    # Fill the remaining slots by length first: a long unique body is worth
-    # more than another short fragment that would only stand in for others.
-    by_length = sorted(
-        range(len(samples)),
-        key=lambda i: (len(samples[i].data), uses.get(i, 0)),
-        reverse=True,
-    )
-    chosen: list[int] = []
-    seen: set[int] = set()
-    for i in by_uses[:min(DAC_HOT_ANCHORS, target)]:
-        chosen.append(i)
-        seen.add(i)
-    for i in by_length:
-        if len(chosen) >= target:
-            break
-        if i in seen:
-            continue
-        chosen.append(i)
-        seen.add(i)
-    return chosen
-
-
 def _cluster_fragments(
     samples: list[DacSample],
     notes: list[tuple[int, int, int]],
@@ -2278,72 +2228,28 @@ def _cluster_fragments(
     *,
     target: int = DAC_TARGET_SAMPLES,
 ) -> tuple[list[DacSample], list[tuple[int, int, int]]]:
-    """Reduce the sample map to ``target`` bodies by clustering fragments.
-
-    Samples always start at frame 0, so a fragment can only reuse a body
-    whose opening frames sound like the fragment's opening.  The comparison
-    is deliberately loose: these are sub-row fragments and the row grid
-    cannot resolve their exact timbre anyway.  The note's own span still cuts
-    the shared body at the source run's end.
-    """
+    """Optionally reduce the sample map to ``target`` bodies."""
     if not notes or len(samples) <= target:
         return samples, notes
     uses: dict[int, int] = {}
     for _t, idx, _pan in notes:
         uses[idx] = uses.get(idx, 0) + 1
-    anchors = _fragment_anchors(samples, uses, target)
-    if not anchors:
-        return samples, notes
-    anchor_set = set(anchors)
-    non_anchors = [i for i in range(len(samples)) if i not in anchor_set]
-
-    remap: dict[int, int] = {}
-    for i in non_anchors:
-        smp = samples[i]
-        limit = min(len(smp.data), DAC_FRAGMENT_LIMIT)
-        best: tuple[float, int] | None = None
-        for j in anchors:
-            other = samples[j]
-            score = min(
-                (value for shift in range(-DAC_FRAGMENT_SHIFT,
-                                          DAC_FRAGMENT_SHIFT + 1)
-                 if (value := _prefix_mad(
-                     smp.data, other.data, shift, limit,
-                 )) is not None),
-                default=None,
-            )
-            if score is None:
-                continue
-            # Rate and length are tie-breakers: a same-rate body that covers
-            # the whole fragment is preferable to one that detunes or ends
-            # early.  Every fragment still gets a home.
-            rate_penalty = abs(math.log(smp.c4_rate / other.c4_rate)) * 40.0
-            length_penalty = (
-                40.0 if len(other.data) < len(smp.data) else 0.0
-            )
-            effective = score + rate_penalty + length_penalty
-            if best is None or effective < best[0]:
-                best = (effective, j)
-        # Every fragment gets a home, even if its body is empty or shorter
-        # than the comparison window.
-        remap[i] = best[1] if best is not None else anchors[0]
-
-    if not remap:
+    keep, remap = cluster_bodies(
+        [smp.data for smp in samples],
+        [smp.c4_rate for smp in samples],
+        uses,
+        target=target,
+        hot=DAC_HOT_ANCHORS,
+    )
+    if len(keep) == len(samples):
         return samples, notes
     new_notes = [
-        (t, remap.get(idx, idx), pan) for t, idx, pan in notes
+        (t, remap[idx] if idx >= 0 else idx, pan)
+        for t, idx, pan in notes
     ]
-    used = {idx for _t, idx, _pan in new_notes}
-    keep = [
-        i for i in range(len(samples))
-        if i in used and i in anchor_set
-    ]
-    compact = {old: new for new, old in enumerate(keep)}
-    stats["dac_fragment_clustered"] = len(remap)
+    stats["dac_fragment_clustered"] = len(samples) - len(keep)
     stats["dac_fragment_samples_kept"] = len(keep)
-    return [samples[i] for i in keep], [
-        (t, compact[idx], pan) for t, idx, pan in new_notes
-    ]
+    return [samples[i] for i in keep], new_notes
 
 
 def group_dac_plays(
@@ -2357,7 +2263,7 @@ def group_dac_plays(
     map_capacity: int = DAC_MAP_CAPACITY,
     trim: bool = True,
     drop_quiet: bool = True,
-    cluster_fragments: bool = True,
+    cluster_fragments: bool = False,
 ) -> tuple[
     list[DacSample], list[tuple[int, int, int]],
     list[tuple[int, int]], list[tuple[int, int]],

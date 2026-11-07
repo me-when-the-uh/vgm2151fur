@@ -24,9 +24,11 @@ bit-bang bodies become 8-bit signed PCM.
 from __future__ import annotations
 
 import math
+from collections import Counter
 from dataclasses import dataclass, field
 
 from vgm2151fur.pitch import furnace_period_note
+from vgm2151fur.samplecluster import cluster_fragments
 from vgm2151fur.vgm import VGM_RATE, VgmFile
 
 NES_CHANNELS = 5
@@ -719,3 +721,29 @@ def collect_nes_pcm(
                 sample_index=idx,
             ))
     return samples, hits, warnings
+
+
+def cluster_nes_pcm(
+    samples: list[NesPcmSample],
+    hits: list[NesPcmHit],
+    *,
+    target: int = 32,
+    hot: int = 16,
+) -> tuple[list[NesPcmSample], list[NesPcmHit]]:
+    """Optionally fold short NES raw-PCM bodies into the hottest/longest ones."""
+    if len(samples) <= target:
+        return samples, hits
+    uses: Counter[int] = Counter(hit.sample_index for hit in hits)
+    keep, remap = cluster_fragments(
+        [smp.data for smp in samples],
+        [smp.rate for smp in samples],
+        dict(uses),
+        target=target,
+        hot=hot,
+    )
+    if len(keep) == len(samples):
+        return samples, hits
+    new_samples = [samples[i] for i in keep]
+    for hit in hits:
+        hit.sample_index = remap[hit.sample_index]
+    return new_samples, hits
