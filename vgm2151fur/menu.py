@@ -198,13 +198,13 @@ def _ask(read, prompt: str, default: str = "") -> str:
 
 def _ask_optimise(read) -> str:
     """`all` on yes, `none` on no. The prompt defaults to yes."""
-    answer = _ask(read, "optimise? (Y/n)", "y").lower()
+    answer = _ask(read, "optimise for pattern density? (Y/n)", "y").lower()
     return "none" if answer in ("n", "no") else "all"
 
 
 def _ask_lfo_loop(read) -> bool:
     """LFO/tail macro loop search. A separate, default-yes question."""
-    answer = _ask(read, "LFO looping optimization? (Y/n)", "y").lower()
+    answer = _ask(read, "detect and optimise for LFO loops? (Y/n)", "y").lower()
     return answer not in ("n", "no")
 
 
