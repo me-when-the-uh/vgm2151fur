@@ -1523,6 +1523,99 @@ def _tone_macro_size(spec: ToneIns) -> int:
     return sum(len(getattr(spec, field)) for field in _TONE_MACRO_FIELDS)
 
 
+def _tone_vol_sig(spec: ToneIns) -> tuple:
+    """Everything about a tone instrument except its volume macro."""
+    skip = {"vol", "vol_speed", "vol_loop"}
+    return tuple(
+        (name, getattr(spec, name))
+        for name in spec.__dataclass_fields__ if name not in skip
+    )
+
+
+_AY_VOL_SPREAD = 4
+
+
+def _vol_offset(loud: ToneIns, quiet: ToneIns) -> int | None:
+    """Constant 1..4-level difference from `loud` to `quiet`, else None."""
+    a = tuple(loud.vol)
+    b = tuple(quiet.vol)
+    if (
+        not a or not b or len(a) != len(b)
+        or loud.vol_speed != quiet.vol_speed
+        or loud.vol_loop != quiet.vol_loop
+    ):
+        return None
+    delta = a[0] - b[0]
+    if delta < 1 or delta > _AY_VOL_SPREAD:
+        return None
+    if any(x - y != delta for x, y in zip(a, b)):
+        return None
+    return delta
+
+
+def _merge_ay_volume_offsets(
+    bucket: list[ToneIns], notes: list[tuple[NoteEvent, int]],
+) -> dict[int, int]:
+    """Share one AY/SSG volume macro when copies differ by up to four levels.
+
+    The AY platform adds the pattern column to the macro
+    (``macro + column - 15``), so a quieter macro can ride the same
+    instrument by lowering the note's column by the same constant. The
+    difference has to be consistent at every macro step; a varying shape is
+    a different envelope, not a normalization. Keep the loudest macro so
+    every note still reaches the chip's maximum level.
+    """
+    if len(bucket) < 2:
+        return {i: i for i in range(len(bucket))}
+    groups: dict[tuple, list[int]] = {}
+    for i, spec in enumerate(bucket):
+        groups.setdefault(_tone_vol_sig(spec), []).append(i)
+    center_of: dict[int, int] = {i: i for i in range(len(bucket))}
+    volume_notes: dict[int, list[NoteEvent]] = {}
+    for event, idx in notes:
+        volume_notes.setdefault(idx, []).append(event)
+    for indexes in groups.values():
+        if len(indexes) < 2:
+            continue
+        # Keep the loudest macro: compensating columns only move down. The
+        # other direction would need a column above 15, which the platform
+        # cannot reach.
+        pending = sorted(
+            indexes, key=lambda i: (-sum(bucket[i].vol), i)
+        )
+        while pending:
+            center = pending.pop(0)
+            cluster = [center]
+            rest: list[int] = []
+            for i in pending:
+                if _vol_offset(bucket[center], bucket[i]) is not None:
+                    cluster.append(i)
+                else:
+                    rest.append(i)
+            pending = rest
+            if len(cluster) < 2:
+                continue
+            for i in cluster[1:]:
+                delta = _vol_offset(bucket[center], bucket[i])
+                assert delta is not None
+                if any(ev.vol < delta for ev in volume_notes.get(i, ())):
+                    continue
+                for ev in volume_notes.get(i, ()):
+                    ev.vol = max(0, min(15, ev.vol - delta))
+                center_of[i] = center
+    mapping: dict[int, int] = {}
+    kept: list[ToneIns] = []
+    for i in range(len(bucket)):
+        if center_of[i] == i:
+            mapping[i] = len(kept)
+            kept.append(bucket[i])
+    for i in range(len(bucket)):
+        mapping[i] = mapping[center_of[i]]
+    if len(kept) != len(bucket):
+        bucket[:] = kept
+    return mapping
+
+
 def _merge_tone_prefixes(
     bucket: list[ToneIns],
     notes_by_ins: dict[int, list[tuple[int, int]]] | None = None,
@@ -1999,6 +2092,17 @@ def _bind_tone_instruments(
         else:
             e.vol = column_vol
             e.vol_pts = ()
+    # AY/SSG volume envelopes that differ by a constant 1 or 2 can share the
+    # loudest instrument; the quieter notes ride the volume column. This runs
+    # before the generic prefix merge so the reduced volume list is what gets
+    # compared.
+    ay_notes = [(ev, idx) for ev, idx in bound if ev.tone_chip == 2]
+    ay_vol_map = _merge_ay_volume_offsets(ay_ins, ay_notes)
+    if any(old != new for old, new in ay_vol_map.items()):
+        for i, (event, idx) in enumerate(bound):
+            if event.tone_chip == 2:
+                bound[i] = (event, ay_vol_map.get(idx, idx))
+
     # Merge truncated macro copies before fixing the absolute indices. Each
     # family has its own list, so shrinking one only moves that family's
     # indices; the base offsets are computed from the final lengths below.

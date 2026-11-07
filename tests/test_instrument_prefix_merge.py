@@ -17,7 +17,8 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from vgm2151fur.analyze import (  # noqa: E402
-    NoteEvent, ToneIns, _merge_fm_prefix_macros, _merge_tone_prefixes,
+    NoteEvent, ToneIns, _merge_ay_volume_offsets, _merge_fm_prefix_macros,
+    _merge_tone_prefixes,
 )
 from vgm2151fur.fm import FMPatch, OpRegs  # noqa: E402
 
@@ -65,6 +66,62 @@ class TestFMPrefixMerge(unittest.TestCase):
         events = [_note(0), _note(1)]
         self.assertEqual(_merge_fm_prefix_macros(events, patches, 1000), 0)
         self.assertEqual(len(patches), 2)
+
+
+def _ay_note(ins: int, vol: int = 15) -> NoteEvent:
+    return NoteEvent(
+        sample=ins * 1000, ch=16 + ins, on=True, note=60, ins=ins,
+        vol=vol, e5=0x80, pan=0, end=ins * 1000 + 500,
+        tone_chip=2,
+    )
+
+
+class TestAyVolumeOffsetMerge(unittest.TestCase):
+    def test_offsets_up_to_four_share_the_loudest_macro(self):
+        bucket = [
+            ToneIns(wave=1, vol=(10, 9, 8)),
+            ToneIns(wave=1, vol=(12, 11, 10)),
+            ToneIns(wave=1, vol=(14, 13, 12)),
+        ]
+        notes = [(_ay_note(0), 0), (_ay_note(1), 1), (_ay_note(2), 2)]
+        mapping = _merge_ay_volume_offsets(bucket, notes)
+        self.assertEqual(len(bucket), 1)
+        self.assertEqual(mapping[0], mapping[1])
+        self.assertEqual(mapping[0], mapping[2])
+        self.assertEqual(bucket[0].vol, (14, 13, 12))
+        # Each quieter note loses exactly the macro offset on its column:
+        # effective = macro + column - 15 is unchanged.
+        self.assertEqual([ev.vol for ev, _i in notes], [11, 13, 15])
+
+    def test_a_difference_over_four_stays_separate(self):
+        bucket = [
+            ToneIns(wave=1, vol=(10, 9)),
+            ToneIns(wave=1, vol=(15, 14)),
+        ]
+        notes = [(_ay_note(0), 0), (_ay_note(1), 1)]
+        mapping = _merge_ay_volume_offsets(bucket, notes)
+        self.assertEqual(len(bucket), 2)
+        self.assertNotEqual(mapping[0], mapping[1])
+
+    def test_a_nonconstant_difference_stays_separate(self):
+        bucket = [
+            ToneIns(wave=1, vol=(10, 9)),
+            ToneIns(wave=1, vol=(10, 8)),
+        ]
+        notes = [(_ay_note(0), 0), (_ay_note(1), 1)]
+        mapping = _merge_ay_volume_offsets(bucket, notes)
+        self.assertEqual(len(bucket), 2)
+        self.assertNotEqual(mapping[0], mapping[1])
+
+    def test_another_macro_must_match(self):
+        bucket = [
+            ToneIns(wave=1, vol=(10, 9), pitch=(0,)),
+            ToneIns(wave=1, vol=(11, 10), pitch=(1,)),
+        ]
+        notes = [(_ay_note(0), 0), (_ay_note(1), 1)]
+        mapping = _merge_ay_volume_offsets(bucket, notes)
+        self.assertEqual(len(bucket), 2)
+        self.assertNotEqual(mapping[0], mapping[1])
 
 
 class TestTonePrefixMerge(unittest.TestCase):
