@@ -19,7 +19,9 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from vgm2151fur.analyze import analyze  # noqa: E402
-from vgm2151fur.furio import decompress_fur, iter_blocks  # noqa: E402
+from vgm2151fur.furio import (  # noqa: E402
+    decompress_fur, iter_blocks, parse_fur,
+)
 from vgm2151fur.furwrite import write_fur  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -80,25 +82,79 @@ class TestShortNoteOperatorTracking(unittest.TestCase):
             [(2, 0), (2, 1), (2, 2), (2, 3)],
         )
 
-    def test_the_staircase_becomes_a_mult_macro(self):
-        entries = {
-            oi: (values, speed)
-            for oi, values, speed in self.patch.op_mul_macro
-        }
-        self.assertIn(2, entries)
-        values, _speed = entries[2]
-        self.assertEqual(values[0], 0, "entry 0 is the attack multiplier")
-        for value in range(4):
-            self.assertIn(value, values)
+    def test_the_staircase_becomes_row_effects(self):
+        # The steps land on separate rows, so the pattern carries them.
+        self.assertTrue(self.ev.op_mul_fx)
+        self.assertEqual(
+            [value for _s, op, value in self.ev.op_mul_fx], [0, 1, 2, 3]
+        )
+        self.assertEqual(self.patch.op_mul_macro, ())
 
-    def test_the_file_stores_macro_code_three(self):
+    def test_the_file_stores_16xy_rows(self):
         data = write_fur(self.song, include_pcm=False, include_fm=True)
-        feats = [f for f in _op_macros(data) if f[1] == 3]
-        self.assertTrue(feats, "no MULT macro reached the instrument")
-        tag, code, _speed, values = feats[0]
-        self.assertEqual(tag, "O3")
-        self.assertEqual(code, 3)
-        self.assertIn(3, values)
+        m = parse_fur(data)
+        fx = [
+            (code, value)
+            for (_ch, _pat), rows in m.patterns.items()
+            for row in rows for code, value in row.fx
+        ]
+        # Operator index 2 is effect x=2 on the OPM (orderedOps 0,2,1,3).
+        self.assertEqual(
+            [value for code, value in fx if code == 0x16],
+            [0x20, 0x21, 0x22, 0x23],
+        )
+        self.assertFalse(
+            [f for f in _op_macros(data) if f[1] == 3],
+            "row-safe steps must not create an operator macro",
+        )
+
+    def test_two_steps_inside_one_row_stay_a_macro(self):
+        # Both changes are shorter than a row, so a row effect would lose one.
+        song = analyze(_song(
+            (KEY_ON + 100, 0x50 | CH, 0),
+            (KEY_ON + 200, 0x50 | CH, 1),
+            (KEY_ON + 300, 0x50 | CH, 2),
+            (KEY_ON + 400, 0x50 | CH, 3),
+        ), pcm=False)
+        ev = next(e for e in song.events if e.on and e.ch == CH)
+        patch = song.fm_patches[ev.ins]
+        self.assertFalse(ev.op_mul_fx)
+        self.assertTrue(patch.op_mul_macro)
+
+    def test_detune_steps_use_53xy_on_rows(self):
+        song = analyze(_song(
+            (KEY_ON + 100, 0x50 | CH, 0x31),   # DT1 raw 3 (engine 6)
+            (KEY_ON + 900, 0x50 | CH, 0x71),   # DT1 raw 7 (engine 0)
+        ), pcm=False)
+        ev = next(e for e in song.events if e.on and e.ch == CH)
+        self.assertEqual(
+            [value for _s, op, value in ev.op_dt_fx], [6, 0]
+        )
+        data = write_fur(song, include_pcm=False, include_fm=True)
+        m = parse_fur(data)
+        fx = [
+            value for (_ch, _pat), rows in m.patterns.items()
+            for row in rows for code, value in row.fx if code == 0x53
+        ]
+        self.assertEqual(fx, [0x26, 0x20])
+
+    def test_detune2_steps_use_55xy_on_rows(self):
+        reg = 0xD0 | CH                     # operator 3's DT2/D2R
+        song = analyze(_song(
+            (KEY_ON + 100, reg, 0x40),
+            (KEY_ON + 900, reg, 0x80),
+        ), pcm=False)
+        ev = next(e for e in song.events if e.on and e.ch == CH)
+        self.assertEqual(
+            [value for _s, op, value in ev.op_dt2_fx], [1, 2]
+        )
+        data = write_fur(song, include_pcm=False, include_fm=True)
+        m = parse_fur(data)
+        fx = [
+            value for (_ch, _pat), rows in m.patterns.items()
+            for row in rows for code, value in row.fx if code == 0x55
+        ]
+        self.assertEqual(fx, [0x21, 0x22])
 
     def test_a_key_on_burst_mult_is_the_instrument_not_a_macro(self):
         song = analyze(_song((KEY_ON, 0x50 | CH, 0)), pcm=False)

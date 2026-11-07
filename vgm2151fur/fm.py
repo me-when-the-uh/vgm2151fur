@@ -221,6 +221,7 @@ class FMPatch:
     # staircase on a modulator or carrier changes the partial's frequency
     # inside one short note; it has no row-level equivalent.
     op_dt_macro: tuple[tuple[int, tuple[int, ...], int], ...] = ()
+    op_dt2_macro: tuple[tuple[int, tuple[int, ...], int], ...] = ()
     op_mul_macro: tuple[tuple[int, tuple[int, ...], int], ...] = ()
     # For an instrument copy made by a macro pass: the instrument this one
     # was copied from, or -1 for a base voice. The final budget trim folds a

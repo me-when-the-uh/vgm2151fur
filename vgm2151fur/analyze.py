@@ -454,6 +454,14 @@ class NoteEvent:
     # short staccato note has no row equivalent; a per-operator macro keeps
     # the partial's fast pitch/timbre motion.
     op_dtmul_pts: tuple[tuple[int, int, int], ...] = ()
+    # YM2151 only: MULT/DT1/DT2 changes that fit on pattern rows, as
+    # (sample, operator, engine value) for 16xy, 53xy and 55xy. Used
+    # instead of an operator macro whenever the steps land on rows.
+    op_mul_fx: tuple[tuple[int, int, int], ...] = ()
+    op_dt_fx: tuple[tuple[int, int, int], ...] = ()
+    op_dt2_fx: tuple[tuple[int, int, int], ...] = ()
+    # YM2151 only: mid-note DT2 writes, (sample, operator, 0-3).
+    op_dt2_pts: tuple[tuple[int, int, int], ...] = ()
     # Volume-column baseline override for `tl_pts` and this note's own level.
     # An Ext channel-3 column scales one operator, not the algorithm's carrier
     # set (`ym2203ext.cpp` DIV_CMD_VOLUME), so the writer cannot take the
@@ -3423,17 +3431,18 @@ _YM_DT_TO_FURNACE = (3, 4, 5, 6, 7, 2, 1, 0)
 
 def _bind_opm_dtmul_macros(
     events: list["NoteEvent"], patches: dict[tuple, FMPatch],
-    patch_order: list[tuple], tick_samples: float, cap: int = 250,
+    patch_order: list[tuple], tick_samples: float, t0: int, use_speed: int,
+    cap: int = 250,
 ) -> tuple[int, int]:
-    """Give a note's mid-note DT1/MULT writes to its instrument.
+    """Place a note's mid-note DT1/MULT/DT2 writes.
 
     A YM2151 driver can retune one operator every frame inside a very short
     staccato note (Magical Chase walks channel 1's third operator MULT
-    through 0..4, and later through long staircases). The note is too short
-    for a row-level pitch slide, and the change is one operator rather than
-    the whole voice, so a pitch macro is wrong. Furnace has per-operator
-    DT and MULT macros; store each note's trajectory there and share the
-    copies when several notes use the same staircase.
+    through 0..4, and later through long staircases). When the changes fit
+    on pattern rows, use the operator effects 16xy/53xy/55xy - the pattern
+    then shows the movement and no instrument copy is needed. Only motion
+    that collides inside one row falls back to a per-operator DT/MULT/DT2
+    macro.
 
     Returns (notes given a copy, notes left on the base voice at the cap).
     """
@@ -3441,6 +3450,7 @@ def _bind_opm_dtmul_macros(
     idx_map: dict[tuple, int] = {}
     if tick_samples <= 0:
         return 0, 0
+    row_samples = tick_samples * max(1, use_speed)
 
     def expand(marks: list[tuple[int, int]], start: int) -> tuple[int, ...]:
         cur = start
@@ -3453,56 +3463,120 @@ def _bind_opm_dtmul_macros(
             values.append(cur)
         return tuple(values)
 
+    def row_marks(
+        pts: list[tuple[int, int]], start: int,
+    ) -> tuple[list[tuple[int, int]], bool]:
+        """(sample, value) points that fit rows, and whether nothing is lost.
+
+        A row can carry one value per operator. If a row contains two
+        different values and the first is not what the previous row already
+        held, the intermediate transition is lost and the macro path is
+        needed instead.
+        """
+        groups: dict[int, list[tuple[int, int]]] = {}
+        for s, value in pts:
+            if ev.end and s >= ev.end:
+                continue
+            row = max(0, int((s - t0) // row_samples))
+            groups.setdefault(row, []).append((s, value))
+        carried = start
+        out: list[tuple[int, int]] = []
+        lossless = True
+        for row in sorted(groups):
+            vals = groups[row]
+            distinct: list[int] = []
+            for _s, value in vals:
+                if not distinct or distinct[-1] != value:
+                    distinct.append(value)
+            if len(distinct) > 1 and distinct[0] != carried:
+                lossless = False
+            if distinct[-1] != carried:
+                out.append((vals[-1][0], distinct[-1]))
+                carried = distinct[-1]
+        return out, lossless
+
+    def macro_values(
+        pts: list[tuple[int, int]], start: int,
+    ) -> tuple[int, ...]:
+        last_s = pts[-1][0]
+        span_end = ev.end if (ev.end and ev.end > last_s) else last_s
+        span_ticks = max(1.0, (span_end - ev.sample) / tick_samples)
+        speed = max(1, min(254, int(span_ticks // 240) + 1))
+        marks: list[tuple[int, int]] = []
+        for s, value in pts:
+            slot = max(0, int((s - ev.sample) // tick_samples)) // speed
+            if slot > 254:
+                break
+            if marks and marks[-1][0] == slot:
+                marks[-1] = (slot, value)
+            else:
+                marks.append((slot, value))
+        return expand(marks, start) if marks else ()
+
     for e in events:
-        if not e.on or not e.op_dtmul_pts or e.pcm:
+        ev = e
+        if not ev.on or not (ev.op_dtmul_pts or ev.op_dt2_pts) or ev.pcm:
             continue
-        if not (0 <= e.ins < len(patch_order)):
+        if not (0 <= ev.ins < len(patch_order)):
             continue
-        base = patches[patch_order[e.ins]]
+        base = patches[patch_order[ev.ins]]
         by_op: dict[int, list[tuple[int, int]]] = {}
-        for s, oi, raw in e.op_dtmul_pts:
+        for s, oi, raw in ev.op_dtmul_pts:
             by_op.setdefault(oi, []).append((s, raw))
+        dt2_by_op: dict[int, list[tuple[int, int]]] = {}
+        for s, oi, dt2 in ev.op_dt2_pts:
+            dt2_by_op.setdefault(oi, []).append((s, dt2))
         mul_entries: list[tuple[int, tuple[int, ...], int]] = []
         dt_entries: list[tuple[int, tuple[int, ...], int]] = []
-        for oi, pts in by_op.items():
-            if not 0 <= oi < 4:
+        dt2_entries: list[tuple[int, tuple[int, ...], int]] = []
+        for oi in range(4):
+            raw_pts = by_op.get(oi, [])
+            dt2_pts = dt2_by_op.get(oi, [])
+            if not raw_pts and not dt2_pts:
                 continue
             start_raw = base.ops[oi].dt_mul
-            last_s = pts[-1][0]
-            span_end = e.end if (e.end and e.end > last_s) else last_s
-            span_ticks = max(1.0, (span_end - e.sample) / tick_samples)
-            speed = max(1, min(254, int(span_ticks // 240) + 1))
-            mul_marks: list[tuple[int, int]] = []
-            dt_marks: list[tuple[int, int]] = []
-            for s, raw in pts:
-                slot = max(0, int((s - e.sample) // tick_samples)) // speed
-                if slot > 254:
-                    break
-                item = (slot, raw & 0x0F)
-                if mul_marks and mul_marks[-1][0] == slot:
-                    mul_marks[-1] = item
-                else:
-                    mul_marks.append(item)
-                item = (slot, _YM_DT_TO_FURNACE[(raw >> 4) & 7])
-                if dt_marks and dt_marks[-1][0] == slot:
-                    dt_marks[-1] = item
-                else:
-                    dt_marks.append(item)
             start_mul = start_raw & 0x0F
-            if mul_marks:
-                values = expand(mul_marks, start_mul)
-                if len(set(values)) > 1 or values[0] != start_mul:
-                    mul_entries.append((oi, values, speed))
             start_dt = _YM_DT_TO_FURNACE[(start_raw >> 4) & 7]
-            if dt_marks:
-                values = expand(dt_marks, start_dt)
-                if len(set(values)) > 1 or values[0] != start_dt:
-                    dt_entries.append((oi, values, speed))
-        if not mul_entries and not dt_entries:
+            start_dt2 = (base.ops[oi].dt2_d2r >> 6) & 3
+            if raw_pts:
+                mul_pts = [(s, raw & 0x0F) for s, raw in raw_pts]
+                marks, ok = row_marks(mul_pts, start_mul)
+                if ok:
+                    ev.op_mul_fx += tuple(
+                        (s, oi, value) for s, value in marks
+                    )
+                else:
+                    values = macro_values(mul_pts, start_mul)
+                    if len(set(values)) > 1 or values[0] != start_mul:
+                        mul_entries.append((oi, values, 1))
+                dt_pts = [
+                    (s, _YM_DT_TO_FURNACE[(raw >> 4) & 7])
+                    for s, raw in raw_pts
+                ]
+                marks, ok = row_marks(dt_pts, start_dt)
+                if ok:
+                    ev.op_dt_fx += tuple(
+                        (s, oi, value) for s, value in marks
+                    )
+                else:
+                    values = macro_values(dt_pts, start_dt)
+                    if len(set(values)) > 1 or values[0] != start_dt:
+                        dt_entries.append((oi, values, 1))
+            if dt2_pts:
+                marks, ok = row_marks(dt2_pts, start_dt2)
+                if ok:
+                    ev.op_dt2_fx += tuple(
+                        (s, oi, value) for s, value in marks
+                    )
+                else:
+                    values = macro_values(dt2_pts, start_dt2)
+                    if len(set(values)) > 1 or values[0] != start_dt2:
+                        dt2_entries.append((oi, values, 1))
+        if not mul_entries and not dt_entries and not dt2_entries:
             continue
         key = (
-            "op-dtmul", patch_order[e.ins],
-            tuple(mul_entries), tuple(dt_entries),
+            "op-dtmul", patch_order[ev.ins],
+            tuple(mul_entries), tuple(dt_entries), tuple(dt2_entries),
         )
         idx = idx_map.get(key)
         if idx is None:
@@ -3514,8 +3588,10 @@ def _bind_opm_dtmul_macros(
                 changes["op_mul_macro"] = tuple(mul_entries)
             if dt_entries:
                 changes["op_dt_macro"] = tuple(dt_entries)
+            if dt2_entries:
+                changes["op_dt2_macro"] = tuple(dt2_entries)
             copy = replace(
-                base, uses=1, name=f"{base.name}+mul", base_ins=e.ins,
+                base, uses=1, name=f"{base.name}+mul", base_ins=ev.ins,
                 **changes,
             )
             patches[key] = copy
@@ -3524,7 +3600,7 @@ def _bind_opm_dtmul_macros(
             idx_map[key] = idx
         else:
             patches[patch_order[idx]].uses += 1
-        e.ins = idx
+        ev.ins = idx
         made += 1
     return made, fallbacks
 
@@ -5568,6 +5644,10 @@ def analyze(
     dtmul_pts: list[list[tuple[int, int, int]]] = [[] for _ in range(8)]
     dtmul_last = [[0] * 4 for _ in range(8)]
     dtmul_ev: list[int | None] = [None] * 8
+    # Mid-note DT2 changes per held note.
+    dt2_pts: list[list[tuple[int, int, int]]] = [[] for _ in range(8)]
+    dt2_last = [[0] * 4 for _ in range(8)]
+    dt2_ev: list[int | None] = [None] * 8
     # Last KON operator mask per channel: key state is per operator, and an
     # envelope restarts only on a 0->1 transition of its bit.
     op_mask = [0] * 8
@@ -5600,6 +5680,12 @@ def analyze(
         if idx is not None and dtmul_pts[ch]:
             events[idx].op_dtmul_pts = tuple(dtmul_pts[ch])
         dtmul_ev[ch] = None
+
+    def close_dt2(ch: int) -> None:
+        idx = dt2_ev[ch]
+        if idx is not None and dt2_pts[ch]:
+            events[idx].op_dt2_pts = tuple(dt2_pts[ch])
+        dt2_ev[ch] = None
 
     def intern_patch(ch: int, mask: int = 0xF) -> int:
         snap = ym.snapshot(ch)
@@ -5702,7 +5788,8 @@ def analyze(
                 if w2.sample - sample > _OPM_BURST_LOAD_SAMPLES:
                     break
                 if (w2.chip != "ym2151" or w2.chip_id != opm_cid
-                        or not (0x40 <= w2.reg <= 0x5F)):
+                        or not (0x40 <= w2.reg <= 0x5F
+                                or 0xC0 <= w2.reg <= 0xDF)):
                     continue
                 if (w2.reg & 7) != ch:
                     continue
@@ -5786,6 +5873,15 @@ def analyze(
                         if cur != dtmul_last[ch][op]:
                             dtmul_pts[ch].append((w.sample, op, cur))
                             dtmul_last[ch][op] = cur
+                elif 0xC0 <= w.reg <= 0xDF:
+                    # DT2 changes while the note sounds.
+                    ch = w.reg & 7
+                    op = (w.reg >> 3) & 3
+                    if ym.kon[ch] and dt2_ev[ch] is not None:
+                        cur = (ym.ops[ch][op].dt2_d2r >> 6) & 3
+                        if cur != dt2_last[ch][op]:
+                            dt2_pts[ch].append((w.sample, op, cur))
+                            dt2_last[ch][op] = cur
                 continue
             ch = w.val & 7
             mask = (w.val & 0x78) >> 3
@@ -5797,6 +5893,7 @@ def analyze(
                 close_sweep(ch)
                 close_tl(ch)
                 close_dtmul(ch)
+                close_dt2(ch)
                 if ym.carrier_tl(ch) >= 0x7F:
                     # Nothing in this voice can sound yet: the driver loads the
                     # real levels at the tail of this same burst.
@@ -5826,6 +5923,11 @@ def analyze(
                 dtmul_pts[ch] = []
                 dtmul_last[ch] = [ym.ops[ch][i].dt_mul for i in range(4)]
                 dtmul_ev[ch] = len(events) - 1
+                dt2_pts[ch] = []
+                dt2_last[ch] = [
+                    (ym.ops[ch][i].dt2_d2r >> 6) & 3 for i in range(4)
+                ]
+                dt2_ev[ch] = len(events) - 1
                 keyon_times.append(w.sample)
                 last_keyon_sample[ch] = w.sample
                 ym.kon[ch] = True
@@ -5847,6 +5949,7 @@ def analyze(
                 close_pms(ch)
                 close_tl(ch)
                 close_dtmul(ch)
+                close_dt2(ch)
                 ym.kon[ch] = False
                 held_ins[ch] = -1
 
@@ -5855,6 +5958,7 @@ def analyze(
             close_sweep(ch)
             close_tl(ch)
             close_dtmul(ch)
+            close_dt2(ch)
 
         # A crescendo walks the carriers *down* through the TL range while the note
         # sounds. The volume column can only attenuate what the instrument stores, so
@@ -9576,7 +9680,8 @@ def analyze(
     opm_dtmul_copies = opm_dtmul_lost = 0
     if convert_opm:
         opm_dtmul_copies, opm_dtmul_lost = _bind_opm_dtmul_macros(
-            events, patches, patch_order, VGM_RATE / hz, cap=fm_ins_cap,
+            events, patches, patch_order, VGM_RATE / hz,
+            t0, use_speed, cap=fm_ins_cap,
         )
     # An operator level the driver scripted while its note sounded. The volume
     # column reaches only a KVS operator. The rest travel as instrument macros.

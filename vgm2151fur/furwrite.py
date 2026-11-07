@@ -696,6 +696,9 @@ def _write_ins_opm(b: Buf, name: str, patch) -> None:
     for oi, values, speed in getattr(patch, "op_dt_macro", ()) or ():
         op_entries.setdefault(oi, []).append(
             (9, tuple(values), speed, False, 0x07))
+    for oi, values, speed in getattr(patch, "op_dt2_macro", ()) or ():
+        op_entries.setdefault(oi, []).append(
+            (7, tuple(values), speed, False, 0x03))
     for oi in sorted(op_entries):
         _write_op_group(b, oi, op_entries[oi])
     b.raw(b"EN")
@@ -1764,6 +1767,69 @@ def _traj_at(pts: list[tuple[int, int]], t: int) -> int:
             break
         v = d
     return v
+
+
+def _emit_op_fx(
+    grid: list[dict[int, Row]],
+    song: Song,
+    ev,
+    points: tuple[tuple[int, int, int], ...],
+    code: int,
+    fx_cols: int,
+    total_rows: int,
+    chan: int | None = None,
+    stats: dict | None = None,
+    note_row: int | None = None,
+) -> None:
+    """Place an operator MULT/DT/DT2 change as a pattern effect.
+
+    ``points`` are (sample, operator, value) already in the effect's own
+    value domain. One row can carry one value per operator; a later write at
+    the same row wins. The effect is allowed on the note's own row so the
+    attack value is not delayed by a row.
+    """
+    if chan is not None and chan != ev.ch:
+        ev = replace(ev, ch=chan)
+    ch = ev.ch
+    if ch >= len(grid) or not points:
+        return
+    if note_row is None:
+        note_row = song.place(ev.sample, stats)[0]
+    limit_row = total_rows
+    if ev.end:
+        limit_row = min(
+            total_rows, max(note_row + 1, song.place(ev.end, stats)[0] + 1),
+        )
+    by_row: dict[tuple[int, int], tuple[int, int]] = {}
+    for sample, op, value in points:
+        row, delay = song.place(sample, stats)
+        if row < note_row:
+            row = note_row
+        if not (0 <= row < limit_row):
+            continue
+        by_row[(row, op)] = (delay, value)
+    # The OPM platform walks the effect's operator nibble through
+    # orderedOps = {0,2,1,3} (fmsharedbase.h), while the instrument and the
+    # logged registers use plain register order. Convert the register index
+    # back to the effect's operator number, or 16xx/53xx/55xx hit the wrong
+    # slot (op2's $50 becomes op1's $48).
+    effect_ops = (0, 2, 1, 3)
+    for (row, op), (delay, value) in sorted(by_row.items()):
+        cell = grid[ch].get(row)
+        if cell is None:
+            cell = _blank_row()
+            grid[ch][row] = cell
+        if 0 <= cell.note < 180 and row != note_row:
+            continue          # a later note's key-on reloads the operator
+        if row == note_row:
+            delay = 0          # never delay the note that owns this row
+        if delay > 0 and not any(c == 0xED for c, _v in (cell.fx or ())):
+            _add_fx(cell, 0xED, delay, fx_cols, stats)
+        x = effect_ops[op & 3] if code in (0x16, 0x53, 0x55) else op
+        _add_fx(
+            cell, code, (((x + 1) & 0x0F) << 4) | (value & 0x0F),
+            fx_cols, stats,
+        )
 
 
 def _emit_steps(
@@ -3180,6 +3246,33 @@ def _build_patterns(song: Song, n_ch: int, pat_len_max: int, fx_cols: int,
                     _emit_steps(
                         grid, song, ev, fx_cols, total_rows, sweep_e5,
                         stats=stats, note_row=placed_note_row(ev),
+                    )
+    if song.events:
+        for ev in song.events:
+            if not (
+                ev.on
+                and 0 <= ev.ch + ch_offset < n_ch
+                and (ev.op_mul_fx or ev.op_dt_fx or ev.op_dt2_fx)
+                and (content_cut is None or ev.sample < content_cut)
+            ):
+                continue
+            note_row = placed_note_row(ev)
+            if note_row < 0:
+                continue
+            chan = ev.ch + ch_offset if ch_offset else None
+            for points, code in (
+                (ev.op_mul_fx, 0x16),
+                (ev.op_dt_fx, 0x53),
+                (ev.op_dt2_fx, 0x55),
+            ):
+                if content_cut is not None:
+                    points = tuple(
+                        p for p in points if p[0] < content_cut
+                    )
+                if points:
+                    _emit_op_fx(
+                        grid, song, ev, points, code, fx_cols, total_rows,
+                        chan=chan, stats=stats, note_row=note_row,
                     )
     if song.events:
         for ev in song.events:
