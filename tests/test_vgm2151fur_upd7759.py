@@ -54,9 +54,9 @@ class TestUpd7759Collector(unittest.TestCase):
         self.assertGreater(samples[0].hits[0].end, 0)
 
     def test_slave_stream_decodes_after_handshake(self):
-        # Handshake (6 bytes) then a rate-1 block with four nibbles.
+        # Five handshake bytes, then a rate-1 block with four nibbles.
         burst = bytes([
-            0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00,
+            0xFF, 0xFF, 0x00, 0x00, 0x00,
             0x80, 0x03, 0x12, 0x34, 0x00,
         ])
         writes = [ChipWrite(0, "upd7759", 0, 1, 0)]

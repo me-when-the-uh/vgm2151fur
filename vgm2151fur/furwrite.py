@@ -397,7 +397,6 @@ def _sample_chip_volume(song: "Song", chip: int, instances: int) -> float:
         # Generic PCM DAC output is unity in Furnace.  VGMPlay's uPD7759
         # default is 0x11E; MSM6258 shares that id but has its own core scale,
         # so do not inherit the 0x16 entry from _FURNACE_VOLUME_SCALE.
-        # Measured against VGMPlay on a uPD-only render, the module needs 0.6x.
         return 0.6 * _player_chip_volume(song.vgm, 0x16, instances)
     if chip == CHIP_MULTIPCM:
         # Match the player's lone-chip MultiPCM output without halving a
@@ -5276,8 +5275,6 @@ def write_fur(
             cv = _sample_chip_volume(song, chip, chip_counts[chip])
         else:
             cv = 1.0
-        # Furnace's per-chip mixer volume tops out at 2.0.
-        cv = min(2.0, max(0.0, cv))
         chip_vols.append(cv)
         pan = pwm_pan.get(i, 0.0)
         if (opl and opl_kind == "opl2" and len(opl_ids) > 1

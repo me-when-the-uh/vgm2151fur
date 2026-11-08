@@ -280,9 +280,9 @@ class Upd7759Sample:
 # The module renders phrases at a fixed rate; the PCM DAC system uses the same
 # value so note 108 plays them back at 1x.
 UPD_OUTPUT_RATE = 44100
-# The slave state machine consumes six bytes of handshake before the first
-# block header (start request, last-sample, dummy, address MSB/LSB, dummy).
-UPD_SLAVE_HANDSHAKE = 6
+# The slave state machine consumes five bytes of handshake before the first
+# block header (start request, last-sample, dummy, address MSB/LSB).
+UPD_SLAVE_HANDSHAKE = 5
 UPD_MAX_PHRASE_SECONDS = 30.0
 
 
@@ -308,6 +308,9 @@ def collect_upd7759(
 
     clock = vgm.upd7759_clock or STANDARD_CLOCK
     samples: dict[tuple[int, bytes], Upd7759Sample] = {}
+    # Decode first, then bank the command streams.  Rendering stays at the
+    # decoder's nominal level; no per-file gain adjustment.
+    pending: list[tuple[int, int, int, Phrase]] = []
 
     def add_sample(cid: int, source: int, pcm: bytes) -> Upd7759Sample:
         key = (cid, pcm)
@@ -327,12 +330,8 @@ def collect_upd7759(
         samples[key] = sample
         return sample
 
-    def render_phrase(phrase: Phrase) -> bytes:
-        return render_wav_bytes(phrase, UPD_OUTPUT_RATE, clock, 1.0)
-
-    def hit_end(start: int, pcm: bytes) -> int:
-        frames = len(pcm) // 2
-        return start + frames
+    def phrase_samples(phrase: Phrase) -> int:
+        return int(round(phrase.seconds(clock) * VGM_RATE))
 
     state: dict[int, dict] = {}
     for cid in ids:
@@ -358,8 +357,9 @@ def collect_upd7759(
         st["burst"] = []
         if not burst:
             return
-        # Skip the port handshake.  The state machine consumes six bytes before
-        # the first command header; keep at least one byte for a malformed log.
+        # Skip the port handshake.  The state machine consumes five bytes
+        # before the first command header; keep at least one byte for a
+        # malformed log.
         data = bytes(v for _when, v in burst)
         start = min(UPD_SLAVE_HANDSHAKE, max(0, len(data) - 1))
         phrase = decode_stream(data, start, clock)
@@ -369,24 +369,8 @@ def collect_upd7759(
                 "had no decodable commands"
             )
             return
-        pcm = render_phrase(phrase)
-        seconds = len(pcm) / 2.0 / UPD_OUTPUT_RATE
-        if seconds > UPD_MAX_PHRASE_SECONDS:
-            warnings.append(
-                f"uPD7759 chip {cid + 1} slave stream at {st['burst_start']} "
-                f"decoded to {seconds:.1f}s; truncated"
-            )
-            pcm = pcm[:int(UPD_MAX_PHRASE_SECONDS * UPD_OUTPUT_RATE) * 2]
-        sample = add_sample(cid, -1, pcm)
-        end = hit_end(st["burst_start"], pcm)
-        sample.hits.append(Upd7759Hit(
-            sample_time=st["burst_start"],
-            chip_id=cid,
-            phrase=-1,
-            clock=clock,
-            end=end,
-        ))
-        st["active_until"] = end
+        pending.append((st["burst_start"], cid, -1, phrase))
+        st["active_until"] = st["burst_start"] + phrase_samples(phrase)
 
     for w in vgm.writes:
         cid = w.chip_id
@@ -454,21 +438,31 @@ def collect_upd7759(
         phrase = decode_phrase(view, source, clock)
         if not phrase.blocks:
             continue
-        pcm = render_phrase(phrase)
-        sample = add_sample(cid, source, pcm)
-        end = hit_end(t, pcm)
-        sample.hits.append(Upd7759Hit(
-            sample_time=t,
-            chip_id=cid,
-            phrase=source,
-            clock=clock,
-            end=end,
-        ))
-        st["active_until"] = end
+        pending.append((t, cid, source, phrase))
+        st["active_until"] = t + phrase_samples(phrase)
 
     # Close a stream whose log ended while start was still high.
     for cid in ids:
         finish_burst(cid, vgm.total_samples or 0)
+
+    gain = 1.0
+    for start, cid, source, phrase in pending:
+        pcm = render_wav_bytes(phrase, UPD_OUTPUT_RATE, clock, gain)
+        seconds = len(pcm) / 2.0 / UPD_OUTPUT_RATE
+        if seconds > UPD_MAX_PHRASE_SECONDS:
+            warnings.append(
+                f"uPD7759 chip {cid + 1} stream at {start} decoded to "
+                f"{seconds:.1f}s; truncated"
+            )
+            pcm = pcm[:int(UPD_MAX_PHRASE_SECONDS * UPD_OUTPUT_RATE) * 2]
+        sample = add_sample(cid, source, pcm)
+        sample.hits.append(Upd7759Hit(
+            sample_time=start,
+            chip_id=cid,
+            phrase=source,
+            clock=clock,
+            end=start + len(pcm) // 2,
+        ))
 
     audible = [s for s in samples.values() if s.hits and s.frames > 0]
     audible.sort(key=lambda s: (s.chip_id, s.phrase, s.name))
