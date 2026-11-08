@@ -67,7 +67,10 @@ semitone is a new note; smaller changes are a pitch trajectory.
 
 - **Pitch**: `freq = clock / (16 * (timer + 1))`. Furnace's NES platform
   writes `period = pitch_table[n] - 1`, so the inverse asks the table for
-  `timer + 1`.
+  `timer + 1`. A timer below 6 is above ~16 kHz, which the console's output
+  filter drops; some drivers park an unused voice at 0 between phrases, so
+  such a write reads as silence (it ends the open note) instead of becoming
+  the top note of Furnace's range.
 - **Volume**: the low nibble of `$4000`/`$4004`/`$400C` is the pattern volume
   (0-15). In envelope mode it is the envelope period, which is what the
   register holds and what Furnace writes back.
@@ -75,6 +78,16 @@ semitone is a new note; smaller changes are a pitch trajectory.
 - **Envelope mode** (`$4000` bits 4-5): `15xx` row effect.
 - **Triangle linear counter** (`$4008`): `19xx` row effect. The volume column
   only gates the triangle.
+- **Sustain**: Furnace reloads the length counter with its longest table value
+  on every note-on, so a note it does not halt dies after a fraction of a
+  second. Drivers keep a voice alive by rewriting its timer/length register
+  every few frames (Danger Zone writes `$4003` 68 times per APU) and the
+  reference player keeps sounding, so a constant-volume note is written
+  halted (`15 03`) and the driver's own writes end it: a pitch change, a
+  volume drop or a `$4015` mute already become note events. An envelope voice
+  keeps the bit it had, because there bit 5 loops the hardware envelope. The
+  triangle's control bit is set the same way (`19 8C` for `$4008 = 0x0C`), so
+  its linear counter holds instead of running out after `value/240` s.
 - Mid-note pitch and volume motion become per-note instrument macros
   (`std.pitch`, `std.vol`), so the changes survive a coarse row grid. If the
   instrument budget is full, `_take_tone` hands that note a plain instrument

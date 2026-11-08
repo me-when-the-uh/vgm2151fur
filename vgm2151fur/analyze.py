@@ -10046,6 +10046,21 @@ def analyze(
                 sweep = deltas if deltas and max(vals + [0]) - min(vals + [0]) >= 4 else ()
             # Duty/noise mode, envelope mode and the triangle linear counter
             # are row effects.
+            #
+            # Furnace's NES note-on reloads the length counter with its longest
+            # table value, so a note it does not halt dies after a fraction of a
+            # second.  Drivers hold a voice by rewriting its timer/length
+            # register every few frames (Danger Zone writes $4003 68 times per
+            # APU) and the reference player keeps sounding, so hand the tracker
+            # a halted note and end it on the driver's next write instead: a
+            # pitch change, a volume drop or a $4015 mute already become note
+            # events.  An envelope voice keeps the bit it had, because there bit
+            # 5 loops the hardware envelope.
+            env_mode = (h.env_mode | 2) if (h.env_mode & 1) else h.env_mode
+            # The triangle's control bit holds the linear counter (the counter
+            # otherwise runs out after (value/240) s) so the note lasts until
+            # the driver moves it.
+            linear = h.linear | 0x80
             if h.voice < 2:
                 channel_fx.append((h.sample_time, ch, 0x12, h.duty))
                 for t, duty in h.duty_pts:
@@ -10054,16 +10069,18 @@ def analyze(
                 channel_fx.append((h.sample_time, ch, 0x12, h.duty))
                 for t, duty in h.duty_pts:
                     channel_fx.append((t, ch, 0x12, duty))
-                channel_fx.append((h.sample_time, ch, 0x15, h.env_mode))
+                channel_fx.append((h.sample_time, ch, 0x15, env_mode))
                 for t, mode in h.env_pts:
+                    mode = (mode | 2) if (mode & 1) else mode
                     channel_fx.append((t, ch, 0x15, mode))
             else:
-                channel_fx.append((h.sample_time, ch, 0x19, h.linear))
-                for t, linear in h.linear_pts:
-                    channel_fx.append((t, ch, 0x19, linear))
+                channel_fx.append((h.sample_time, ch, 0x19, linear))
+                for t, lin in h.linear_pts:
+                    channel_fx.append((t, ch, 0x19, lin | 0x80))
             if h.voice < 2:
-                channel_fx.append((h.sample_time, ch, 0x15, h.env_mode))
+                channel_fx.append((h.sample_time, ch, 0x15, env_mode))
                 for t, mode in h.env_pts:
+                    mode = (mode | 2) if (mode & 1) else mode
                     channel_fx.append((t, ch, 0x15, mode))
             ev = NoteEvent(
                 sample=h.sample_time,

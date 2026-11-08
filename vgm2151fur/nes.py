@@ -39,6 +39,10 @@ NES_CPU_DIVIDER = 16
 NES_MAX_PERIOD = 0x7FF
 # Shorter than this is a click/housekeeping gate, not a note.
 NES_MIN_NOTE = 100
+# A timer this low renders above ~16 kHz, which the console's output filter
+# drops.  Some drivers park an unused voice at timer 0 between phrases, so a
+# write there is silence, not the top of the tracker's note range.
+NES_MIN_PERIOD = 6
 # A period change this large is a new note rather than a bend.
 NES_NOTE_JUMP_ST = 1.0
 # NES drivers re-strike a note by writing a new volume without clearing the
@@ -319,9 +323,11 @@ def _nes_tones_one(
             on = on and bool(env_mode[2] & 2 or length[3] > 0)
         elif voice == 2:
             on = bool(enabled & 0x04) and freq_hi[2]
+            on = on and period[2] >= NES_MIN_PERIOD
             on = on and (linear & 0x7F) > 0 and (length[2] > 0 or bool(linear & 0x80))
         else:
             on = bool(enabled & (1 << voice)) and freq_hi[voice]
+            on = on and period[voice] >= NES_MIN_PERIOD
             on = on and _tone_audible(vol[voice], env_mode[voice])
             on = on and bool(env_mode[voice] & 2 or length[voice] > 0)
         hit = active[voice]

@@ -242,11 +242,52 @@ class TestNesTones(unittest.TestCase):
             _nes(1000, 0x02, 0x00), _nes(1000, 0x03, 0x01),
         ]
         writes = base + [
-            _nes(5000, 0x02, 0x00), _nes(5000, 0x03, 0x00),  # octave up
+            _nes(5000, 0x02, 0x08), _nes(5000, 0x03, 0x00),  # octave up
         ]
         hits, _offs, _warn = collect_nes_tones(_vgm(writes))
         self.assertEqual(len(hits), 2)
         self.assertGreater(hits[0].period, hits[1].period)
+
+    def test_parking_a_voice_below_the_audible_floor_is_silence(self):
+        # The console's output filter drops anything above ~16 kHz.  A driver
+        # that parks an unused voice at timer 0 is not playing the top note of
+        # Furnace's range, so the write ends the note instead of starting one.
+        writes = [
+            _nes(1000, 0x15, 0x0F), _nes(1000, 0x00, 0xBF),
+            _nes(1000, 0x02, 0x00), _nes(1000, 0x03, 0x01),
+            _nes(5000, 0x02, 0x00), _nes(5000, 0x03, 0x00),
+        ]
+        hits, offs, _warn = collect_nes_tones(_vgm(writes))
+        self.assertEqual([(h.voice, h.period) for h in hits], [(0, 0x100)])
+        self.assertEqual([o.sample_time for o in offs], [5000])
+
+    def test_module_halts_a_constant_volume_note(self):
+        # Furnace reloads the length counter on note-on, so an un-halted note
+        # dies after a fraction of a second.  A constant-volume voice can take
+        # the halt bit without side effects, so the note lasts until the
+        # driver's next write.
+        writes = [
+            _nes(1000, 0x15, 0x0F), _nes(1000, 0x00, 0xBF),
+            _nes(1000, 0x02, 0x00), _nes(1000, 0x03, 0x01),
+        ]
+        song = analyze(_vgm(writes, nes_clock=1789773))
+        mod = parse_fur(write_fur(song, include_pcm=True))
+        fx = [tuple(f) for (_ch, _i), rows in mod.patterns.items()
+              for r in rows for f in r.fx]
+        self.assertIn((0x15, 0x03), fx)
+
+    def test_module_holds_the_triangle_linear_counter(self):
+        # Without the control bit the linear counter runs out after
+        # (value/240) s and the note stops between the driver's writes.
+        writes = [
+            _nes(1000, 0x08, 0x3C),
+            _nes(1000, 0x0A, 0x5D), _nes(1000, 0x0B, 0xC2),
+        ]
+        song = analyze(_vgm(writes, nes_clock=1789773))
+        mod = parse_fur(write_fur(song, include_pcm=True))
+        fx = [tuple(f) for (_ch, _i), rows in mod.patterns.items()
+              for r in rows for f in r.fx]
+        self.assertIn((0x19, 0xBC), fx)
 
     def test_high_byte_before_low_completes_the_pitch(self):
         # Gimmick! writes $400B (timer high) before $400A (timer low).  The
