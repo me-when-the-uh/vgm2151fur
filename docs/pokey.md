@@ -47,6 +47,10 @@ has bit 30 set.
 - **AUDCTL**: the instrument's duty macro carries the AUDCTL value at each
   note tick, so high-clock, filter and join state belong to the note; an
   `11xx` row effect still carries the chip-wide changes.
+- **Filter control**: with filter 1+3 (bit 2) or 2+4 (bit 1) the high channel
+  is normally silent, but its AUDF still clocks the filter.  The converter
+  keeps a volume-0 note on that channel so the filter gets the right
+  frequency; dropping it leaves channel 1/2's filtered timbre wrong.
 - **Joined pairs**: one voice on the low column. `AUDF_low` is the low byte,
   `AUDF_high` the high byte, and the high channel's `AUDC` supplies volume and
   waveform. This is how VGMPlay and Furnace both read the joined register, so
@@ -56,9 +60,14 @@ has bit 30 set.
   written `AUDF` with a transform that depends on `AUDCTL` and the waveform
   (the bass/buzz waveforms divide and snap their periods). The converter
   inverts that transform, so the module writes the source's `AUDF` rather than
-  an approximate closed-form value.
+  an approximate closed-form value. The inverse picks the middle of each
+  transform plateau, because the single nearest note/E5 can fall on the lower
+  edge and write one register step low.
 - **Timing**: a POKEY-only log uses the driver's register-write lattice as the
   row grid, so each frame's volume/envelope step lands on a row.
+- **Mix**: the chip is written at the player's default level (1.0), not a
+  compensated core gain.  The optional level normalizer can still change the
+  song master; `--no-normalize` keeps the source's unity mix.
 
 ## Limitations
 

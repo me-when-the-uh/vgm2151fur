@@ -334,9 +334,6 @@ _FURNACE_VOLUME_SCALE = {
     # MAME shifts the voice product by 6 bits, the Furnace core by 7, so the
     # module needs twice the player's system volume to reach the same level.
     0x1D: 2.0,
-    # POKEY's Furnace core is 3.3x quieter than VGMPlay's at the same system
-    # volume (measured on a constant-volume square).
-    0x1E: 3.3,
     # VBOY's core has a 6x post-amp.  Measured against VGMPlay on Galactic
     # Pinball and Jack Bros: the module is about 2.2x quieter at unity.
     0x22: 2.2,

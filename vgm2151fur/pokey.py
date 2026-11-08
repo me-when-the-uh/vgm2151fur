@@ -162,15 +162,32 @@ def _invert_register(
 
     lo, hi = 1, 1 << 24
     if written(hi) < target:
-        best = hi
-    else:
-        while lo < hi:
-            mid = (lo + hi) // 2
-            if written(mid) < target:
-                lo = mid + 1
+        return hi
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if written(mid) < target:
+            lo = mid + 1
+        else:
+            hi = mid
+    if written(lo) == target:
+        # Return the middle of the plateau.  The pitch table only stores a
+        # few discrete values, and its nearest entry to the lower edge can
+        # fall just below and write target-1; the middle keeps the note/E5
+        # selection inside the plateau.
+        left = lo
+        right = min(lo + 1, 1 << 24)
+        while right < (1 << 24) and written(right) == target:
+            left = right
+            right = min(right * 2, 1 << 24)
+        a, b = left, right
+        while a < b:
+            mid = (a + b + 1) // 2
+            if written(mid) == target:
+                a = mid
             else:
-                hi = mid
-        best = lo
+                b = mid - 1
+        return (lo + a) // 2
+    best = lo
     best_err = abs(written(best) - target)
     for cand in (best - 3, best - 2, best - 1, best + 1, best + 2, best + 3):
         if cand < 1:
@@ -292,10 +309,24 @@ def collect_pokey(
         ctrl = (low + 1) if low is not None else voice
         return st["wave"][ctrl] & 7
 
+    def filter_control(voice: int, st: dict) -> bool:
+        """True for a silent channel that still clocks a high-pass filter.
+
+        AUDCTL bit 2 filters channel 1 with channel 3, bit 1 filters channel 2
+        with channel 4.  The control channel's volume is normally 0, but its
+        AUDF still sets the filter, so it needs a silent note in the module.
+        """
+        return bool(
+            (voice == 2 and st["audctl"] & 0x04)
+            or (voice == 3 and st["audctl"] & 0x02)
+        )
+
     def audible(voice: int, st: dict) -> bool:
         low = joined_low(voice, st)
         if low is not None and voice != low:
             return False
+        if filter_control(voice, st):
+            return True
         return effective_volume(voice, st) > 0
 
     def value_for(voice: int, st: dict) -> int:
@@ -414,6 +445,11 @@ def collect_pokey(
             for voice in range(POKEY_VOICES):
                 if st["active"][voice] is not None:
                     refresh(st, cid, voice, t)
+            # A filter control channel (3 for 1+3, 4 for 2+4) is silent by
+            # volume but still needs a note so its AUDF drives the filter.
+            for voice in (2, 3):
+                if filter_control(voice, st) or st["active"][voice] is not None:
+                    refresh(st, cid, voice, t)
             continue
         if r == REG_SKCTL:
             if val & 0x80 and not st["skctl"] & 0x80:
@@ -425,9 +461,9 @@ def collect_pokey(
             st["audf"][voice] = val
             module = module_voice_for_audf(voice, st)
             # A low join byte that is not the output byte still changes the
-            # pair's combined period.
-            if st["active"][module] is not None:
-                refresh(st, cid, module, t)
+            # pair's combined period.  A silent filter control also needs its
+            # note opened/retuned here.
+            refresh(st, cid, module, t)
             continue
         if r in REG_AUDC:
             voice = r // 2

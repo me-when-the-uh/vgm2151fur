@@ -156,6 +156,48 @@ class TestPokeyCollector(unittest.TestCase):
             furnace_written_register(hit.value, 0, 1, 7, False), 51,
         )
 
+    def test_filter_control_keeps_silent_note(self):
+        # AUDCTL bit 2 filters channel 1 with channel 3.  Voice 3 is silent
+        # (AUDC volume 0) but its AUDF still drives the filter, so it needs a
+        # volume-0 note in the module.
+        writes = [
+            _pokey(0, 4, 190), _pokey(0, 5, 0xA0),
+            _pokey(0, 0, 192), _pokey(0, 1, 0xAF),
+            _pokey(0, 8, 0x04),
+            _pokey(735 * 4, 8, 0x00),
+        ]
+        hits, _offs, _audctl, _waves, _warn = collect_pokey(_vgm(writes))
+        control = [h for h in hits if h.voice == 2]
+        self.assertEqual(len(control), 1)
+        self.assertEqual(control[0].vol, 0)
+        self.assertEqual(
+            furnace_written_register(
+                control[0].value, 0x04, 2, 5, False,
+            ),
+            190,
+        )
+
+    def test_pitch_plateau_hits_the_exact_register(self):
+        # The exact note/E5 must land inside the transform's plateau, not on
+        # its lower edge (which would write target-1).
+        for target, audctl, voice, wave in (
+            (192, 0x04, 0, 5),
+            (51, 0x00, 1, 7),
+            (102, 0x00, 1, 7),
+            (190, 0x04, 2, 5),
+        ):
+            t = pokey_value(target, audctl, voice, wave)
+            note, e5 = pokey_note(POKEY_DEFAULT_CLOCK, t)
+            value = pitch_table(
+                module_clock(POKEY_DEFAULT_CLOCK), 1,
+                maximum=POKEY_PITCH_MAX,
+            ).value(note, e5 - 0x80)
+            self.assertEqual(
+                furnace_written_register(value, audctl, voice, wave, False),
+                target,
+                (target, audctl, voice, wave),
+            )
+
     def test_volume_rise_retriggers(self):
         writes = [
             _pokey(0, 0, 100), _pokey(0, 1, 0xAF),
