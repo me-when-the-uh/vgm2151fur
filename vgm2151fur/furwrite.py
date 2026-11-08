@@ -25,6 +25,7 @@ from vgm2151fur.opl import (
     opll_module_clock,
 )
 from vgm2151fur.pcm import pcm7_to_s8, scale_pcm7
+from vgm2151fur.mikey import MIKEY_VOICES
 from vgm2151fur.pitch import FURNACE_CLOCK_DEFAULT, module_clock
 from vgm2151fur.pokey import POKEY_VOICES
 from vgm2151fur.saa1099 import (
@@ -119,6 +120,9 @@ CHIP_K052539 = 0xB4
 CHIP_AY8910 = 0x80
 # DIV_SYSTEM_POKEY: four voices, AUDCTL waveform/filter/join features.
 CHIP_POKEY = 0x94
+# DIV_SYSTEM_LYNX: Atari Lynx Mikey, four LFSR/DAC voices.
+CHIP_LYNX = 0xA8
+INS_MIKEY = 23
 # DIV_SYSTEM_SAA1099: six square/noise voices, no software timers.  A pair of
 # these is the Creative Music System / Game Blaster.
 CHIP_SAA1099 = 0x97
@@ -1096,6 +1100,68 @@ def _write_ins_pokey(b: Buf, name: str, ins=None) -> None:
     b.strz(name)
     b.b[na_size:na_size + 2] = int(len(b.b) - na_start).to_bytes(2, "little")
     _write_tone_macros(b, ins or ToneIns(), wave=True)
+    b.raw(b"EN")
+    b.end_block(size_off, start)
+
+
+def _write_ins_mikey(b: Buf, name: str, ins=None) -> None:
+    """DIV_INS_MIKEY: LFSR tone macros for the Atari Lynx."""
+    size_off, start = b.begin_block(b"INS2")
+    b.u16(FUR_VERSION)
+    b.u16(INS_MIKEY)
+    b.raw(b"NA")
+    na_size = len(b.b)
+    b.u16(0)
+    na_start = len(b.b)
+    b.strz(name)
+    b.b[na_size:na_size + 2] = int(len(b.b) - na_start).to_bytes(2, "little")
+    if ins is None:
+        ins = ToneIns()
+    if (
+        ins.vol or ins.duty or ins.pitch or ins.lfsr
+        or ins.panl or ins.panr
+    ):
+        b.raw(b"MA")
+        ma_size = len(b.b)
+        b.u16(0)
+        ma_start = len(b.b)
+        b.u16(8)
+        if ins.vol:
+            _write_macro(
+                b, 0, ins.vol, speed=ins.vol_speed, loop=ins.vol_loop,
+                delay=getattr(ins, "vol_delay", 0),
+            )
+        # Code 2 is Duty/Int: the tap bitmask is 10 bits wide, not one byte.
+        if ins.duty:
+            _write_macro(
+                b, 2, ins.duty, speed=ins.duty_speed, loop=ins.duty_loop,
+                width=2,
+            )
+        if ins.pitch:
+            _write_macro(
+                b, 4, ins.pitch, speed=ins.pitch_speed, loop=ins.pitch_loop,
+                delay=getattr(ins, "pitch_delay", 0), width=2,
+            )
+        # Code 5 is Load LFSR; the seed is 12 bits.
+        if ins.lfsr:
+            _write_macro(
+                b, 5, ins.lfsr, speed=ins.lfsr_speed, loop=ins.lfsr_loop,
+                width=2,
+            )
+        if ins.panl:
+            _write_macro(
+                b, 12, ins.panl, speed=ins.panl_speed, loop=ins.panl_loop,
+            )
+        if ins.panr:
+            _write_macro(
+                b, 13, ins.panr, speed=ins.panr_speed, loop=ins.panr_loop,
+            )
+        b.u8(255)
+        b.b[ma_size:ma_size + 2] = int(len(b.b) - ma_start).to_bytes(
+            2, "little",
+        )
+    else:
+        _write_ma(b)
     b.raw(b"EN")
     b.end_block(size_off, start)
 
@@ -3330,7 +3396,7 @@ def _build_patterns(song: Song, n_ch: int, pat_len_max: int, fx_cols: int,
         # default (both full). FM pan 0 still means "no 08xx on this row".
         if ev.quad is not None:
             _add_quad_fx(cell, ev.quad, fx_cols, stats)
-        elif (ev.pcm or ev.pan or ev.tone_chip == 7) and not ev.no_pan:
+        elif (ev.pcm or ev.pan or ev.tone_chip in (7, 10)) and not ev.no_pan:
             # VSU LRV 0 is "both sides off", not "leave the previous pan".
             _add_fx(cell, 0x08, ev.pan & 0xFF, fx_cols, stats)
 
@@ -4283,6 +4349,7 @@ def write_fur(
         or getattr(song, "saa_ids", ())
         or getattr(song, "psg_ids", ())
         or getattr(song, "pokey_ids", ())
+        or getattr(song, "mikey_ids", ())
         # YMZ280B is a sample engine with real module columns; a YMZ-only log
         # must not gain an empty YM2151 placeholder above it.
         or getattr(song, "ymz280b_samples", ())
@@ -4354,6 +4421,12 @@ def write_fur(
     ) or sorted({s.chip_id for s in pwm_smps})
     n_upd_ins = (len(upd7759_smps) + 119) // 120
     n_pwm_ins = (len(pwm_smps) + 119) // 120
+    mikey_smps = (
+        list(getattr(song, "mikey_samples", ()) or ())
+        if include_pcm else []
+    )
+    mikey_ids = list(getattr(song, "mikey_ids", ()) or ())
+    n_mikey_ins = (len(mikey_smps) + 119) // 120
     dac_smps = list(getattr(song, "dac_samples", ()) or ()) if include_pcm else []
     n_dac_ins = (len(dac_smps) + 119) // 120
     dac_smp_base = (
@@ -4449,6 +4522,7 @@ def write_fur(
     saa_specs = list(getattr(song, "saa_ins", ()) or ())
     pokey_ids = list(getattr(song, "pokey_ids", ()) or ())
     pokey_specs = list(getattr(song, "pokey_ins", ()) or ())
+    mikey_specs = list(getattr(song, "mikey_ins", ()) or ())
     scc_chip = CHIP_K052539 if song.vgm.k051649_plus else CHIP_K051649
     n_scc = 5 * len(scc_ids)
     n_ay = 3 * len(ay_ids)
@@ -4459,6 +4533,7 @@ def write_fur(
     n_vsu = 6 * len(vsu_ids)
     n_saa = 6 * len(saa_ids)
     n_pokey = 4 * len(pokey_ids)
+    n_mikey = 4 * len(mikey_ids)
     n_nes_dpcm_ins = len(nes_dpcm_smps)
     n_nes_pcm_ins = (len(nes_pcm_smps) + 119) // 120
     n_huc6280_pcm_ins = len(huc6280_pcm_smps)
@@ -4506,7 +4581,7 @@ def write_fur(
         + 28 * len(multipcm_ids) + len(upd7759_ids)
         + 2 * len(pwm_ids)
         + n_scc + n_ay + n_nes + n_huc6280 + n_gb + n_vsu + n_saa
-        + n_pokey
+        + n_pokey + n_mikey
     )
     if n_ch == 0:
         raise ValueError("write_fur: need include_fm and/or include_pcm")
@@ -4528,9 +4603,10 @@ def write_fur(
         + n_y8950_b_ins + n_opl4_wave_ins + n_ssg_pcm_ins
         + n_nes_dpcm_ins + n_nes_pcm_ins + n_huc6280_pcm_ins
         + len(ymz_smps) + len(multipcm_smps) + n_upd_ins + n_pwm_ins
+        + n_mikey_ins
         + len(scc_specs) + len(ay_specs) + len(psg_specs) + len(nes_specs)
         + len(huc6280_specs) + len(gb_specs) + len(vsu_specs)
-        + len(saa_specs)
+        + len(saa_specs) + len(mikey_specs)
     )
     n_smp = (
         len(pcm_smps) + len(oki_smps) + len(adpcm_smps)
@@ -4540,7 +4616,8 @@ def write_fur(
         + len(ym2610_a_smps) + len(ym2610_b_smps) + len(ym2608_b_smps)
         + len(y8950_b_smps) + len(opl4_wave_smps) + len(ssg_pcm_smps)
         + len(nes_dpcm_smps) + len(nes_pcm_smps) + len(huc6280_pcm_smps)
-        + len(ymz_smps) + len(multipcm_smps) + len(upd7759_smps) + len(pwm_smps)
+        + len(ymz_smps) + len(multipcm_smps) + len(upd7759_smps)
+        + len(pwm_smps) + len(mikey_smps)
     )
     n_wav = (
         len(scc_waves) + len(huc6280_waves) + len(gb_waves) + len(vsu_waves)
@@ -4623,6 +4700,7 @@ def write_fur(
     multipcm_smp_base = ymz_smp_base + len(ymz_smps)
     upd7759_smp_base = multipcm_smp_base + len(multipcm_smps)
     pwm_smp_base = upd7759_smp_base + len(upd7759_smps)
+    mikey_smp_base = pwm_smp_base + len(pwm_smps)
     n_ins = (
         len(fm_ins) + n_dac_ins + len(pcm_smps) + len(oki_smps) + n_adpcm_ins
         + len(spcm_smps) + len(rf5c68_smps) + len(rf5c164_smps)
@@ -4632,9 +4710,10 @@ def write_fur(
         + n_y8950_b_ins + n_opl4_wave_ins + n_ssg_pcm_ins
         + n_nes_dpcm_ins + n_nes_pcm_ins + n_huc6280_pcm_ins
         + len(ymz_smps) + len(multipcm_smps) + n_upd_ins + n_pwm_ins
+        + n_mikey_ins
         + len(scc_specs) + len(ay_specs) + len(psg_specs) + len(nes_specs)
         + len(huc6280_specs) + len(gb_specs) + len(vsu_specs)
-        + len(saa_specs) + len(pokey_specs)
+        + len(saa_specs) + len(pokey_specs) + len(mikey_specs)
     )
     n_smp = (
         len(pcm_smps) + len(oki_smps) + len(adpcm_smps)
@@ -4644,7 +4723,8 @@ def write_fur(
         + len(ym2610_a_smps) + len(ym2610_b_smps) + len(ym2608_b_smps)
         + len(y8950_b_smps) + len(opl4_wave_smps) + len(ssg_pcm_smps)
         + len(nes_dpcm_smps) + len(nes_pcm_smps) + len(huc6280_pcm_smps)
-        + len(ymz_smps) + len(multipcm_smps) + len(upd7759_smps) + len(pwm_smps)
+        + len(ymz_smps) + len(multipcm_smps) + len(upd7759_smps)
+        + len(pwm_smps) + len(mikey_smps)
     )
 
     n_ord = len(orders[0]) if orders else 1
@@ -4776,6 +4856,10 @@ def write_fur(
         for voice in range(POKEY_VOICES):
             names_long.append(f"POKEY {cid + 1}-{voice + 1}")
             names_short.append(f"PK{cid + 1}{voice + 1}")
+    for cid in mikey_ids:
+        for voice in range(MIKEY_VOICES):
+            names_long.append(f"Mikey {cid + 1}-{voice + 1}")
+            names_short.append(f"MK{cid + 1}{voice + 1}")
 
     label_parts: list[str] = []
     if fm_present:
@@ -4865,6 +4949,10 @@ def write_fur(
     if saa_ids:
         label_parts.append(
             "SAA1099 x2" if len(saa_ids) > 1 else "SAA1099"
+        )
+    if mikey_ids:
+        label_parts.append(
+            "Atari Lynx x2" if len(mikey_ids) > 1 else "Atari Lynx"
         )
     chip_label = " + ".join(label_parts) or "empty"
 
@@ -5223,6 +5311,12 @@ def write_fur(
             else (song.vgm.pokey_clock or POKEY_DEFAULT_CLOCK)
         )
         flag_texts.append(pokey_flag_text(clock))
+    for _cid in mikey_ids:
+        chips.append(CHIP_LYNX)
+        clock = song.vgm.mikey_clock or 16_000_000
+        flag_texts.append(
+            "" if abs(clock - 16_000_000) <= 2 else f"customClock={clock}"
+        )
     n_chips = len(chips)
     # MultiPCM owns a 2 MB / 512-sample memory.  Do not let every other
     # sample body in a combined module fill it; only the bodies written with
@@ -5584,6 +5678,16 @@ def write_fur(
         _write_ins_sample_map(
             b, f"PWM PCM {group + 1}", 0, maps, INS_AMIGA, flags=0x03,
         )
+    for group in range(n_mikey_ins):
+        ins_ptrs.append(len(b))
+        first = group * 120
+        maps = [
+            mikey_smp_base + first + slot
+            for slot in range(min(120, len(mikey_smps) - first))
+        ]
+        _write_ins_sample_map(
+            b, f"MIKEY PCM {group + 1}", 0, maps, INS_AMIGA, flags=0x03,
+        )
     for i, spec in enumerate(scc_specs):
         ins_ptrs.append(len(b))
         wave = scc_waves[spec.wave] if spec.wave < len(scc_waves) else b""
@@ -5676,6 +5780,18 @@ def write_fur(
         if spec.vol:
             name += "+vol"
         _write_ins_pokey(b, name, spec)
+    for i, spec in enumerate(mikey_specs):
+        ins_ptrs.append(len(b))
+        name = f"MIKEY {i:02d}"
+        if spec.pitch:
+            name += "+pitch"
+        if spec.vol:
+            name += "+vol"
+        if spec.duty:
+            name += "+duty"
+        if spec.lfsr:
+            name += "+lfsr"
+        _write_ins_mikey(b, name, spec)
 
     smp_ptrs: list[int] = []
     for i, smp in enumerate(pcm_smps):
@@ -5905,6 +6021,12 @@ def write_fur(
         _write_sample_s8(
             b, smp.name, smp.data, smp.rate, loop=loop,
             depth=SMP_DEPTH_16BIT, render_masks=(0, 0, 0, 0),
+        )
+    for smp in mikey_smps:
+        smp_ptrs.append(len(b))
+        _write_sample_s8(
+            b, smp.name, smp.data, smp.rate,
+            depth=SMP_DEPTH_8BIT, render_masks=(0, 0, 0, 0),
         )
 
     pat_ptrs: list[int] = []

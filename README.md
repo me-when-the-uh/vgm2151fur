@@ -5,7 +5,7 @@ Supported chips:
 - Yamaha: YM2151, YM2203, YM2612, YM2610/YM2610B, YM2608, YM2413, YM3526, YM3812, YMF262, Y8950, YMF278B, YMZ280B, YMW258-F (MultiPCM) and YM2149.
 - General Instrument: AY-3-8910.
 - Konami: VRC7, K007232, K053260 and SCC/SCC+.
-- Atari: POKEY.
+- Atari: POKEY and Lynx/Mikey.
 - Philips: SAA1099.
 - Texas Instruments: SN76489 and T6W28.
 - NEC: uPD7759 (stand-alone phrase ROMs and slave streams).
@@ -89,7 +89,7 @@ tests/          pytest suite
 docs/           operating guide, format notes, chip notes
 ```
 
-Project state and workflow are in `docs/portable-context.md` and `docs/implementation-notes.md`. Chip details are in `docs/opm-notes.md`, `docs/ym2203.md`, `docs/ym2612.md`, `docs/ym2610.md`, `docs/opna-opll.md`, `docs/opl.md`, `docs/k053260.md`, `docs/scc-ay8910.md`, `docs/segapcm-c140.md`, `docs/ssg-pcm.md`, `docs/nes-vrc7.md`, `docs/gb.md`, `docs/huc6280.md`, `docs/c352.md`, `docs/ymz280b.md`, `docs/multipcm.md`, `docs/upd7759.md`, `docs/pwm32x.md`, `docs/pokey.md` and `docs/vsu.md`. `docs/merged-logs.md` covers multi-family modules, and `docs/psg-open-items.md` tracks the remaining AY accuracy gaps.
+Project state and workflow are in `docs/portable-context.md` and `docs/implementation-notes.md`. Chip details are in `docs/opm-notes.md`, `docs/ym2203.md`, `docs/ym2612.md`, `docs/ym2610.md`, `docs/opna-opll.md`, `docs/opl.md`, `docs/k053260.md`, `docs/scc-ay8910.md`, `docs/segapcm-c140.md`, `docs/ssg-pcm.md`, `docs/nes-vrc7.md`, `docs/gb.md`, `docs/huc6280.md`, `docs/c352.md`, `docs/ymz280b.md`, `docs/multipcm.md`, `docs/upd7759.md`, `docs/pwm32x.md`, `docs/pokey.md`, `docs/mikey.md` and `docs/vsu.md`. `docs/merged-logs.md` covers multi-family modules, and `docs/psg-open-items.md` tracks the remaining AY accuracy gaps.
 
 Open follow-ups are tracked in [TODO.md](./TODO.md).
 
@@ -139,6 +139,10 @@ Open follow-ups are tracked in [TODO.md](./TODO.md).
   - The noise note is a hardware table index, so the fastest NR43 entries fold onto C-5 and are not bit-exact on export.
 - HuC6280 converts six wavetable voices, with periodic noise split into a transient and tone tail and DAC-stream bodies as 8-bit samples.
 - Atari POKEY converts four voices per chip, including dual-chip logs, per-frame AUDC volume/waveform macros, AUDCTL macros/effects, joined 16-bit pairs, high-clock/15 kHz/filter modes and silent filter-control notes.
+- Atari Lynx/Mikey converts four LFSR voices per chip with volume/pitch/duty/LFSR macros and panning, plus CPU-fed 8-bit DAC streams as native Lynx sample-map bodies.
+  - LFSR notes use the source timer divider `(backup+1)<<shift`, so pitches follow the hardware except for Furnace's timer-divider clamp.
+  - A streamed output register becomes a banked 0.25-second 8-bit sample at its inferred write rate; repeated chunks share one body.
+  - Negative source volume is played at its magnitude because Furnace's Mikey volume column has no sign bit.
   - Volume-only mode (AUDC bit 4) is not converted because Furnace has no DC/DAC mode.
   - Two-tone mode (SKCTL bit 7) exists only on Furnace's ASAP core and is not converted.
   - AUDC distortion 7 has no separate Furnace wave tap and plays as distortion 6 with a warning.

@@ -104,6 +104,14 @@ from vgm2151fur.pwm import (
     PwmSample,
     collect_pwm,
 )
+from vgm2151fur.mikey import (
+    MIKEY_DEFAULT_CLOCK,
+    MIKEY_DIVIDER,
+    MIKEY_MAX_PERIOD,
+    MIKEY_VOICES,
+    MikeySample,
+    collect_mikey,
+)
 from vgm2151fur.pitch import (
     E5_CENTER, NOTE_MAX, furnace_period_note, module_clock, pitch_table,
 )
@@ -560,6 +568,13 @@ class NoteEvent:
     # keeping the pair (rather than a volume plus a balance) reproduces soft
     # pan and a volume envelope exactly.
     tone_amp_pts: tuple[tuple[int, int, int], ...] = ()
+    # Lynx Mikey only: (sample, duty/int bitmask) and (sample, 12-bit LFSR
+    # seed) changes while the note is held.  Both become 16-bit macros.
+    tone_duty_pts: tuple[tuple[int, int], ...] = ()
+    tone_lfsr_pts: tuple[tuple[int, int], ...] = ()
+    # Initial duty/int bitmask and LFSR seed for a Mikey note.
+    tone_duty: int = 0
+    tone_lfsr: int = 0
     # PCE noise-mode note: its "pitch" is the 0-31 noise register, which the
     # platform adds ``std.pitch`` to directly, not a period-table value.
     tone_noise: bool = False
@@ -660,6 +675,14 @@ class ToneIns:
     env_period: tuple[int, ...] = ()
     env_period_speed: int = 1
     env_period_loop: int = 255
+    # Atari Lynx Mikey: the duty/int bitmask and the 12-bit LFSR seed, both
+    # stored as 16-bit macros (the values exceed one byte).
+    duty: tuple[int, ...] = ()
+    duty_speed: int = 1
+    duty_loop: int = 255
+    lfsr: tuple[int, ...] = ()
+    lfsr_speed: int = 1
+    lfsr_loop: int = 255
     # SAA1099 only: the raw amplitude nibbles as panning macros.  Furnace's
     # SAA platform writes the amplitude register as
     # ``applyPan(outVol, pan)``, and ``applyPan(15, (left << 4) | right)`` is
@@ -810,6 +833,13 @@ class Song:
     pwm_samples: list[PwmSample] = field(default_factory=list)
     pwm_ids: list[int] = field(default_factory=list)
     pwm_count: int = 0
+    # Atari Lynx Mikey: four voices per chip.  `mikey_ins` holds the LFSR
+    # tone instruments (volume/pitch/duty/LFSR macros); streamed output
+    # bytes become native 8-bit sample-map bodies in `mikey_samples`.
+    mikey_ids: list[int] = field(default_factory=list)
+    mikey_ins: list[ToneIns] = field(default_factory=list)
+    mikey_samples: list[MikeySample] = field(default_factory=list)
+    mikey_count: int = 0
     # (sample, channel, effect, value) placed before notes. MSM6258 divider.
     channel_fx: list[tuple[int, int, int, int]] = field(default_factory=list)
     # Chip-wide YM2151 LFO effects: (sample, effect, value[, tick offset]).
@@ -1540,6 +1570,15 @@ def _plain_tone(spec: ToneIns, tone_chip: int) -> ToneIns:
             gb_env_len=spec.gb_env_len,
             gb_sound_len=spec.gb_sound_len,
         )
+    if tone_chip == 10:
+        # Lynx: without the tap mask the voice is silent, so a budget
+        # fallback still keeps the starting duty/int and LFSR seed.
+        return ToneIns(
+            duty=spec.duty, duty_speed=spec.duty_speed,
+            duty_loop=spec.duty_loop,
+            lfsr=spec.lfsr, lfsr_speed=spec.lfsr_speed,
+            lfsr_loop=spec.lfsr_loop,
+        )
     return ToneIns()
 
 
@@ -1646,7 +1685,7 @@ def _take_tone(
 
 _TONE_MACRO_FIELDS = (
     "pitch", "waves", "vol", "noise", "mode", "env_shape", "env_period",
-    "panl", "panr", "env",
+    "panl", "panr", "env", "duty", "lfsr",
 )
 _TONE_MACRO_TIMING = (
     ("pitch", "pitch_speed", "pitch_loop"),
@@ -1659,6 +1698,8 @@ _TONE_MACRO_TIMING = (
     ("panl", "panl_speed", "panl_loop"),
     ("panr", "panr_speed", "panr_loop"),
     ("env", "env_speed", "env_loop"),
+    ("duty", "duty_speed", "duty_loop"),
+    ("lfsr", "lfsr_speed", "lfsr_loop"),
 )
 
 
@@ -1965,6 +2006,7 @@ def _bind_tone_instruments(
     vsu_ins: list[ToneIns],
     saa_ins: list[ToneIns],
     pokey_ins: list[ToneIns],
+    mikey_ins: list[ToneIns],
     tone_ins_base: int,
     scc_clock: int,
     ay_clock: int,
@@ -1975,6 +2017,7 @@ def _bind_tone_instruments(
     vsu_clock: int,
     saa_clock: int,
     pokey_clock: int,
+    mikey_clock: int,
     hz: float,
     total_samples: int,
     use_speed: int = 1,
@@ -2002,13 +2045,14 @@ def _bind_tone_instruments(
     vsu_map: dict[ToneIns, int] = {}
     saa_map: dict[ToneIns, int] = {}
     pokey_map: dict[ToneIns, int] = {}
+    mikey_map: dict[ToneIns, int] = {}
     ins_cap = max(1, INS_TARGET - tone_ins_base)
     # GB, VSU and POKEY bind last. Reserve a share so a large SCC/AY/PCE list
     # cannot spend every slot before them; the surplus collapses to plain
     # per-wave/per-env instruments, the documented "fall back to columns"
     # behavior.
     has_late = any(
-        e.tone_chip in (6, 7, 8, 9) and e.on for e in events
+        e.tone_chip in (6, 7, 8, 9, 10) and e.on for e in events
     )
     early_cap = ins_cap
     if has_late:
@@ -2035,6 +2079,7 @@ def _bind_tone_instruments(
     tone_order += [e for e in events if e.on and e.tone_chip == 7]
     tone_order += [e for e in events if e.on and e.tone_chip == 8]
     tone_order += [e for e in events if e.on and e.tone_chip == 9]
+    tone_order += [e for e in events if e.on and e.tone_chip == 10]
     for e in tone_order:
         end = e.end or track_end
         # 255 macro values times the largest speed byte. Long SSG pads can
@@ -2094,6 +2139,12 @@ def _bind_tone_instruments(
             clock = e.tone_clock or pokey_clock or POKEY_DEFAULT_CLOCK
             divider = 1
             maximum = POKEY_PITCH_MAX
+        elif e.tone_chip == 10:
+            # Lynx Mikey: the collector's value is the timer divider
+            # (backup+1)<<shift, which is exactly what MikeyFreqDiv consumes.
+            clock = e.tone_clock or mikey_clock or MIKEY_DEFAULT_CLOCK
+            divider = MIKEY_DIVIDER
+            maximum = MIKEY_MAX_PERIOD
         else:
             # AY and the YM2203's SSG share the instrument path but not the
             # clock or Furnace's divider (8 vs 16).
@@ -2104,6 +2155,8 @@ def _bind_tone_instruments(
             tbl = pitch_table(saa_module_clock(clock), divider, maximum=maximum)
         elif e.tone_chip == 9:
             tbl = pitch_table(module_clock(clock), divider, maximum=maximum)
+        elif e.tone_chip == 10:
+            tbl = pitch_table(float(clock), divider, maximum=maximum)
         else:
             tbl = (
                 pitch_table(float(clock), divider, maximum=maximum)
@@ -2329,6 +2382,9 @@ def _bind_tone_instruments(
         panl_speed = panr_speed = env_speed = 1
         panl_loop = panr_loop = env_loop = 255
         panl_delay = panr_delay = env_delay = 0
+        duty = lfsr = ()
+        duty_speed = lfsr_speed = 1
+        duty_loop = lfsr_loop = 255
         if e.tone_chip == 8:
             # SAA1099: the amplitude register carries volume and soft pan
             # together; put the raw nibbles on the two panning macros and
@@ -2384,6 +2440,29 @@ def _bind_tone_instruments(
             )
             if not noise and audctl_pts:
                 noise, noise_speed, noise_loop = (audctl_pts[0][1],), 1, 255
+        elif e.tone_chip == 10:
+            # Lynx: the feedback/control taps and the LFSR seed are 10- and
+            # 12-bit values, so they live in the 16-bit macro encoding.
+            duty_pts = [(e.sample, e.tone_duty)] + list(e.tone_duty_pts)
+            duty_series = _tick_values(
+                duty_pts, e.sample, ticks, tick_samples,
+            )
+            if len(set(duty_series)) > 1:
+                duty, duty_speed, duty_loop, _delay = _macro_series_delay(
+                    duty_series,
+                )
+            elif e.tone_duty or e.tone_duty_pts:
+                duty, duty_speed, duty_loop = (e.tone_duty,), 1, 255
+            lfsr_pts = [(e.sample, e.tone_lfsr)] + list(e.tone_lfsr_pts)
+            lfsr_series = _tick_values(
+                lfsr_pts, e.sample, ticks, tick_samples,
+            )
+            if len(set(lfsr_series)) > 1:
+                lfsr, lfsr_speed, lfsr_loop, _delay = _macro_series_delay(
+                    lfsr_series,
+                )
+            elif e.tone_lfsr or e.tone_lfsr_pts:
+                lfsr, lfsr_speed, lfsr_loop = (e.tone_lfsr,), 1, 255
         elif e.tone_fx_pts:
             noise, noise_speed, noise_loop = _macro_if_moving(
                 [(t, val) for t, cmd, val in e.tone_fx_pts if cmd == FX_NOISE],
@@ -2440,6 +2519,8 @@ def _bind_tone_instruments(
             panr_delay=panr_delay,
             env=env, env_speed=env_speed, env_loop=env_loop,
             env_delay=env_delay,
+            duty=duty, duty_speed=duty_speed, duty_loop=duty_loop,
+            lfsr=lfsr, lfsr_speed=lfsr_speed, lfsr_loop=lfsr_loop,
             gb_soft_env=bool(getattr(e, "gb_soft_env", False)),
             gb_env_vol=int(getattr(e, "gb_env_vol", 0)),
             gb_env_dir=int(getattr(e, "gb_env_dir", 0)),
@@ -2498,12 +2579,20 @@ def _bind_tone_instruments(
                 + len(saa_ins),
                 ins_cap, 9,
             )
+        elif e.tone_chip == 10:
+            idx, kept = take(
+                spec, mikey_map, mikey_ins,
+                len(scc_ins) + len(ay_ins) + len(psg_ins) + len(nes_ins)
+                + len(huc6280_ins) + len(gb_ins) + len(vsu_ins)
+                + len(saa_ins) + len(pokey_ins),
+                ins_cap, 10,
+            )
         else:
             # AY runs first, so the SCC list is still empty and `others` is 0.
             idx, kept = take(spec, ay_map, ay_ins, 0, early_cap, 2)
         bound.append((e, idx))
         if (
-            e.tone_chip in (3, 7, 9)
+            e.tone_chip in (3, 7, 9, 10)
             and not e.tone_noise
             and kept != spec
             and not kept.pitch
@@ -2553,6 +2642,15 @@ def _bind_tone_instruments(
             # pattern steps rather than folding them into a volume macro.
             # The GB wave column is the NR32 level (0/5/10/15), same idea.
             pass
+        elif e.tone_chip == 10:
+            # Lynx computes outVol = (column * macro) / 127.  A 127 column
+            # makes the volume macro the raw register level.
+            if kept.vol:
+                e.vol = 127
+                e.vol_pts = ()
+                e.vol_slide = 0
+            else:
+                e.vol = column_vol
         elif kept.vol:
             # The column that makes the macro the register: SCC vol*macro/15,
             # AY macro + column - 15, PCE vol*macro/31.
@@ -2632,6 +2730,8 @@ def _bind_tone_instruments(
     n_huc = len(huc6280_ins)
     n_gb = len(gb_ins)
     n_vsu = len(vsu_ins)
+    n_saa = len(saa_ins)
+    n_pokey = len(pokey_ins)
     for event, idx in bound:
         if event.tone_chip == 1:
             event.ins = tone_ins_base + idx
@@ -2655,7 +2755,18 @@ def _bind_tone_instruments(
                 tone_ins_base + n_scc + n_ay + n_psg + n_nes + n_huc
                 + n_gb + n_vsu + idx
             )
+        elif event.tone_chip == 9:
+            event.ins = (
+                tone_ins_base + n_scc + n_ay + n_psg + n_nes + n_huc
+                + n_gb + n_vsu + n_saa + idx
+            )
+        elif event.tone_chip == 10:
+            event.ins = (
+                tone_ins_base + n_scc + n_ay + n_psg + n_nes + n_huc
+                + n_gb + n_vsu + n_saa + n_pokey + idx
+            )
         else:
+            # AY-8910 (tone_chip 2) binds first, so its list starts at SCC end.
             event.ins = tone_ins_base + n_scc + idx
     return merged
 
@@ -2770,6 +2881,7 @@ def _tone_instrument_demand(
     vsu_clock: int,
     saa_clock: int,
     pokey_clock: int,
+    mikey_clock: int,
     hz: float,
     total_samples: int,
     use_speed: int = 1,
@@ -2787,19 +2899,21 @@ def _tone_instrument_demand(
         return 0
     scc, ay, psg, nes, huc, gb, vsu, saa = [], [], [], [], [], [], [], []
     pokey = []
+    mikey = []
     _bind_tone_instruments(
-        tone, scc, ay, psg, nes, huc, gb, vsu, saa, pokey,
+        tone, scc, ay, psg, nes, huc, gb, vsu, saa, pokey, mikey,
         # A negative base leaves the instrument cap effectively unlimited, so
         # every distinct macro shape is counted.
         -1000,
         scc_clock, ay_clock, psg_clock, nes_clock, huc6280_clock,
-        gb_clock, vsu_clock, saa_clock, pokey_clock, hz, total_samples,
+        gb_clock, vsu_clock, saa_clock, pokey_clock, mikey_clock,
+        hz, total_samples,
         use_speed,
         lfo_loop=lfo_loop,
     )
     return sum(
         len(bucket)
-        for bucket in (scc, ay, psg, nes, huc, gb, vsu, saa, pokey)
+        for bucket in (scc, ay, psg, nes, huc, gb, vsu, saa, pokey, mikey)
     )
 
 
@@ -3513,6 +3627,95 @@ def _emit_ay_notes(
                 tone_fx_pts=tuple(buckets[i]),
             ))
             count += 1
+    for off in offs:
+        base = at.get(off.chip_id)
+        if base is None:
+            continue
+        events.append(NoteEvent(
+            sample=off.sample_time, ch=base + off.voice, on=False, note=180,
+            ins=-1, vol=-1, e5=0x80, pan=0,
+        ))
+    return count
+
+
+def _emit_mikey_notes(
+    events: list[NoteEvent],
+    channel_fx: list[tuple[int, int, int, int]],
+    hits,
+    offs,
+    at: dict[int, int],
+    total_samples: int = 0,
+) -> int:
+    """Append Lynx LFSR notes/key-offs.
+
+    Pitch is the timer divider ``(backup+1)<<shift``; Furnace's period table
+    turns it back into note+E5.  Duty/int, LFSR seed and pan ride the
+    instrument macros or 08xx effects.  A large held pitch step becomes a new
+    note via `segment_periods`, exactly like POKEY.
+    """
+    count = 0
+    for h in hits:
+        base = at.get(h.chip_id)
+        if base is None:
+            continue
+        ch = base + h.voice
+        st = h.sample_time
+        gate_end = h.off_sample or (total_samples or st)
+        segs = segment_periods(
+            [(st, h.value), *h.freq_pts],
+            gate_end, h.clock, MIKEY_DIVIDER, 0,
+            merge_gap=_AY_MERGE_GAP,
+            min_hold=_AY_NOTE_HOLD,
+            drop_short=False,
+            maximum=MIKEY_MAX_PERIOD,
+        )
+        for i, (sst, value, intra) in enumerate(segs):
+            nxt = segs[i + 1][0] if i + 1 < len(segs) else 0
+            seg_end = nxt or h.off_sample
+            bound = nxt or gate_end
+            note, e5 = furnace_period_note(
+                h.clock, MIKEY_DIVIDER, max(1, value),
+                maximum=MIKEY_MAX_PERIOD,
+            )
+            steps = _tone_steps(intra, sst, 0, _AY_MERGE_GAP)
+            vol = _value_at(h.vol_pts, sst, h.vol)
+            vol_pts = tuple(
+                (t, v, None) for t, v in h.vol_pts if sst < t < bound
+            )
+            duty_at = _value_at(h.duty_pts, sst, h.duty)
+            duty_steps = tuple(
+                (t, v) for t, v in h.duty_pts if sst < t < bound
+            )
+            lfsr_at = _value_at(h.lfsr_pts, sst, h.lfsr)
+            lfsr_steps = tuple(
+                (t, v) for t, v in h.lfsr_pts if sst < t < bound
+            )
+            events.append(NoteEvent(
+                sample=sst,
+                ch=ch,
+                on=True,
+                note=note,
+                ins=-1,
+                vol=vol,
+                e5=e5,
+                pan=_value_at(h.pan_pts, sst, h.pan),
+                end=seg_end,
+                vol_pts=vol_pts,
+                tone_pitch_pts=tuple(steps),
+                tone_chip=10,
+                tone_clock=h.clock,
+                tone_div=MIKEY_DIVIDER,
+                tone_period_offset=0,
+                tone_period=value,
+                tone_duty=duty_at,
+                tone_duty_pts=duty_steps,
+                tone_lfsr=lfsr_at,
+                tone_lfsr_pts=lfsr_steps,
+            ))
+            count += 1
+            for t, pan in h.pan_pts:
+                if sst < t < bound:
+                    channel_fx.append((t, ch, 0x08, pan))
     for off in offs:
         base = at.get(off.chip_id)
         if base is None:
@@ -10243,6 +10446,34 @@ def analyze(
     else:
         audible = []
 
+    # Atari Lynx Mikey: LFSR tones always convert; streamed output bytes are
+    # native 8-bit samples and follow --melody-only/--pcm-only like the other
+    # sample engines.
+    mikey_hits, mikey_offs, mikey_samples, mikey_warn = collect_mikey(
+        vgm, lossy=lossy_samples,
+    )
+    mikey_clock = vgm.mikey_clock or MIKEY_DEFAULT_CLOCK
+    warnings.extend(mikey_warn)
+    if not pcm:
+        mikey_samples = []
+    mikey_ids = _dual_ids(
+        sorted(
+            {h.chip_id for h in mikey_hits}
+            | {s.chip_id for s in mikey_samples}
+        )
+        or ([0] if vgm.mikey_clock else []),
+        bool(getattr(vgm, "mikey_dual", False)),
+    )
+    if getattr(vgm, "mikey_dual", False):
+        warnings.append(
+            "Mikey header declares a second chip, but VGM command 0x40 has "
+            "no instance bit; both voices play on the first chip"
+        )
+    n_mikey_ins = (len(mikey_samples) + 119) // 120
+    mikey_sample_events: list[tuple[NoteEvent, int]] = []
+    mikey_ins: list[ToneIns] = []
+    mikey_count = 0
+
     # NES APU: two pulses, triangle, noise and the DPCM/PCM channel per
     # instance.  Collect now so the instrument counts are known before the tone
     # list is placed.
@@ -11262,6 +11493,63 @@ def analyze(
             vgm.total_samples or 0,
         )
 
+    # Atari Lynx Mikey: four columns after the POKEY block.  LFSR notes bind
+    # through the tone-instrument pass; streamed DAC bodies use a 120-slot
+    # native Lynx sample map, exactly like the other sample-map engines.
+    if mikey_ids:
+        mikey_base = (
+            tone_base + SCC_VOICES * len(scc_ids) + AY_VOICES * len(ay_ids)
+            + NES_CHANNELS * len(nes_ids)
+            + (HUC6280_CHANNELS if huc6280_ids else 0)
+            + (4 * len(gb_ids))
+            + VSU_CHANNELS * len(vsu_ids)
+            + SAA_VOICES * len(saa_ids)
+            + POKEY_VOICES * len(pokey_ids)
+        )
+        mikey_at = {
+            cid: mikey_base + MIKEY_VOICES * i
+            for i, cid in enumerate(mikey_ids)
+        }
+        mikey_count = _emit_mikey_notes(
+            events, channel_fx, mikey_hits, mikey_offs, mikey_at,
+            vgm.total_samples or 0,
+        )
+        total = vgm.total_samples or 0
+        for i, smp in enumerate(mikey_samples):
+            slot = i % 120
+            ins_slot = i // 120
+            duration = int(round(smp.frames / smp.rate * VGM_RATE))
+            for hit in smp.hits:
+                start = hit.time
+                end = min(start + duration, total or start + duration)
+                ev = NoteEvent(
+                    sample=start,
+                    ch=mikey_at.get(smp.chip_id, mikey_base) + hit.voice,
+                    on=True,
+                    note=60 + slot,  # 120-slot map, slot plays at C-4
+                    ins=-1,
+                    vol=127,
+                    e5=0x80,
+                    pan=hit.pan,
+                    pcm=True,
+                    end=end,
+                )
+                events.append(ev)
+                mikey_sample_events.append((ev, ins_slot))
+                mikey_count += 1
+                if end and end < total:
+                    events.append(NoteEvent(
+                        sample=end,
+                        ch=ev.ch,
+                        on=False,
+                        note=180,
+                        ins=-1,
+                        vol=-1,
+                        e5=0x80,
+                        pan=0,
+                        pcm=True,
+                    ))
+
     # The YM2203 SSG rides in the same six-channel system: 0-2 FM, 3-5 PSG. Its
     # notes share the AY instrument list.
     ssg_pcm, ssg_pcm_hits = _ssg_pcm("ym2203_ssg")
@@ -11365,6 +11653,8 @@ def analyze(
     tone_ins_base += n_upd_ins
     pwm_ins_base = tone_ins_base
     tone_ins_base += n_pwm_ins
+    mikey_ins_base = tone_ins_base
+    tone_ins_base += n_mikey_ins
 
     events.sort(key=lambda e: (e.sample, e.ch, 0 if e.on else 1))
 
@@ -11637,17 +11927,18 @@ def analyze(
     # which cannot use row effects, still get their macros.
     tone_groups = (
         n_ssg_pcm + n_nes_dpcm_ins + n_nes_pcm_ins
-        + n_huc6280_pcm_ins + n_opl4_wave_ins
+        + n_huc6280_pcm_ins + n_opl4_wave_ins + n_mikey_ins
     )
     tone_demand = 0
     if (
         scc_ids or ay_ids or psg_ids or nes_ids or huc6280_ids
-        or gb_ids or vsu_ids or saa_ids or pokey_ids
+        or gb_ids or vsu_ids or saa_ids or pokey_ids or mikey_ids
     ):
         tone_demand = _tone_instrument_demand(
             events, vgm.k051649_clock or SCC_DEFAULT_CLOCK, ay_note_clock,
             psg_clock, nes_clock, huc6280_clock, gb_clock, vsu_clock,
-            saa_clock, pokey_clock, hz, vgm.total_samples, use_speed,
+            saa_clock, pokey_clock, mikey_clock, hz, vgm.total_samples,
+            use_speed,
             lfo_loop=lfo_loop,
         )
     tone_demand_raw = tone_demand
@@ -11729,6 +12020,8 @@ def analyze(
         tone_ins_base += n_upd_ins
         pwm_ins_base = tone_ins_base
         tone_ins_base += n_pwm_ins
+        mikey_ins_base = tone_ins_base
+        tone_ins_base += n_mikey_ins
     if pms_lost:
         warnings.append(
             f"{pms_lost} YM2151 PMS/AMS ramps stayed on the base instrument: "
@@ -11769,7 +12062,7 @@ def analyze(
     )
     tone_merged = _bind_tone_instruments(
         events, scc_ins, ay_ins, psg_ins, nes_ins, huc6280_ins, gb_ins,
-        vsu_ins, saa_ins, pokey_ins,
+        vsu_ins, saa_ins, pokey_ins, mikey_ins,
         tone_ins_base,
         vgm.k051649_clock or SCC_DEFAULT_CLOCK,
         ay_note_clock,
@@ -11780,6 +12073,7 @@ def analyze(
         vsu_clock,
         saa_clock,
         pokey_clock,
+        mikey_clock,
         hz, vgm.total_samples, use_speed,
         merge_tol=tone_merge_tol, lfo_loop=lfo_loop,
     )
@@ -11822,6 +12116,8 @@ def analyze(
         ev.ins = upd_ins_base + idx
     for ev, idx in pwm_events:
         ev.ins = pwm_ins_base + idx
+    for ev, idx in mikey_sample_events:
+        ev.ins = mikey_ins_base + idx
 
     loop_sample = vgm.loop_sample
     if loop_sample is not None and loop_sample < 0:
@@ -11838,6 +12134,7 @@ def analyze(
         or nes_ids or nes_dpcm_samples or nes_pcm_samples
         or huc_pcm_samples or ymz_audible
         or multipcm_audible or upd_audible or pwm_audible
+        or mikey_ids
         or any(s.length >= 8 for s in pcm_samples)
         or scc_waves or ay_count or dac_samples or psg_count
         or saa_ids or saa_count or pokey_count
@@ -11990,6 +12287,10 @@ def analyze(
         pwm_samples=pwm_audible,
         pwm_ids=pwm_ids,
         pwm_count=pwm_count,
+        mikey_samples=mikey_samples,
+        mikey_ids=mikey_ids,
+        mikey_ins=mikey_ins,
+        mikey_count=mikey_count,
         channel_fx=channel_fx,
         k007232_volume=k007232_volume,
         c352_quad=c352_quad_events,
@@ -12504,6 +12805,12 @@ def format_report(song: Song) -> str:
                 f"  {s.name:<10}  frames {s.frames:7d}  "
                 f"{'loop' if s.loop_start is not None else 'one-shot'}"
             )
+    if song.mikey_ids or song.mikey_ins or song.mikey_samples:
+        lines.append(
+            f"Atari Lynx  {len(song.mikey_ids)} chip(s)  "
+            f"{song.mikey_count} note(s)  {len(song.mikey_ins)} tone ins  "
+            f"{len(song.mikey_samples)} DAC bodies"
+        )
     last = song.events[-1].sample if song.events else song.t0
     rows = song.row_of(last) + 1
     lines.append(f"rows        {rows}  (~{math.ceil(rows / 256)} orders of 256)")

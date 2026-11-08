@@ -350,6 +350,8 @@ def convert_vgm(
         "c140_samples": len(song.c140_samples) if pcm else 0,
         "c352_samples": len(song.c352_samples) if pcm else 0,
         "k053260_samples": len(song.k053260_samples) if pcm else 0,
+        "mikey_samples": len(song.mikey_samples) if pcm else 0,
+        "mikey_notes": song.mikey_count,
         "ym2610_a_samples": len(song.ym2610_a_samples) if pcm else 0,
         "ym2610_b_samples": len(song.ym2610_b_samples) if pcm else 0,
         "ym2610_a_notes": song.ym2610_a_count,

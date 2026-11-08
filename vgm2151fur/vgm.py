@@ -184,6 +184,7 @@ EXTRA_YMZ280B = 0x0F
 EXTRA_MULTIPCM = 0x15  # Yamaha YMW258-F (MultiPCM)
 EXTRA_UPD7759 = 0x16  # NEC uPD7759
 EXTRA_POKEY = 0x1E  # Atari POKEY (same id as libvgm's DEVID_POKEY)
+EXTRA_MIKEY = 0x29  # Atari Lynx Mikey (libvgm DEVID_MIKEY)
 # Main-header clocks (VGMFile.h layout, spec v1.71). 0x98 is MSM6295, 0x90
 # MSM6258, 0x94 its flags. K007232 has no spec field; VGMPlay tools put it at
 # 0xE8 (1.71+). C140 is 0xA8 and its type byte 0x96. AY-8910 is 0x74 with its
@@ -334,6 +335,12 @@ PWM_CLOCK_OFF = 0x70
 PWM_DEFAULT_CLOCK = 23_011_361
 PWM_DUAL_BIT = 0x40000000
 PWM_DATA_TYPE = 0x03  # PWM PCM data bank
+# Atari Lynx Mikey header 0xE4 (VGM 1.72+).  Command 0x40 writes one 8-bit
+# register; four voices can run as LFSR tones or CPU-fed 8-bit DAC samples.
+MIKEY_CLOCK_OFF = 0xE4
+MIKEY_DEFAULT_CLOCK = 16_000_000
+MIKEY_DUAL_BIT = 0x40000000
+CMD_MIKEY = 0x40
 C352_CLOCK_OFF = 0xDC  # VGM 1.71 crystal; bit 31 mutes the rear pair
 C352_DIV_OFF = 0xD6  # hardware divider / 4; 72 means a divider of 288
 SEGAPCM_CLOCK_X = 4000000  # X board / Hang-On
@@ -750,6 +757,10 @@ class VgmFile:
     pwm_dual: bool = False
     pwm_bank: bytearray = field(default_factory=bytearray)
     pwm_blocks: list[bytes] = field(default_factory=list)
+    # Atari Lynx Mikey header 0xE4 (VGM 1.72+).  Writes arrive on command
+    # 0x40 as (register, value); the chip has four LFSR/DAC voices.
+    mikey_clock: int = 0
+    mikey_dual: bool = False
     # Extra-header clocks, raw (bit 31 kept). Keyed by libvgm chip id.
     extra_clocks: dict[int, int] = field(default_factory=dict)
     # Extra-header volume mix: chip id -> (flags, raw value, 0x100 = 1.0).
@@ -1515,6 +1526,13 @@ def load_vgm(path: Path | str) -> VgmFile:
     if not pwm_clock:
         pwm_clock = _sane_clock(clocks.get(STREAM_PWM, 0))
     pwm_clock_2 = _sane_clock(clocks.get(STREAM_PWM, 0)) if pwm_dual else 0
+    # Atari Lynx Mikey clock 0xE4 (VGM 1.72+).  Bit 30 is a second-instance
+    # marker in the spec, though command 0x40 has no instance bit.
+    mikey_raw = _header_raw(buf, MIKEY_CLOCK_OFF) if ver >= 0x172 else 0
+    mikey_dual = bool(mikey_raw & MIKEY_DUAL_BIT)
+    mikey_clock = _sane_clock(mikey_raw)
+    if not mikey_clock:
+        mikey_clock = _sane_clock(clocks.get(EXTRA_MIKEY, 0))
 
     main_volume = 0.0
     # Bytes past the declared command offset are not header fields. Synthetic
@@ -1621,6 +1639,8 @@ def load_vgm(path: Path | str) -> VgmFile:
         pwm_clock=pwm_clock,
         pwm_clock_2=pwm_clock_2,
         pwm_dual=pwm_dual,
+        mikey_clock=mikey_clock,
+        mikey_dual=mikey_dual,
         extra_clocks=clocks,
         extra_volumes=volumes,
     )
@@ -2085,6 +2105,14 @@ def load_vgm(path: Path | str) -> VgmFile:
                 (port << 8) | buf[pos + 2], buf[pos + 3],
             ))
             pos += 4
+            continue
+        if cmd == CMD_MIKEY and pos + 3 <= n:
+            # Atari Lynx Mikey register write: 40 aa vv.  Timer/IRQ
+            # registers below 0x20 are kept too; the collector ignores them.
+            vgm.writes.append(ChipWrite(
+                sample, "mikey", 0, buf[pos + 1], buf[pos + 2],
+            ))
+            pos += 3
             continue
         if cmd == 0xB2 and pos + 3 <= n:
             # PWM: ad dd, where a is the 4-bit register, d the value MSB and dd
