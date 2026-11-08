@@ -2299,9 +2299,14 @@ def _bind_tone_instruments(
                     if pitch_delay == 0:
                         pitch = _absorb_detune(e, pitch, pitch_speed)
                 else:
+                    # X1-010 drivers use pitch slides, and the loop detector
+                    # can mistake a repeated slide fragment for an LFO and
+                    # make it repeat forever.  Keep those macros linear.
                     pitch, pitch_speed, pitch_loop, pitch_delay = (
                         _macro_series_delay(
-                            series, tail_loop=lfo_loop, step_compress=True,
+                            series,
+                            tail_loop=lfo_loop and e.tone_chip != 11,
+                            step_compress=True,
                         )
                     )
                     # A delayed first value is held long enough to be a real
@@ -2762,11 +2767,17 @@ def _bind_tone_instruments(
             else:
                 e.vol = column_vol
         elif e.tone_chip == 11:
-            # The X1 hardware envelope supplies the amplitude.  A full column
-            # makes envWrite() reproduce the source nibbles unchanged.
-            e.vol = 15
-            e.vol_pts = ()
-            e.vol_slide = 0
+            # A period-0 envelope holds one level, so its live first-byte
+            # rewrites become volume macro/column steps against a constant
+            # full-scale envelope wavetable.  A moving envelope keeps the
+            # selected shape and a full column.
+            if kept.vol:
+                e.vol = 15
+                e.vol_pts = ()
+                e.vol_slide = 0
+            else:
+                e.vol = column_vol
+                e.vol_slide = 0
         elif kept.vol:
             # The column that makes the macro the register: SCC vol*macro/15,
             # AY macro + column - 15, PCE vol*macro/31.
@@ -3921,6 +3932,12 @@ def _emit_x1_wave_notes(
         )
         wave_idx = wave_map.get(h.wave_data, 0)
         env_idx = env_map.get(h.env_data, 0)
+        const_env = env_map.get(bytes([0xFF]) * 128, env_idx)
+        period_zero = h.env_period == 0
+        initial_level = (
+            (((h.env_data[0] >> 4) & 0x0F) + (h.env_data[0] & 0x0F) + 1) // 2
+            if period_zero else 15
+        )
         for i, (sst, value, intra) in enumerate(segs):
             nxt = segs[i + 1][0] if i + 1 < len(segs) else 0
             seg_end = nxt or h.off_sample
@@ -3933,9 +3950,20 @@ def _emit_x1_wave_notes(
                 (t, wave_map.get(body, wave_idx))
                 for t, body in h.wave_pts if wave_map.get(body, wave_idx) != wave_idx
             )
-            env_pts = tuple(
+            env_pts = () if period_zero else tuple(
                 (t, env_map.get(body, env_idx))
                 for t, body in h.env_pts if env_map.get(body, env_idx) != env_idx
+            )
+            vol_pts = (
+                tuple(
+                    (t, level, None)
+                    for t, level in h.env_level_pts if sst < t < bound
+                )
+                if period_zero else ()
+            )
+            level = (
+                _value_at(h.env_level_pts, sst, initial_level)
+                if period_zero else 15
             )
             mode = 1 | (2 if h.env_oneshot else 0)
             events.append(NoteEvent(
@@ -3944,11 +3972,11 @@ def _emit_x1_wave_notes(
                 on=True,
                 note=note,
                 ins=-1,
-                vol=15,
+                vol=level,
                 e5=e5,
                 pan=0,
                 end=seg_end,
-                vol_pts=(),
+                vol_pts=vol_pts,
                 tone_pitch_pts=tuple(intra),
                 tone_chip=11,
                 tone_clock=h.clock,
@@ -3956,7 +3984,7 @@ def _emit_x1_wave_notes(
                 tone_period=value,
                 tone_wave=wave_idx,
                 x1_wave_pts=wave_pts,
-                tone_env_shape=env_idx,
+                tone_env_shape=(const_env if period_zero else env_idx),
                 x1_env_shape_pts=env_pts,
                 tone_env_period=h.env_period,
                 x1_env_period_pts=tuple(
@@ -10752,6 +10780,7 @@ def analyze(
     x1_envs: list[bytes] = []
     x1_wave_map: dict[bytes, int] = {}
     x1_env_map: dict[bytes, int] = {}
+    x1_const_env = bytes([0xFF]) * 128
 
     def _bank_x1_wave(body: bytes) -> int:
         idx = x1_wave_map.get(body)
@@ -10777,6 +10806,8 @@ def analyze(
             _bank_x1_wave(body)
         for _t, body in h.env_pts:
             _bank_x1_env(body)
+    if any(h.env_period == 0 for h in x1_wave_hits):
+        _bank_x1_env(x1_const_env)
     x1_samples: list[X1PcmHit] = []
     x1_sample_index: dict[bytes, int] = {}
     for h in x1_pcm_hits:

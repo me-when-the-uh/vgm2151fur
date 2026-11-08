@@ -1213,6 +1213,11 @@ def _write_ins_x1(
     b.u16(0)
     ma_start = len(b.b)
     b.u16(8)
+    if getattr(ins, "vol", ()):
+        _write_macro(
+            b, 0, ins.vol, speed=ins.vol_speed, loop=ins.vol_loop,
+            delay=getattr(ins, "vol_delay", 0),
+        )
     if getattr(ins, "waves", ()):
         macro_waves = tuple(wave_base + int(v) for v in ins.waves)
         _write_macro(

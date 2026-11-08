@@ -247,6 +247,36 @@ class TestX1Module(unittest.TestCase):
             2000,
         )
 
+    def test_period_zero_envelope_rewrites_become_volume_steps(self):
+        # Replace the constant envelope with a low starting level, then
+        # rewrite envelope byte 0 while the note is sounding.
+        writes = [
+            _write(0, 0x80 + i, 0x11) for i in range(128)
+        ] + _wave_setup()[128:]
+        writes[-2:-2] = [_write(0, 4, 0)]
+        writes.insert(-1, _write(3_000, 0x80, 0x99))
+        song = analyze(_vgm(writes))
+        ev = [e for e in song.events if e.on and e.tone_chip == 11][0]
+        ins = song.x1_010_ins[ev.ins]
+        self.assertTrue(ins.vol)
+        self.assertEqual(ins.vol[0], 1)
+        self.assertIn(9, ins.vol)
+        self.assertEqual(ev.vol, 15)
+        self.assertEqual(ev.vol_pts, ())
+
+    def test_pitch_macros_are_not_lfo_looped(self):
+        writes = _wave_setup()
+        extra = []
+        for i in range(20):
+            value = 1900 if i & 1 else 1800
+            extra += [
+                _write(2_500 + i * 300, 2, value & 0xFF),
+                _write(2_500 + i * 300, 3, (value >> 8) & 0xFF),
+            ]
+        writes[-1:-1] = extra
+        song = analyze(_vgm(writes))
+        self.assertTrue(all(ins.pitch_loop == 255 for ins in song.x1_010_ins))
+
     def test_pcm_only_has_no_wave_assets(self):
         body = bytes((i * 3) & 0xFF for i in range(0x2000))
         writes = [

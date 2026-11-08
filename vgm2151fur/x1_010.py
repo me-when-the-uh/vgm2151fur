@@ -75,6 +75,9 @@ class X1Hit:
     env_pts: list[tuple[int, bytes]] = field(default_factory=list)
     env_period_pts: list[tuple[int, int]] = field(default_factory=list)
     env_mode_pts: list[tuple[int, int]] = field(default_factory=list)
+    # Period-0 envelopes hold envelope byte 0.  Some drivers rewrite that byte
+    # while a note sounds, so keep the resulting mono level steps.
+    env_level_pts: list[tuple[int, int]] = field(default_factory=list)
 
 
 @dataclass
@@ -240,12 +243,25 @@ def collect_x1_010(
                         )
             continue
         if addr >= 0x80:
-            env_ram[cid][addr & 0x0FFF] = val
+            env_off = addr & 0x0FFF
+            env_ram[cid][env_off] = val
+            level = (((val >> 4) & 0x0F) + (val & 0x0F) + 1) // 2
             for ch in range(X1_CHANNELS):
                 hit = active[(cid, ch)]
-                if isinstance(hit, X1Hit):
-                    start = hit.env_shape * X1_ENV_BYTES
-                    if start <= (addr & 0x0FFF) < start + X1_ENV_BYTES:
+                if not isinstance(hit, X1Hit):
+                    continue
+                start = hit.env_shape * X1_ENV_BYTES
+                if start <= env_off < start + X1_ENV_BYTES:
+                    if env_off == start and hit.env_period == 0:
+                        last = (
+                            hit.env_level_pts[-1][1]
+                            if hit.env_level_pts
+                            else ((((hit.env_data[0] >> 4) & 0x0F)
+                                   + (hit.env_data[0] & 0x0F) + 1) // 2)
+                        )
+                        if level != last:
+                            hit.env_level_pts.append((t, level))
+                    else:
                         warnings_seen["env_live"] = (
                             warnings_seen.get("env_live", 0) + 1
                         )
