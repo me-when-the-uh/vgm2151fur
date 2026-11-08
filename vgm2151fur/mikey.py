@@ -53,6 +53,11 @@ REG_STEREO = 0x50
 
 # A register stream faster than this on the output byte is a software DAC.
 MIKEY_DAC_WRITES = 32
+# A control/feedback setup followed by a volume write this soon is a new note.
+MIKEY_SETUP_GAP = 64
+# Register writes this soon after a gate are the note's own setup, not a
+# mid-note macro step; fold them into the initial timbre.
+MIKEY_SETTLE = 64
 # Sub-frame gates are driver housekeeping rather than notes.
 MIKEY_MIN_NOTE = 80
 # Output chunks: 0.25 s at the reconstructed rate.
@@ -176,6 +181,7 @@ def _blank_channel() -> dict:
         "counter": 0,
         "other": 0,
         "active": None,
+        "setup_sample": -1,
         "output_writes": 0,
         "tone_writes": 0,
     }
@@ -332,6 +338,7 @@ def collect_mikey(
             pan=effective_pan(cid, ch),
         )
         st["active"] = hit
+        st["setup_sample"] = -1
 
     def refresh(cid: int, ch: int, t: int) -> None:
         st = state[cid][ch]
@@ -349,13 +356,22 @@ def collect_mikey(
             return
         value = mikey_period(st["backup"], st["control"])
         if value != (hit.freq_pts[-1][1] if hit.freq_pts else hit.value):
-            hit.freq_pts.append((t, value))
+            if t - hit.sample_time <= MIKEY_SETTLE and not hit.freq_pts:
+                hit.value = value
+            else:
+                hit.freq_pts.append((t, value))
         duty = mikey_duty(st["feedback"], st["control"])
         if duty != (hit.duty_pts[-1][1] if hit.duty_pts else hit.duty):
-            hit.duty_pts.append((t, duty))
+            if t - hit.sample_time <= MIKEY_SETTLE and not hit.duty_pts:
+                hit.duty = duty
+            else:
+                hit.duty_pts.append((t, duty))
         lfsr = mikey_lfsr(st["shift"], st["other"])
         if lfsr != (hit.lfsr_pts[-1][1] if hit.lfsr_pts else hit.lfsr):
-            hit.lfsr_pts.append((t, lfsr))
+            if t - hit.sample_time <= MIKEY_SETTLE and not hit.lfsr_pts:
+                hit.lfsr = lfsr
+            else:
+                hit.lfsr_pts.append((t, lfsr))
         volume = max(0, min(127, abs(_s8(st["volume"]))))
         if volume != (hit.vol_pts[-1][1] if hit.vol_pts else hit.vol):
             hit.vol_pts.append((t, volume))
@@ -395,9 +411,25 @@ def collect_mikey(
                 # A signed volume byte: negative means phase-inverted output.
                 if (_s8(w.val) < 0) != (_s8(old) < 0):
                     warnings_seen["negative_volume"] += 1
+                hit = st["active"]
+                # A full note setup (control/feedback) followed within a few
+                # samples by a volume write is the driver starting the next
+                # note.  Vibrato-only backup writes do not set this flag, so
+                # the pitch macro still owns that motion.
+                if (
+                    hit is not None
+                    and 0 <= t - st["setup_sample"] <= MIKEY_SETUP_GAP
+                    and t - hit.sample_time >= MIKEY_MIN_NOTE
+                ):
+                    close(cid, ch, t, emit_off=False)
+                    if abs(_s8(st["volume"])) > 0:
+                        open_hit(cid, ch, t)
+                    st["setup_sample"] = -1
+                    continue
                 refresh(cid, ch, t)
             elif sub == REG_FEEDBACK:
                 st["feedback"] = w.val
+                st["setup_sample"] = t
                 refresh(cid, ch, t)
             elif sub == REG_SHIFT:
                 st["shift"] = w.val
@@ -408,11 +440,13 @@ def collect_mikey(
             elif sub == REG_CONTROL:
                 old = st["control"]
                 st["control"] = w.val
+                st["setup_sample"] = t
                 # A 0->1 count-enable transition is the driver's key-on.
                 if (old & 0x08) == 0 and (w.val & 0x08):
                     close(cid, ch, t, emit_off=False)
                     if abs(_s8(st["volume"])) > 0:
                         open_hit(cid, ch, t)
+                        st["setup_sample"] = -1
                     continue
                 refresh(cid, ch, t)
             elif sub == REG_OTHER:

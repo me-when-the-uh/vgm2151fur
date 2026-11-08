@@ -105,6 +105,41 @@ class TestMikeyCollector(unittest.TestCase):
         self.assertEqual(hit.vol_pts[0], (882, 78))
         self.assertEqual(hit.freq_pts[0], (1764, 326))
 
+    def test_full_setup_before_volume_splits_note(self):
+        writes = [
+            _write(0, 0x21, 0x84),
+            _write(0, 0x24, 230),
+            _write(0, 0x25, 0x38),
+            _write(5, 0x20, 40),
+            _write(5000, 0x21, 7),
+            _write(5000, 0x24, 244),
+            _write(5000, 0x25, 0x19),
+            _write(5005, 0x20, 48),
+            _write(10000, 0x20, 0),
+        ]
+        hits, _offs, _samples, _warnings = collect_mikey(
+            _vgm(writes, total=12000),
+        )
+        self.assertEqual(len(hits), 2)
+        self.assertEqual(hits[0].off_sample, 5005)
+        self.assertEqual(hits[1].sample_time, 5005)
+        self.assertEqual(hits[0].duty, 0x304)
+        self.assertEqual(hits[1].duty, 7)
+
+    def test_attack_settle_updates_initial_duty(self):
+        writes = [
+            _write(0, 0x20, 40),
+            _write(5, 0x21, 7),
+            _write(5, 0x25, 0x19),
+            _write(9000, 0x20, 0),
+        ]
+        hits, _offs, _samples, _warnings = collect_mikey(
+            _vgm(writes, total=10000),
+        )
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0].duty, 7)
+        self.assertEqual(hits[0].duty_pts, [])
+
     def test_pan_register(self):
         writes = _tone_writes(off=None)
         writes += [

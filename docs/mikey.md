@@ -12,6 +12,9 @@ register writes with command `0x40` (`40 aa vv`).  Each of the four voices at
   source write rate.
 - Feedback and control become the 10-bit Duty/Int macro (taps 0-5, 7, 10, 11
   and the integrate bit).
+- A control/feedback setup followed within a few samples by a volume write is
+  a new note, so each instrument keeps its own duty/int macro instead of
+  absorbing the next note's setup.
 - Shift and other become the 12-bit Load LFSR macro; `3xxx` is available as a
   row effect but the converter uses the instrument macro.
 - Attenuation and the stereo mute bits become `08xy` panning; a clear pan bit
