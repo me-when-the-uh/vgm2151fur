@@ -140,8 +140,10 @@ Remaining:
   module body; a segmented representation could preserve them exactly.
 - **PWM compressed banks.** The n-Bit copy and shift subtypes decode; table
   (`0x7F`) and DPCM-compressed banks are reported as unsupported.
-- **PWM chunk reuse.** Repeated chunks and identical left/right bodies share
-  one module sample; a stereo stream still splits each side independently.
+- **PWM chunk reuse.** Attack transients are the primary candidate starts;
+  repeated bodies and identical left/right bodies share one module sample.
+  Rest boundaries and 0.25-second chunks are the fallbacks.  Silence-only
+  pieces are dropped.
 - **PWM direct level writes.** A log that writes registers 2/3/4 directly
   without DAC streams only gets point samples, not a continuous stream.
 

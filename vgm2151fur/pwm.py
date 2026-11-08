@@ -16,7 +16,9 @@ sample on a Generic PCM DAC system and panned hard left/right.
 
 from __future__ import annotations
 
+import array
 from bisect import bisect_right
+from collections import Counter
 from dataclasses import dataclass, field
 
 from vgm2151fur.vgm import STREAM_PWM, VGM_RATE, VgmFile
@@ -29,6 +31,20 @@ PWM_SIDE_RIGHT = 1
 # multi-megabyte sample.  0.25 s at 22020 Hz.
 PWM_CHUNK_FRAMES = 5505
 PWM_MAP_SLOTS = 120
+# Attack segmentation.  A near-silent stretch separates two hits; the body is
+# trimmed to the audible part and long bodies are split so a single segment
+# cannot become a multi-second sample.  If this yields more unique bodies than
+# fixed chunks, the collector falls back to chunks.
+PWM_ATTACK_SILENCE = 250       # ~11 ms of near-silence splits a hit
+PWM_ATTACK_MIN_FRAMES = 64     # ignore clicks shorter than ~3 ms
+PWM_ATTACK_MAX_FRAMES = 44100  # split a sustained body at ~1 s
+PWM_ATTACK_QUIET_DIV = 32      # quiet threshold = peak / 32
+PWM_ATTACK_MAX_SAMPLES = 480   # above this, use fixed chunks
+# Attack-transient candidates: a short rise from the idle band to a strong
+# level is a new sample start even when there was no long rest before it.
+PWM_ONSET_WINDOW = 8
+PWM_ONSET_QUIET = 32
+PWM_ONSET_MIN_GAP = 64
 
 
 @dataclass
@@ -99,6 +115,133 @@ def _stream_positions(play, bank: bytes, blocks: list[bytes]) -> tuple[bytes, in
     if start > len(data):
         start = len(data)
     return data, start
+
+
+def _pcm_stats(data: bytes) -> tuple[array.array, int, int, int]:
+    """(values, idle level, quiet width, peak) for one rendered side."""
+    vals = array.array("h")
+    vals.frombytes(data)
+    if not vals:
+        return vals, 0, 64, 0
+    peak = max(abs(v) for v in vals)
+    counts = Counter(vals)
+    idle, idle_count = counts.most_common(1)[0]
+    # Only a dominant low-level value is a real idle/rest level.  A common
+    # musical sustain must not be mistaken for silence.
+    if idle_count * 100 < len(vals) or abs(idle) > max(64, peak // 4):
+        idle = 0
+    width = max(64, peak // PWM_ATTACK_QUIET_DIV)
+    return vals, idle, width, peak
+
+
+def _audible_pcm(data: bytes, idle: int, width: int) -> bool:
+    vals = array.array("h")
+    vals.frombytes(data)
+    return any(abs(v - idle) > width for v in vals)
+
+
+def _onset_starts(
+    vals: array.array, idle: int, width: int, peak: int,
+) -> list[int]:
+    """Attack-transient candidates: rises out of the idle band."""
+    if not vals:
+        return []
+    amp = [abs(v - idle) for v in vals]
+    env: list[int] = []
+    window: list[int] = []
+    for value in amp:
+        window.append(value)
+        if len(window) > PWM_ONSET_WINDOW:
+            window.pop(0)
+        env.append(max(window))
+    low = width
+    high = max(width * 4, peak // 8)
+    jump = max(256, peak // 6)
+    starts: list[int] = []
+
+    def add(pos: int) -> None:
+        if not starts or pos - starts[-1] >= PWM_ONSET_MIN_GAP:
+            starts.append(pos)
+
+    if env[0] >= high:
+        add(0)
+    quiet = 0
+    for i, value in enumerate(env):
+        if value <= low:
+            quiet += 1
+            continue
+        if quiet >= PWM_ONSET_QUIET and value >= high:
+            add(i)
+        quiet = 0
+    for i in range(1, len(env)):
+        if env[i] >= high and env[i] - env[i - 1] > jump:
+            add(i)
+    return sorted(starts)
+
+
+def _attack_bodies(
+    data: bytes, vals: array.array, idle: int, width: int,
+) -> list[tuple[int, bytes]]:
+    """Split one rendered side into bodies starting at attack transients.
+
+    Every detected attack is a candidate start, so pieces reused inside a
+    longer musical passage can be banked separately.  When no attacks are
+    found the older rest-based split is used; both paths trim silence and
+    drop inaudible bodies.
+    """
+    if not vals:
+        return []
+    peak = max(abs(v - idle) for v in vals)
+    starts = _onset_starts(vals, idle, width, peak)
+    if len(starts) < 2:
+        starts = []
+
+    def quiet(value: int) -> bool:
+        return abs(value - idle) <= width
+
+    bounds: list[tuple[int, int]] = []
+    if starts:
+        for i, a in enumerate(starts):
+            b = starts[i + 1] if i + 1 < len(starts) else len(vals)
+            while b > a and quiet(vals[b - 1]):
+                b -= 1
+            if b - a >= PWM_ATTACK_MIN_FRAMES:
+                bounds.append((a, b))
+    else:
+        start = 0
+        quiet_start: int | None = None
+        for i, value in enumerate(vals):
+            if quiet(value):
+                if quiet_start is None:
+                    quiet_start = i
+                continue
+            if quiet_start is not None and i - quiet_start >= PWM_ATTACK_SILENCE:
+                a, b = start, quiet_start
+                while a < b and quiet(vals[a]):
+                    a += 1
+                while b > a and quiet(vals[b - 1]):
+                    b -= 1
+                if b - a >= PWM_ATTACK_MIN_FRAMES:
+                    bounds.append((a, b))
+                start = i
+            quiet_start = None
+        a, b = start, len(vals)
+        while a < b and quiet(vals[a]):
+            a += 1
+        while b > a and quiet(vals[b - 1]):
+            b -= 1
+        if b - a >= PWM_ATTACK_MIN_FRAMES:
+            bounds.append((a, b))
+    out: list[tuple[int, bytes]] = []
+    for a, b in bounds:
+        body = data[a * 2:b * 2]
+        if not _audible_pcm(body, idle, width):
+            continue
+        while b - a > PWM_ATTACK_MAX_FRAMES:
+            out.append((a, data[a * 2:(a + PWM_ATTACK_MAX_FRAMES) * 2]))
+            a += PWM_ATTACK_MAX_FRAMES
+        out.append((a, data[a * 2:b * 2]))
+    return out
 
 
 def collect_pwm(vgm: VgmFile) -> tuple[list[PwmSample], list[str]]:
@@ -244,38 +387,59 @@ def collect_pwm(vgm: VgmFile) -> tuple[list[PwmSample], list[str]]:
                 )
                 sample.data = bytes(dst)
 
+    def occurrences(use_attack: bool) -> list[tuple[int, int, int, bytes]]:
+        out: list[tuple[int, int, int, bytes]] = []
+        for (cid, side), sample in sorted(samples.items()):
+            full = sample.data
+            frames = len(full) // 2
+            if frames <= 0:
+                continue
+            vals, idle, width, _peak = _pcm_stats(full)
+            if use_attack:
+                for start, body in _attack_bodies(full, vals, idle, width):
+                    out.append((cid, side, start, body))
+            else:
+                for start in range(0, frames, PWM_CHUNK_FRAMES):
+                    end = min(frames, start + PWM_CHUNK_FRAMES)
+                    body = full[start * 2:end * 2]
+                    if _audible_pcm(body, idle, width):
+                        out.append((cid, side, start, body))
+        return out
+
+    attack_occ = occurrences(True)
+    chunk_occ = occurrences(False)
+    attack_unique = len({(cid, body) for cid, _side, _s, body in attack_occ})
+    # Prefer attack segmentation whenever it finds real splits.  Fixed chunks
+    # are the fallback for a steady/continuous stream or a body budget blow-up.
+    use_attack = (
+        len(attack_occ) > 1
+        and attack_unique <= PWM_ATTACK_MAX_SAMPLES
+    )
+    chosen = attack_occ if use_attack else chunk_occ
+
     audible: list[PwmSample] = []
     seen: dict[tuple[int, bytes], PwmSample] = {}
-    for (cid, side), sample in sorted(samples.items()):
-        full = sample.data
-        frames = len(full) // 2
-        if frames <= 0:
+    for cid, side, start, body in chosen:
+        hit = PwmHit(
+            time=int(round(start / PWM_RATE * VGM_RATE)),
+            side=side,
+        )
+        key = (cid, body)
+        found = seen.get(key)
+        if found is not None:
+            found.hits.append(hit)
             continue
-        for start in range(0, frames, PWM_CHUNK_FRAMES):
-            end = min(frames, start + PWM_CHUNK_FRAMES)
-            body = full[start * 2:end * 2]
-            if not any(body):
-                continue
-            hit = PwmHit(
-                time=int(round(start / PWM_RATE * VGM_RATE)),
-                side=side,
-            )
-            key = (cid, body)
-            found = seen.get(key)
-            if found is not None:
-                found.hits.append(hit)
-                continue
-            chunk = PwmSample(
-                chip_id=cid,
-                side=side,
-                data=body,
-                rate=PWM_RATE,
-                hits=[hit],
-                chunk=len(audible),
-                first_chunk=(start == 0),
-            )
-            seen[key] = chunk
-            audible.append(chunk)
+        chunk = PwmSample(
+            chip_id=cid,
+            side=side,
+            data=body,
+            rate=PWM_RATE,
+            hits=[hit],
+            chunk=len(audible),
+            first_chunk=(start == 0),
+        )
+        seen[key] = chunk
+        audible.append(chunk)
     if not audible:
         warnings.append("PWM streams decoded to silence")
     return audible, warnings
