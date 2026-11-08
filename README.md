@@ -6,6 +6,7 @@ Supported chips:
 - General Instrument: AY-3-8910.
 - Konami: VRC7, K007232, K053260 and SCC/SCC+.
 - Atari: POKEY and Lynx/Mikey.
+- Seta: X1-010.
 - Philips: SAA1099.
 - Texas Instruments: SN76489 and T6W28.
 - NEC: uPD7759 (stand-alone phrase ROMs and slave streams).
@@ -89,7 +90,7 @@ tests/          pytest suite
 docs/           operating guide, format notes, chip notes
 ```
 
-Project state and workflow are in `docs/portable-context.md` and `docs/implementation-notes.md`. Chip details are in `docs/opm-notes.md`, `docs/ym2203.md`, `docs/ym2612.md`, `docs/ym2610.md`, `docs/opna-opll.md`, `docs/opl.md`, `docs/k053260.md`, `docs/scc-ay8910.md`, `docs/segapcm-c140.md`, `docs/ssg-pcm.md`, `docs/nes-vrc7.md`, `docs/gb.md`, `docs/huc6280.md`, `docs/c352.md`, `docs/ymz280b.md`, `docs/multipcm.md`, `docs/upd7759.md`, `docs/pwm32x.md`, `docs/pokey.md`, `docs/mikey.md` and `docs/vsu.md`. `docs/merged-logs.md` covers multi-family modules, and `docs/psg-open-items.md` tracks the remaining AY accuracy gaps.
+Project state and workflow are in `docs/portable-context.md` and `docs/implementation-notes.md`. Chip details are in `docs/opm-notes.md`, `docs/ym2203.md`, `docs/ym2612.md`, `docs/ym2610.md`, `docs/opna-opll.md`, `docs/opl.md`, `docs/k053260.md`, `docs/scc-ay8910.md`, `docs/segapcm-c140.md`, `docs/ssg-pcm.md`, `docs/nes-vrc7.md`, `docs/gb.md`, `docs/huc6280.md`, `docs/c352.md`, `docs/ymz280b.md`, `docs/multipcm.md`, `docs/upd7759.md`, `docs/pwm32x.md`, `docs/pokey.md`, `docs/mikey.md`, `docs/x1-010.md` and `docs/vsu.md`. `docs/merged-logs.md` covers multi-family modules, and `docs/psg-open-items.md` tracks the remaining AY accuracy gaps.
 
 Open follow-ups are tracked in [TODO.md](./TODO.md).
 
@@ -146,6 +147,7 @@ Open follow-ups are tracked in [TODO.md](./TODO.md).
   - Volume-only mode (AUDC bit 4) is not converted because Furnace has no DC/DAC mode.
   - Two-tone mode (SKCTL bit 7) exists only on Furnace's ASAP core and is not converted.
   - AUDC distortion 7 has no separate Furnace wave tap and plays as distortion 6 with a warning.
+- Seta X1-010 converts sixteen wavetable/PCM voices per chip using Furnace's native wave/envelope macros and 8-bit ROM sample maps.
 - C352 needs a Furnace build with the ported core.
 - C219 logs are detected but not converted.
 - K053260 loops the whole sample, and mid-note loop, KADPCM or direction changes use the key-on value.

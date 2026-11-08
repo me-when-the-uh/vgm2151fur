@@ -185,6 +185,7 @@ EXTRA_MULTIPCM = 0x15  # Yamaha YMW258-F (MultiPCM)
 EXTRA_UPD7759 = 0x16  # NEC uPD7759
 EXTRA_POKEY = 0x1E  # Atari POKEY (same id as libvgm's DEVID_POKEY)
 EXTRA_MIKEY = 0x29  # Atari Lynx Mikey (libvgm DEVID_MIKEY)
+EXTRA_X1_010 = 0x26  # Seta X1-010 (libvgm DEVID_X1_010)
 # Main-header clocks (VGMFile.h layout, spec v1.71). 0x98 is MSM6295, 0x90
 # MSM6258, 0x94 its flags. K007232 has no spec field; VGMPlay tools put it at
 # 0xE8 (1.71+). C140 is 0xA8 and its type byte 0x96. AY-8910 is 0x74 with its
@@ -341,6 +342,13 @@ MIKEY_CLOCK_OFF = 0xE4
 MIKEY_DEFAULT_CLOCK = 16_000_000
 MIKEY_DUAL_BIT = 0x40000000
 CMD_MIKEY = 0x40
+# Seta/Allumer X1-010 header 0xD8 (VGM 1.71+).  Command 0xC8 writes a 16-bit
+# big-endian register/memory offset plus one byte; 0x91 is its 1 MB sample ROM.
+X1_010_CLOCK_OFF = 0xD8
+X1_010_DEFAULT_CLOCK = 16_000_000
+X1_010_DUAL_BIT = 0x40000000
+X1_010_ROM_TYPE = 0x91
+CMD_X1_010 = 0xC8
 C352_CLOCK_OFF = 0xDC  # VGM 1.71 crystal; bit 31 mutes the rear pair
 C352_DIV_OFF = 0xD6  # hardware divider / 4; 72 means a divider of 288
 SEGAPCM_CLOCK_X = 4000000  # X board / Hang-On
@@ -761,6 +769,9 @@ class VgmFile:
     # 0x40 as (register, value); the chip has four LFSR/DAC voices.
     mikey_clock: int = 0
     mikey_dual: bool = False
+    # Seta X1-010 header 0xD8 (VGM 1.71+).  Sixteen wavetable/PCM voices.
+    x1_010_clock: int = 0
+    x1_010_dual: bool = False
     # Extra-header clocks, raw (bit 31 kept). Keyed by libvgm chip id.
     extra_clocks: dict[int, int] = field(default_factory=dict)
     # Extra-header volume mix: chip id -> (flags, raw value, 0x100 = 1.0).
@@ -1533,6 +1544,13 @@ def load_vgm(path: Path | str) -> VgmFile:
     mikey_clock = _sane_clock(mikey_raw)
     if not mikey_clock:
         mikey_clock = _sane_clock(clocks.get(EXTRA_MIKEY, 0))
+    # Seta X1-010 clock 0xD8 (VGM 1.71+).  Bit 30 is a second-instance marker,
+    # but command 0xC8 has no instance bit.
+    x1_raw = _header_raw(buf, X1_010_CLOCK_OFF) if ver >= 0x171 else 0
+    x1_010_dual = bool(x1_raw & X1_010_DUAL_BIT)
+    x1_010_clock = _sane_clock(x1_raw)
+    if not x1_010_clock:
+        x1_010_clock = _sane_clock(clocks.get(EXTRA_X1_010, 0))
 
     main_volume = 0.0
     # Bytes past the declared command offset are not header fields. Synthetic
@@ -1641,6 +1659,8 @@ def load_vgm(path: Path | str) -> VgmFile:
         pwm_dual=pwm_dual,
         mikey_clock=mikey_clock,
         mikey_dual=mikey_dual,
+        x1_010_clock=x1_010_clock,
+        x1_010_dual=x1_010_dual,
         extra_clocks=clocks,
         extra_volumes=volumes,
     )
@@ -1784,6 +1804,7 @@ def load_vgm(path: Path | str) -> VgmFile:
                     YMF278B_ROM_TYPE: "ymf278b_rom",
                     YMF278B_RAM_TYPE: "ymf278b_ram",
                     YMZ280B_ROM_TYPE: "ymz280b",
+                    X1_010_ROM_TYPE: "x1_010",
                 }.get(typ) if len(payload) >= 8 else None
                 if kind:
                     rom_size = int.from_bytes(payload[0:4], "little")
@@ -2103,6 +2124,14 @@ def load_vgm(path: Path | str) -> VgmFile:
             vgm.writes.append(ChipWrite(
                 sample, "ymf278b", cid,
                 (port << 8) | buf[pos + 2], buf[pos + 3],
+            ))
+            pos += 4
+            continue
+        if cmd == CMD_X1_010 and pos + 4 <= n:
+            # 0xC8: 16-bit big-endian register/memory offset, then data.
+            vgm.writes.append(ChipWrite(
+                sample, "x1_010", 0,
+                int.from_bytes(buf[pos + 1:pos + 3], "big"), buf[pos + 3],
             ))
             pos += 4
             continue
@@ -2504,6 +2533,10 @@ def load_vgm(path: Path | str) -> VgmFile:
     if saw_adpcm_compressed:
         vgm.warnings.append(
             "compressed OKIM6258 data block (type 44) is not converted"
+        )
+    if any(w.chip == "x1_010" for w in vgm.writes) and not vgm.x1_010_clock:
+        vgm.warnings.append(
+            "X1-010 clock is missing or out of range; using 16000000"
         )
     if any(w.chip == "c352" for w in vgm.writes) and not vgm.c352_clock:
         vgm.warnings.append("C352 clock is missing or out of range; using 24192000")

@@ -352,6 +352,8 @@ def convert_vgm(
         "k053260_samples": len(song.k053260_samples) if pcm else 0,
         "mikey_samples": len(song.mikey_samples) if pcm else 0,
         "mikey_notes": song.mikey_count,
+        "x1_010_samples": len(song.x1_010_samples) if pcm else 0,
+        "x1_010_notes": song.x1_010_count,
         "ym2610_a_samples": len(song.ym2610_a_samples) if pcm else 0,
         "ym2610_b_samples": len(song.ym2610_b_samples) if pcm else 0,
         "ym2610_a_notes": song.ym2610_a_count,

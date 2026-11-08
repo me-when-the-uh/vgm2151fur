@@ -83,6 +83,7 @@ CHIP_CHANNELS = {
     CHIP_SAA1099: 6,  # Philips SAA1099
     CHIP_POKEY: 4,  # Atari POKEY
     0xA8: 4,  # Atari Lynx Mikey: four LFSR/DAC voices
+    0xB0: 16,  # Seta/Allumer X1-010: sixteen wavetable/PCM voices
     0x03: 4,  # TI SN76489 (three tone + noise)
     0xBF: 4,  # Toshiba T6W28 (stereo SN76489 derivative)
     0xBB: 8,  # Namco C30 WSG
