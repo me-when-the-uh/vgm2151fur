@@ -261,6 +261,92 @@ class TestNesTones(unittest.TestCase):
         self.assertEqual([(h.voice, h.period) for h in hits], [(0, 0x100)])
         self.assertEqual([o.sample_time for o in offs], [5000])
 
+    def test_zero_length_load_is_a_noise_hit(self):
+        # ``$400F = 0`` loads the table's index 0, which is 10 half-frames: a
+        # driver that marks each drum with that write gets an 83 ms burst, not
+        # silence.  The reference player gates the same way.
+        writes = [
+            _nes(1000, 0x0C, 0x0F), _nes(1000, 0x0E, 0x00),
+            _nes(1000, 0x0F, 0x00),
+        ]
+        hits, offs, _warn = collect_nes_tones(_vgm(writes, nes_clock=1789773))
+        self.assertEqual([(h.voice, h.period) for h in hits], [(3, 0)])
+        self.assertEqual([o.sample_time for o in offs], [1000 + 3675])
+
+    def test_noise_hits_retrigger_after_the_gate_ran_out(self):
+        # Each hit is marked by a ``$400F`` write; the previous 83 ms gate has
+        # already ended, so the write starts a new one.
+        writes = [
+            _nes(1000, 0x0C, 0x0F), _nes(1000, 0x0E, 0x00),
+            _nes(1000, 0x0F, 0x00),
+            _nes(21000, 0x0E, 0x00), _nes(21000, 0x0F, 0x00),
+        ]
+        hits, offs, _warn = collect_nes_tones(_vgm(writes, nes_clock=1789773))
+        self.assertEqual([h.sample_time for h in hits], [1000, 21000])
+        self.assertEqual([o.sample_time for o in offs], [4675, 24675])
+
+    def test_noise_length_reload_every_frame_stays_one_note(self):
+        # A driver that holds the noise alive by rewriting the length register
+        # must not become one note per frame: the gate never runs out.  It ends
+        # one gate after the last rewrite.
+        writes = [_nes(1000, 0x0C, 0x0F), _nes(1000, 0x0E, 0x00)]
+        for i in range(20):
+            writes.append(_nes(1000 + i * 1000, 0x0F, 0xF8))
+        hits, offs, _warn = collect_nes_tones(_vgm(writes, nes_clock=1789773))
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0].sample_time, 1000)
+        # Index 31 is 32 half-frames, so the last reload at 20000 ends at 31760.
+        self.assertEqual([o.sample_time for o in offs], [31760])
+
+    def test_envelope_mode_becomes_a_constant_peak_with_a_decay(self):
+        # Furnace's NES envelope runs once and a later note-on does not restart
+        # it, so a channel whose driver writes $4000 once would fall silent
+        # after the first decay.  Keep the peak as a constant level and carry
+        # the decay on the volume column at the hardware rate.
+        writes = [
+            _nes(1000, 0x00, 0x8F), _nes(1000, 0x02, 0xCA),
+            _nes(1000, 0x03, 0xC0),
+        ]
+        song = analyze(_vgm(writes, nes_clock=1789773))
+        ev = [e for e in song.events if e.on and e.tone_chip == 4][0]
+        self.assertEqual(ev.vol, 15)          # the envelope's peak, not its period
+        levels = [v for _t, v, _p in ev.vol_pts]
+        self.assertGreater(len(levels), 10)
+        self.assertEqual(levels[0], 15)
+        self.assertEqual(levels[-1], 1)
+        self.assertEqual(levels, sorted(levels, reverse=True))
+        # Period 15: one step per 16 quarter frames (240 Hz), so ~1 s in all.
+        self.assertAlmostEqual(
+            ev.vol_pts[-1][0] - ev.sample, 14 * 16 * (44100 / 240.0),
+            delta=3,
+        )
+        mod = parse_fur(write_fur(song, include_pcm=True))
+        fx = [tuple(f) for (_c, _i), rows in mod.patterns.items()
+              for r in rows for f in r.fx]
+        self.assertIn((0x15, 0x03), fx)      # constant volume + length halt
+        vols = [r.vol for (_c, _i), rows in mod.patterns.items()
+                for r in rows if r.vol >= 0]
+        self.assertIn(15, vols)
+        self.assertTrue(any(v < 15 for v in vols))
+
+    def test_triangle_notes_end_at_the_linear_counter(self):
+        # The triangle is gated by its linear counter ((value/240) s), which the
+        # reference player honours: a note the driver does not retrigger in time
+        # ends there instead of ringing on.  $4008 = 0x2F is 47 quarter frames,
+        # 8,636 samples.
+        writes = [
+            _nes(1000, 0x08, 0x2F),
+            _nes(1000, 0x0A, 0xFD), _nes(1000, 0x0B, 0xC1),
+            _nes(22050, 0x0A, 0xA7), _nes(22050, 0x0B, 0xC1),
+        ]
+        hits, offs, _warn = collect_nes_tones(_vgm(writes, nes_clock=1789773))
+        self.assertEqual([h.sample_time for h in hits], [1000, 22050])
+        self.assertEqual(hits[0].off_sample, 1000 + 8636)
+        self.assertEqual(hits[1].off_sample, 22050 + 8636)
+        self.assertEqual(
+            [o.sample_time for o in offs], [1000 + 8636, 22050 + 8636],
+        )
+
     def test_module_halts_a_constant_volume_note(self):
         # Furnace reloads the length counter on note-on, so an un-halted note
         # dies after a fraction of a second.  A constant-volume voice can take

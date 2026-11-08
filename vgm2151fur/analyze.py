@@ -10054,9 +10054,29 @@ def analyze(
             # APU) and the reference player keeps sounding, so hand the tracker
             # a halted note and end it on the driver's next write instead: a
             # pitch change, a volume drop or a $4015 mute already become note
-            # events.  An envelope voice keeps the bit it had, because there bit
-            # 5 loops the hardware envelope.
-            env_mode = (h.env_mode | 2) if (h.env_mode & 1) else h.env_mode
+            # events.
+            #
+            # Envelope mode needs the opposite of what the chip does.  Furnace
+            # runs the hardware envelope once and a later note-on does not
+            # restart it, so a channel whose driver writes $4000 once (Access
+            # Block's pulses, Danger Zone's noise) would fall silent after the
+            # first decay and never come back.  Keep the peak level constant and
+            # carry the decay on the volume column at the hardware rate: 15 down
+            # to 0, one step per (period + 1) quarter frames.
+            env_mode = h.env_mode | 3
+            vol = 15 if h.voice == 2 else h.vol
+            vol_pts: tuple[tuple[int, int, int | None], ...] = tuple(
+                (t, v, None) for t, v in h.vol_pts
+            )
+            # The triangle has no volume register: its hit carries the noise
+            # voice's volume state, so it must not be read as an envelope here.
+            if h.voice != 2 and not (h.env_mode & 1):
+                step = ((h.vol & 0x0F) + 1) * (VGM_RATE / 240.0)
+                vol_pts = tuple(
+                    (h.sample_time + int(round(k * step)), 15 - k, None)
+                    for k in range(1, 15)
+                )
+                vol = 15
             # The triangle's control bit holds the linear counter (the counter
             # otherwise runs out after (value/240) s) so the note lasts until
             # the driver moves it.
@@ -10070,29 +10090,27 @@ def analyze(
                 for t, duty in h.duty_pts:
                     channel_fx.append((t, ch, 0x12, duty))
                 channel_fx.append((h.sample_time, ch, 0x15, env_mode))
-                for t, mode in h.env_pts:
-                    mode = (mode | 2) if (mode & 1) else mode
-                    channel_fx.append((t, ch, 0x15, mode))
+                for t, _mode in h.env_pts:
+                    channel_fx.append((t, ch, 0x15, env_mode))
             else:
                 channel_fx.append((h.sample_time, ch, 0x19, linear))
                 for t, lin in h.linear_pts:
                     channel_fx.append((t, ch, 0x19, lin | 0x80))
             if h.voice < 2:
                 channel_fx.append((h.sample_time, ch, 0x15, env_mode))
-                for t, mode in h.env_pts:
-                    mode = (mode | 2) if (mode & 1) else mode
-                    channel_fx.append((t, ch, 0x15, mode))
+                for t, _mode in h.env_pts:
+                    channel_fx.append((t, ch, 0x15, env_mode))
             ev = NoteEvent(
                 sample=h.sample_time,
                 ch=ch,
                 on=True,
                 note=note,
                 ins=-1,
-                vol=15 if h.voice == 2 else h.vol,
+                vol=vol,
                 e5=e5,
                 pan=0,
                 end=h.off_sample,
-                vol_pts=tuple((t, v, None) for t, v in h.vol_pts),
+                vol_pts=vol_pts,
                 sweep=sweep,
                 sweep_div=2.0,
                 e5_lo=0x00,

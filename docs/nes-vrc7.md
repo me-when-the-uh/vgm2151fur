@@ -72,22 +72,40 @@ semitone is a new note; smaller changes are a pitch trajectory.
   such a write reads as silence (it ends the open note) instead of becoming
   the top note of Furnace's range.
 - **Volume**: the low nibble of `$4000`/`$4004`/`$400C` is the pattern volume
-  (0-15). In envelope mode it is the envelope period, which is what the
-  register holds and what Furnace writes back.
+  (0-15) when the constant-volume bit is set.
 - **Duty / noise mode**: `12xx` row effect at the note and on changes.
-- **Envelope mode** (`$4000` bits 4-5): `15xx` row effect.
 - **Triangle linear counter** (`$4008`): `19xx` row effect. The volume column
   only gates the triangle.
+- **Envelope mode** (`$4000` bit 4 clear). Furnace runs the NES hardware
+  envelope once and a later note-on does not restart it, so a channel whose
+  driver writes `$4000` only once (Access Block's pulses, Danger Zone's noise)
+  would fall silent after the first decay and never return. The converter
+  therefore writes the peak level as constant volume (`15 03`) and puts the
+  decay on the volume column at the hardware rate: 15 down to 0, one step per
+  `(period + 1)` quarter frames. The volume column carries the level, not the
+  envelope period.
+- **Gate length**. The length register's 5-bit load indexes the counter table,
+  so `$400F = 0` loads the table's index 0 (10 half-frames, an 83 ms burst) --
+  not "no length". Drivers mark a drum hit with exactly that write. Where the
+  counter's own end is audible, it becomes a note-off at its real time:
+  - noise: the length counter (`value/120` s);
+  - triangle: the linear counter (`value/240` s);
+  - pulses: no natural end -- the reference player keeps them sounding until
+    the driver's next write.
+
+  A register reload that arrives before the gate runs out extends the note
+  (drivers hold a voice by rewriting the length register every frame); one
+  that arrives after starts a new hit.
 - **Sustain**: Furnace reloads the length counter with its longest table value
   on every note-on, so a note it does not halt dies after a fraction of a
   second. Drivers keep a voice alive by rewriting its timer/length register
   every few frames (Danger Zone writes `$4003` 68 times per APU) and the
-  reference player keeps sounding, so a constant-volume note is written
-  halted (`15 03`) and the driver's own writes end it: a pitch change, a
-  volume drop or a `$4015` mute already become note events. An envelope voice
-  keeps the bit it had, because there bit 5 loops the hardware envelope. The
-  triangle's control bit is set the same way (`19 8C` for `$4008 = 0x0C`), so
-  its linear counter holds instead of running out after `value/240` s.
+  reference player keeps sounding, so tone notes are written halted (`15 03`)
+  and the driver's own writes end them: a pitch change, a volume drop, a
+  `$4015` mute or a counter expiry become note events. The triangle's control
+  bit is set (`19 8C` for `$4008 = 0x0C`) so the tracker itself does not expire
+  the linear counter early; the converter's own note-off, computed from the
+  source's counter values, ends the note.
 - Mid-note pitch and volume motion become per-note instrument macros
   (`std.pitch`, `std.vol`), so the changes survive a coarse row grid. If the
   instrument budget is full, `_take_tone` hands that note a plain instrument

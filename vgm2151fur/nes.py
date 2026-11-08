@@ -39,6 +39,18 @@ NES_CPU_DIVIDER = 16
 NES_MAX_PERIOD = 0x7FF
 # Shorter than this is a click/housekeeping gate, not a note.
 NES_MIN_NOTE = 100
+# The APU length-counter table: the 5-bit load index maps to a number of
+# half-frames (decremented at 120 Hz).  Index 0 is 10, so a driver that writes
+# ``$400F = 0`` to mark a noise hit still plays an 83 ms burst, exactly as the
+# console does.
+NES_LENGTH_TABLE = (
+    10, 254, 20, 2, 40, 4, 80, 6, 160, 8, 60, 10, 120, 12, 240, 14,
+    1, 18, 2, 20, 4, 22, 6, 24, 8, 26, 10, 28, 12, 30, 14, 32,
+)
+# VGM samples per frame-sequencer tick: the length counter runs at 120 Hz
+# (half frames) and the triangle's linear counter at 240 Hz (quarter frames).
+SAMPLES_PER_HALF_FRAME = VGM_RATE / 120.0
+SAMPLES_PER_QUARTER_FRAME = VGM_RATE / 240.0
 # A timer this low renders above ~16 kHz, which the console's output filter
 # drops.  Some drivers park an unused voice at timer 0 between phrases, so a
 # write there is silence, not the top of the tracker's note range.
@@ -238,8 +250,11 @@ def collect_nes_tones(
     hits: list[NesHit] = []
     offs: list[NesOff] = []
     glitches = 0
+    total = vgm.total_samples or 0
     for cid in sorted(by_cid):
-        chip_hits, chip_offs, chip_glitches = _nes_tones_one(by_cid[cid], cid)
+        chip_hits, chip_offs, chip_glitches = _nes_tones_one(
+            by_cid[cid], cid, total,
+        )
         hits.extend(chip_hits)
         offs.extend(chip_offs)
         glitches += chip_glitches
@@ -251,7 +266,7 @@ def collect_nes_tones(
 
 
 def _nes_tones_one(
-    writes: list, chip_id: int,
+    writes: list, chip_id: int, total: int = 0,
 ) -> tuple[list[NesHit], list[NesOff], int]:
     """The voice machine of one 2A03 instance.
 
@@ -260,7 +275,7 @@ def _nes_tones_one(
     """
     period = [0, 0, 0]
     freq_hi = [False, False, False]
-    length = [0, 0, 0, 0]
+    length = [0, 0, 0, 0]     # half-frames loaded, 0 = counter never loaded
     vol = [0, 0, 0]           # pulse 1, pulse 2, noise
     duty = [0, 0]             # pulse 1, pulse 2
     env_mode = [0, 0, 0]
@@ -272,6 +287,11 @@ def _nes_tones_one(
     hits: list[NesHit] = []
     offs: list[NesOff] = []
     glitches = 0
+    # Absolute sample at which the current gate's counters run out, 0 = held.
+    # A length reload that arrives after it starts a new hit; one that arrives
+    # before it just extends the same note (drivers that hold a voice by
+    # rewriting the length register every frame).
+    gate_end = [0, 0, 0, 0]
     # Volume jumps that may be a re-attack, and the last small period change
     # that may belong to the same hit.
     rise_t = [-1, -1, -1, -1]
@@ -282,12 +302,34 @@ def _nes_tones_one(
     # pitch macro).
     prev_period = [0, 0, 0]
 
+    def gate_end_at(voice: int, t: int) -> int:
+        """Sample where a voice's own counter closes the gate, 0 for a held one.
+
+        The reference player gates each noise hit by its length counter (a
+        ``$400F`` write of 0 loads the table's 10 half-frames, an 83 ms burst)
+        and each triangle note by its linear counter ((value/240) s), while
+        pulse notes keep sounding until the driver's next write.  Drivers mark
+        a hit by rewriting those registers, so a reload that arrives after the
+        gate ran out starts a new note and one that arrives before it extends
+        the same note.
+        """
+        if voice == 3:
+            if env_mode[2] & 2 or length[3] == 0:
+                return 0
+            return t + int(round(length[3] * SAMPLES_PER_HALF_FRAME))
+        if voice == 2:
+            if linear & 0x80 or (linear & 0x7F) == 0:
+                return 0
+            return t + int(round((linear & 0x7F) * SAMPLES_PER_QUARTER_FRAME))
+        return 0
+
     def close(voice: int, t: int, *, emit_off: bool = True) -> None:
         nonlocal glitches
         hit = active[voice]
         if hit is None:
             return
         hit.off_sample = t
+        gate_end[voice] = 0
         if t <= 0:
             hits.append(hit)
         elif t - hit.sample_time >= NES_MIN_NOTE:
@@ -302,6 +344,7 @@ def _nes_tones_one(
         last_period_t[voice] = t
         if voice != 3:
             prev_period[voice] = period[voice]
+        gate_end[voice] = gate_end_at(voice, t)
         if voice == 3:
             active[voice] = NesHit(
                 sample_time=t, voice=3, period=noise_period,
@@ -317,7 +360,17 @@ def _nes_tones_one(
                 linear=linear if voice == 2 else 0,
             )
 
-    def evaluate(voice: int, t: int) -> None:
+    def evaluate(voice: int, t: int, *, rearm: bool = False) -> None:
+        # The voice's own counter may already have closed this note.  End it at
+        # that time, so the pattern gets the note-off where the chip went quiet,
+        # and let this write start the next note.  A reload that arrives while
+        # the gate is still open only extends the same note (drivers hold a
+        # voice by rewriting the length register every frame).
+        if (active[voice] is not None and gate_end[voice]
+                and gate_end[voice] <= t):
+            close(voice, gate_end[voice])
+        elif rearm and active[voice] is not None:
+            gate_end[voice] = gate_end_at(voice, t)
         if voice == 3:
             on = bool(enabled & 0x08) and _tone_audible(vol[2], env_mode[2])
             on = on and bool(env_mode[2] & 2 or length[3] > 0)
@@ -455,9 +508,9 @@ def _nes_tones_one(
         elif reg == 0x03 or reg == 0x07:
             voice = 0 if reg == 0x03 else 1
             period[voice] = (period[voice] & 0xFF) | ((val & 7) << 8)
-            length[voice] = (val >> 3) & 0x1F
+            length[voice] = NES_LENGTH_TABLE[(val >> 3) & 0x1F]
             freq_hi[voice] = True
-            evaluate(voice, t)
+            evaluate(voice, t, rearm=True)
         elif reg == 0x08:
             linear = val
             evaluate(2, t)
@@ -467,9 +520,9 @@ def _nes_tones_one(
                 evaluate(2, t)
         elif reg == 0x0B:
             period[2] = (period[2] & 0xFF) | ((val & 7) << 8)
-            length[2] = (val >> 3) & 0x1F
+            length[2] = NES_LENGTH_TABLE[(val >> 3) & 0x1F]
             freq_hi[2] = True
-            evaluate(2, t)
+            evaluate(2, t, rearm=True)
         elif reg == 0x0C:
             vol[2] = val & 0x0F
             env_mode[2] = (val >> 4) & 3
@@ -479,15 +532,22 @@ def _nes_tones_one(
             noise_mode = (val >> 7) & 1
             evaluate(3, t)
         elif reg == 0x0F:
-            length[3] = (val >> 3) & 0x1F
-            evaluate(3, t)
+            length[3] = NES_LENGTH_TABLE[(val >> 3) & 0x1F]
+            evaluate(3, t, rearm=True)
         elif reg == 0x15:
             enabled = val & 0x1F
             evaluate_all(t)
         # 0x01/0x05 sweep, 0x09/0x0D unused, 0x10-0x13 DPCM, 0x17 frame ctl
 
     for voice in range(4):
-        if active[voice] is not None:
+        if active[voice] is None:
+            continue
+        end = gate_end[voice]
+        if end and (not total or end <= total):
+            # A percussion gate that ran out before the stream did: end the
+            # note there so the pattern shows the hit's real length.
+            close(voice, end)
+        else:
             close(voice, 0, emit_off=False)
     return hits, offs, glitches
 
