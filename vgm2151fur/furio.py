@@ -23,6 +23,7 @@ from vgm2151fur.furwrite import (
     CHIP_YM2608, CHIP_YM2608_EXT,
     CHIP_YM2610, CHIP_YM2610B, CHIP_YM2612, CHIP_YM2612_CSM, CHIP_YM2612_EXT,
     CHIP_YMZ280B, CHIP_VBOY,
+    CHIP_MULTIPCM, CHIP_PCM_DAC,
     FUR_MAGIC, decompress_fur,
 )
 
@@ -73,6 +74,8 @@ CHIP_CHANNELS = {
     CHIP_C352: 32,  # Namco C352
     CHIP_K053260: 4,  # Konami K053260
     CHIP_YMZ280B: 8,  # Yamaha YMZ280B (PCMD8)
+    CHIP_MULTIPCM: 28,  # Yamaha YMW258-F (MultiPCM)
+    CHIP_PCM_DAC: 1,  # Generic PCM DAC (one system per uPD7759/PWM side)
     CHIP_VBOY: 6,  # Virtual Boy VSU: five wave voices + noise
     CHIP_K051649: 5,  # Konami SCC
     CHIP_K052539: 5,  # Konami SCC+
@@ -88,7 +91,7 @@ CHIP_CHANNELS = {
 # Chips whose samples carry playable 8-bit bodies (VOX depths stay out).
 _PCM_BODY_CHIPS = (
     CHIP_K007232, CHIP_SEGAPCM, CHIP_RF5C68, CHIP_C140, CHIP_C352,
-    CHIP_K053260, CHIP_YMZ280B,
+    CHIP_K053260, CHIP_YMZ280B, CHIP_MULTIPCM, CHIP_PCM_DAC,
 )
 
 

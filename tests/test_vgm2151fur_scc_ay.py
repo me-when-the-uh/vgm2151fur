@@ -108,10 +108,11 @@ class TestSccParsing(unittest.TestCase):
         self.assertIn("ay8910", chips_in_head(p.read_bytes()))
 
     def test_multi_pcm_is_not_a0(self):
-        # 0xA0 is the AY-8910 register write; MultiPCM is 0xB5.
+        # 0xA0 is the AY-8910 register write; MultiPCM is 0xB5 and is now
+        # converted rather than reported as unsupported.
         from vgm2151fur.vgm import UNCONVERTED_SAMPLE_CMDS
         self.assertNotIn(0xA0, UNCONVERTED_SAMPLE_CMDS)
-        self.assertEqual(UNCONVERTED_SAMPLE_CMDS.get(0xB5), "MultiPCM")
+        self.assertNotIn(0xB5, UNCONVERTED_SAMPLE_CMDS)
 
 
 class TestSccCollect(unittest.TestCase):

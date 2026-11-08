@@ -2,15 +2,16 @@
 
 Converts arcade and console VGM/VGZ rips into Furnace Tracker modules.
 Supported chips:
-- Yamaha: YM2151, YM2203, YM2612, YM2610/YM2610B, YM2608, YM2413, YM3526, YM3812, YMF262, Y8950, YMF278B, YMZ280B and YM2149.
+- Yamaha: YM2151, YM2203, YM2612, YM2610/YM2610B, YM2608, YM2413, YM3526, YM3812, YMF262, Y8950, YMF278B, YMZ280B, YMW258-F (MultiPCM) and YM2149.
 - General Instrument: AY-3-8910.
 - Konami: VRC7, K007232, K053260 and SCC/SCC+.
 - Atari: POKEY.
 - Philips: SAA1099.
 - Texas Instruments: SN76489 and T6W28.
+- NEC: uPD7759 (stand-alone phrase ROMs and slave streams).
+- Sega: SegaPCM and 32X PWM.
 - Nintendo: NES APU (2A03), Game Boy DMG, Virtual Boy VSU and Hudson HuC6280 (PC Engine).
 - OKI: MSM6295 and MSM6258.
-- Sega: SegaPCM.
 - Namco: C140 and C352.
 - Ricoh: RF5C68 and RF5C164.
 
@@ -88,7 +89,7 @@ tests/          pytest suite
 docs/           operating guide, format notes, chip notes
 ```
 
-Project state and workflow are in `docs/portable-context.md` and `docs/implementation-notes.md`. Chip details are in `docs/opm-notes.md`, `docs/ym2203.md`, `docs/ym2612.md`, `docs/ym2610.md`, `docs/opna-opll.md`, `docs/opl.md`, `docs/k053260.md`, `docs/scc-ay8910.md`, `docs/segapcm-c140.md`, `docs/ssg-pcm.md`, `docs/nes-vrc7.md`, `docs/gb.md`, `docs/huc6280.md`, `docs/c352.md`, `docs/ymz280b.md`, `docs/pokey.md` and `docs/vsu.md`. `docs/merged-logs.md` covers multi-family modules, and `docs/psg-open-items.md` tracks the remaining AY accuracy gaps.
+Project state and workflow are in `docs/portable-context.md` and `docs/implementation-notes.md`. Chip details are in `docs/opm-notes.md`, `docs/ym2203.md`, `docs/ym2612.md`, `docs/ym2610.md`, `docs/opna-opll.md`, `docs/opl.md`, `docs/k053260.md`, `docs/scc-ay8910.md`, `docs/segapcm-c140.md`, `docs/ssg-pcm.md`, `docs/nes-vrc7.md`, `docs/gb.md`, `docs/huc6280.md`, `docs/c352.md`, `docs/ymz280b.md`, `docs/multipcm.md`, `docs/upd7759.md`, `docs/pwm32x.md`, `docs/pokey.md` and `docs/vsu.md`. `docs/merged-logs.md` covers multi-family modules, and `docs/psg-open-items.md` tracks the remaining AY accuracy gaps.
 
 Open follow-ups are tracked in [TODO.md](./TODO.md).
 
@@ -106,6 +107,15 @@ Open follow-ups are tracked in [TODO.md](./TODO.md).
 - OPL4 ROM waves need the `VGM2151FUR_YRW801` image and RAM wave IDs need the VGM RAM dump.
   - The Y8950 ADPCM voice is silent without a delta-T data block.
 - YMZ280B extracts distinct ROM bodies and keeps key-on start/stop/loop, levels, pan and mid-note pitch/level sweeps.
+- YMW258-F (MultiPCM) converts 28 sample voices per chip from 8- or 12-bit ROM bodies, with source loop points, ADSR/LFO values, Sega 1 MB/512 KB banks and mid-note pitch/volume/pan writes.
+  - Only triggered bodies are written, and the source sample index is remapped to a module instrument index.
+- uPD7759 converts stand-alone phrase ROMs and slave port streams, rendered as 16-bit PCM and played on a Generic PCM DAC system (one column per chip).
+  - Unique phrases use 120-slot sample maps, so a speech-heavy rip stays inside the instrument budget.
+  - Identical phrases share one body, and rate changes inside a phrase are resampled to the module body's fixed rate.
+- Sega 32X PWM converts streamed 12-bit stereo data to two Generic PCM DAC columns per chip, including n-Bit compressed `0x43` banks.
+  - The stream is cut into 0.25-second PCM chunks and grouped through 120-slot sample maps, like the YM2612 DAC path.
+  - The PWM data is a streamed duty sequence, so the module stores the decoded left/right PCM rather than the source register writes.
+- Generic PCM DAC mix levels are limited to 2.0 per chip and the song master to 3.0; the source normalizer stops at that ceiling.
 - SegaPCM and C140 follow mid-note volume and frequency writes, while start/end/loop/bank changes stay at the key-on value.
   - The C140 sign-flip and sign-magnitude mode bits are ignored, as libvgm ignores them.
 - RF5C68 and RF5C164 share one Furnace system selected by `chipType`, and a looping SSG PCM DAC stream plays once because the AY sample instrument is one-shot.

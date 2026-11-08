@@ -55,6 +55,12 @@ before SCC/AY/NES/PCE/Game Boy. A YMZ-only log suppresses the legacy YM2151
 placeholder, so `07 Stage4.vgm` becomes two `0xB8` systems and sixteen real
 columns (`docs/ymz280b.md`).
 
+MultiPCM, uPD7759 and 32X PWM follow YMZ280B in the sample-engine order.
+MultiPCM is a native 28-column system per chip (`docs/multipcm.md`); uPD7759
+and PWM use Generic PCM DAC systems because Furnace has no native platform
+(`docs/upd7759.md`, `docs/pwm32x.md`).  A log with only these chips likewise
+suppresses the legacy YM2151 placeholder.
+
 Virtual Boy VSU is a pitched chip and comes after Game Boy: six columns per
 chip (`0x9C`). A VSU-only log likewise suppresses the placeholder, so the
 Jack Bros and Galactic Pinball references are six real columns

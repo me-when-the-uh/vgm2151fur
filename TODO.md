@@ -125,6 +125,24 @@ Remaining:
 - **Filter-control corpus.** The silent note on the filter clock channel is
   verified on `combat_vehicle`; broaden the check to other filter-heavy rips.
 
+## MultiPCM, uPD7759 and 32X PWM
+
+- **MultiPCM envelope writes after key-on.** ADSR/LFO values come from the ROM
+  sample header; a driver that rewrites registers 7-10 per note has no
+  per-note instrument copy yet.
+- **MultiPCM sample-memory limits.** Furnace's platform holds 512 bodies and
+  2 MB. A source that triggers more than 512 distinct ROM samples needs a
+  clustering/remap policy.
+- **uPD7759 slave timing.** The converter decodes the command stream after the
+  six-byte handshake. Validate against VGMPlay on the `01 IPL` and
+  `07 Picture Book` references, especially FIFO stalls between port writes.
+- **uPD7759 rate changes.** Phrase-internal rate changes are resampled to one
+  module body; a segmented representation could preserve them exactly.
+- **PWM compressed banks.** The n-Bit copy and shift subtypes decode; table
+  (`0x7F`) and DPCM-compressed banks are reported as unsupported.
+- **PWM direct level writes.** A log that writes registers 2/3/4 directly
+  without DAC streams only gets point samples, not a continuous stream.
+
 ## From the 2026-11 batch (PSG default, Ext columns, OPM key-on bits, OKI length)
 
 - **`02 Zero Cop [Opening]` (Batrider) differs in pitch on FM 4-6.** Four runs,

@@ -121,6 +121,9 @@ def _sample_counts(info: dict) -> str:
         ("c352_samples", "C352"),
         ("k053260_samples", "K053260"),
         ("ymz280b_samples", "YMZ280B"),
+        ("multipcm_samples", "MultiPCM"),
+        ("upd7759_samples", "uPD7759"),
+        ("pwm_samples", "PWM"),
         ("oki_samples", "OKI"),
         ("msm6258_samples", "ADPCM"),
         ("ym2610_a_samples", "ADPCM-A"),
@@ -541,7 +544,8 @@ def build_parser() -> argparse.ArgumentParser:
             "Transcribe YM2151 (OPM), YM2203 (OPN), YM2612 (OPN2), YM2610 and "
             "OPL-family (YM3526/YM3812/YMF262) + "
             "sample-chip (K007232, MSM6295, MSM6258, SegaPCM, C140, C352, "
-            "K053260, YMZ280B) + Nintendo Virtual Boy (VSU) + Philips "
+            "K053260, YMZ280B, YMW258-F MultiPCM, uPD7759, 32X PWM) + "
+            "Nintendo Virtual Boy (VSU) + Philips "
             "SAA1099 (Creative Music System / Game Blaster) + Atari POKEY "
             "VGMs into Furnace .fur files, and edit the result."
         ),

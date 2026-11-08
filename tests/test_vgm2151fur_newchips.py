@@ -142,12 +142,15 @@ class TestVgmParsing(unittest.TestCase):
         self.assertEqual(v.c140_clock, 12288000)
         self.assertEqual(v.c140_type, 1)
 
-    def test_unsupported_sample_chip_warns(self):
-        raw = _raw_vgm(b"\xb6\x00\x00")  # uPD7759 write
+    def test_upd7759_write_is_parsed(self):
+        raw = _raw_vgm(b"\xb6\x00\x00")  # uPD7759 register write
         p = TMP / "upd.vgm"
         p.write_bytes(raw)
         v = load_vgm(p)
-        self.assertTrue(any("uPD7759" in w for w in v.warnings))
+        self.assertEqual(
+            [(x.chip, x.chip_id, x.reg, x.val) for x in v.writes],
+            [("upd7759", 0, 0, 0)],
+        )
 
     def test_segapcm_interface_bytes(self):
         raw = _raw_vgm(b"", shift=12, mask=0x70)
