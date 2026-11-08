@@ -124,8 +124,6 @@ Remaining:
   source distortion 7 plays as 6 and warns.
 - **Filter-control corpus.** The silent note on the filter clock channel is
   verified on `combat_vehicle`; broaden the check to other filter-heavy rips.
-- **Silent second chip.** A dual-chip log whose second POKEY never plays drops
-  that system; decide whether to keep it for layout parity.
 
 ## From the 2026-11 batch (PSG default, Ext columns, OPM key-on bits, OKI length)
 

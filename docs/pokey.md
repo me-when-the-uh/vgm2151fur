@@ -32,7 +32,7 @@ has bit 30 set.
 ## Conversion
 
 - **Voices**: four columns per chip; a dual-chip log becomes two POKEY systems
-  (eight columns).
+  (eight columns), even when the second chip never plays a note.
 - **Gate**: volume > 0 opens a note, volume 0 closes it. A large volume rise
   while the gate is open is a new hit (a drum roll).
 - **Volume envelope**: the `AUDC` volume steps become a Furnace volume macro,

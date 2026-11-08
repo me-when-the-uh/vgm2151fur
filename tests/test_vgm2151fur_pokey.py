@@ -7,7 +7,9 @@ from pathlib import Path
 
 from vgm2151fur.analyze import analyze
 from vgm2151fur.furio import parse_fur
-from vgm2151fur.furwrite import CHIP_POKEY, INS_POKEY, write_fur
+from vgm2151fur.furwrite import (
+    CHIP_AY8910, CHIP_POKEY, INS_POKEY, write_fur,
+)
 from vgm2151fur.pitch import module_clock, pitch_table
 from vgm2151fur.pokey import (
     POKEY_DEFAULT_CLOCK,
@@ -293,6 +295,17 @@ class TestPokeyWriter(unittest.TestCase):
             next(r for r in rows if r.note == 180).note, 180,
         )
 
+    def test_dual_header_keeps_silent_second_chip(self):
+        writes = [
+            _pokey(0, 0, 100, 0), _pokey(0, 1, 0xAF, 0),
+            _pokey(735 * 4, 1, 0x00, 0),
+        ]
+        song = analyze(_vgm(writes, pokey_dual=True))
+        self.assertEqual(song.pokey_ids, [0, 1])
+        mod = parse_fur(write_fur(song, include_fm=False))
+        self.assertEqual(mod.chips, [CHIP_POKEY, CHIP_POKEY])
+        self.assertEqual(mod.n_ch, 8)
+
     def test_dual_chip_module_layout(self):
         writes = [
             _pokey(0, 0, 100, 0), _pokey(0, 1, 0xAF, 0),
@@ -307,6 +320,24 @@ class TestPokeyWriter(unittest.TestCase):
 
     def test_pokey_instrument_type(self):
         self.assertEqual(INS_POKEY, 20)
+
+
+class TestGeneralDualHeader(unittest.TestCase):
+    def test_ay_dual_header_keeps_silent_second_chip(self):
+        writes = [
+            ChipWrite(0, "ay8910", 0, 7, 0x38),
+            ChipWrite(0, "ay8910", 0, 0, 0xB0),
+            ChipWrite(0, "ay8910", 0, 1, 0x00),
+            ChipWrite(0, "ay8910", 0, 8, 0x0F),
+            ChipWrite(735 * 4, "ay8910", 0, 8, 0x00),
+        ]
+        song = analyze(_vgm(
+            writes, ay8910_clock=POKEY_DEFAULT_CLOCK, ay8910_dual=True,
+        ))
+        self.assertEqual(song.ay_ids, [0, 1])
+        mod = parse_fur(write_fur(song, include_fm=False))
+        self.assertEqual(mod.chips, [CHIP_AY8910, CHIP_AY8910])
+        self.assertEqual(mod.n_ch, 6)
 
 
 if __name__ == "__main__":

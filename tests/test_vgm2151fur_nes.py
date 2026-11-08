@@ -808,14 +808,14 @@ class TestDualApu(unittest.TestCase):
         self.assertEqual(notes.get(0), 1)
         self.assertEqual(notes.get(5), 1)
 
-    def test_apu_that_never_plays_gets_no_columns(self):
+    def test_dual_header_keeps_apu_that_never_plays(self):
         writes = self._writes()[:3] + [_nes(1500, 0x15, 0x00, chip_id=1)]
         song = analyze(_vgm(writes, nes_clock=1789773, nes_dual=True))
-        self.assertEqual(song.nes_ids, [0])
+        self.assertEqual(song.nes_ids, [0, 1])
         self.assertTrue(song.nes_present)
         mod = parse_fur(write_fur(song, include_pcm=True))
-        self.assertEqual(mod.chips, [CHIP_NES])
-        self.assertEqual(mod.n_ch, 5)
+        self.assertEqual(mod.chips, [CHIP_NES, CHIP_NES])
+        self.assertEqual(mod.n_ch, 10)
 
     def test_dpcm_ram_is_read_per_apu(self):
         # Both APUs hold the same address with different data: each 2A03 has its

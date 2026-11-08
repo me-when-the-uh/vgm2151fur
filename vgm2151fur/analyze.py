@@ -719,6 +719,19 @@ def system_channel_ranges(systems) -> list[tuple[FmSystem, int]]:
     return out
 
 
+def _dual_ids(ids, dual: bool) -> list[int]:
+    """Keep a header-declared second chip even when it never sounds.
+
+    The clock field's dual bit is a layout declaration.  When the log has one
+    instance's writes but not the other's, the module still gets both systems
+    and the empty one only adds columns.
+    """
+    values = sorted(set(ids))
+    if dual and values:
+        values = sorted(set(values) | {0, 1})
+    return values
+
+
 @dataclass
 class Song:
     vgm: VgmFile
@@ -6870,9 +6883,17 @@ def analyze(
         )
     # The OPL4's registers live under the "ymf278b" chip name, not "opl4".
     opl_source = "ymf278b" if opl_kind == "opl4" else opl_kind
-    opl_ids = (
+    opl_dual = {
+        KIND_OPL: getattr(vgm, "opl_dual", False),
+        KIND_OPL2: getattr(vgm, "opl2_dual", False),
+        KIND_OPL3: getattr(vgm, "opl3_dual", False),
+        KIND_Y8950: getattr(vgm, "y8950_dual", False),
+        KIND_OPL4: getattr(vgm, "ymf278b_dual", False),
+    }.get(opl_kind, False)
+    opl_ids = _dual_ids(
         sorted({w.chip_id for w in vgm.writes if w.chip == opl_source})
-        if is_opl else []
+        if is_opl else [],
+        bool(opl_dual and is_opl),
     )
     # Bit 5 of the rhythm register is the mode switch, but a driver may poke it
     # during chip init and clear it in the same sample without ever sounding a
@@ -6893,9 +6914,10 @@ def analyze(
             opl_is_opl3,
         ) if is_opl else 0.0
     )
-    opll_ids = (
+    opll_ids = _dual_ids(
         sorted({w.chip_id for w in vgm.writes if w.chip == "opll"})
-        if is_opll else []
+        if is_opll else [],
+        bool(getattr(vgm, "ym2413_dual", False) and is_opll),
     )
     # Bit 31 of the YM2413 clock field asks for the Konami VRC7: same OPLL
     # core, six channels and the VRC7 preset ROM. It has no rhythm mode.
@@ -6909,9 +6931,10 @@ def analyze(
     opll_clock = (
         opll_module_clock(vgm.ym2413_clock or 3579545) if is_opll else 0.0
     )
-    ym_ids = (
+    ym_ids = _dual_ids(
         sorted({w.chip_id for w in vgm.writes if w.chip in ("ym2203", "ym2203_ssg")})
-        if is_opn else []
+        if is_opn else [],
+        bool(getattr(vgm, "ym2203_dual", False) and is_opn),
     )
     ym_clock = vgm.ym2203_clock or YM2203_DEFAULT_CLOCK
     # 0xA8-0xAE means 3-slot mode. Furnace's Ext layout gives each
@@ -6919,9 +6942,10 @@ def analyze(
     ym2203_ext = is_opn and any(
         w.chip == "ym2203" and 0xA8 <= w.reg <= 0xAE for w in vgm.writes
     )
-    ym2612_ids = (
+    ym2612_ids = _dual_ids(
         sorted({w.chip_id for w in vgm.writes if w.chip == "ym2612"})
-        if is_opn2 else []
+        if is_opn2 else [],
+        bool(getattr(vgm, "ym2612_dual", False) and is_opn2),
     )
     ym2612_clock = vgm.ym2612_clock or YM2612_DEFAULT_CLOCK
     # 0x27 bits 6-7 select special mode (01) or CSM (10). Both use the Ext
@@ -6933,12 +6957,13 @@ def analyze(
     }
     ym2612_ext = is_opn2 and bool(ym2612_modes & {1, 2})
     ym2612_csm = is_opn2 and 2 in ym2612_modes
-    ym2610_ids = (
+    ym2610_ids = _dual_ids(
         sorted({
             w.chip_id for w in vgm.writes
             if w.chip in ("ym2610", "ym2610_ssg")
         })
-        if is_opnb else []
+        if is_opnb else [],
+        bool(getattr(vgm, "ym2610_dual", False) and is_opnb),
     )
     ym2610_clock = vgm.ym2610_clock or YM2610_DEFAULT_CLOCK
     ym2610_b = bool(vgm.ym2610_b)
@@ -6957,12 +6982,13 @@ def analyze(
     # ADPCM-A: six FM (nine when channel 3 is split), three SSG, six rhythm
     # and one ADPCM-B. Bus A $27 bits 6-7 are the same mode field, and only
     # special mode (01) is in these logs - the OPNA has no CSM.
-    ym2608_ids = (
+    ym2608_ids = _dual_ids(
         sorted({
             w.chip_id for w in vgm.writes
             if w.chip in ("ym2608", "ym2608_ssg")
         })
-        if is_opna else []
+        if is_opna else [],
+        bool(getattr(vgm, "ym2608_dual", False) and is_opna),
     )
     ym2608_clock = vgm.ym2608_clock or YM2608_DEFAULT_CLOCK
     ym2608_modes = {
@@ -7004,9 +7030,10 @@ def analyze(
     # (or the OPM's eight voices) first, then every OPL one. The bases below
     # are offsets into the module's channel space, not per-chip ones.
     convert_opm = "ym2151" in converted
-    opm_ids = (
+    opm_ids = _dual_ids(
         sorted({w.chip_id for w in vgm.writes if w.chip == "ym2151"})
-        if convert_opm else []
+        if convert_opm else [],
+        bool(getattr(vgm, "ym2151_dual", False) and convert_opm),
     )
     opm_base = {cid: 8 * i for i, cid in enumerate(opm_ids)}
     ym_end = (
@@ -7104,6 +7131,9 @@ def analyze(
         present = sorted({w.chip_id for w in vgm.writes if w.chip == "sn76489"})
         if present:
             psg_ids = present
+        psg_ids = _dual_ids(
+            psg_ids, bool(getattr(vgm, "sn76489_dual", False)),
+        )
     psg_stereo = bool(psg_ids and getattr(vgm, "sn76489_stereo", False))
     psg_base = fm_end if psg_ids else None
     psg_clock = vgm.sn76489_clock or PSG_DEFAULT_CLOCK
@@ -9235,7 +9265,10 @@ def analyze(
         # pattern index has to count those, not the raw bank slot.
         audible = [s for s in pcm_samples if s.length >= 8]
         audible_index = {id(s): i for i, s in enumerate(audible)}
-        pcm_ids = sorted({s.chip_id for s in audible})
+        pcm_ids = _dual_ids(
+            sorted({s.chip_id for s in audible}),
+            bool(getattr(vgm, "k007232_dual", False)),
+        )
         pcm_at = {
             cid: fm_end + 2 * i for i, cid in enumerate(pcm_ids)
         }
@@ -9303,6 +9336,9 @@ def analyze(
         for smp in oki_samples:
             if smp.chip_id not in oki_ids:
                 oki_ids.append(smp.chip_id)
+        oki_ids = _dual_ids(
+            oki_ids, bool(getattr(vgm, "msm6295_dual", False)),
+        )
         oki_base = {cid: sample_base + 4 * i for i, cid in enumerate(oki_ids)}
         ins0 = pcm_ins_base + (len(audible) if pcm else 0)
         for i, smp in enumerate(oki_samples):
@@ -9340,6 +9376,9 @@ def analyze(
         for smp in adpcm_samples:
             if smp.chip_id not in adpcm_ids:
                 adpcm_ids.append(smp.chip_id)
+        adpcm_ids = _dual_ids(
+            adpcm_ids, bool(getattr(vgm, "msm6258_dual", False)),
+        )
         adpcm_at = {cid: adpcm_base + i for i, cid in enumerate(adpcm_ids)}
         ins1 = ins0 + len(oki_samples)
         n_adpcm_ch = len(adpcm_ids)
@@ -9392,7 +9431,10 @@ def analyze(
         _spcm_rom, spcm_samples, spcm_warn = collect_segapcm(vgm)
         warnings.extend(spcm_warn)
         spcm_audible = [s for s in spcm_samples if s.length >= 8]
-        spcm_ids = sorted({s.chip_id for s in spcm_audible})
+        spcm_ids = _dual_ids(
+            sorted({s.chip_id for s in spcm_audible}),
+            bool(getattr(vgm, "segapcm_dual", False)),
+        )
         spcm_base = adpcm_base + len(adpcm_ids)
         spcm_at = {
             cid: spcm_base + 16 * i for i, cid in enumerate(spcm_ids)
@@ -9463,6 +9505,9 @@ def analyze(
             for h in smp.hits:
                 if h.chip_id not in c140_ids:
                     c140_ids.append(h.chip_id)
+        c140_ids = _dual_ids(
+            c140_ids, bool(getattr(vgm, "c140_dual", False)),
+        )
         c140_base = spcm_base + 16 * len(spcm_ids)
         c140_at = {cid: c140_base + 24 * i for i, cid in enumerate(c140_ids)}
         ins3 = ins2 + len(spcm_audible)
@@ -9663,6 +9708,9 @@ def analyze(
             for h in smp.hits:
                 if h.chip_id not in k053260_ids:
                     k053260_ids.append(h.chip_id)
+        k053260_ids = _dual_ids(
+            k053260_ids, bool(getattr(vgm, "k053260_dual", False)),
+        )
         k053260_base = c352_base + 32 * len(c352_ids)
         k053260_at = {
             cid: k053260_base + 4 * i for i, cid in enumerate(k053260_ids)
@@ -9767,8 +9815,14 @@ def analyze(
             warnings.extend(warn)
         rf5c68_audible = [s for s in rf5c68_samples if s.length >= 8]
         rf5c164_audible = [s for s in rf5c164_samples if s.length >= 8]
-        rf5c68_ids = sorted({s.chip_id for s in rf5c68_audible})
-        rf5c164_ids = sorted({s.chip_id for s in rf5c164_audible})
+        rf5c68_ids = _dual_ids(
+            sorted({s.chip_id for s in rf5c68_audible}),
+            bool(getattr(vgm, "rf5c68_dual", False)),
+        )
+        rf5c164_ids = _dual_ids(
+            sorted({s.chip_id for s in rf5c164_audible}),
+            bool(getattr(vgm, "rf5c164_dual", False)),
+        )
         rf5c_base = k053260_base + 4 * len(k053260_ids)
         ins6 = ins5 + len(k053260_audible)
         rf5c68_at = {
@@ -9840,7 +9894,10 @@ def analyze(
         ymz_samples, ymz_offs, ymz_warn = collect_ymz280b(vgm)
         warnings.extend(ymz_warn)
         ymz_audible = [s for s in ymz_samples if s.length > 0 and s.hits]
-        ymz_ids = sorted({s.chip_id for s in ymz_audible})
+        ymz_ids = _dual_ids(
+        sorted({s.chip_id for s in ymz_audible}),
+        bool(getattr(vgm, "ymz280b_dual", False)),
+    )
         ymz_base = (
             fm_end + 2 * len(pcm_ids)
             + 4 * len({s.chip_id for s in oki_samples}) + n_adpcm_ch
@@ -9953,13 +10010,15 @@ def analyze(
                     f"NES raw PCM: lossy sample clustering {before} -> "
                     f"{len(nes_pcm_samples)} bodies"
                 )
-        # Header bit 30 asks for a second APU, but a cart whose extra chip
-        # never plays would only add five silent columns.  The column map is
-        # built from the instances that actually sounded.
-        nes_ids = sorted(
-            {h.chip_id for h in nes_tones} | {o.chip_id for o in nes_offs}
-            | {hit.chip_id for hit in nes_dpcm_hits}
-            | {hit.chip_id for hit in nes_pcm_hits}
+        # Header bit 30 asks for a second APU.  Keep it even when it never
+        # plays, so the module layout matches the log's declared chips.
+        nes_ids = _dual_ids(
+            sorted(
+                {h.chip_id for h in nes_tones} | {o.chip_id for o in nes_offs}
+                | {hit.chip_id for hit in nes_dpcm_hits}
+                | {hit.chip_id for hit in nes_pcm_hits}
+            ),
+            bool(getattr(vgm, "nes_dual", False)),
         )
     else:
         nes_ids = []
@@ -10053,6 +10112,9 @@ def analyze(
     if scc_notes:
         for cid in sorted({n.hit.chip_id for n in scc_notes}):
             scc_ids.append(cid)
+        scc_ids = _dual_ids(
+            scc_ids, bool(getattr(vgm, "k051649_dual", False)),
+        )
         scc_waves = list(scc_wave_list)
         scc_wave_index = {img: i for i, img in enumerate(scc_waves)}
         scc_at = {cid: tone_base + SCC_VOICES * i for i, cid in enumerate(scc_ids)}
@@ -10189,6 +10251,9 @@ def analyze(
     if ay_cids:
         for cid in ay_cids:
             ay_ids.append(cid)
+        ay_ids = _dual_ids(
+            ay_ids, bool(getattr(vgm, "ay8910_dual", False)),
+        )
         ay_at = {cid: tone_base + SCC_VOICES * len(scc_ids) + AY_VOICES * i
                  for i, cid in enumerate(ay_ids)}
         if ay_hits:
@@ -10389,6 +10454,9 @@ def analyze(
     if huc_cids:
         for cid in huc_cids:
             huc6280_ids.append(cid)
+        huc6280_ids = _dual_ids(
+            huc6280_ids, bool(getattr(vgm, "huc6280_dual", False)),
+        )
         huc_base = (
             tone_base + SCC_VOICES * len(scc_ids) + AY_VOICES * len(ay_ids)
             + NES_CHANNELS * len(nes_ids)
@@ -10658,6 +10726,9 @@ def analyze(
     warnings.extend(gb_warn)
     if gb_hits or gb_offs:
         gb_ids.append(0)
+        gb_ids = _dual_ids(
+            gb_ids, bool(getattr(vgm, "gb_dmg_dual", False)),
+        )
         gb_base = (
             tone_base + SCC_VOICES * len(scc_ids) + AY_VOICES * len(ay_ids)
             + NES_CHANNELS * len(nes_ids)
@@ -10777,7 +10848,10 @@ def analyze(
     )
     warnings.extend(vsu_warn)
     if vsu_hits or vsu_offs:
-        vsu_ids = sorted({h.chip_id for h in vsu_hits})
+        vsu_ids = _dual_ids(
+            sorted({h.chip_id for h in vsu_hits}),
+            bool(getattr(vgm, "vsu_dual", False)),
+        )
         vsu_waves = list(vsu_wave_list)
         vsu_mod_waves = list(vsu_mod_list)
         vsu_base = (
@@ -10874,6 +10948,9 @@ def analyze(
         })
         if not saa_ids:
             saa_ids = sorted({h.chip_id for h in saa_hits})
+        saa_ids = _dual_ids(
+            saa_ids, bool(getattr(vgm, "saa1099_dual", False)),
+        )
         saa_base = (
             tone_base + SCC_VOICES * len(scc_ids) + AY_VOICES * len(ay_ids)
             + NES_CHANNELS * len(nes_ids)
@@ -10898,11 +10975,14 @@ def analyze(
         pokey_hits, pokey_offs, pokey_audctl, pokey_waves, pokey_warn,
     ) = collect_pokey(vgm)
     warnings.extend(pokey_warn)
-    if pokey_hits or pokey_offs:
-        pokey_ids = sorted(
+    pokey_ids = _dual_ids(
+        sorted(
             {h.chip_id for h in pokey_hits}
             | {o.chip_id for o in pokey_offs}
-        )
+        ),
+        bool(getattr(vgm, "pokey_dual", False)),
+    )
+    if pokey_ids:
         pokey_base = (
             tone_base + SCC_VOICES * len(scc_ids) + AY_VOICES * len(ay_ids)
             + NES_CHANNELS * len(nes_ids)

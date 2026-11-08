@@ -14,7 +14,7 @@ Supported chips:
 - Namco: C140 and C352.
 - Ricoh: RF5C68 and RF5C164.
 
-A log that mixes several chip families is written as one module when the combination is supported. `docs/merged-logs.md` lists the rules.
+A log that mixes several chip families is written as one module when the combination is supported. `docs/merged-logs.md` lists the rules. A clock field's dual bit keeps both chip instances, even when one never sounds a note; T6W28 is the exception, since its two bits describe one stereo chip.
 
 It runs on Windows and Linux with Python 3.11 or newer.
 
@@ -131,7 +131,6 @@ Open follow-ups are tracked in [TODO.md](./TODO.md).
   - Volume-only mode (AUDC bit 4) is not converted because Furnace has no DC/DAC mode.
   - Two-tone mode (SKCTL bit 7) exists only on Furnace's ASAP core and is not converted.
   - AUDC distortion 7 has no separate Furnace wave tap and plays as distortion 6 with a warning.
-  - A dual-chip log whose second chip never plays drops the silent system.
 - C352 needs a Furnace build with the ported core.
 - C219 logs are detected but not converted.
 - K053260 loops the whole sample, and mid-note loop, KADPCM or direction changes use the key-on value.
