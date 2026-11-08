@@ -32,6 +32,8 @@ import wave
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from vgm2151fur.vgm import VGM_RATE, VgmFile, assemble_rom
+
 STANDARD_CLOCK = 640_000
 MAGIC = b"\x5a\xa5\x69\x55"
 
@@ -113,6 +115,8 @@ def _decode_nibbles(rom: bytes, offset: int, count: int, rate: int, phrase: Phra
     """
     left = count
     while left > 0:
+        if offset >= len(rom):
+            break
         byte = rom[offset]
         offset += 1
         for nibble in (byte >> 4, byte & 0x0F):
@@ -180,6 +184,290 @@ def decode_phrase(rom: bytes, index: int, clock: int = STANDARD_CLOCK) -> Phrase
             first_valid = True
 
     return phrase
+
+
+def decode_stream(data: bytes, start: int = 0,
+                  clock: int = STANDARD_CLOCK) -> Phrase:
+    """Decode a raw uPD7759 command stream (slave mode).
+
+    Slave logs send command bytes through the port instead of pointing the chip
+    at its own phrase ROM.  The command grammar after the port handshake is the
+    same as a stand-alone phrase, so the same state machine applies.
+    """
+    phrase = Phrase(index=-1, start=start, end=None)
+    level = 0
+    state = 0
+    repeat_count = 0
+    repeat_offset = start
+    offset = start
+    first_valid = False
+
+    while offset < len(data):
+        if repeat_count:
+            repeat_count -= 1
+            offset = repeat_offset
+        if offset >= len(data):
+            break
+        header = data[offset]
+        offset += 1
+        kind = header & 0xC0
+
+        if kind == 0x00:
+            phrase.events.append((0, 1024 * ((header & 0x3F) + 1)))
+            phrase.blocks += 1
+            level = 0
+            state = 0
+            if header == 0 and first_valid:
+                phrase.end = offset
+                break
+        elif kind == 0x40:
+            rate = (header & 0x3F) + 1
+            phrase.rates.add(rate)
+            phrase.blocks += 1
+            phrase.events.append((level, HEADER_CLOCKS))
+            offset, level, state = _decode_nibbles(
+                data, offset, 256, rate, phrase, level, state,
+            )
+        elif kind == 0x80:
+            rate = (header & 0x3F) + 1
+            phrase.rates.add(rate)
+            phrase.blocks += 1
+            phrase.events.append((level, HEADER_CLOCKS))
+            if offset >= len(data):
+                break
+            count = data[offset] + 1
+            offset += 1
+            phrase.events.append((level, HEADER_CLOCKS))
+            offset, level, state = _decode_nibbles(
+                data, offset, count, rate, phrase, level, state,
+            )
+        else:
+            repeat_count = (header & 0x07) + 1
+            repeat_offset = offset
+            phrase.blocks += 1
+            phrase.events.append((level, HEADER_CLOCKS))
+
+        if header:
+            first_valid = True
+
+    return phrase
+
+
+@dataclass
+class Upd7759Hit:
+    sample_time: int
+    chip_id: int
+    phrase: int
+    clock: int
+    # Key-off sample time (0 = held to the end).
+    end: int = 0
+
+
+@dataclass
+class Upd7759Sample:
+    chip_id: int
+    phrase: int
+    data: bytes  # 16-bit signed little-endian PCM at UPD_OUTPUT_RATE
+    clock: int
+    hits: list[Upd7759Hit] = field(default_factory=list)
+    name: str = ""
+
+    @property
+    def frames(self) -> int:
+        return len(self.data) // 2
+
+
+# The module renders phrases at a fixed rate; the PCM DAC system uses the same
+# value so note 108 plays them back at 1x.
+UPD_OUTPUT_RATE = 44100
+# The slave state machine consumes five bytes of handshake before the first
+# block header (start request, last-sample, dummy, address MSB/LSB).
+UPD_SLAVE_HANDSHAKE = 5
+UPD_MAX_PHRASE_SECONDS = 30.0
+
+
+def collect_upd7759(
+    vgm: "VgmFile",
+) -> tuple[list[Upd7759Sample], list[str]]:
+    """Turn uPD7759 register traffic into PCM phrase bodies and note hits."""
+    warnings: list[str] = []
+    ids = sorted({
+        w.chip_id for w in vgm.writes if w.chip == "upd7759"
+    })
+    if not ids:
+        return [], warnings
+
+    roms: dict[int, bytes] = {}
+    for cid in ids:
+        rom = assemble_rom(vgm, "upd7759", cid, fill=0xFF)
+        if not rom and not vgm.upd7759_slave:
+            warnings.append(
+                f"uPD7759 chip {cid + 1} has no type-0x8A ROM block"
+            )
+        roms[cid] = rom
+
+    clock = vgm.upd7759_clock or STANDARD_CLOCK
+    samples: dict[tuple[int, bytes], Upd7759Sample] = {}
+    # Decode first, then bank the command streams.  Rendering stays at the
+    # decoder's nominal level; no per-file gain adjustment.
+    pending: list[tuple[int, int, int, Phrase]] = []
+
+    def add_sample(cid: int, source: int, pcm: bytes) -> Upd7759Sample:
+        key = (cid, pcm)
+        found = samples.get(key)
+        if found is not None:
+            return found
+        name = (
+            f"uPD{source + 1}" if source >= 0 else f"uPD stream {len(samples) + 1}"
+        )
+        sample = Upd7759Sample(
+            chip_id=cid,
+            phrase=source,
+            data=pcm,
+            clock=clock,
+            name=name,
+        )
+        samples[key] = sample
+        return sample
+
+    def phrase_samples(phrase: Phrase) -> int:
+        return int(round(phrase.seconds(clock) * VGM_RATE))
+
+    state: dict[int, dict] = {}
+    for cid in ids:
+        state[cid] = {
+            # libvgm starts the chip with reset and start high; VGM logs then
+            # toggle them.  This is why some logs never write register 0.
+            "reset": True,
+            "start": True,
+            "port": 0,
+            "bank": 0,
+            "active_until": 0,
+            "collecting": False,
+            "burst_start": 0,
+            "burst": [],
+        }
+
+    def finish_burst(cid: int, t: int) -> None:
+        st = state[cid]
+        if not st["collecting"]:
+            return
+        st["collecting"] = False
+        burst = st["burst"]
+        st["burst"] = []
+        if not burst:
+            return
+        # Skip the port handshake.  The state machine consumes five bytes
+        # before the first command header; keep at least one byte for a
+        # malformed log.
+        data = bytes(v for _when, v in burst)
+        start = min(UPD_SLAVE_HANDSHAKE, max(0, len(data) - 1))
+        phrase = decode_stream(data, start, clock)
+        if not phrase.blocks:
+            warnings.append(
+                f"uPD7759 chip {cid + 1} slave stream at {st['burst_start']} "
+                "had no decodable commands"
+            )
+            return
+        pending.append((st["burst_start"], cid, -1, phrase))
+        st["active_until"] = st["burst_start"] + phrase_samples(phrase)
+
+    for w in vgm.writes:
+        cid = w.chip_id
+        if w.chip != "upd7759" or cid not in state:
+            continue
+        st = state[cid]
+        t = w.sample
+        if st["active_until"] and t >= st["active_until"]:
+            st["active_until"] = 0
+        reg = w.reg
+        if reg == 3:
+            st["bank"] = w.val << 17
+            continue
+        if reg == 2:
+            st["port"] = w.val
+            if st["collecting"]:
+                st["burst"].append((t, w.val))
+            continue
+        if reg == 0:
+            old = st["reset"]
+            st["reset"] = w.val != 0
+            if old and not st["reset"]:
+                finish_burst(cid, t)
+                st["active_until"] = 0
+            continue
+        if reg != 1:
+            continue
+        old = st["start"]
+        st["start"] = w.val != 0
+        rising = st["start"] and not old
+        falling = old and not st["start"]
+        if falling:
+            finish_burst(cid, t)
+            continue
+        if not rising or not st["reset"] or st["active_until"] > t:
+            continue
+        # A start rising edge while reset is high and the chip is idle.
+        if vgm.upd7759_slave:
+            st["collecting"] = True
+            st["burst_start"] = t
+            st["burst"] = []
+            continue
+        view = roms.get(cid, b"")[st["bank"]:]
+        if not view:
+            warnings.append(
+                f"uPD7759 chip {cid + 1} start at {t}: no ROM at bank "
+                f"{st['bank']:#x}"
+            )
+            continue
+        try:
+            count = phrase_count(view)
+        except ValueError:
+            warnings.append(
+                f"uPD7759 chip {cid + 1} start at {t}: ROM bank "
+                f"{st['bank']:#x} has no phrase header"
+            )
+            continue
+        source = st["port"]
+        if source >= count:
+            warnings.append(
+                f"uPD7759 chip {cid + 1} sample {source} is past the ROM's "
+                f"{count} phrases"
+            )
+            continue
+        phrase = decode_phrase(view, source, clock)
+        if not phrase.blocks:
+            continue
+        pending.append((t, cid, source, phrase))
+        st["active_until"] = t + phrase_samples(phrase)
+
+    # Close a stream whose log ended while start was still high.
+    for cid in ids:
+        finish_burst(cid, vgm.total_samples or 0)
+
+    gain = 1.0
+    for start, cid, source, phrase in pending:
+        pcm = render_wav_bytes(phrase, UPD_OUTPUT_RATE, clock, gain)
+        seconds = len(pcm) / 2.0 / UPD_OUTPUT_RATE
+        if seconds > UPD_MAX_PHRASE_SECONDS:
+            warnings.append(
+                f"uPD7759 chip {cid + 1} stream at {start} decoded to "
+                f"{seconds:.1f}s; truncated"
+            )
+            pcm = pcm[:int(UPD_MAX_PHRASE_SECONDS * UPD_OUTPUT_RATE) * 2]
+        sample = add_sample(cid, source, pcm)
+        sample.hits.append(Upd7759Hit(
+            sample_time=start,
+            chip_id=cid,
+            phrase=source,
+            clock=clock,
+            end=start + len(pcm) // 2,
+        ))
+
+    audible = [s for s in samples.values() if s.hits and s.frames > 0]
+    audible.sort(key=lambda s: (s.chip_id, s.phrase, s.name))
+    warnings = list(dict.fromkeys(warnings))
+    return audible, warnings
 
 
 def _event_points(phrase: Phrase, clock: int) -> tuple[list[float], list[int]]:

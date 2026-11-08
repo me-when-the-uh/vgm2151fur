@@ -105,6 +105,44 @@ the real rips are available. Open:
   condense factors. Moving them into the instrument's volume macro is the next
   step (`docs/psg-open-items.md`).
 
+## Atari POKEY
+
+POKEY is in the tree: four voices per chip, dual-chip logs, per-frame AUDC
+volume and waveform instrument macros, AUDCTL macros and `11xx` effects, joined
+16-bit pairs, high-clock/15 kHz/filter modes, silent filter-control notes,
+exact-register pitch inversion and PAL/custom clocks. The seven-rip pack
+(including `porkyspokeys`) covers the common driver shapes, and the modules keep
+the source's unity mix.
+
+Remaining:
+
+- **Volume-only mode.** `AUDC` bit 4 is a DC/DAC level Furnace cannot reproduce;
+  the converter warns and does not emit it.
+- **Two-tone mode.** `SKCTL` bit 7 exists only on the ASAP core; the converter
+  reports it instead of converting it.
+- **Distortion 7.** Furnace's wave map has only the distortion-6 poly4 tap, so
+  source distortion 7 plays as 6 and warns.
+- **Filter-control corpus.** The silent note on the filter clock channel is
+  verified on `combat_vehicle`; broaden the check to other filter-heavy rips.
+
+## MultiPCM, uPD7759 and 32X PWM
+
+- **MultiPCM envelope writes after key-on.** ADSR/LFO values come from the ROM
+  sample header; a driver that rewrites registers 7-10 per note has no
+  per-note instrument copy yet.
+- **MultiPCM sample-memory limits.** Furnace's platform holds 512 bodies and
+  2 MB. A source that triggers more than 512 distinct ROM samples needs a
+  clustering/remap policy.
+- **uPD7759 slave timing.** The converter decodes the command stream after the
+  six-byte handshake. Validate against VGMPlay on the `01 IPL` and
+  `07 Picture Book` references, especially FIFO stalls between port writes.
+- **uPD7759 rate changes.** Phrase-internal rate changes are resampled to one
+  module body; a segmented representation could preserve them exactly.
+- **PWM compressed banks.** The n-Bit copy and shift subtypes decode; table
+  (`0x7F`) and DPCM-compressed banks are reported as unsupported.
+- **PWM direct level writes.** A log that writes registers 2/3/4 directly
+  without DAC streams only gets point samples, not a continuous stream.
+
 ## From the 2026-11 batch (PSG default, Ext columns, OPM key-on bits, OKI length)
 
 - **`02 Zero Cop [Opening]` (Batrider) differs in pitch on FM 4-6.** Four runs,

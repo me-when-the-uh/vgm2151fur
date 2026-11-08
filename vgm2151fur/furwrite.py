@@ -26,6 +26,7 @@ from vgm2151fur.opl import (
 )
 from vgm2151fur.pcm import pcm7_to_s8, scale_pcm7
 from vgm2151fur.pitch import FURNACE_CLOCK_DEFAULT, module_clock
+from vgm2151fur.pokey import POKEY_VOICES
 from vgm2151fur.saa1099 import (
     SAA_CLOCK_8M, SAA_CLOCK_NTSC, SAA_CLOCK_PAL, SAA_DEFAULT_CLOCK,
 )
@@ -101,6 +102,11 @@ CHIP_C140 = 0xCE
 CHIP_K053260 = 0xCC
 # DIV_SYSTEM_YMZ280B: eight PCM/ADPCM sample voices.
 CHIP_YMZ280B = 0xB8
+# Furnace's native Yamaha YMW258-F (MultiPCM): 28 sample voices per instance.
+CHIP_MULTIPCM = 0x92
+# Furnace's Generic PCM DAC, used for streamed sample chips with no native
+# platform (uPD7759, Sega 32X PWM).
+CHIP_PCM_DAC = 0xC0
 # DIV_SYSTEM_VBOY: five wavetable voices and one noise voice.
 CHIP_VBOY = 0x9C
 # Furnace format.md reserves 0xD0 for Namco C352, 32 channels, and marks it
@@ -111,6 +117,8 @@ CHIP_C352 = 0xD0
 CHIP_K051649 = 0xA1
 CHIP_K052539 = 0xB4
 CHIP_AY8910 = 0x80
+# DIV_SYSTEM_POKEY: four voices, AUDCTL waveform/filter/join features.
+CHIP_POKEY = 0x94
 # DIV_SYSTEM_SAA1099: six square/noise voices, no software timers.  A pair of
 # these is the Creative Music System / Game Blaster.
 CHIP_SAA1099 = 0x97
@@ -246,6 +254,8 @@ INS_SEGAPCM = 39
 # when the module's instrument budget requires it).
 INS_YMZ280B = 41
 INS_RF5C68 = 42
+# DIV_INS_AMIGA is the Generic Sample instrument used by the Generic PCM DAC.
+INS_AMIGA = 4
 # DIV_INS_MULTIPCM: the OPL4 wave slot's sample-map instrument.
 INS_MULTIPCM = 28
 INS_K007232 = 45
@@ -262,6 +272,9 @@ INS_SCC = 18
 # DIV_INS_SAA1099: standard macros, with the raw amplitude carried by the
 # pan-left/pan-right macros and the envelope by ex1.
 INS_SAA = 9
+# DIV_INS_POKEY: volume and pitch macros; AUDCTL and waveform are 11xx/10xx
+# pattern effects (the platform's duty and wave macros share those slots).
+INS_POKEY = 20
 # DIV_INS_PCE: the HuC6280's 32x5-bit wavetable, through the same wave synth
 # as the SCC. Its direct-D/A bodies use DIV_INS_AMIGA (INS_C352 above).
 INS_PCE = 5
@@ -283,8 +296,14 @@ SMP_DEPTH_ADPCM_A = 5
 SMP_DEPTH_ADPCM_B = 6
 SMP_DEPTH_YMZ_ADPCM = 3
 SMP_DEPTH_8BIT = 8
+SMP_DEPTH_12BIT = 12
 SMP_DEPTH_16BIT = 16
 SMP_DEPTH_VOX = 10
+# Default sample-upload masks. write_fur narrows this when a MultiPCM system
+# is present so unrelated bodies do not fill its 2 MB sample memory.
+_DEFAULT_RENDER_MASKS = (
+    0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF,
+)
 # Furnace's DAC rate is calcFreq(C-4) * sampleRate / getCenterRate(); the
 # engine's C-4 reference is a hair sharp, so a 22050 Hz sample exports as
 # 22073.  Compensate at write time so the DAC clock matches the source.
@@ -310,7 +329,9 @@ _DEV_DEFAULT_VOLUME = {
     0x00: 0x80,
     0x03: 0x100, 0x04: 0x180, 0x08: 0x100, 0x12: 0x100, 0x16: 0x11E,
     0x18: 0x100, 0x19: 0xA0, 0x1C: 0x100, 0x1D: 0x100, 0x27: 0x40,
-    0x0F: 0x100, 0x22: 0x100,  # VSU
+    0x0F: 0x100, 0x22: 0x100, 0x1E: 0x100,  # VSU, POKEY
+    0x11: 0xE0,  # Sega 32X PWM
+    0x15: 0x40,  # YMW258-F / MultiPCM
 }
 _DEV_CORE_PATCH = {
     0x19: lambda v: v * 8 // 5,  # K051649 SCC core scale
@@ -325,6 +346,10 @@ _FURNACE_VOLUME_SCALE = {
     # YMZ280B's Furnace core is 1.27x quieter than VGMPlay's at the same
     # system volume (measured on the two-chip Stage 4 module).
     0x0F: 1.27,
+    # Furnace's MultiPCM core outputs about 1/8 of the raw sample level at the
+    # VGM player's 0.25 default.  Use the chip's full 2.0 mixer range instead of
+    # folding that into master (which is capped at 3.0).
+    0x15: 8.0,
     # MAME shifts the voice product by 6 bits, the Furnace core by 7, so the
     # module needs twice the player's system volume to reach the same level.
     0x1D: 2.0,
@@ -340,6 +365,8 @@ _CHIP_DEV = {CHIP_YM2151: 0x03, CHIP_SEGAPCM: 0x04, CHIP_MSM6295: 0x18,
              CHIP_SMS: 0x00, CHIP_T6W28: 0x00,
              CHIP_K051649: 0x19, CHIP_K052539: 0x19,
              CHIP_AY8910: 0x12,
+             CHIP_POKEY: 0x1E,
+             CHIP_MULTIPCM: 0x15, CHIP_PCM_DAC: 0x16,
              CHIP_YM2610: 0x08, CHIP_YM2610B: 0x08}
 
 
@@ -366,6 +393,15 @@ def _sample_chip_volume(song: "Song", chip: int, instances: int) -> float:
     dev = _CHIP_DEV.get(chip)
     if dev is None:
         return 1.0
+    if chip == CHIP_PCM_DAC:
+        # Generic PCM DAC output is unity in Furnace.  VGMPlay's uPD7759
+        # default is 0x11E; MSM6258 shares that id but has its own core scale,
+        # so do not inherit the 0x16 entry from _FURNACE_VOLUME_SCALE.
+        return 0.6 * _player_chip_volume(song.vgm, 0x16, instances)
+    if chip == CHIP_MULTIPCM:
+        # Match the player's lone-chip MultiPCM output without halving a
+        # dual-header pair: both systems run at the 2.0 mixer ceiling.
+        instances = 1
     if chip == CHIP_MSM6295 and getattr(song.vgm, "msm6295_dual", False):
         # The player halves every instance when the header carries two,
         # even on a track that only writes to one of them.
@@ -752,7 +788,49 @@ def _write_ins_sample_map(
     b.end_block(size_off, start)
 
 
-def _write_ins_pcm(b: Buf, name: str, sample_index: int, ins_type: int = INS_K007232) -> None:
+def _write_sample_s12(
+    b: Buf,
+    name: str,
+    data: bytes,
+    frames: int,
+    c4_rate: int,
+    loop: tuple[int | None, int | None] = (None, None),
+    render_masks: tuple[int, int, int, int] | None = None,
+) -> None:
+    """MultiPCM 12-bit PCM: SMP2 stores a frame count and packed 3-byte pairs."""
+    if render_masks is None:
+        render_masks = _DEFAULT_RENDER_MASKS
+
+    frames = max(0, min(frames, 98303))
+    size_off, start = b.begin_block(b"SMP2")
+    b.strz(name)
+    b.u32(frames)
+    b.u32(c4_rate)
+    b.u32(c4_rate)
+    b.u8(SMP_DEPTH_12BIT)
+    b.u8(0)
+    b.u8(0)
+    b.u8(0)
+    if (
+        loop[0] is not None and loop[1] is not None
+        and 0 <= loop[0] < loop[1] <= frames
+    ):
+        b.s32(loop[0])
+        b.s32(loop[1])
+    else:
+        b.s32(-1)
+        b.s32(-1)
+    for mask in render_masks:
+        b.u32(mask)
+    byte_len = (frames * 3 + 1) // 2
+    b.raw(data[:byte_len])
+    b.end_block(size_off, start)
+
+
+def _write_ins_pcm(
+    b: Buf, name: str, sample_index: int, ins_type: int = INS_K007232,
+    mp: tuple[int, ...] | None = None,
+) -> None:
     size_off, start = b.begin_block(b"INS2")
     b.u16(FUR_VERSION)
     b.u16(ins_type)
@@ -771,6 +849,16 @@ def _write_ins_pcm(b: Buf, name: str, sample_index: int, ins_type: int = INS_K00
     b.u8(0)
     b.b[sm_size:sm_size + 2] = int(len(b.b) - sm_start).to_bytes(2, "little")
     _write_ma(b)
+    if mp is not None:
+        # DIV_INS_MULTIPCM's MP feature: AR, D1R, DL, D2R, RR, RC, LFO, VIB,
+        # AM, then damp/pseudo-reverb/LFO-reset/level-direct flags.
+        b.raw(b"MP")
+        mp_size = len(b.b)
+        b.u16(0)
+        mp_start = len(b.b)
+        for value in mp[:10]:
+            b.u8(value & 0xFF)
+        b.b[mp_size:mp_size + 2] = int(len(b.b) - mp_start).to_bytes(2, "little")
     b.raw(b"EN")
     b.end_block(size_off, start)
 
@@ -991,6 +1079,27 @@ def _write_ins_ay(b: Buf, name: str, ins=None) -> None:
     b.end_block(size_off, start)
 
 
+def _write_ins_pokey(b: Buf, name: str, ins=None) -> None:
+    """DIV_INS_POKEY: volume, AUDCTL, waveform and pitch macros.
+
+    The platform's duty macro is AUDCTL and its wave macro is the AUDC
+    distortion, so each note can carry its timbre as well as its volume and
+    pitch contour.  Pattern 10xx/11xx effects remain as a fallback.
+    """
+    size_off, start = b.begin_block(b"INS2")
+    b.u16(FUR_VERSION)
+    b.u16(INS_POKEY)
+    b.raw(b"NA")
+    na_size = len(b.b)
+    b.u16(0)
+    na_start = len(b.b)
+    b.strz(name)
+    b.b[na_size:na_size + 2] = int(len(b.b) - na_start).to_bytes(2, "little")
+    _write_tone_macros(b, ins or ToneIns(), wave=True)
+    b.raw(b"EN")
+    b.end_block(size_off, start)
+
+
 def _write_ins_saa(b: Buf, name: str, ins=None) -> None:
     """DIV_INS_SAA1099: standard macros plus the raw pan pair and ex1.
 
@@ -1179,8 +1288,8 @@ def _write_sample_dpcm(
     else:
         b.s32(-1)
         b.s32(-1)
-    for _ in range(4):
-        b.u32(0xFFFFFFFF)
+    for mask in _DEFAULT_RENDER_MASKS:
+        b.u32(mask)
     b.raw(body)
     b.end_block(size_off, start)
 
@@ -1234,8 +1343,8 @@ def _write_sample(b: Buf, name: str, pcm7: bytes, c4_rate: int, volume_scale: fl
     # 4 banks × 32 chip bits. Zero means "do not upload to this chip": Furnace
     # then never copies the sample into K007232 RAM. Song playback stays silent
     # even though the sample editor can still preview the raw PCM.
-    for _ in range(4):
-        b.u32(0xFFFFFFFF)
+    for mask in _DEFAULT_RENDER_MASKS:
+        b.u32(mask)
     b.raw(data)
     b.end_block(size_off, start)
 
@@ -1269,8 +1378,8 @@ def _write_vox(
     b.u8(0)
     b.s32(-1)
     b.s32(-1)
-    for _ in range(4):
-        b.u32(0xFFFFFFFF)
+    for mask in _DEFAULT_RENDER_MASKS:
+        b.u32(mask)
     b.raw(stored)
     b.end_block(size_off, start)
 
@@ -1283,15 +1392,15 @@ def _write_sample_s8(
     loop: tuple[int | None, int | None] = (None, None),
     depth: int = SMP_DEPTH_8BIT,
     loop_mode: int = 0,
-    render_masks: tuple[int, int, int, int] = (
-        0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF,
-    ),
+    render_masks: tuple[int, int, int, int] | None = None,
 ) -> None:
     """Signed PCM with optional loop points. Depth 16 is int16 LE (mulaw).
 
     loop_mode is the SMP2 byte: 0 forward, 1 backward, 2 ping-pong.
     render_masks selects the systems whose sample memory receives the body.
     """
+    if render_masks is None:
+        render_masks = _DEFAULT_RENDER_MASKS
     width = 2 if depth == SMP_DEPTH_16BIT else 1
     n_frames = len(data) // width
     size_off, start = b.begin_block(b"SMP2")
@@ -1324,9 +1433,7 @@ def _write_sample_ymz_adpcm(
     data: bytes,
     c4_rate: int,
     loop: tuple[int | None, int | None] = (None, None),
-    render_masks: tuple[int, int, int, int] = (
-        0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF,
-    ),
+    render_masks: tuple[int, int, int, int] | None = None,
 ) -> None:
     """YMZ280B 4-bit ADPCM body.
 
@@ -1335,6 +1442,8 @@ def _write_sample_ymz_adpcm(
     nibbles, which is what the YMZ platform divides by two for its byte
     addresses.
     """
+    if render_masks is None:
+        render_masks = _DEFAULT_RENDER_MASKS
     samples = len(data) * 2
     size_off, start = b.begin_block(b"SMP2")
     b.strz(name)
@@ -1373,8 +1482,8 @@ def _write_sample_k(
     b.u8(0)
     b.s32(0 if loop else -1)
     b.s32(nibbles if loop else -1)
-    for _ in range(4):
-        b.u32(0xFFFFFFFF)
+    for mask in _DEFAULT_RENDER_MASKS:
+        b.u32(mask)
     b.raw(data)
     b.end_block(size_off, start)
 
@@ -1433,6 +1542,26 @@ def ymz280b_flag_text(clock: int) -> str:
     if sel is not None:
         return f"clockSel={sel}"
     return f"customClock={clk}"
+
+
+def multipcm_flag_text(clock: int) -> str:
+    """Furnace MultiPCM flags: the player's *224/180 clock correction."""
+    raw = clock or 8_053_975
+    effective = int(round(raw * 224 / 180))
+    if abs(effective - 10_000_000) <= 2:
+        return ""
+    return f"customClock={effective}"
+
+
+def pcm_dac_flag_text(rate: int, stereo: bool = False) -> str:
+    """Generic PCM DAC flags: 16-bit output at the sample's own rate."""
+    return (
+        f"rate={int(rate)}\n"
+        "outDepth=15\n"
+        f"stereo={'true' if stereo else 'false'}\n"
+        "volMax=255\n"
+        "interpolation=1"
+    )
 
 
 def segapcm_flag_text(clock: int, rom_size: int) -> str:
@@ -1523,6 +1652,22 @@ def k051649_flag_text(clock: int) -> str:
     if module_clock(clock) != FURNACE_CLOCK_DEFAULT:
         return f"customClock={clock}"
     return ""
+
+
+# Furnace's POKEY clock list: NTSC (default) and PAL.  COLOR_PAL*2/5 is
+# 1773447.5 Hz.
+POKEY_PAL_CLOCK = 1_773_448
+POKEY_DEFAULT_CLOCK = 1_789_772
+
+
+def pokey_flag_text(clock: int) -> str:
+    """POKEY system flags: NTSC default, PAL preset, or a custom clock."""
+    clk = float(clock or POKEY_DEFAULT_CLOCK)
+    if abs(clk - POKEY_PAL_CLOCK) <= 2:
+        return "clockSel=1"
+    if module_clock(clk) == FURNACE_CLOCK_DEFAULT:
+        return ""
+    return f"customClock={int(round(clk))}"
 
 
 def pce_flag_text(clock: int) -> str:
@@ -4081,6 +4226,7 @@ def write_fur(
     song: Song, *, include_pcm: bool = True, include_fm: bool = True,
     stats: dict | None = None, compress: bool = False,
 ) -> bytes:
+    global _DEFAULT_RENDER_MASKS
     gd3 = song.vgm.gd3
     # Every pitched FM system in module order. A log normally contributes one;
     # the combined Zone 66 shape carries a PCM-only YM2612 beside the OPL that
@@ -4136,9 +4282,12 @@ def write_fur(
         or getattr(song, "vsu_ids", ())
         or getattr(song, "saa_ids", ())
         or getattr(song, "psg_ids", ())
+        or getattr(song, "pokey_ids", ())
         # YMZ280B is a sample engine with real module columns; a YMZ-only log
         # must not gain an empty YM2151 placeholder above it.
         or getattr(song, "ymz280b_samples", ())
+        or getattr(song, "multipcm_samples", ())
+        or getattr(song, "upd7759_samples", ())
     )
     if ym2610 or ym2608:
         fm_present = (include_fm or include_pcm) and bool(ym_ids)
@@ -4182,6 +4331,29 @@ def write_fur(
         if include_pcm else []
     )
     ymz_ids = sorted({s.chip_id for s in ymz_smps})
+    multipcm_smps = (
+        list(getattr(song, "multipcm_samples", ()) or ())
+        if include_pcm else []
+    )
+    multipcm_ids = (
+        list(getattr(song, "multipcm_ids", ()) or ()) if include_pcm else []
+    ) or sorted({s.chip_id for s in multipcm_smps})
+    upd7759_smps = (
+        list(getattr(song, "upd7759_samples", ()) or ())
+        if include_pcm else []
+    )
+    upd7759_ids = (
+        list(getattr(song, "upd7759_ids", ()) or ()) if include_pcm else []
+    ) or sorted({s.chip_id for s in upd7759_smps})
+    pwm_smps = (
+        list(getattr(song, "pwm_samples", ()) or ())
+        if include_pcm else []
+    )
+    pwm_ids = (
+        list(getattr(song, "pwm_ids", ()) or ()) if include_pcm else []
+    ) or sorted({s.chip_id for s in pwm_smps})
+    n_upd_ins = (len(upd7759_smps) + 119) // 120
+    n_pwm_ins = (len(pwm_smps) + 119) // 120
     dac_smps = list(getattr(song, "dac_samples", ()) or ()) if include_pcm else []
     n_dac_ins = (len(dac_smps) + 119) // 120
     dac_smp_base = (
@@ -4275,6 +4447,8 @@ def write_fur(
     vsu_specs = list(getattr(song, "vsu_ins", ()) or ())
     saa_ids = list(getattr(song, "saa_ids", ()) or ())
     saa_specs = list(getattr(song, "saa_ins", ()) or ())
+    pokey_ids = list(getattr(song, "pokey_ids", ()) or ())
+    pokey_specs = list(getattr(song, "pokey_ins", ()) or ())
     scc_chip = CHIP_K052539 if song.vgm.k051649_plus else CHIP_K051649
     n_scc = 5 * len(scc_ids)
     n_ay = 3 * len(ay_ids)
@@ -4284,6 +4458,7 @@ def write_fur(
     n_gb = 4 * len(gb_ids)
     n_vsu = 6 * len(vsu_ids)
     n_saa = 6 * len(saa_ids)
+    n_pokey = 4 * len(pokey_ids)
     n_nes_dpcm_ins = len(nes_dpcm_smps)
     n_nes_pcm_ins = (len(nes_pcm_smps) + 119) // 120
     n_huc6280_pcm_ins = len(huc6280_pcm_smps)
@@ -4328,7 +4503,10 @@ def write_fur(
         + 16 * len(spcm_ids) + n_rf5c
         + 24 * len(c140_ids) + 32 * len(c352_ids)
         + 4 * len(k053260_ids) + 8 * len(ymz_ids)
+        + 28 * len(multipcm_ids) + len(upd7759_ids)
+        + 2 * len(pwm_ids)
         + n_scc + n_ay + n_nes + n_huc6280 + n_gb + n_vsu + n_saa
+        + n_pokey
     )
     if n_ch == 0:
         raise ValueError("write_fur: need include_fm and/or include_pcm")
@@ -4349,7 +4527,7 @@ def write_fur(
         + n_ym2608_rhythm_ins + n_ym2608_b_ins
         + n_y8950_b_ins + n_opl4_wave_ins + n_ssg_pcm_ins
         + n_nes_dpcm_ins + n_nes_pcm_ins + n_huc6280_pcm_ins
-        + len(ymz_smps)
+        + len(ymz_smps) + len(multipcm_smps) + n_upd_ins + n_pwm_ins
         + len(scc_specs) + len(ay_specs) + len(psg_specs) + len(nes_specs)
         + len(huc6280_specs) + len(gb_specs) + len(vsu_specs)
         + len(saa_specs)
@@ -4362,7 +4540,7 @@ def write_fur(
         + len(ym2610_a_smps) + len(ym2610_b_smps) + len(ym2608_b_smps)
         + len(y8950_b_smps) + len(opl4_wave_smps) + len(ssg_pcm_smps)
         + len(nes_dpcm_smps) + len(nes_pcm_smps) + len(huc6280_pcm_smps)
-        + len(ymz_smps)
+        + len(ymz_smps) + len(multipcm_smps) + len(upd7759_smps) + len(pwm_smps)
     )
     n_wav = (
         len(scc_waves) + len(huc6280_waves) + len(gb_waves) + len(vsu_waves)
@@ -4442,6 +4620,9 @@ def write_fur(
     huc6280_pcm_smp_base = nes_pcm_smp_base + len(nes_pcm_smps)
     # YMZ280B bodies and instruments come last among the sample engines.
     ymz_smp_base = huc6280_pcm_smp_base + len(huc6280_pcm_smps)
+    multipcm_smp_base = ymz_smp_base + len(ymz_smps)
+    upd7759_smp_base = multipcm_smp_base + len(multipcm_smps)
+    pwm_smp_base = upd7759_smp_base + len(upd7759_smps)
     n_ins = (
         len(fm_ins) + n_dac_ins + len(pcm_smps) + len(oki_smps) + n_adpcm_ins
         + len(spcm_smps) + len(rf5c68_smps) + len(rf5c164_smps)
@@ -4450,10 +4631,10 @@ def write_fur(
         + n_ym2608_rhythm_ins + n_ym2608_b_ins
         + n_y8950_b_ins + n_opl4_wave_ins + n_ssg_pcm_ins
         + n_nes_dpcm_ins + n_nes_pcm_ins + n_huc6280_pcm_ins
-        + len(ymz_smps)
+        + len(ymz_smps) + len(multipcm_smps) + n_upd_ins + n_pwm_ins
         + len(scc_specs) + len(ay_specs) + len(psg_specs) + len(nes_specs)
         + len(huc6280_specs) + len(gb_specs) + len(vsu_specs)
-        + len(saa_specs)
+        + len(saa_specs) + len(pokey_specs)
     )
     n_smp = (
         len(pcm_smps) + len(oki_smps) + len(adpcm_smps)
@@ -4463,7 +4644,7 @@ def write_fur(
         + len(ym2610_a_smps) + len(ym2610_b_smps) + len(ym2608_b_smps)
         + len(y8950_b_smps) + len(opl4_wave_smps) + len(ssg_pcm_smps)
         + len(nes_dpcm_smps) + len(nes_pcm_smps) + len(huc6280_pcm_smps)
-        + len(ymz_smps)
+        + len(ymz_smps) + len(multipcm_smps) + len(upd7759_smps) + len(pwm_smps)
     )
 
     n_ord = len(orders[0]) if orders else 1
@@ -4536,6 +4717,20 @@ def write_fur(
         for voice in range(8):
             names_long.append(f"YMZ280B {cid + 1}-{voice + 1}")
             names_short.append(f"Y{cid + 1}-{voice + 1}")
+    for cid in multipcm_ids:
+        for voice in range(28):
+            names_long.append(f"MultiPCM {cid + 1}-{voice + 1}")
+            names_short.append(f"M{cid + 1}-{voice + 1}")
+    for cid in upd7759_ids:
+        suffix = f" ({cid + 1})" if len(upd7759_ids) > 1 else ""
+        names_long.append(f"uPD7759{suffix}")
+        names_short.append(f"U{cid + 1}")
+    for cid in pwm_ids:
+        suffix = f" ({cid + 1})" if len(pwm_ids) > 1 else ""
+        names_long.append(f"PWM Left{suffix}")
+        names_short.append(f"PW{cid + 1}L")
+        names_long.append(f"PWM Right{suffix}")
+        names_short.append(f"PW{cid + 1}R")
     for cid in scc_ids:
         for voice in range(5):
             names_long.append(f"SCC {cid + 1}-{voice + 1}")
@@ -4545,10 +4740,17 @@ def write_fur(
             names_long.append(f"PSG {cid + 1}-{voice + 1}")
             names_short.append(f"P{cid + 1}-{voice + 1}")
     nes_labels = ("Pulse 1", "Pulse 2", "Triangle", "Noise", "DPCM")
+    # The label follows the chip's position in the module, not the source
+    # instance number: a rip whose first APU plays nothing leaves no columns,
+    # so its second APU is Furnace's chip 1.
+    nes_slot = {cid: i for i, cid in enumerate(nes_ids)}
     for cid in nes_ids:
         for voice, label in enumerate(nes_labels):
-            names_long.append(f"{label} ({cid + 1})")
-            names_short.append(f"N{cid + 1}-{voice + 1}")
+            n = nes_slot[cid] + 1
+            names_long.append(
+                f"{label} ({n})" if len(nes_ids) > 1 else label
+            )
+            names_short.append(f"N{n}-{voice + 1}")
     pce_labels = ("Wave 1", "Wave 2", "Wave 3", "Wave 4", "Wave 5", "Wave 6")
     for cid in huc6280_ids:
         for voice, label in enumerate(pce_labels):
@@ -4570,6 +4772,10 @@ def write_fur(
         for voice in range(6):
             names_long.append(f"SAA1099 {cid + 1}-{voice + 1}")
             names_short.append(f"A{cid + 1}-{voice + 1}")
+    for cid in pokey_ids:
+        for voice in range(POKEY_VOICES):
+            names_long.append(f"POKEY {cid + 1}-{voice + 1}")
+            names_short.append(f"PK{cid + 1}{voice + 1}")
 
     label_parts: list[str] = []
     if fm_present:
@@ -4633,12 +4839,23 @@ def write_fur(
         label_parts.append("K053260")
     if ymz_ids:
         label_parts.append("YMZ280B")
+    if multipcm_ids:
+        label_parts.append(
+            f"MultiPCM x{len(multipcm_ids)}" if len(multipcm_ids) > 1
+            else "MultiPCM"
+        )
+    if upd7759_ids:
+        label_parts.append("uPD7759")
+    if pwm_ids:
+        label_parts.append("32X PWM")
     if scc_ids:
         label_parts.append("SCC+" if song.vgm.k051649_plus else "SCC")
     if ay_ids:
         label_parts.append("AY-8910")
     if nes_ids:
-        label_parts.append("NES APU")
+        label_parts.append(
+            f"NES APU x{len(nes_ids)}" if len(nes_ids) > 1 else "NES APU"
+        )
     if huc6280_ids:
         label_parts.append("PC Engine")
     if gb_ids:
@@ -4932,13 +5149,32 @@ def write_fur(
         ymz_sys[cid] = len(chips)
         chips.append(CHIP_YMZ280B)
         flag_texts.append(ymz280b_flag_text(ymz280b_clock(song.vgm, cid)))
+    multipcm_sys: dict[int, int] = {}
+    for cid in multipcm_ids:
+        multipcm_sys[cid] = len(chips)
+        chips.append(CHIP_MULTIPCM)
+        clock = song.vgm.multipcm_clock or 8_053_975
+        if cid == 1 and getattr(song.vgm, "multipcm_clock_2", 0):
+            clock = song.vgm.multipcm_clock_2
+        flag_texts.append(multipcm_flag_text(clock))
+    for cid in upd7759_ids:
+        chips.append(CHIP_PCM_DAC)
+        flag_texts.append(pcm_dac_flag_text(44100))
+    pwm_sys: dict[tuple[int, int], int] = {}
+    for cid in pwm_ids:
+        for side in range(2):
+            pwm_sys[(cid, side)] = len(chips)
+            chips.append(CHIP_PCM_DAC)
+            flag_texts.append(pcm_dac_flag_text(22020, stereo=True))
     for cid in scc_ids:
         chips.append(scc_chip)
         flag_texts.append(k051649_flag_text(song.vgm.k051649_clock))
     # A Famicom's AY is always a Sunsoft 5B (SEL tied low).  Its module type
     # carries the /2, and the analyzer labelled the notes at half speed so the
-    # tracker's pitch table writes the doubled period.
-    ay_sunsoft5b = bool(nes_ids)
+    # tracker's pitch table writes the doubled period.  The pairing comes from
+    # the analysis, because a rip whose APU played no notes has no NES columns
+    # while its AY stays a 5B.
+    ay_sunsoft5b = bool(nes_ids) or bool(getattr(song, "nes_present", False))
     for cid in ay_ids:
         chips.append(CHIP_AY8910)
         flag_texts.append(ay8910_flag_text(
@@ -4979,7 +5215,26 @@ def write_fur(
     for _cid in saa_ids:
         chips.append(CHIP_SAA1099)
         flag_texts.append(saa1099_flag_text(song.vgm.saa1099_clock))
+    for cid in pokey_ids:
+        chips.append(CHIP_POKEY)
+        clock = (
+            (song.vgm.pokey_clock_2 or song.vgm.pokey_clock)
+            if cid == 1 and getattr(song.vgm, "pokey_clock_2", 0)
+            else (song.vgm.pokey_clock or POKEY_DEFAULT_CLOCK)
+        )
+        flag_texts.append(pokey_flag_text(clock))
     n_chips = len(chips)
+    # MultiPCM owns a 2 MB / 512-sample memory.  Do not let every other
+    # sample body in a combined module fill it; only the bodies written with
+    # an explicit MultiPCM mask may enter.
+    _DEFAULT_RENDER_MASKS = (
+        0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF,
+    )
+    if multipcm_ids:
+        mask = 0xFFFFFFFF
+        for idx in multipcm_sys.values():
+            mask &= ~(1 << idx) & 0xFFFFFFFF
+        _DEFAULT_RENDER_MASKS = (mask, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF)
 
     info_size_off, info_start = b.begin_block(b"INFO")
     b.u8(0)  # timebase stored as value-1; 0 → timebase 1
@@ -5004,18 +5259,24 @@ def write_fur(
     chip_pans: list[float] = []
     k_vol = min(1.0, max(0.0, song.k007232_volume))
     chip_counts = Counter(chips)
+    pwm_pan = {idx: (-1.0 if side == 0 else 1.0)
+               for (_cid, side), idx in pwm_sys.items()}
     for i, chip in enumerate(chips):
         # Twin16 K007232 sits under the OPM; the rip's mix says how far. Every
         # other sample chip uses the player's mix (defaults + extra-header
         # entries) through _sample_chip_volume.
         if chip == CHIP_K007232 and include_fm:
             cv = k_vol
+        elif i in pwm_pan:
+            # VGMPlay's 32X PWM default is 0xE0 for the stereo chip; each
+            # module system carries one side.
+            cv = _player_chip_volume(song.vgm, 0x11, 1)
         elif chip in _CHIP_DEV:
             cv = _sample_chip_volume(song, chip, chip_counts[chip])
         else:
             cv = 1.0
         chip_vols.append(cv)
-        pan = 0.0
+        pan = pwm_pan.get(i, 0.0)
         if (opl and opl_kind == "opl2" and len(opl_ids) > 1
                 and getattr(song.vgm, "opl2_pan", False)):
             pan = -1.0 if i == opl_first else 1.0
@@ -5023,7 +5284,14 @@ def write_fur(
     # A chip volume above 1.0 (the MSM6258 player default is 0x11E) does not
     # fit Furnace's 0-64 field. Raise the song master instead and scale every
     # chip down by the same factor so the source mix is preserved exactly.
-    master_gain = max([1.0] + chip_vols)
+    # MultiPCM already runs near the 2.0 chip ceiling and master is capped at
+    # 3.0, so leave its gain on the chip and keep master at 1.0.
+    master_gain = max(
+        [1.0] + [
+            cv for i, cv in enumerate(chip_vols)
+            if chips[i] != CHIP_MULTIPCM
+        ]
+    )
     for i, cv in enumerate(chip_vols):
         vols[i] = max(0, min(64, int(round(cv / master_gain * 64))))
     b.raw(bytes(vols))
@@ -5256,6 +5524,7 @@ def write_fur(
     for i, smp in enumerate(nes_dpcm_smps):
         ins_ptrs.append(len(b))
         # Note 60+rate selects the DMC rate; this instrument names the body.
+        # Bodies are deduplicated across the APUs, so the index alone is unique.
         _write_ins_pcm(
             b, f"NES DPCM {i:02d}", nes_dpcm_smp_base + i, INS_NES,
         )
@@ -5283,6 +5552,37 @@ def write_fur(
         _write_ins_pcm(
             b, f"YMZ{smp.chip_id + 1} {smp.start:06x}",
             ymz_smp_base + i, INS_YMZ280B,
+        )
+    for i, smp in enumerate(multipcm_smps):
+        ins_ptrs.append(len(b))
+        mp = (
+            smp.ar, smp.d1r, smp.dl, smp.d2r, smp.rr, smp.rc,
+            smp.lfo, smp.vib, smp.am,
+            (8 if smp.direct else 0),
+        )
+        _write_ins_pcm(
+            b, f"MP{smp.chip_id + 1} {smp.index:03d}",
+            multipcm_smp_base + i, INS_MULTIPCM, mp=mp,
+        )
+    for group in range(n_upd_ins):
+        ins_ptrs.append(len(b))
+        first = group * 120
+        maps = [
+            upd7759_smp_base + first + slot
+            for slot in range(min(120, len(upd7759_smps) - first))
+        ]
+        _write_ins_sample_map(
+            b, f"uPD PCM {group + 1}", 0, maps, INS_AMIGA, flags=0x03,
+        )
+    for group in range(n_pwm_ins):
+        ins_ptrs.append(len(b))
+        first = group * 120
+        maps = [
+            pwm_smp_base + first + slot
+            for slot in range(min(120, len(pwm_smps) - first))
+        ]
+        _write_ins_sample_map(
+            b, f"PWM PCM {group + 1}", 0, maps, INS_AMIGA, flags=0x03,
         )
     for i, spec in enumerate(scc_specs):
         ins_ptrs.append(len(b))
@@ -5368,6 +5668,14 @@ def write_fur(
         if spec.noise:
             name += "+noise"
         _write_ins_saa(b, name, spec)
+    for i, spec in enumerate(pokey_specs):
+        ins_ptrs.append(len(b))
+        name = f"POKEY {i:02d}"
+        if spec.pitch:
+            name += "+pitch"
+        if spec.vol:
+            name += "+vol"
+        _write_ins_pokey(b, name, spec)
 
     smp_ptrs: list[int] = []
     for i, smp in enumerate(pcm_smps):
@@ -5559,6 +5867,45 @@ def write_fur(
                 b, name, smp.data, smp.c4_rate(), loop=loop,
                 depth=smp.depth, render_masks=masks,
             )
+    for smp in multipcm_smps:
+        smp_ptrs.append(len(b))
+        sys = multipcm_sys.get(smp.chip_id, 0)
+        masks = ((1 << sys) if sys < 32 else 0, 0, 0, 0)
+        loop = (
+            (smp.loop_start, smp.loop_end)
+            if smp.loop_start is not None and smp.loop_end is not None
+            else (None, None)
+        )
+        name = f"mp{smp.chip_id + 1}_{smp.index:03d}"
+        if smp.depth == 12:
+            _write_sample_s12(
+                b, name, smp.data, smp.frames, smp.c4_rate(),
+                loop=loop, render_masks=masks,
+            )
+        else:
+            _write_sample_s8(
+                b, name, smp.data, smp.c4_rate(), loop=loop,
+                depth=smp.depth, render_masks=masks,
+            )
+    for smp in upd7759_smps:
+        smp_ptrs.append(len(b))
+        # The Generic PCM DAC reads the DivSample directly; no sample-chip
+        # memory receives this body.
+        _write_sample_s8(
+            b, smp.name, smp.data, 44100, depth=SMP_DEPTH_16BIT,
+            render_masks=(0, 0, 0, 0),
+        )
+    for smp in pwm_smps:
+        smp_ptrs.append(len(b))
+        loop = (
+            (smp.loop_start, smp.loop_end)
+            if smp.loop_start is not None and smp.loop_end is not None
+            else (None, None)
+        )
+        _write_sample_s8(
+            b, smp.name, smp.data, smp.rate, loop=loop,
+            depth=SMP_DEPTH_16BIT, render_masks=(0, 0, 0, 0),
+        )
 
     pat_ptrs: list[int] = []
     for ch, idx, rows in patterns:

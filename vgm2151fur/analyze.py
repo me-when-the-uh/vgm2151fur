@@ -87,8 +87,34 @@ from vgm2151fur.ym2413 import (
     opll_rhythm_plan,
 )
 from vgm2151fur.pcm import PcmSample, build_pcm_bank, pitch_to_note, rate_to_note
+from vgm2151fur.multipcm import (
+    MULTIPCM_VOICES,
+    MultipcmSample,
+    collect_multipcm,
+    played_rate as multipcm_played_rate,
+)
+from vgm2151fur.upd7759 import (
+    UPD_OUTPUT_RATE,
+    Upd7759Sample,
+    collect_upd7759,
+)
+from vgm2151fur.pwm import (
+    PWM_RATE,
+    PWM_SIDES,
+    PwmSample,
+    collect_pwm,
+)
 from vgm2151fur.pitch import (
     E5_CENTER, NOTE_MAX, furnace_period_note, module_clock, pitch_table,
+)
+from vgm2151fur.pokey import (
+    FX_AUDCTL as POKEY_FX_AUDCTL,
+    FX_WAVE as POKEY_FX_WAVE,
+    POKEY_DEFAULT_CLOCK,
+    POKEY_PITCH_MAX,
+    POKEY_VOICES,
+    collect_pokey,
+    pokey_note,
 )
 from vgm2151fur.scc import (
     SCC_DEFAULT_CLOCK,
@@ -405,6 +431,26 @@ def _pcm_rate_note(rate: int, reference: int) -> tuple[int, int]:
     return note, max(0, min(255, E5_CENTER + fine))
 
 
+def multipcm_pan_fx(pan: int) -> int:
+    """Furnace 08xy that reproduces a MultiPCM pan-register nibble.
+
+    The chip's panpot is not a normal balance: 0 is both channels full, 1-7
+    attenuate the left side, 8 is the hardware mute value, and 9-15 attenuate
+    the right side.  Furnace's MultiPCM platform maps 08xy through its own
+    linear-pan conversion and XORs 8, so this table inverts that conversion.
+    """
+    pan &= 0xF
+    if pan == 8:
+        return 0
+    if pan == 0:
+        return 0xFF
+    if pan < 8:
+        left = 16 - 2 * pan
+        return ((left & 0xF) << 4) | 0x0F
+    right = 2 * (pan - 9)
+    return 0xF0 | (right & 0xF)
+
+
 def pcm_pan_fx(vl: int, vr: int) -> int:
     """Furnace 08xy from K007232 L/R volumes (0–15).
 
@@ -710,6 +756,19 @@ def system_channel_ranges(systems) -> list[tuple[FmSystem, int]]:
     return out
 
 
+def _dual_ids(ids, dual: bool) -> list[int]:
+    """Keep a header-declared second chip even when it never sounds.
+
+    The clock field's dual bit is a layout declaration.  When the log has one
+    instance's writes but not the other's, the module still gets both systems
+    and the empty one only adds columns.
+    """
+    values = sorted(set(ids))
+    if dual and values:
+        values = sorted(set(values) | {0, 1})
+    return values
+
+
 @dataclass
 class Song:
     vgm: VgmFile
@@ -735,6 +794,22 @@ class Song:
     ymz280b_samples: list[YmzSample] = field(default_factory=list)
     ymz280b_ids: list[int] = field(default_factory=list)
     ymz280b_count: int = 0
+    # YMW258-F (MultiPCM): 28 sample voices per instance.  One body per
+    # distinct triggered ROM sample index; the source 9-bit index is remapped
+    # to a module instrument index by the writer.
+    multipcm_samples: list[MultipcmSample] = field(default_factory=list)
+    multipcm_ids: list[int] = field(default_factory=list)
+    multipcm_count: int = 0
+    # uPD7759 phrases, rendered as 16-bit PCM and played on a Generic PCM DAC
+    # system (one column per chip).  `upd7759_samples` is deduplicated.
+    upd7759_samples: list[Upd7759Sample] = field(default_factory=list)
+    upd7759_ids: list[int] = field(default_factory=list)
+    upd7759_count: int = 0
+    # Sega 32X PWM: two 16-bit PCM bodies per chip (left/right), each on its
+    # own Generic PCM DAC system.
+    pwm_samples: list[PwmSample] = field(default_factory=list)
+    pwm_ids: list[int] = field(default_factory=list)
+    pwm_count: int = 0
     # (sample, channel, effect, value) placed before notes. MSM6258 divider.
     channel_fx: list[tuple[int, int, int, int]] = field(default_factory=list)
     # Chip-wide YM2151 LFO effects: (sample, effect, value[, tick offset]).
@@ -882,6 +957,12 @@ class Song:
     ay_ids: list[int] = field(default_factory=list)
     ay_ins: list[ToneIns] = field(default_factory=list)
     ay_count: int = 0
+    # Atari POKEY: four voices per instance.  `pokey_ins` holds the volume
+    # contour/pitch instruments; AUDCTL and waveform ride as 10xx/11xx row
+    # effects.
+    pokey_ids: list[int] = field(default_factory=list)
+    pokey_ins: list[ToneIns] = field(default_factory=list)
+    pokey_count: int = 0
     # SSG/PSG PCM streams: volume-register spamming while the voice's mixer
     # bits are off. Each body becomes a DIV_INS_AY sample instrument played at
     # note 108 (C-4), matching the reference modules. One instance per body;
@@ -892,6 +973,10 @@ class Song:
     # instrument; DPCM bodies are 1-bit (depth 1) and direct `$4011` bodies are
     # 8-bit PCM, each with one sample instrument.
     nes_ids: list[int] = field(default_factory=list)
+    # True when the log carries a 2A03 at all, even one whose gates were all
+    # sub-frame.  A Famicom's AY is a Sunsoft 5B whatever the APU played, so
+    # the half-clock rule follows the hardware pairing and not the column list.
+    nes_present: bool = False
     nes_ins: list[ToneIns] = field(default_factory=list)
     nes_dpcm_samples: list[NesDpcmSample] = field(default_factory=list)
     nes_pcm_samples: list[NesPcmSample] = field(default_factory=list)
@@ -1083,9 +1168,13 @@ _AY_MERGE_GAP = 16  # low/high byte pair, and a second write in the same tick
 _AY_NOTE_HOLD = 1470  # two frames: a one-frame AY step is the pitch macro
 
 
-def _period_semitones(clock: float, divider: int, period: int, offset: int) -> float:
+def _period_semitones(
+    clock: float, divider: int, period: int, offset: int,
+    maximum: int = 0xFFF,
+) -> float:
     note, e5 = furnace_period_note(
         module_clock(clock), divider, max(1, period), period_offset=offset,
+        maximum=maximum,
     )
     return note + (e5 - E5_CENTER) / 128.0
 
@@ -1100,6 +1189,7 @@ def segment_periods(
     merge_gap: int = _NOTE_HOLD_SAMPLES,
     min_hold: int = _NOTE_HOLD_SAMPLES,
     drop_short: bool = True,
+    maximum: int = 0xFFF,
 ) -> list[tuple[int, int, list[tuple[int, int]]]]:
     """Split a period timeline into notes.
 
@@ -1111,15 +1201,17 @@ def segment_periods(
         return []
     merged = merge_step_writes(list(points), gap=merge_gap)
     cur_t, cur_p = merged[0]
-    cur_s = _period_semitones(clock, divider, cur_p, offset)
+    cur_s = _period_semitones(clock, divider, cur_p, offset, maximum)
     intra: list[tuple[int, int]] = []
     segs: list[tuple[int, int, list[tuple[int, int]]]] = []
     for i in range(1, len(merged)):
         t, period = merged[i]
         hold_until = merged[i + 1][0] if i + 1 < len(merged) else end
         held = hold_until - t
-        step = abs(_period_semitones(clock, divider, period, offset) - cur_s)
-        new_s = _period_semitones(clock, divider, period, offset)
+        step = abs(
+            _period_semitones(clock, divider, period, offset, maximum) - cur_s
+        )
+        new_s = _period_semitones(clock, divider, period, offset, maximum)
         if step >= _NOTE_STEP_SEMITONES and held >= min_hold:
             segs.append((cur_t, cur_p, intra))
             cur_t, cur_p = t, period
@@ -1145,15 +1237,15 @@ def _value_at(pts, start: int, default):
     return cur
 
 
-def _saa_tick_interval(vgm: VgmFile) -> float | None:
-    """Most common gap between SAA1099 writes, in samples.
+def _saa_tick_interval(vgm: VgmFile, chip: str = "saa1099") -> float | None:
+    """Most common gap between a pitched chip's register writes, in samples.
 
-    A Furnace export writes its macros once per tick; the CMS rips do the
-    same at the driver's frame rate.  Using that gap as one row keeps the
+    A Furnace export writes its macros once per tick; the CMS/POKEY rips do
+    the same at the driver's frame rate.  Using that gap as one row keeps the
     macros and the pattern grid on the source's own clock instead of guessing
     a 16th from the note onsets.
     """
-    times = [w.sample for w in vgm.writes if w.chip == "saa1099"]
+    times = [w.sample for w in vgm.writes if w.chip == chip]
     if len(times) < 16:
         return None
     intervals = [
@@ -1872,6 +1964,7 @@ def _bind_tone_instruments(
     gb_ins: list[ToneIns],
     vsu_ins: list[ToneIns],
     saa_ins: list[ToneIns],
+    pokey_ins: list[ToneIns],
     tone_ins_base: int,
     scc_clock: int,
     ay_clock: int,
@@ -1881,6 +1974,7 @@ def _bind_tone_instruments(
     gb_clock: int,
     vsu_clock: int,
     saa_clock: int,
+    pokey_clock: int,
     hz: float,
     total_samples: int,
     use_speed: int = 1,
@@ -1907,13 +2001,14 @@ def _bind_tone_instruments(
     gb_map: dict[ToneIns, int] = {}
     vsu_map: dict[ToneIns, int] = {}
     saa_map: dict[ToneIns, int] = {}
+    pokey_map: dict[ToneIns, int] = {}
     ins_cap = max(1, INS_TARGET - tone_ins_base)
-    # GB and VSU bind last. Reserve a share so a large SCC/AY/PCE list cannot
-    # spend every slot before them; the surplus collapses to plain
+    # GB, VSU and POKEY bind last. Reserve a share so a large SCC/AY/PCE list
+    # cannot spend every slot before them; the surplus collapses to plain
     # per-wave/per-env instruments, the documented "fall back to columns"
     # behavior.
     has_late = any(
-        e.tone_chip in (6, 7, 8) and e.on for e in events
+        e.tone_chip in (6, 7, 8, 9) and e.on for e in events
     )
     early_cap = ins_cap
     if has_late:
@@ -1939,6 +2034,7 @@ def _bind_tone_instruments(
     tone_order += [e for e in events if e.on and e.tone_chip == 6]
     tone_order += [e for e in events if e.on and e.tone_chip == 7]
     tone_order += [e for e in events if e.on and e.tone_chip == 8]
+    tone_order += [e for e in events if e.on and e.tone_chip == 9]
     for e in tone_order:
         end = e.end or track_end
         # 255 macro values times the largest speed byte. Long SSG pads can
@@ -1992,6 +2088,12 @@ def _bind_tone_instruments(
             clock = e.tone_clock or saa_clock or SAA_DEFAULT_CLOCK
             divider = SAA_DIVIDER
             maximum = SAA_PITCH_MAX
+        elif e.tone_chip == 9:
+            # POKEY: the collector's "period" is already the platform's
+            # pitch-table value, with the wave/AUDCTL transform inverted.
+            clock = e.tone_clock or pokey_clock or POKEY_DEFAULT_CLOCK
+            divider = 1
+            maximum = POKEY_PITCH_MAX
         else:
             # AY and the YM2203's SSG share the instrument path but not the
             # clock or Furnace's divider (8 vs 16).
@@ -2000,6 +2102,8 @@ def _bind_tone_instruments(
             maximum = 0xFFF
         if e.tone_chip == 8:
             tbl = pitch_table(saa_module_clock(clock), divider, maximum=maximum)
+        elif e.tone_chip == 9:
+            tbl = pitch_table(module_clock(clock), divider, maximum=maximum)
         else:
             tbl = (
                 pitch_table(float(clock), divider, maximum=maximum)
@@ -2125,6 +2229,12 @@ def _bind_tone_instruments(
             wave_vals, wave_speed, wave_loop = _macro_series(
                 _tick_values(pts, e.sample, ticks, tick_samples),
             )
+            if e.tone_chip == 9 and not wave_vals:
+                # A constant distortion still belongs in the instrument: the
+                # note then carries its own waveform instead of depending on a
+                # 10xx row effect.
+                wave_vals, wave_speed, wave_loop = (
+                    max(0, e.tone_wave),), 1, 255
         column_vol = e.vol
         pce_peak = 0
         saa_peak = 0
@@ -2259,6 +2369,21 @@ def _bind_tone_instruments(
                     e.sample, ticks, tick_samples,
                 ),
             )
+        elif e.tone_chip == 9:
+            # POKEY: AUDCTL is the instrument's duty macro.  A constant value
+            # still gets a one-value macro, so the note re-asserts its clock
+            # and filter state on its own tick instead of relying on a row
+            # effect that may have been moved.
+            audctl_pts = [
+                (t, val) for t, cmd, val in e.tone_fx_pts
+                if cmd == POKEY_FX_AUDCTL
+            ]
+            noise, noise_speed, noise_loop = _macro_if_moving(
+                audctl_pts, e.sample, ticks, tick_samples,
+                merge_gap=_AY_MERGE_GAP,
+            )
+            if not noise and audctl_pts:
+                noise, noise_speed, noise_loop = (audctl_pts[0][1],), 1, 255
         elif e.tone_fx_pts:
             noise, noise_speed, noise_loop = _macro_if_moving(
                 [(t, val) for t, cmd, val in e.tone_fx_pts if cmd == FX_NOISE],
@@ -2365,12 +2490,20 @@ def _bind_tone_instruments(
                 + len(huc6280_ins) + len(gb_ins) + len(vsu_ins),
                 ins_cap, 8, 0,
             )
+        elif e.tone_chip == 9:
+            idx, kept = take(
+                spec, pokey_map, pokey_ins,
+                len(scc_ins) + len(ay_ins) + len(psg_ins) + len(nes_ins)
+                + len(huc6280_ins) + len(gb_ins) + len(vsu_ins)
+                + len(saa_ins),
+                ins_cap, 9,
+            )
         else:
             # AY runs first, so the SCC list is still empty and `others` is 0.
             idx, kept = take(spec, ay_map, ay_ins, 0, early_cap, 2)
         bound.append((e, idx))
         if (
-            e.tone_chip in (3, 7)
+            e.tone_chip in (3, 7, 9)
             and not e.tone_noise
             and kept != spec
             and not kept.pitch
@@ -2636,6 +2769,7 @@ def _tone_instrument_demand(
     gb_clock: int,
     vsu_clock: int,
     saa_clock: int,
+    pokey_clock: int,
     hz: float,
     total_samples: int,
     use_speed: int = 1,
@@ -2652,18 +2786,20 @@ def _tone_instrument_demand(
     if not tone:
         return 0
     scc, ay, psg, nes, huc, gb, vsu, saa = [], [], [], [], [], [], [], []
+    pokey = []
     _bind_tone_instruments(
-        tone, scc, ay, psg, nes, huc, gb, vsu, saa,
+        tone, scc, ay, psg, nes, huc, gb, vsu, saa, pokey,
         # A negative base leaves the instrument cap effectively unlimited, so
         # every distinct macro shape is counted.
         -1000,
         scc_clock, ay_clock, psg_clock, nes_clock, huc6280_clock,
-        gb_clock, vsu_clock, saa_clock, hz, total_samples, use_speed,
+        gb_clock, vsu_clock, saa_clock, pokey_clock, hz, total_samples,
+        use_speed,
         lfo_loop=lfo_loop,
     )
     return sum(
         len(bucket)
-        for bucket in (scc, ay, psg, nes, huc, gb, vsu, saa)
+        for bucket in (scc, ay, psg, nes, huc, gb, vsu, saa, pokey)
     )
 
 
@@ -3385,6 +3521,120 @@ def _emit_ay_notes(
             sample=off.sample_time, ch=base + off.voice, on=False, note=180,
             ins=-1, vol=-1, e5=0x80, pan=0,
         ))
+    return count
+
+
+def _emit_pokey_notes(
+    events: list[NoteEvent],
+    channel_fx: list[tuple[int, int, int, int]],
+    hits,
+    offs,
+    at: dict[int, int],
+    audctl_pts,
+    wave_pts,
+    ins_base: int,
+    total_samples: int = 0,
+) -> int:
+    """Append notes/key-offs for one POKEY register stream.
+
+    AUDCTL is chip-wide, so one 0x11 effect per change goes on the chip's first
+    column.  Waveform changes are per column (0x10).  The instrument itself
+    carries the per-frame volume contour and the pitch trajectory.
+    """
+    count = 0
+    wave_by_ch: dict[tuple[int, int], list[tuple[int, int]]] = {}
+    for sample, cid, voice, val in sorted(wave_pts, key=lambda p: p[0]):
+        wave_by_ch.setdefault((cid, voice), []).append((sample, val))
+    audctl_by_cid: dict[int, list[tuple[int, int]]] = {}
+    for sample, cid, val in sorted(audctl_pts, key=lambda p: p[0]):
+        audctl_by_cid.setdefault(cid, []).append((sample, val))
+    for h in hits:
+        base = at.get(h.chip_id)
+        if base is None:
+            continue
+        ch = base + h.voice
+        st = h.sample_time
+        gate_end = h.off_sample or (total_samples or st)
+        wpts = wave_by_ch.get((h.chip_id, h.voice), [])
+        apts = audctl_by_cid.get(h.chip_id, [])
+        segs = segment_periods(
+            [(st, h.value), *h.freq_pts],
+            gate_end, h.clock, 1, 0,
+            merge_gap=_AY_MERGE_GAP,
+            min_hold=_AY_NOTE_HOLD,
+            drop_short=False,
+            maximum=POKEY_PITCH_MAX,
+        )
+        for i, (sst, value, intra) in enumerate(segs):
+            nxt = segs[i + 1][0] if i + 1 < len(segs) else 0
+            seg_end = nxt or h.off_sample
+            bound = nxt or gate_end
+            note, e5 = pokey_note(h.clock, value)
+            steps = _tone_steps(intra, sst, 0, _AY_MERGE_GAP)
+            vol = _value_at(h.vol_pts, sst, h.vol)
+            vol_pts = tuple(
+                (t, v, None)
+                for t, v in h.vol_pts if sst < t < bound
+            )
+            # AUDC's distortion and AUDCTL live in the POKEY instrument's
+            # wave and duty macros, so each note carries the timbre state at
+            # its own tick instead of depending only on a row effect.
+            wave_at = _value_at(wpts, sst, 5)
+            wave_steps = (
+                ((sst, wave_at),)
+                + tuple((t, w) for t, w in wpts if sst < t < bound)
+            )
+            audctl_at = _value_at(apts, sst, 0)
+            audctl_steps = (
+                ((sst, POKEY_FX_AUDCTL, audctl_at),)
+                + tuple(
+                    (t, POKEY_FX_AUDCTL, v)
+                    for t, v in apts if sst < t < bound
+                )
+            )
+            events.append(NoteEvent(
+                sample=sst,
+                ch=ch,
+                on=True,
+                note=note,
+                ins=ins_base,
+                vol=vol,
+                e5=e5,
+                pan=0,
+                end=seg_end,
+                vol_pts=vol_pts,
+                tone_pitch_pts=tuple(steps),
+                tone_chip=9,
+                tone_clock=h.clock,
+                tone_div=1,
+                tone_period_offset=0,
+                tone_wave=wave_at,
+                tone_wave_pts=wave_steps,
+                tone_fx_pts=audctl_steps,
+            ))
+            count += 1
+    for off in offs:
+        base = at.get(off.chip_id)
+        if base is None:
+            continue
+        events.append(NoteEvent(
+            sample=off.sample_time, ch=base + off.voice, on=False, note=180,
+            ins=-1, vol=-1, e5=0x80, pan=0,
+        ))
+    for sample, cid, val in audctl_pts:
+        base = at.get(cid)
+        if base is not None:
+            channel_fx.append((sample, base, POKEY_FX_AUDCTL, val))
+    last_wave: dict[int, int] = {}
+    for sample, cid, voice, val in sorted(wave_pts, key=lambda p: p[0]):
+        base = at.get(cid)
+        if base is None:
+            continue
+        ch = base + voice
+        if last_wave.get(ch) == val:
+            continue
+        last_wave[ch] = val
+        channel_fx.append((sample, ch, POKEY_FX_WAVE, val))
     return count
 
 
@@ -6686,9 +6936,17 @@ def analyze(
         )
     # The OPL4's registers live under the "ymf278b" chip name, not "opl4".
     opl_source = "ymf278b" if opl_kind == "opl4" else opl_kind
-    opl_ids = (
+    opl_dual = {
+        KIND_OPL: getattr(vgm, "opl_dual", False),
+        KIND_OPL2: getattr(vgm, "opl2_dual", False),
+        KIND_OPL3: getattr(vgm, "opl3_dual", False),
+        KIND_Y8950: getattr(vgm, "y8950_dual", False),
+        KIND_OPL4: getattr(vgm, "ymf278b_dual", False),
+    }.get(opl_kind, False)
+    opl_ids = _dual_ids(
         sorted({w.chip_id for w in vgm.writes if w.chip == opl_source})
-        if is_opl else []
+        if is_opl else [],
+        bool(opl_dual and is_opl),
     )
     # Bit 5 of the rhythm register is the mode switch, but a driver may poke it
     # during chip init and clear it in the same sample without ever sounding a
@@ -6709,9 +6967,10 @@ def analyze(
             opl_is_opl3,
         ) if is_opl else 0.0
     )
-    opll_ids = (
+    opll_ids = _dual_ids(
         sorted({w.chip_id for w in vgm.writes if w.chip == "opll"})
-        if is_opll else []
+        if is_opll else [],
+        bool(getattr(vgm, "ym2413_dual", False) and is_opll),
     )
     # Bit 31 of the YM2413 clock field asks for the Konami VRC7: same OPLL
     # core, six channels and the VRC7 preset ROM. It has no rhythm mode.
@@ -6725,9 +6984,10 @@ def analyze(
     opll_clock = (
         opll_module_clock(vgm.ym2413_clock or 3579545) if is_opll else 0.0
     )
-    ym_ids = (
+    ym_ids = _dual_ids(
         sorted({w.chip_id for w in vgm.writes if w.chip in ("ym2203", "ym2203_ssg")})
-        if is_opn else []
+        if is_opn else [],
+        bool(getattr(vgm, "ym2203_dual", False) and is_opn),
     )
     ym_clock = vgm.ym2203_clock or YM2203_DEFAULT_CLOCK
     # 0xA8-0xAE means 3-slot mode. Furnace's Ext layout gives each
@@ -6735,9 +6995,10 @@ def analyze(
     ym2203_ext = is_opn and any(
         w.chip == "ym2203" and 0xA8 <= w.reg <= 0xAE for w in vgm.writes
     )
-    ym2612_ids = (
+    ym2612_ids = _dual_ids(
         sorted({w.chip_id for w in vgm.writes if w.chip == "ym2612"})
-        if is_opn2 else []
+        if is_opn2 else [],
+        bool(getattr(vgm, "ym2612_dual", False) and is_opn2),
     )
     ym2612_clock = vgm.ym2612_clock or YM2612_DEFAULT_CLOCK
     # 0x27 bits 6-7 select special mode (01) or CSM (10). Both use the Ext
@@ -6749,12 +7010,13 @@ def analyze(
     }
     ym2612_ext = is_opn2 and bool(ym2612_modes & {1, 2})
     ym2612_csm = is_opn2 and 2 in ym2612_modes
-    ym2610_ids = (
+    ym2610_ids = _dual_ids(
         sorted({
             w.chip_id for w in vgm.writes
             if w.chip in ("ym2610", "ym2610_ssg")
         })
-        if is_opnb else []
+        if is_opnb else [],
+        bool(getattr(vgm, "ym2610_dual", False) and is_opnb),
     )
     ym2610_clock = vgm.ym2610_clock or YM2610_DEFAULT_CLOCK
     ym2610_b = bool(vgm.ym2610_b)
@@ -6773,12 +7035,13 @@ def analyze(
     # ADPCM-A: six FM (nine when channel 3 is split), three SSG, six rhythm
     # and one ADPCM-B. Bus A $27 bits 6-7 are the same mode field, and only
     # special mode (01) is in these logs - the OPNA has no CSM.
-    ym2608_ids = (
+    ym2608_ids = _dual_ids(
         sorted({
             w.chip_id for w in vgm.writes
             if w.chip in ("ym2608", "ym2608_ssg")
         })
-        if is_opna else []
+        if is_opna else [],
+        bool(getattr(vgm, "ym2608_dual", False) and is_opna),
     )
     ym2608_clock = vgm.ym2608_clock or YM2608_DEFAULT_CLOCK
     ym2608_modes = {
@@ -6820,9 +7083,10 @@ def analyze(
     # (or the OPM's eight voices) first, then every OPL one. The bases below
     # are offsets into the module's channel space, not per-chip ones.
     convert_opm = "ym2151" in converted
-    opm_ids = (
+    opm_ids = _dual_ids(
         sorted({w.chip_id for w in vgm.writes if w.chip == "ym2151"})
-        if convert_opm else []
+        if convert_opm else [],
+        bool(getattr(vgm, "ym2151_dual", False) and convert_opm),
     )
     opm_base = {cid: 8 * i for i, cid in enumerate(opm_ids)}
     ym_end = (
@@ -6920,6 +7184,9 @@ def analyze(
         present = sorted({w.chip_id for w in vgm.writes if w.chip == "sn76489"})
         if present:
             psg_ids = present
+        psg_ids = _dual_ids(
+            psg_ids, bool(getattr(vgm, "sn76489_dual", False)),
+        )
     psg_stereo = bool(psg_ids and getattr(vgm, "sn76489_stereo", False))
     psg_base = fm_end if psg_ids else None
     psg_clock = vgm.sn76489_clock or PSG_DEFAULT_CLOCK
@@ -9051,7 +9318,10 @@ def analyze(
         # pattern index has to count those, not the raw bank slot.
         audible = [s for s in pcm_samples if s.length >= 8]
         audible_index = {id(s): i for i, s in enumerate(audible)}
-        pcm_ids = sorted({s.chip_id for s in audible})
+        pcm_ids = _dual_ids(
+            sorted({s.chip_id for s in audible}),
+            bool(getattr(vgm, "k007232_dual", False)),
+        )
         pcm_at = {
             cid: fm_end + 2 * i for i, cid in enumerate(pcm_ids)
         }
@@ -9104,6 +9374,20 @@ def analyze(
     ymz_ids: list[int] = []
     ymz_events: list[tuple[NoteEvent, int]] = []
     ymz_count = 0
+    multipcm_audible: list[MultipcmSample] = []
+    multipcm_ids: list[int] = []
+    multipcm_events: list[tuple[NoteEvent, int]] = []
+    multipcm_count = 0
+    upd_audible: list[Upd7759Sample] = []
+    upd_ids: list[int] = []
+    upd_events: list[tuple[NoteEvent, int]] = []
+    upd_count = 0
+    pwm_audible: list[PwmSample] = []
+    pwm_ids: list[int] = []
+    pwm_events: list[tuple[NoteEvent, int]] = []
+    pwm_count = 0
+    n_upd_ins = 0
+    n_pwm_ins = 0
     # Set where the C352 runs and the source drives its rear pair.
     c352_quad_events = False
     if pcm:
@@ -9119,6 +9403,9 @@ def analyze(
         for smp in oki_samples:
             if smp.chip_id not in oki_ids:
                 oki_ids.append(smp.chip_id)
+        oki_ids = _dual_ids(
+            oki_ids, bool(getattr(vgm, "msm6295_dual", False)),
+        )
         oki_base = {cid: sample_base + 4 * i for i, cid in enumerate(oki_ids)}
         ins0 = pcm_ins_base + (len(audible) if pcm else 0)
         for i, smp in enumerate(oki_samples):
@@ -9156,6 +9443,9 @@ def analyze(
         for smp in adpcm_samples:
             if smp.chip_id not in adpcm_ids:
                 adpcm_ids.append(smp.chip_id)
+        adpcm_ids = _dual_ids(
+            adpcm_ids, bool(getattr(vgm, "msm6258_dual", False)),
+        )
         adpcm_at = {cid: adpcm_base + i for i, cid in enumerate(adpcm_ids)}
         ins1 = ins0 + len(oki_samples)
         n_adpcm_ch = len(adpcm_ids)
@@ -9208,7 +9498,10 @@ def analyze(
         _spcm_rom, spcm_samples, spcm_warn = collect_segapcm(vgm)
         warnings.extend(spcm_warn)
         spcm_audible = [s for s in spcm_samples if s.length >= 8]
-        spcm_ids = sorted({s.chip_id for s in spcm_audible})
+        spcm_ids = _dual_ids(
+            sorted({s.chip_id for s in spcm_audible}),
+            bool(getattr(vgm, "segapcm_dual", False)),
+        )
         spcm_base = adpcm_base + len(adpcm_ids)
         spcm_at = {
             cid: spcm_base + 16 * i for i, cid in enumerate(spcm_ids)
@@ -9279,6 +9572,9 @@ def analyze(
             for h in smp.hits:
                 if h.chip_id not in c140_ids:
                     c140_ids.append(h.chip_id)
+        c140_ids = _dual_ids(
+            c140_ids, bool(getattr(vgm, "c140_dual", False)),
+        )
         c140_base = spcm_base + 16 * len(spcm_ids)
         c140_at = {cid: c140_base + 24 * i for i, cid in enumerate(c140_ids)}
         ins3 = ins2 + len(spcm_audible)
@@ -9479,6 +9775,9 @@ def analyze(
             for h in smp.hits:
                 if h.chip_id not in k053260_ids:
                     k053260_ids.append(h.chip_id)
+        k053260_ids = _dual_ids(
+            k053260_ids, bool(getattr(vgm, "k053260_dual", False)),
+        )
         k053260_base = c352_base + 32 * len(c352_ids)
         k053260_at = {
             cid: k053260_base + 4 * i for i, cid in enumerate(k053260_ids)
@@ -9583,8 +9882,14 @@ def analyze(
             warnings.extend(warn)
         rf5c68_audible = [s for s in rf5c68_samples if s.length >= 8]
         rf5c164_audible = [s for s in rf5c164_samples if s.length >= 8]
-        rf5c68_ids = sorted({s.chip_id for s in rf5c68_audible})
-        rf5c164_ids = sorted({s.chip_id for s in rf5c164_audible})
+        rf5c68_ids = _dual_ids(
+            sorted({s.chip_id for s in rf5c68_audible}),
+            bool(getattr(vgm, "rf5c68_dual", False)),
+        )
+        rf5c164_ids = _dual_ids(
+            sorted({s.chip_id for s in rf5c164_audible}),
+            bool(getattr(vgm, "rf5c164_dual", False)),
+        )
         rf5c_base = k053260_base + 4 * len(k053260_ids)
         ins6 = ins5 + len(k053260_audible)
         rf5c68_at = {
@@ -9656,7 +9961,10 @@ def analyze(
         ymz_samples, ymz_offs, ymz_warn = collect_ymz280b(vgm)
         warnings.extend(ymz_warn)
         ymz_audible = [s for s in ymz_samples if s.length > 0 and s.hits]
-        ymz_ids = sorted({s.chip_id for s in ymz_audible})
+        ymz_ids = _dual_ids(
+        sorted({s.chip_id for s in ymz_audible}),
+        bool(getattr(vgm, "ymz280b_dual", False)),
+    )
         ymz_base = (
             fm_end + 2 * len(pcm_ids)
             + 4 * len({s.chip_id for s in oki_samples}) + n_adpcm_ch
@@ -9741,15 +10049,202 @@ def analyze(
                 pan=0,
                 pcm=True,
             ))
+
+        # Yamaha YMW258-F (MultiPCM): 28 sample voices per instance.  The
+        # source writes a 9-bit ROM sample index, a signed octave and a 10-bit
+        # f-num for each voice; the module instrument table holds one body per
+        # distinct triggered index.
+        multipcm_samples, multipcm_warn = collect_multipcm(vgm)
+        warnings.extend(multipcm_warn)
+        multipcm_audible = [
+            s for s in multipcm_samples if s.hits and s.length > 0
+        ]
+        multipcm_ids = _dual_ids(
+            sorted({s.chip_id for s in multipcm_audible})
+            or ([0] if vgm.multipcm_clock else []),
+            bool(getattr(vgm, "multipcm_dual", False)),
+        )
+        multipcm_base = ymz_base + YMZ280B_VOICES * len(ymz_ids)
+        multipcm_at = {
+            cid: multipcm_base + MULTIPCM_VOICES * i
+            for i, cid in enumerate(multipcm_ids)
+        }
+        for i, smp in enumerate(multipcm_audible):
+            ref = smp.c4_rate()
+            for h in smp.hits:
+                base_rate = multipcm_played_rate(
+                    smp.clock, h.octave, h.fnum,
+                )
+                note, e5 = rate_to_note(base_rate, ref)
+                sweep: tuple[tuple[int, int], ...] = ()
+                if h.freq_pts and base_rate:
+                    deltas = tuple(
+                        (t, int(round(64.0 * 12.0 * math.log2(
+                            multipcm_played_rate(smp.clock, octave, fnum)
+                            / base_rate
+                        ))))
+                        for t, octave, fnum in h.freq_pts
+                        if multipcm_played_rate(smp.clock, octave, fnum)
+                    )
+                    vals = [d for _t, d in deltas]
+                    if deltas and max(vals + [0]) - min(vals + [0]) >= 4:
+                        sweep = deltas
+                vol = max(0, min(127, 127 - h.tl))
+                if h.pan == 8:
+                    vol = 0
+                pts = tuple(
+                    (
+                        t,
+                        0 if pan == 8 else max(0, min(127, 127 - tl)),
+                        None if multipcm_pan_fx(pan) == 0
+                        else multipcm_pan_fx(pan),
+                    )
+                    for t, tl, pan in h.vol_pts
+                )
+                if smp.loop_start is None:
+                    natural_end = h.sample_time + int(round(
+                        smp.frames / (base_rate or ref) * VGM_RATE
+                    ))
+                    end = min(h.off_sample or natural_end, natural_end)
+                else:
+                    end = h.off_sample or (vgm.total_samples or 0)
+                ev = NoteEvent(
+                    sample=h.sample_time,
+                    ch=multipcm_at.get(h.chip_id, multipcm_base) + h.voice,
+                    on=True,
+                    note=note,
+                    ins=-1,  # bound after the sample-instrument base is known
+                    vol=vol,
+                    e5=e5,
+                    pan=multipcm_pan_fx(h.pan),
+                    pcm=True,
+                    end=end,
+                    sweep=sweep,
+                    vol_pts=pts,
+                )
+                events.append(ev)
+                multipcm_events.append((ev, i))
+                multipcm_count += 1
+                if end and end < (vgm.total_samples or 0):
+                    # Stop an earlier hit even when the channel is silent
+                    # before its next note.  Looped bodies with no source
+                    # key-off keep `end` at the song end and get the writer's
+                    # final off instead.
+                    events.append(NoteEvent(
+                        sample=end,
+                        ch=ev.ch,
+                        on=False,
+                        note=180,
+                        ins=-1,
+                        vol=-1,
+                        e5=0x80,
+                        pan=0,
+                        pcm=True,
+                    ))
+                for t, code, value in h.lfo_pts:
+                    channel_fx.append((t, ev.ch, code, value & 0xFF))
+
+        # NEC uPD7759: one phrase at a time per chip, rendered to 16-bit PCM
+        # and played on a Generic PCM DAC system because Furnace has no native
+        # uPD7759 platform.
+        upd_samples, upd_warn = collect_upd7759(vgm)
+        warnings.extend(upd_warn)
+        upd_audible = [s for s in upd_samples if s.hits and s.frames > 0]
+        upd_ids = _dual_ids(
+            sorted({s.chip_id for s in upd_audible})
+            or ([0] if vgm.upd7759_clock else []),
+            bool(getattr(vgm, "upd7759_dual", False)),
+        )
+        upd_base = multipcm_base + MULTIPCM_VOICES * len(multipcm_ids)
+        upd_at = {cid: upd_base + i for i, cid in enumerate(upd_ids)}
+        n_upd_ins = (len(upd_audible) + 119) // 120
+        for i, smp in enumerate(upd_audible):
+            slot = i % 120
+            ins_slot = i // 120
+            for h in smp.hits:
+                ev = NoteEvent(
+                    sample=h.sample_time,
+                    ch=upd_at.get(h.chip_id, upd_base),
+                    on=True,
+                    note=60 + slot,  # 120-slot map, slot plays at C-4
+                    ins=-1,
+                    vol=255,
+                    e5=0x80,
+                    pan=0,
+                    pcm=True,
+                    end=h.end,
+                )
+                events.append(ev)
+                upd_events.append((ev, ins_slot))
+                upd_count += 1
+                if h.end and h.end < (vgm.total_samples or 0):
+                    events.append(NoteEvent(
+                        sample=h.end,
+                        ch=ev.ch,
+                        on=False,
+                        note=180,
+                        ins=-1,
+                        vol=-1,
+                        e5=0x80,
+                        pan=0,
+                        pcm=True,
+                    ))
+
+        # Sega 32X PWM: two streamed PCM channels per chip.  Each side gets a
+        # Generic PCM DAC column and a hard pan.
+        pwm_samples, pwm_warn = collect_pwm(vgm)
+        warnings.extend(pwm_warn)
+        pwm_audible = [s for s in pwm_samples if s.frames > 0]
+        pwm_ids = _dual_ids(
+            sorted({s.chip_id for s in pwm_audible})
+            or ([0] if vgm.pwm_clock else []),
+            bool(getattr(vgm, "pwm_dual", False)),
+        )
+        pwm_base = upd_base + len(upd_ids)
+        pwm_at = {
+            cid: pwm_base + PWM_SIDES * i
+            for i, cid in enumerate(pwm_ids)
+        }
+        n_pwm_ins = (len(pwm_audible) + 119) // 120
+        for i, smp in enumerate(pwm_audible):
+            slot = i % 120
+            ins_slot = i // 120
+            start = smp.hits[0] if smp.hits else 0
+            duration = int(round(smp.frames / smp.rate * VGM_RATE))
+            end = min(start + duration, vgm.total_samples or start + duration)
+            ev = NoteEvent(
+                sample=start,
+                ch=pwm_at.get(smp.chip_id, pwm_base) + smp.side,
+                on=True,
+                note=60 + slot,  # 120-slot map, slot plays at C-4
+                ins=-1,
+                vol=255,
+                e5=0x80,
+                pan=0xF0 if smp.side == 0 else 0x0F,
+                pcm=True,
+                end=end,
+            )
+            events.append(ev)
+            pwm_events.append((ev, ins_slot))
+            pwm_count += 1
+            if end and end < (vgm.total_samples or 0):
+                events.append(NoteEvent(
+                    sample=end,
+                    ch=ev.ch,
+                    on=False,
+                    note=180,
+                    ins=-1,
+                    vol=-1,
+                    e5=0x80,
+                    pan=0,
+                    pcm=True,
+                ))
     else:
         audible = []
 
-    # NES APU: two pulses, triangle, noise and the DPCM/PCM channel.  Collect
-    # now so the instrument counts are known before the tone list is placed.
-    nes_ids = (
-        sorted({w.chip_id for w in vgm.writes if w.chip == "nes"})
-        if has_nes else []
-    )
+    # NES APU: two pulses, triangle, noise and the DPCM/PCM channel per
+    # instance.  Collect now so the instrument counts are known before the tone
+    # list is placed.
     nes_clock = vgm.nes_clock or NES_DEFAULT_CLOCK
     if has_nes:
         nes_tones, nes_offs, nes_warn = collect_nes_tones(vgm, nes_clock)
@@ -9772,7 +10267,18 @@ def analyze(
                     f"NES raw PCM: lossy sample clustering {before} -> "
                     f"{len(nes_pcm_samples)} bodies"
                 )
+        # Header bit 30 asks for a second APU.  Keep it even when it never
+        # plays, so the module layout matches the log's declared chips.
+        nes_ids = _dual_ids(
+            sorted(
+                {h.chip_id for h in nes_tones} | {o.chip_id for o in nes_offs}
+                | {hit.chip_id for hit in nes_dpcm_hits}
+                | {hit.chip_id for hit in nes_pcm_hits}
+            ),
+            bool(getattr(vgm, "nes_dual", False)),
+        )
     else:
+        nes_ids = []
         nes_tones, nes_offs = [], []
         nes_dpcm_samples, nes_dpcm_hits = [], []
         nes_pcm_samples, nes_pcm_hits = [], []
@@ -9793,6 +10299,9 @@ def analyze(
         + 32 * len({h.chip_id for s in c352_audible for h in s.hits})
         + 4 * len({h.chip_id for s in k053260_audible for h in s.hits})
         + YMZ280B_VOICES * len(ymz_ids)
+        + MULTIPCM_VOICES * len(multipcm_ids)
+        + len(upd_ids)
+        + PWM_SIDES * len(pwm_ids)
     )
     # Count the final DAC maps once, below; the collector's list is transient.
     n_ym2610_a_ins = (len(ym2610_a_samples) + YM2610_MAP_SLOTS - 1) // YM2610_MAP_SLOTS
@@ -9863,6 +10372,9 @@ def analyze(
     if scc_notes:
         for cid in sorted({n.hit.chip_id for n in scc_notes}):
             scc_ids.append(cid)
+        scc_ids = _dual_ids(
+            scc_ids, bool(getattr(vgm, "k051649_dual", False)),
+        )
         scc_waves = list(scc_wave_list)
         scc_wave_index = {img: i for i, img in enumerate(scc_waves)}
         scc_at = {cid: tone_base + SCC_VOICES * i for i, cid in enumerate(scc_ids)}
@@ -9983,9 +10495,12 @@ def analyze(
     # thing on other platforms.  The tracker's pitch table still runs from the
     # logged clock, so label the notes at half speed; the written period is
     # then doubled and the chip sounds at the real /2 rate.  A rip that
-    # already logged the halved clock is left alone.
+    # already logged the halved clock is left alone.  The pairing is a property
+    # of the hardware, so an APU that played nothing (all gates under one frame)
+    # still says "Famicom".
     nes_clk = vgm.nes_clock or NES_DEFAULT_CLOCK
-    if nes_ids:
+    nes_present = has_nes
+    if nes_present:
         ay_half = abs(ay_clock - nes_clk) <= 16
     else:
         ay_half = bool(getattr(vgm, "ay8910_flags", 0) & 0x10)
@@ -9996,6 +10511,9 @@ def analyze(
     if ay_cids:
         for cid in ay_cids:
             ay_ids.append(cid)
+        ay_ids = _dual_ids(
+            ay_ids, bool(getattr(vgm, "ay8910_dual", False)),
+        )
         ay_at = {cid: tone_base + SCC_VOICES * len(scc_ids) + AY_VOICES * i
                  for i, cid in enumerate(ay_ids)}
         if ay_hits:
@@ -10005,15 +10523,20 @@ def analyze(
             )
         _emit_pcm(ay_pcm, ay_pcm_hits, ay_at)
 
-    # NES APU columns: two pulses, triangle, noise and DPCM/PCM. They follow
-    # the SCC/AY blocks in module order.
+    # NES APU columns: per instance two pulses, triangle, noise and the
+    # DPCM/PCM channel. They follow the SCC/AY blocks in module order, and each
+    # 2A03 keeps its own five columns so Furnace drives it with its own chip.
     if nes_ids:
         nes_base = (
             tone_base + SCC_VOICES * len(scc_ids) + AY_VOICES * len(ay_ids)
         )
+        nes_at = {
+            cid: nes_base + NES_CHANNELS * i
+            for i, cid in enumerate(nes_ids)
+        }
         nes_tone_events: list[NoteEvent] = []
         for h in nes_tones:
-            ch = nes_base + h.voice
+            ch = nes_at.get(h.chip_id, nes_base) + h.voice
             if h.voice == 3:
                 note = nes_noise_note(h.period)
                 e5 = 0x80
@@ -10028,6 +10551,41 @@ def analyze(
                 sweep = deltas if deltas and max(vals + [0]) - min(vals + [0]) >= 4 else ()
             # Duty/noise mode, envelope mode and the triangle linear counter
             # are row effects.
+            #
+            # Furnace's NES note-on reloads the length counter with its longest
+            # table value, so a note it does not halt dies after a fraction of a
+            # second.  Drivers hold a voice by rewriting its timer/length
+            # register every few frames (Danger Zone writes $4003 68 times per
+            # APU) and the reference player keeps sounding, so hand the tracker
+            # a halted note and end it on the driver's next write instead: a
+            # pitch change, a volume drop or a $4015 mute already become note
+            # events.
+            #
+            # Envelope mode needs the opposite of what the chip does.  Furnace
+            # runs the hardware envelope once and a later note-on does not
+            # restart it, so a channel whose driver writes $4000 once (Access
+            # Block's pulses, Danger Zone's noise) would fall silent after the
+            # first decay and never come back.  Keep the peak level constant and
+            # carry the decay on the volume column at the hardware rate: 15 down
+            # to 0, one step per (period + 1) quarter frames.
+            env_mode = h.env_mode | 3
+            vol = 15 if h.voice == 2 else h.vol
+            vol_pts: tuple[tuple[int, int, int | None], ...] = tuple(
+                (t, v, None) for t, v in h.vol_pts
+            )
+            # The triangle has no volume register: its hit carries the noise
+            # voice's volume state, so it must not be read as an envelope here.
+            if h.voice != 2 and not (h.env_mode & 1):
+                step = ((h.vol & 0x0F) + 1) * (VGM_RATE / 240.0)
+                vol_pts = tuple(
+                    (h.sample_time + int(round(k * step)), 15 - k, None)
+                    for k in range(1, 15)
+                )
+                vol = 15
+            # The triangle's control bit holds the linear counter (the counter
+            # otherwise runs out after (value/240) s) so the note lasts until
+            # the driver moves it.
+            linear = h.linear | 0x80
             if h.voice < 2:
                 channel_fx.append((h.sample_time, ch, 0x12, h.duty))
                 for t, duty in h.duty_pts:
@@ -10036,28 +10594,28 @@ def analyze(
                 channel_fx.append((h.sample_time, ch, 0x12, h.duty))
                 for t, duty in h.duty_pts:
                     channel_fx.append((t, ch, 0x12, duty))
-                channel_fx.append((h.sample_time, ch, 0x15, h.env_mode))
-                for t, mode in h.env_pts:
-                    channel_fx.append((t, ch, 0x15, mode))
+                channel_fx.append((h.sample_time, ch, 0x15, env_mode))
+                for t, _mode in h.env_pts:
+                    channel_fx.append((t, ch, 0x15, env_mode))
             else:
-                channel_fx.append((h.sample_time, ch, 0x19, h.linear))
-                for t, linear in h.linear_pts:
-                    channel_fx.append((t, ch, 0x19, linear))
+                channel_fx.append((h.sample_time, ch, 0x19, linear))
+                for t, lin in h.linear_pts:
+                    channel_fx.append((t, ch, 0x19, lin | 0x80))
             if h.voice < 2:
-                channel_fx.append((h.sample_time, ch, 0x15, h.env_mode))
-                for t, mode in h.env_pts:
-                    channel_fx.append((t, ch, 0x15, mode))
+                channel_fx.append((h.sample_time, ch, 0x15, env_mode))
+                for t, _mode in h.env_pts:
+                    channel_fx.append((t, ch, 0x15, env_mode))
             ev = NoteEvent(
                 sample=h.sample_time,
                 ch=ch,
                 on=True,
                 note=note,
                 ins=-1,
-                vol=15 if h.voice == 2 else h.vol,
+                vol=vol,
                 e5=e5,
                 pan=0,
                 end=h.off_sample,
-                vol_pts=tuple((t, v, None) for t, v in h.vol_pts),
+                vol_pts=vol_pts,
                 sweep=sweep,
                 sweep_div=2.0,
                 e5_lo=0x00,
@@ -10076,15 +10634,17 @@ def analyze(
             nes_tone_events.append(ev)
         for off in nes_offs:
             events.append(NoteEvent(
-                sample=off.sample_time, ch=nes_base + off.voice, on=False,
-                note=180, ins=-1, vol=-1, e5=0x80, pan=0,
+                sample=off.sample_time,
+                ch=nes_at.get(off.chip_id, nes_base) + off.voice,
+                on=False, note=180, ins=-1, vol=-1, e5=0x80, pan=0,
             ))
         # DPCM: the note value selects the DMC rate (60 + rate index); one
         # instrument per sample body. PCM: note 108 plays an 8-bit body at its
-        # stored rate.
+        # stored rate. Each APU triggers its own DMC voice, so the hit's
+        # instance picks both the column and the mode effect.
         nes_dpcm_events: list[tuple[NoteEvent, int]] = []
         for hit in nes_dpcm_hits:
-            ch = nes_base + 4
+            ch = nes_at.get(hit.chip_id, nes_base) + 4
             channel_fx.append((hit.sample_time, ch, 0x18, 1))
             channel_fx.append((hit.sample_time, ch, 0x11, 0))
             ev = NoteEvent(
@@ -10103,12 +10663,12 @@ def analyze(
                     vol=-1, e5=0x80, pan=0, pcm=True,
                 ))
         nes_pcm_events: list[tuple[NoteEvent, int]] = []
-        pcm_mode_set = False
+        pcm_mode_set: set[int] = set()
         for hit in nes_pcm_hits:
-            ch = nes_base + 4
-            if not pcm_mode_set:
+            ch = nes_at.get(hit.chip_id, nes_base) + 4
+            if hit.chip_id not in pcm_mode_set:
                 channel_fx.append((hit.sample_time, ch, 0x18, 0))
-                pcm_mode_set = True
+                pcm_mode_set.add(hit.chip_id)
             ev = NoteEvent(
                 sample=hit.sample_time, ch=ch, on=True,
                 note=60 + (hit.sample_index % NES_PCM_MAP_SLOTS),
@@ -10154,9 +10714,12 @@ def analyze(
     if huc_cids:
         for cid in huc_cids:
             huc6280_ids.append(cid)
+        huc6280_ids = _dual_ids(
+            huc6280_ids, bool(getattr(vgm, "huc6280_dual", False)),
+        )
         huc_base = (
             tone_base + SCC_VOICES * len(scc_ids) + AY_VOICES * len(ay_ids)
-            + (NES_CHANNELS if nes_ids else 0)
+            + NES_CHANNELS * len(nes_ids)
         )
         huc_at = {
             cid: huc_base + HUC6280_CHANNELS * i
@@ -10423,9 +10986,12 @@ def analyze(
     warnings.extend(gb_warn)
     if gb_hits or gb_offs:
         gb_ids.append(0)
+        gb_ids = _dual_ids(
+            gb_ids, bool(getattr(vgm, "gb_dmg_dual", False)),
+        )
         gb_base = (
             tone_base + SCC_VOICES * len(scc_ids) + AY_VOICES * len(ay_ids)
-            + (NES_CHANNELS if nes_ids else 0)
+            + NES_CHANNELS * len(nes_ids)
             + (HUC6280_CHANNELS if huc6280_ids else 0)
         )
         gb_waves = list(gb_wave_list)
@@ -10542,12 +11108,15 @@ def analyze(
     )
     warnings.extend(vsu_warn)
     if vsu_hits or vsu_offs:
-        vsu_ids = sorted({h.chip_id for h in vsu_hits})
+        vsu_ids = _dual_ids(
+            sorted({h.chip_id for h in vsu_hits}),
+            bool(getattr(vgm, "vsu_dual", False)),
+        )
         vsu_waves = list(vsu_wave_list)
         vsu_mod_waves = list(vsu_mod_list)
         vsu_base = (
             tone_base + SCC_VOICES * len(scc_ids) + AY_VOICES * len(ay_ids)
-            + (NES_CHANNELS if nes_ids else 0)
+            + NES_CHANNELS * len(nes_ids)
             + (HUC6280_CHANNELS if huc6280_ids else 0)
             + (4 * len(gb_ids))
         )
@@ -10639,9 +11208,12 @@ def analyze(
         })
         if not saa_ids:
             saa_ids = sorted({h.chip_id for h in saa_hits})
+        saa_ids = _dual_ids(
+            saa_ids, bool(getattr(vgm, "saa1099_dual", False)),
+        )
         saa_base = (
             tone_base + SCC_VOICES * len(scc_ids) + AY_VOICES * len(ay_ids)
-            + (NES_CHANNELS if nes_ids else 0)
+            + NES_CHANNELS * len(nes_ids)
             + (HUC6280_CHANNELS if huc6280_ids else 0)
             + (4 * len(gb_ids))
             + VSU_CHANNELS * len(vsu_ids)
@@ -10652,6 +11224,40 @@ def analyze(
         }
         saa_count = _emit_saa_notes(
             events, channel_fx, saa_hits, saa_offs, saa_at, saa_clock,
+            vgm.total_samples or 0,
+        )
+
+    pokey_ids: list[int] = []
+    pokey_ins: list[ToneIns] = []
+    pokey_count = 0
+    pokey_clock = vgm.pokey_clock or POKEY_DEFAULT_CLOCK
+    (
+        pokey_hits, pokey_offs, pokey_audctl, pokey_waves, pokey_warn,
+    ) = collect_pokey(vgm)
+    warnings.extend(pokey_warn)
+    pokey_ids = _dual_ids(
+        sorted(
+            {h.chip_id for h in pokey_hits}
+            | {o.chip_id for o in pokey_offs}
+        ),
+        bool(getattr(vgm, "pokey_dual", False)),
+    )
+    if pokey_ids:
+        pokey_base = (
+            tone_base + SCC_VOICES * len(scc_ids) + AY_VOICES * len(ay_ids)
+            + NES_CHANNELS * len(nes_ids)
+            + (HUC6280_CHANNELS if huc6280_ids else 0)
+            + (4 * len(gb_ids))
+            + VSU_CHANNELS * len(vsu_ids)
+            + SAA_VOICES * len(saa_ids)
+        )
+        pokey_at = {
+            cid: pokey_base + POKEY_VOICES * i
+            for i, cid in enumerate(pokey_ids)
+        }
+        pokey_count = _emit_pokey_notes(
+            events, channel_fx, pokey_hits, pokey_offs, pokey_at,
+            pokey_audctl, pokey_waves, tone_ins_base,
             vgm.total_samples or 0,
         )
 
@@ -10752,6 +11358,12 @@ def analyze(
     # pitched SCC/AY/NES/PCE/GB tone instruments.
     ymz_ins_base = tone_ins_base
     tone_ins_base += len(ymz_audible)
+    multipcm_ins_base = tone_ins_base
+    tone_ins_base += len(multipcm_audible)
+    upd_ins_base = tone_ins_base
+    tone_ins_base += n_upd_ins
+    pwm_ins_base = tone_ins_base
+    tone_ins_base += n_pwm_ins
 
     events.sort(key=lambda e: (e.sample, e.ch, 0 if e.on else 1))
 
@@ -10795,18 +11407,25 @@ def analyze(
             grid = _grid("pcm", onsets=pcm_onsets, label="sample-trigger lattice")
         if grid is not None:
             tone_only = (
-                scc_count or ay_count or vsu_count or saa_count
+                scc_count or ay_count or vsu_count or saa_count or pokey_count
             ) and not keyon_times and not any(
                 e.on and e.pcm for e in events
             )
             if tone_only:
-                saa_tick = _saa_tick_interval(vgm) if saa_count else None
+                tick_chip = (
+                    "saa1099" if saa_count
+                    else ("pokey" if pokey_count else None)
+                )
+                saa_tick = (
+                    _saa_tick_interval(vgm, tick_chip) if tick_chip else None
+                )
                 if saa_tick:
                     hz = VGM_RATE / saa_tick
                     use_speed = 1
                     row_subdiv = 1.0
                     grid_note = (
-                        f"SAA1099 write lattice ({saa_tick:g} samples/tick), "
+                        f"{'SAA1099' if tick_chip == 'saa1099' else 'POKEY'} "
+                        f"write lattice ({saa_tick:g} samples/tick), "
                         "row = 1 write tick"
                     )
                     tone_hilight = True
@@ -11022,12 +11641,12 @@ def analyze(
     tone_demand = 0
     if (
         scc_ids or ay_ids or psg_ids or nes_ids or huc6280_ids
-        or gb_ids or vsu_ids or saa_ids
+        or gb_ids or vsu_ids or saa_ids or pokey_ids
     ):
         tone_demand = _tone_instrument_demand(
             events, vgm.k051649_clock or SCC_DEFAULT_CLOCK, ay_note_clock,
             psg_clock, nes_clock, huc6280_clock, gb_clock, vsu_clock,
-            saa_clock, hz, vgm.total_samples, use_speed,
+            saa_clock, pokey_clock, hz, vgm.total_samples, use_speed,
             lfo_loop=lfo_loop,
         )
     tone_demand_raw = tone_demand
@@ -11103,6 +11722,12 @@ def analyze(
         tone_ins_base += n_huc6280_pcm_ins
         ymz_ins_base = tone_ins_base
         tone_ins_base += len(ymz_audible)
+        multipcm_ins_base = tone_ins_base
+        tone_ins_base += len(multipcm_audible)
+        upd_ins_base = tone_ins_base
+        tone_ins_base += n_upd_ins
+        pwm_ins_base = tone_ins_base
+        tone_ins_base += n_pwm_ins
     if pms_lost:
         warnings.append(
             f"{pms_lost} YM2151 PMS/AMS ramps stayed on the base instrument: "
@@ -11143,7 +11768,7 @@ def analyze(
     )
     tone_merged = _bind_tone_instruments(
         events, scc_ins, ay_ins, psg_ins, nes_ins, huc6280_ins, gb_ins,
-        vsu_ins, saa_ins,
+        vsu_ins, saa_ins, pokey_ins,
         tone_ins_base,
         vgm.k051649_clock or SCC_DEFAULT_CLOCK,
         ay_note_clock,
@@ -11153,6 +11778,7 @@ def analyze(
         gb_clock,
         vsu_clock,
         saa_clock,
+        pokey_clock,
         hz, vgm.total_samples, use_speed,
         merge_tol=tone_merge_tol, lfo_loop=lfo_loop,
     )
@@ -11189,6 +11815,12 @@ def analyze(
     )
     for ev, idx in ymz_events:
         ev.ins = ymz_ins_base + idx
+    for ev, idx in multipcm_events:
+        ev.ins = multipcm_ins_base + idx
+    for ev, idx in upd_events:
+        ev.ins = upd_ins_base + idx
+    for ev, idx in pwm_events:
+        ev.ins = pwm_ins_base + idx
 
     loop_sample = vgm.loop_sample
     if loop_sample is not None and loop_sample < 0:
@@ -11204,9 +11836,10 @@ def analyze(
         or y8950_b_samples or opl4_wave_samples or ssg_pcm_samples
         or nes_ids or nes_dpcm_samples or nes_pcm_samples
         or huc_pcm_samples or ymz_audible
+        or multipcm_audible or upd_audible or pwm_audible
         or any(s.length >= 8 for s in pcm_samples)
         or scc_waves or ay_count or dac_samples or psg_count
-        or saa_ids or saa_count
+        or saa_ids or saa_count or pokey_count
     )
     if not fm_list:
         chip_name = {
@@ -11266,6 +11899,7 @@ def analyze(
         + len(vsu_ins)
         + n_ym2608_rhythm_ins + n_ym2608_b_ins
         + n_ssg_pcm + len(ymz_audible)
+        + len(multipcm_audible) + n_upd_ins + n_pwm_ins
     )
     # Before trimming anything for the hard limit, share an instrument whose
     # macros only differ by a longer tail with its shorter copies. A short
@@ -11298,6 +11932,7 @@ def analyze(
         + len(ym2610_a_samples) + len(ym2610_b_samples)
         + len(ym2608_b_samples) + len(ssg_pcm_samples)
         + len(ymz_audible)
+        + len(multipcm_audible) + len(upd_audible) + len(pwm_audible)
     )
     if n_total_smp > 65535:
         warnings.append(
@@ -11345,6 +11980,15 @@ def analyze(
         ymz280b_samples=ymz_audible,
         ymz280b_ids=ymz_ids,
         ymz280b_count=ymz_count,
+        multipcm_samples=multipcm_audible,
+        multipcm_ids=multipcm_ids,
+        multipcm_count=multipcm_count,
+        upd7759_samples=upd_audible,
+        upd7759_ids=upd_ids,
+        upd7759_count=upd_count,
+        pwm_samples=pwm_audible,
+        pwm_ids=pwm_ids,
+        pwm_count=pwm_count,
         channel_fx=channel_fx,
         k007232_volume=k007232_volume,
         c352_quad=c352_quad_events,
@@ -11386,6 +12030,7 @@ def analyze(
         opll_drums=opll_drums,
         opll_vrc7=opll_vrc7,
         nes_ids=nes_ids,
+        nes_present=nes_present,
         nes_ins=nes_ins,
         nes_dpcm_samples=nes_dpcm_samples,
         nes_pcm_samples=nes_pcm_samples,
@@ -11444,6 +12089,9 @@ def analyze(
         ay_ids=ay_ids,
         ay_ins=ay_ins,
         ay_count=ay_count,
+        pokey_ids=pokey_ids,
+        pokey_ins=pokey_ins,
+        pokey_count=pokey_count,
         ssg_pcm_samples=ssg_pcm_samples,
         ssg_pcm_count=ssg_pcm_count,
         psg_ids=psg_ids,
@@ -11718,6 +12366,13 @@ def format_report(song: Song) -> str:
             f"{song.vgm.saa1099_clock or SAA_DEFAULT_CLOCK} Hz, "
             f"{len(song.saa_ins)} instruments)"
         )
+    if song.pokey_ids:
+        lines.append(
+            f"POKEY notes {song.pokey_count}  ({len(song.pokey_ids)} chip"
+            f"{'s' if len(song.pokey_ids) > 1 else ''}, "
+            f"{song.vgm.pokey_clock or POKEY_DEFAULT_CLOCK} Hz, "
+            f"{len(song.pokey_ins)} instruments)"
+        )
     if song.huc6280_ids or song.huc6280_pcm_samples:
         lines.append(
             f"PCE notes   {song.huc6280_count}  ({len(song.huc6280_ids)} chip"
@@ -11746,6 +12401,13 @@ def format_report(song: Song) -> str:
             f"{len(song.vsu_waves)} waveforms, {len(song.vsu_ins)} instruments"
             f"{', dynamic waves' if song.vsu_dynamic else ''}, "
             f"{song.vgm.vsu_clock or VSU_DEFAULT_CLOCK} Hz)"
+        )
+    if song.nes_ids:
+        lines.append(
+            f"NES notes   {song.nes_count}  ({len(song.nes_ids)} APU"
+            f"{'s' if len(song.nes_ids) > 1 else ''}, "
+            f"{len(song.nes_dpcm_samples)} DPCM body(ies), "
+            f"{song.vgm.nes_clock or NES_DEFAULT_CLOCK} Hz)"
         )
     if song.ssg_pcm_samples:
         lines.append(
@@ -11805,6 +12467,41 @@ def format_report(song: Song) -> str:
             lines.append(
                 f"  {i:02d}  start {s.start:05X}  len {s.length:5d}  "
                 f"hits {len(s.hits):3d}  {loop}"
+            )
+    if song.multipcm_samples:
+        hits = sum(len(s.hits) for s in song.multipcm_samples)
+        lines.append(
+            f"MultiPCM    {len(song.multipcm_samples)} regions  hits {hits}"
+        )
+        for i, s in enumerate(song.multipcm_samples):
+            loop = (
+                f"loop {s.loop_start}..{s.loop_end}"
+                if s.loop_start is not None else "one-shot"
+            )
+            lines.append(
+                f"  {i:02d}  idx {s.index:3d}  start {s.start:05X}  "
+                f"len {s.length:5d}  {s.depth}-bit  hits {len(s.hits):3d}  "
+                f"{loop}"
+            )
+    if song.upd7759_samples:
+        hits = sum(len(s.hits) for s in song.upd7759_samples)
+        lines.append(
+            f"uPD7759     {len(song.upd7759_samples)} phrases  hits {hits}"
+        )
+        for i, s in enumerate(song.upd7759_samples):
+            lines.append(
+                f"  {i:02d}  {s.name:<16}  frames {s.frames:6d}  "
+                f"hits {len(s.hits):3d}"
+            )
+    if song.pwm_samples:
+        lines.append(
+            f"32X PWM     {len(song.pwm_samples)} chunks  "
+            f"{PWM_RATE} Hz"
+        )
+        for s in song.pwm_samples:
+            lines.append(
+                f"  {s.name:<10}  frames {s.frames:7d}  "
+                f"{'loop' if s.loop_start is not None else 'one-shot'}"
             )
     last = song.events[-1].sample if song.events else song.t0
     rows = song.row_of(last) + 1

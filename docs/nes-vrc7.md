@@ -7,7 +7,40 @@ preset ROM, converted to `DIV_SYSTEM_VRC7` (`0x9D`).
 ## NES APU registers
 
 VGM command `0xB4` (register, data). The register is `0x00-0x17` = `$4000-$4017`
-and bit 7 selects a second APU instance.
+and bit 7 selects a second APU instance (header `0x84` bit 30 declares it).
+
+
+## Two APUs in one log
+
+A Famicom cart with a second 2A03 writes the same `$4000-$4017` numbers twice
+per frame, once per chip, and only the register's bit 7 says which. The
+collectors therefore run one machine per instance, each with its own:
+
+- **voice gates** — `$4015` on one chip must not close the other's pulse, and a
+  timer write belongs to its own voice;
+- **`$C000` sample RAM** — a type-`0xC2` dump carries the instance in bit 31 of
+  its length, and a DMC trigger reads only that chip's image;
+- **type-`0x07` database** — each 0x68 copy addresses its own cart's bank, so
+  the parser records where every instance's bank starts
+  (`VgmFile.nes_dpcm_bank_base`);
+- **`$4011` stream** — burst detection runs per chip, so two interleaved
+  bit-bang drivers do not halve each other's sample rate.
+
+Each sounding instance becomes its own `DIV_SYSTEM_NES` with five columns
+(`Pulse 1 (2)`..`DPCM (2)`), and its DMC voice is the fifth of that block. An
+APU that the log declares but never plays gets no chip and no columns, which is
+why the Sunsoft 5B pairing looks at `Song.nes_present` (the log's APU) rather
+than at the column list. Sample bodies and DMC/PCM sample maps are shared by
+both chips and deduplicated across them, so a second APU costs columns, not
+sample slots.
+
+Measured on a dual-APU cart log (`V-Dog Jack Russell Terrier`): one shared
+machine wrote 2,115 notes and put every one of them in the first chip's five
+columns — 1,133 on its pulse 1 and 256 drums on its noise — while the second
+chip's block stayed empty, because each frame the two drivers re-gated one
+another. Per-instance machines place 780 notes: 200 on APU 1 and 580 on APU 2,
+and only then does the log's real split show. APU 1 keeps `$400C` at level 0, so
+its noise column is empty and all 224 of its drum rows become APU 2's.
 
 | reg | channel | meaning |
 | --- | --- | --- |
@@ -34,14 +67,51 @@ semitone is a new note; smaller changes are a pitch trajectory.
 
 - **Pitch**: `freq = clock / (16 * (timer + 1))`. Furnace's NES platform
   writes `period = pitch_table[n] - 1`, so the inverse asks the table for
-  `timer + 1`.
+  `timer + 1`. A timer below 6 is above ~16 kHz, which the console's output
+  filter drops; some drivers park an unused voice at 0 between phrases, so
+  such a write reads as silence (it ends the open note) instead of becoming
+  the top note of Furnace's range.
+- **Timer writes**: a driver that writes the timer low byte first leaves the
+  stale high byte in place for a sample or two (Santa Claus writes 270 -> 0 as
+  low `0x00` then high `0xC0`, which reads as 256 in between). When the
+  matching high write follows within a few samples the low write is not
+  evaluated, so a half-updated period cannot split a note or steal its
+  note-off.
 - **Volume**: the low nibble of `$4000`/`$4004`/`$400C` is the pattern volume
-  (0-15). In envelope mode it is the envelope period, which is what the
-  register holds and what Furnace writes back.
+  (0-15) when the constant-volume bit is set.
 - **Duty / noise mode**: `12xx` row effect at the note and on changes.
-- **Envelope mode** (`$4000` bits 4-5): `15xx` row effect.
 - **Triangle linear counter** (`$4008`): `19xx` row effect. The volume column
   only gates the triangle.
+- **Envelope mode** (`$4000` bit 4 clear). Furnace runs the NES hardware
+  envelope once and a later note-on does not restart it, so a channel whose
+  driver writes `$4000` only once (Access Block's pulses, Danger Zone's noise)
+  would fall silent after the first decay and never return. The converter
+  therefore writes the peak level as constant volume (`15 03`) and puts the
+  decay on the volume column at the hardware rate: 15 down to 0, one step per
+  `(period + 1)` quarter frames. The volume column carries the level, not the
+  envelope period.
+- **Gate length**. The length register's 5-bit load indexes the counter table,
+  so `$400F = 0` loads the table's index 0 (10 half-frames, an 83 ms burst) --
+  not "no length". Drivers mark a drum hit with exactly that write. Where the
+  counter's own end is audible, it becomes a note-off at its real time:
+  - noise: the length counter (`value/120` s);
+  - triangle: the linear counter (`value/240` s);
+  - pulses: no natural end -- the reference player keeps them sounding until
+    the driver's next write.
+
+  A register reload that arrives before the gate runs out extends the note
+  (drivers hold a voice by rewriting the length register every frame); one
+  that arrives after starts a new hit.
+- **Sustain**: Furnace reloads the length counter with its longest table value
+  on every note-on, so a note it does not halt dies after a fraction of a
+  second. Drivers keep a voice alive by rewriting its timer/length register
+  every few frames (Danger Zone writes `$4003` 68 times per APU) and the
+  reference player keeps sounding, so tone notes are written halted (`15 03`)
+  and the driver's own writes end them: a pitch change, a volume drop, a
+  `$4015` mute or a counter expiry become note events. The triangle's control
+  bit is set (`19 8C` for `$4008 = 0x0C`) so the tracker itself does not expire
+  the linear counter early; the converter's own note-off, computed from the
+  source's counter values, ends the note.
 - Mid-note pitch and volume motion become per-note instrument macros
   (`std.pitch`, `std.vol`), so the changes survive a coarse row grid. If the
   instrument budget is full, `_take_tone` hands that note a plain instrument

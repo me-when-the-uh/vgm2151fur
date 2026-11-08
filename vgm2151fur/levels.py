@@ -24,6 +24,8 @@ from vgm2151fur.furnace import FurnaceError, render_wav
 
 TARGET_PEAK = 10 ** (-2.5 / 20)  # -2.5 dBFS: loudness first, 1.5 dB of headroom
 MAX_GAIN = 10 ** (24 / 20)  # quieter than this is a broken render, not a track
+# Furnace's song master volume is capped at 3.0.
+MAX_MASTER = 3.0
 
 # Probe volumes, loudest first; step down when the render sits at the clamp.
 _PROBES = (0.25, 0.25 / 16, 0.25 / 256)
@@ -102,7 +104,7 @@ def normalize_module(data: bytes, *, name: str = "module") -> Normalization | No
                 break
     if peak <= 0.0:
         return None
-    gain = min(MAX_GAIN, TARGET_PEAK / peak)
+    gain = min(MAX_GAIN, MAX_MASTER, TARGET_PEAK / peak)
     return Normalization(data=furio.set_master_volume(data, gain), peak=peak, gain=gain)
 
 

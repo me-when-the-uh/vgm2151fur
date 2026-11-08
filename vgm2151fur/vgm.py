@@ -122,6 +122,9 @@ CMD_K053260 = 0xBA
 # dual-chip log (Furnace's baseAddr2S rule).
 CMD_VSU = 0xC7
 CMD_SAA1099 = 0xBD
+# Atari POKEY: 0xBB register write. Bit 7 of the register byte selects the
+# second chip (Dual Chip Support #2).
+CMD_POKEY = 0xBB
 VSU_DUAL_BIT = 0x8000
 CMD_DATA_BLOCK = 0x67
 CMD_END = 0x66
@@ -130,6 +133,7 @@ CMD_STREAM_SETUP = 0x90
 # and the HuC6280 is 0x1B (libvgm's device index).
 STREAM_OKIM6258 = 0x17
 STREAM_C6280 = 0x1B
+STREAM_PWM = 0x11
 # The YM2612 DAC stream driver, the other type this tool reconstructs. Its data
 # bank is the type-0x00 PCM database and its register is $2A.
 DAC_STREAM_YM2612 = 0x02
@@ -152,6 +156,8 @@ Y8950_DELTAT_ROM_TYPE = 0x88  # Y8950 delta-T (ADPCM-B) ROM
 YMF278B_ROM_TYPE = 0x84  # YMF278B (OPL4) ROM image
 YMF278B_RAM_TYPE = 0x87  # YMF278B (OPL4) RAM image
 YMZ280B_ROM_TYPE = 0x86  # YMZ280B external sample ROM
+MULTIPCM_ROM_TYPE = 0x89  # YMW258-F (MultiPCM) ROM image
+UPD7759_ROM_TYPE = 0x8A  # uPD7759 phrase ROM image
 C140_ROM_TYPE = 0x8D  # Namco C140 ROM
 C352_ROM_TYPE = 0x92  # Namco C352 ROM
 YM2610_ADPCM_ROM_TYPE = 0x82  # YM2610 ADPCM-A/B ROM
@@ -175,6 +181,9 @@ EXTRA_C352 = 0x27
 EXTRA_K007232 = 0x2A
 EXTRA_VSU = 0x22  # Virtual Boy VSU (VGM chip-volume id 34)
 EXTRA_YMZ280B = 0x0F
+EXTRA_MULTIPCM = 0x15  # Yamaha YMW258-F (MultiPCM)
+EXTRA_UPD7759 = 0x16  # NEC uPD7759
+EXTRA_POKEY = 0x1E  # Atari POKEY (same id as libvgm's DEVID_POKEY)
 # Main-header clocks (VGMFile.h layout, spec v1.71). 0x98 is MSM6295, 0x90
 # MSM6258, 0x94 its flags. K007232 has no spec field; VGMPlay tools put it at
 # 0xE8 (1.71+). C140 is 0xA8 and its type byte 0x96. AY-8910 is 0x74 with its
@@ -297,8 +306,34 @@ C140_TYPE_OFF = 0x96
 SAA1099_CLOCK_OFF = 0xC8
 SAA1099_DEFAULT_CLOCK = 8_000_000
 SAA1099_DUAL_BIT = 0x40000000
+# Atari POKEY header 0xB0 (VGM 1.50+).  Bit 30 marks a second chip; the second
+# instance selects itself with bit 7 of the 0xBB register byte and normally
+# shares this clock (the extra header can carry a separate one).
+POKEY_CLOCK_OFF = 0xB0
+POKEY_DEFAULT_CLOCK = 1_789_772
+POKEY_DUAL_BIT = 0x40000000
 K053260_CLOCK_OFF = 0xAC  # VGM 1.61+, one clock for both instances
 K053260_DEFAULT_CLOCK = 3579545
+# MultiPCM header 0x88 (VGM 1.61+): 28 sample voices.  Bit 30 is the second
+# instance.  The VGM clock is based on the old /180 divider; VGMPlay converts
+# it with *224/180 before the core (which divides by 224).
+MULTIPCM_CLOCK_OFF = 0x88
+MULTIPCM_DEFAULT_CLOCK = 8_053_975
+MULTIPCM_DUAL_BIT = 0x40000000
+# uPD7759 header 0x8C (VGM 1.61+).  Bit 30 is a second chip, bit 31 selects
+# slave mode (the CPU streams command bytes through the port instead of using
+# the chip's own phrase ROM).
+UPD7759_CLOCK_OFF = 0x8C
+UPD7759_DEFAULT_CLOCK = 640_000
+UPD7759_DUAL_BIT = 0x40000000
+UPD7759_SLAVE_BIT = 0x80000000
+# Sega 32X PWM header 0x70 (VGM 1.51+).  The chip is a stereo streamed DAC;
+# command 0xB2 writes its control/cycle/level registers and the DAC-stream
+# control commands feed 12-bit samples to the left/right ports.
+PWM_CLOCK_OFF = 0x70
+PWM_DEFAULT_CLOCK = 23_011_361
+PWM_DUAL_BIT = 0x40000000
+PWM_DATA_TYPE = 0x03  # PWM PCM data bank
 C352_CLOCK_OFF = 0xDC  # VGM 1.71 crystal; bit 31 mutes the rear pair
 C352_DIV_OFF = 0xD6  # hardware divider / 4; 72 means a divider of 288
 SEGAPCM_CLOCK_X = 4000000  # X board / Hang-On
@@ -311,8 +346,7 @@ CLOCK_MAX = 40_000_000
 # Sample-chip write commands this tool does not convert. Anything here that
 # shows up in a stream means samples are being dropped. Say so.
 UNCONVERTED_SAMPLE_CMDS = {
-    0xB2: "PWM",
-    0xB5: "MultiPCM", 0xB6: "uPD7759", 0x40: "NES APU DPCM",
+    0x40: "NES APU DPCM",
 }
 
 # Commands defined by the VGM spec. 0x60/0x64/0x65/0x69-0x6F are undefined;
@@ -489,7 +523,9 @@ class ChipWrite:
     chip: str  # "ym2151" | "ym2203" | "ym2612" | "ym2610" | "opl" | "opl2" |
     #            "opl3" | "k007232" | "msm6295" | "msm6258" | "segapcm" |
     #            "c140" | "c352" | "k053260" | "ay8910" | "k051649" |
-    #            "ymz280b" | "vsu" | "sn76489" (chip_id 1 = T6W28 right half)
+    #            "ymz280b" | "vsu" | "sn76489" (chip_id 1 = T6W28 right half) |
+    #            "multipcm" | "upd7759" | "multipcm_bank" (reg = mask,
+    #            val = bank number; 0xC3 preserves its stream position)
     chip_id: int
     reg: int
     val: int
@@ -550,7 +586,11 @@ class VgmFile:
     nes_fds: bool = False
     # DPCM sample data.  The type-0x07 database is concatenated here and the
     # 0x68 commands copy windows of it into the $C000/$D000 RAM as they play.
+    # A dual-APU log carries one database per chip (bit 31 of the block size),
+    # so `nes_dpcm_bank_base` says where each instance's bank starts and a 0x68
+    # address stays inside the cart it names.
     nes_dpcm_bank: bytearray = field(default_factory=bytearray)
+    nes_dpcm_bank_base: dict[int, int] = field(default_factory=dict)
     pcm_ram_writes: list[PcmRamWrite] = field(default_factory=list)
     # HuC6280 (PC Engine) header 0xA4 (VGM 1.61+).  Writes arrive on command
     # 0xB9; the clock is the PSG clock.  Bit 7 of the register selects a
@@ -675,6 +715,12 @@ class VgmFile:
     ay8910_type: int = 0
     ay8910_flags: int = 0
     ay8910_dual: bool = False
+    # Atari POKEY header 0xB0.  Bit 30 marks two chips, which share the clock
+    # unless the extra header (id 0x1E) gives the second one its own.  Writes
+    # arrive on 0xBB; register bit 7 selects the second instance.
+    pokey_clock: int = 0
+    pokey_clock_2: int = 0
+    pokey_dual: bool = False
     # K051649 / K052539 (SCC) header 0x9C (VGM 1.61+), bit 31 set for the
     # K052539 variant. The clock is the value both libvgm and Furnace run the
     # chip at: pitch = clock / (16 * (period + 1)).
@@ -683,6 +729,27 @@ class VgmFile:
     k051649_dual: bool = False
     # K007232 header 0xE8 (VGM 1.71+); register bit 7 selects a second chip.
     k007232_dual: bool = False
+    # YMW258-F (MultiPCM) header 0x88 (VGM 1.61+).  Writes arrive on 0xB5 as
+    # (register, value); command 0xC3 selects a Sega ROM bank.  Bit 30 marks a
+    # second chip and the extra header (id 0x15) can give it another clock.
+    multipcm_clock: int = 0
+    multipcm_clock_2: int = 0
+    multipcm_dual: bool = False
+    # NEC uPD7759 header 0x8C (VGM 1.61+).  Register writes arrive on 0xB6
+    # (0 reset, 1 start, 2 port, 3 bank base).  Bit 30 marks a second chip and
+    # bit 31 selects slave mode, where the CPU streams command bytes through
+    # the port.  The ROM block is type 0x8A.
+    upd7759_clock: int = 0
+    upd7759_clock_2: int = 0
+    upd7759_dual: bool = False
+    upd7759_slave: bool = False
+    # Sega 32X PWM header 0x70 (VGM 1.51+).  The PCM data is a type-0x03
+    # streamed bank; 0x90-0x95 feed 12-bit left/right values to the chip.
+    pwm_clock: int = 0
+    pwm_clock_2: int = 0
+    pwm_dual: bool = False
+    pwm_bank: bytearray = field(default_factory=bytearray)
+    pwm_blocks: list[bytes] = field(default_factory=list)
     # Extra-header clocks, raw (bit 31 kept). Keyed by libvgm chip id.
     extra_clocks: dict[int, int] = field(default_factory=dict)
     # Extra-header volume mix: chip id -> (flags, raw value, 0x100 = 1.0).
@@ -882,7 +949,7 @@ def chips_in_head(buf: bytes) -> set[str]:
 
     Names match the converter's chips: ym2151, ym2610, msm6295, segapcm, c140,
     c352, k053260, ay8910, k051649 (plus "scc_plus" for the K052539 variant),
-    k007232, ymz280b and vsu (plus "vsu_dual").
+    k007232, ymz280b, vsu (plus "vsu_dual") and pokey (plus "pokey_dual").
     C219 is the C140-family part the converter does not support. It is reported
     apart from c140, and those packs should not be batch-converted. C352 is
     its own chip (32 voices); it is not folded into c140 or c219.
@@ -977,6 +1044,26 @@ def chips_in_head(buf: bytes) -> set[str]:
             kinds.add("ymz280b")
             if ymz_raw & YMZ280B_DUAL_BIT:
                 kinds.add("ymz280b_dual")
+    if version >= 0x151 and _field_in_header(buf, PWM_CLOCK_OFF, 4):
+        raw = _header_raw(buf, PWM_CLOCK_OFF)
+        if 100_000 <= (raw & 0x3FFFFFFF) <= 40_000_000:
+            kinds.add("pwm")
+            if raw & PWM_DUAL_BIT:
+                kinds.add("pwm_dual")
+    if version >= 0x161 and _field_in_header(buf, MULTIPCM_CLOCK_OFF, 4):
+        raw = _header_raw(buf, MULTIPCM_CLOCK_OFF)
+        if 100_000 <= (raw & 0x3FFFFFFF) <= 40_000_000:
+            kinds.add("multipcm")
+            if raw & MULTIPCM_DUAL_BIT:
+                kinds.add("multipcm_dual")
+    if version >= 0x161 and _field_in_header(buf, UPD7759_CLOCK_OFF, 4):
+        raw = _header_raw(buf, UPD7759_CLOCK_OFF)
+        if 100_000 <= (raw & 0x3FFFFFFF) <= 40_000_000:
+            kinds.add("upd7759")
+            if raw & UPD7759_DUAL_BIT:
+                kinds.add("upd7759_dual")
+            if raw & UPD7759_SLAVE_BIT:
+                kinds.add("upd7759_slave")
     if version >= 0x171 and _field_in_header(buf, VSU_CLOCK_OFF, 4):
         vsu_raw = _header_raw(buf, VSU_CLOCK_OFF)
         if 100_000 <= (vsu_raw & 0x3FFFFFFF) <= 40_000_000:
@@ -995,6 +1082,12 @@ def chips_in_head(buf: bytes) -> set[str]:
             kinds.add("ay8910")
             if raw & 0x40000000:
                 kinds.add("ay8910_dual")
+    if version >= 0x150 and _field_in_header(buf, POKEY_CLOCK_OFF, 4):
+        pokey_raw = _header_raw(buf, POKEY_CLOCK_OFF)
+        if 100_000 <= (pokey_raw & 0x3FFFFFFF) <= 40_000_000:
+            kinds.add("pokey")
+            if pokey_raw & POKEY_DUAL_BIT:
+                kinds.add("pokey_dual")
     # The OPL family joined the header in 1.51. A YM3812 field with bit 30 set
     # carries a second chip on command 0xAA. Bit 31 is the Sound Blaster Pro
     # hard-pan of that pair, and it is reported apart from the chip itself.
@@ -1114,6 +1207,63 @@ def _k007232_clock(buf: bytes, extra: dict[int, int], ym_clock: int, version: in
     if extra_clk >= 100_000:
         return extra_clk
     return ym_clock or 3579545
+
+
+def _decompress_data_block(typ: int, payload: bytes) -> bytes | None:
+    """Decode a compressed VGM data block (types 0x40-0x7E).
+
+    Only the n-Bit formats used by streamed PWM banks are implemented here.
+    Returns None when the compression type or sub-type is unsupported.
+    """
+    if not (0x40 <= typ <= 0x7E) or len(payload) < 10:
+        return None
+    comp = payload[0]
+    size = int.from_bytes(payload[1:5], "little")
+    if comp != 0x00:  # 0 = n-Bit; DPCM (1) needs the table bank
+        return None
+    bd = payload[5]
+    bc = payload[6]
+    sub = payload[7]
+    add = int.from_bytes(payload[8:10], "little")
+    if bd <= 0 or bc <= 0 or bd > 16 or bc > 16:
+        return None
+    src = payload[10:]
+    count = size // 2
+    out = bytearray(count * 2)
+    bitpos = 0
+    total_bits = len(src) * 8
+    mask = (1 << bc) - 1
+    for i in range(count):
+        if bitpos + bc > total_bits:
+            break
+        # libvgm's READ_BITS assembles a value from chunks of up to 8 bits,
+        # placing the first chunk in the low byte.  This is not a plain
+        # MSB-first integer read.
+        raw = 0
+        for _ in range(bc):
+            byte = src[bitpos >> 3]
+            bit = 7 - (bitpos & 7)
+            raw = (raw << 1) | ((byte >> bit) & 1)
+            bitpos += 1
+        if bc <= 8:
+            value = raw
+        else:
+            rem = bc - 8
+            chunk0 = raw >> rem
+            chunk1 = raw & ((1 << rem) - 1)
+            value = chunk0 | (chunk1 << 8)
+        if sub == 0:
+            value &= mask
+        elif sub == 1:
+            value = (value & mask) << (bd - bc)
+        elif sub == 2:
+            return None  # table-compressed values need data block 0x7F
+        else:
+            return None
+        value = (value + add) & ((1 << bd) - 1)
+        out[i * 2] = value & 0xFF
+        out[i * 2 + 1] = (value >> 8) & 0xFF
+    return bytes(out)
 
 
 def load_vgm(path: Path | str) -> VgmFile:
@@ -1307,6 +1457,14 @@ def load_vgm(path: Path | str) -> VgmFile:
         buf[AY8910_FLAGS_OFF]
         if ver >= 0x151 and _field_in_header(buf, AY8910_FLAGS_OFF, 1) else 0
     )
+    pokey_raw = _header_raw(buf, POKEY_CLOCK_OFF) if ver >= 0x150 else 0
+    pokey_clock = _sane_clock(pokey_raw)
+    pokey_dual = bool(pokey_raw & POKEY_DUAL_BIT)
+    if not pokey_clock:
+        pokey_clock = _sane_clock(clocks.get(EXTRA_POKEY, 0))
+    # The second instance normally shares the clock; the extra header can give
+    # it a separate one.
+    pokey_clock_2 = _sane_clock(clocks.get(EXTRA_POKEY, 0)) if pokey_dual else 0
     k051_clock = 0
     k051_plus = False
     k051649_dual = False
@@ -1319,6 +1477,44 @@ def load_vgm(path: Path | str) -> VgmFile:
         k051_clock = _sane_clock(clocks.get(EXTRA_K051649, 0))
     k007232_header = _header_raw(buf, K007232_EXTRA_CLOCK_OFF) if ver >= 0x171 else 0
     k007232_dual = bool(k007232_header & 0x40000000)
+
+    # MultiPCM clock 0x88 (VGM 1.61+).  Bit 30 is a second instance; the
+    # extra-header clock list can carry its clock.  The VGM field is based on
+    # the old /180 divider, so the writer stores the raw value and the
+    # collector applies the players' *224/180 conversion.
+    multipcm_raw = (
+        _header_raw(buf, MULTIPCM_CLOCK_OFF) if ver >= 0x161 else 0
+    )
+    multipcm_dual = bool(multipcm_raw & MULTIPCM_DUAL_BIT)
+    multipcm_clock = _sane_clock(multipcm_raw)
+    if not multipcm_clock:
+        multipcm_clock = _sane_clock(clocks.get(EXTRA_MULTIPCM, 0))
+    multipcm_clock_2 = 0
+    if multipcm_dual:
+        multipcm_clock_2 = _sane_clock(clocks.get(EXTRA_MULTIPCM, 0))
+    # uPD7759 clock 0x8C (VGM 1.61+).  Bit 30 is a second instance and bit 31
+    # is slave mode, so read the raw field before masking the clock.
+    upd_raw = _header_raw(buf, UPD7759_CLOCK_OFF) if ver >= 0x161 else 0
+    upd7759_dual = bool(upd_raw & UPD7759_DUAL_BIT)
+    # The slave flag lives on the first instance's field; the extra-header
+    # clock can carry it too, so accept either.
+    upd7759_slave = bool(upd_raw & UPD7759_SLAVE_BIT)
+    upd7759_clock = _sane_clock(upd_raw)
+    if not upd7759_clock:
+        upd7759_clock = _sane_clock(clocks.get(EXTRA_UPD7759, 0))
+    upd7759_clock_2 = 0
+    if upd7759_dual:
+        upd7759_clock_2 = _sane_clock(clocks.get(EXTRA_UPD7759, 0))
+        if clocks.get(EXTRA_UPD7759, 0) & UPD7759_SLAVE_BIT:
+            upd7759_slave = True
+    # Sega 32X PWM clock 0x70 (VGM 1.51+).  Bit 30 is not in the spec's dual
+    # list, but accept it when a writer sets it.
+    pwm_raw = _header_raw(buf, PWM_CLOCK_OFF) if ver >= 0x151 else 0
+    pwm_dual = bool(pwm_raw & PWM_DUAL_BIT)
+    pwm_clock = _sane_clock(pwm_raw)
+    if not pwm_clock:
+        pwm_clock = _sane_clock(clocks.get(STREAM_PWM, 0))
+    pwm_clock_2 = _sane_clock(clocks.get(STREAM_PWM, 0)) if pwm_dual else 0
 
     main_volume = 0.0
     # Bytes past the declared command offset are not header fields. Synthetic
@@ -1408,10 +1604,23 @@ def load_vgm(path: Path | str) -> VgmFile:
         ay8910_type=ay_type,
         ay8910_flags=ay_flags,
         ay8910_dual=ay8910_dual,
+        pokey_clock=pokey_clock,
+        pokey_clock_2=pokey_clock_2,
+        pokey_dual=pokey_dual,
         k051649_clock=k051_clock,
         k051649_plus=k051_plus,
         k051649_dual=k051649_dual,
         k007232_dual=k007232_dual,
+        multipcm_clock=multipcm_clock,
+        multipcm_clock_2=multipcm_clock_2,
+        multipcm_dual=multipcm_dual,
+        upd7759_clock=upd7759_clock,
+        upd7759_clock_2=upd7759_clock_2,
+        upd7759_dual=upd7759_dual,
+        upd7759_slave=upd7759_slave,
+        pwm_clock=pwm_clock,
+        pwm_clock_2=pwm_clock_2,
+        pwm_dual=pwm_dual,
         extra_clocks=clocks,
         extra_volumes=volumes,
     )
@@ -1439,6 +1648,7 @@ def load_vgm(path: Path | str) -> VgmFile:
     stray_c140_second = False
     stray_k053260_second = False
     stray_ay_second = False
+    stray_pokey_second = False
     stray_scc_second = False
     stray_saa_second = False
     stray_ymz_second = False
@@ -1488,7 +1698,12 @@ def load_vgm(path: Path | str) -> VgmFile:
             elif typ == NES_DPCM_BANK_TYPE:
                 # NES DPCM database. 0x68 commands copy windows of this flat
                 # bank into the $C000/$D000 sample RAM as the driver switches
-                # banks, so keep the concatenation in file order.
+                # banks, so keep the concatenation in file order.  A dual-APU
+                # log ships one database per chip and each instance's 0x68
+                # source address is relative to its own first block.
+                vgm.nes_dpcm_bank_base.setdefault(
+                    chip_id, len(vgm.nes_dpcm_bank),
+                )
                 vgm.nes_dpcm_bank.extend(payload)
             elif typ == 0x04:
                 # OKIM6258 ADPCM bank. 0x95 block ids index these in order.
@@ -1501,6 +1716,23 @@ def load_vgm(path: Path | str) -> VgmFile:
                 vgm.huc6280_pcm_blocks.append(bytes(payload))
             elif typ == 0x44:
                 saw_adpcm_compressed = True
+            elif typ == PWM_DATA_TYPE or (
+                0x40 <= typ <= 0x7E and (typ & 0x3F) == PWM_DATA_TYPE
+            ):
+                # PWM PCM data bank.  The pack stream can be n-Bit compressed
+                # (type 0x43); 0x90-0x95 then feed 12-bit left/right samples.
+                data = (
+                    bytes(payload) if typ < 0x40
+                    else _decompress_data_block(typ, payload)
+                )
+                if data is None:
+                    vgm.warnings.append(
+                        f"PWM data block type {typ:#04x}: unsupported "
+                        "compression; stream will be silent"
+                    )
+                else:
+                    vgm.pwm_bank.extend(data)
+                    vgm.pwm_blocks.append(data)
             elif typ in (RF5C68_RAM_TYPE, RF5C164_RAM_TYPE, NES_DPCM_RAM_TYPE):
                 # C0-DF RAM writes: a 16-bit start offset then the bytes. The
                 # two RF5C chips share one register file but each has its own
@@ -1519,6 +1751,8 @@ def load_vgm(path: Path | str) -> VgmFile:
                 kind = {
                     K007232_ROM_TYPE: "k007232",
                     OKI_ROM_TYPE: "msm6295",
+                    MULTIPCM_ROM_TYPE: "multipcm",
+                    UPD7759_ROM_TYPE: "upd7759",
                     SEGAPCM_ROM_TYPE: "segapcm",
                     C140_ROM_TYPE: "c140",
                     C352_ROM_TYPE: "c352",
@@ -1598,8 +1832,8 @@ def load_vgm(path: Path | str) -> VgmFile:
                 )
                 vgm.msm6258_plays.append(play)
                 active_adpcm[stream] = play
-            elif st is not None and st["type"] == STREAM_C6280:
-                # 0x95 on a HuC6280 stream plays one whole type-0x05 block.
+            elif st is not None and st["type"] in (STREAM_C6280, STREAM_PWM):
+                # 0x95 plays one whole data block for the chip's data bank.
                 prev = active_stream.pop(stream, None)
                 if prev is not None:
                     prev.stop_sample = sample
@@ -1852,6 +2086,38 @@ def load_vgm(path: Path | str) -> VgmFile:
             ))
             pos += 4
             continue
+        if cmd == 0xB2 and pos + 3 <= n:
+            # PWM: ad dd, where a is the 4-bit register, d the value MSB and dd
+            # the LSB.  Bit 7 of the first byte selects a second chip.
+            first = buf[pos + 1]
+            value = ((first & 0x0F) << 8) | buf[pos + 2]
+            vgm.writes.append(ChipWrite(
+                sample, "pwm", (first >> 7) & 1, (first >> 4) & 0x07, value,
+            ))
+            pos += 3
+            continue
+        if cmd in (0xB5, 0xB6) and pos + 3 <= n:
+            # MultiPCM (0xB5) and uPD7759 (0xB6) register writes.  Bit 7 of
+            # the register byte selects the second instance.
+            name = "multipcm" if cmd == 0xB5 else "upd7759"
+            reg = buf[pos + 1]
+            cid = (reg >> 7) & 1
+            vgm.writes.append(ChipWrite(
+                sample, name, cid, reg & 0x7F, buf[pos + 2],
+            ))
+            pos += 3
+            continue
+        if cmd == 0xC3 and pos + 4 <= n:
+            # MultiPCM ROM bank: cc carries the second-chip bit and the bank
+            # mask, bb the bank number, the last byte is unused.  Keeping this
+            # in `writes` preserves its position relative to register writes.
+            cc = buf[pos + 1]
+            cid = (cc >> 7) & 1
+            vgm.writes.append(ChipWrite(
+                sample, "multipcm_bank", cid, cc & 0x03, buf[pos + 2],
+            ))
+            pos += 4
+            continue
         if cmd == CMD_VSU and pos + 4 <= n:
             # 0xC7 mmll dd: 16-bit big-endian register *word* index.  Bit 15
             # marks the second chip.  Wave RAM, the mod table and the channel
@@ -1975,6 +2241,18 @@ def load_vgm(path: Path | str) -> VgmFile:
             if cid:
                 stray_k007232_second = True
             vgm.writes.append(ChipWrite(sample, "k007232", cid, aa & 0x7F, buf[pos + 2]))
+            pos += 3
+            continue
+        if cmd == CMD_POKEY and pos + 3 <= n:
+            # 0xBB: register, then data. Bit 7 of the register selects the
+            # second chip (Dual Chip Support #2); the register is 4 bits.
+            rr = buf[pos + 1]
+            cid = (rr >> 7) & 1
+            if cid and not pokey_dual:
+                stray_pokey_second = True
+            vgm.writes.append(ChipWrite(
+                sample, "pokey", cid, rr & 0x0F, buf[pos + 2],
+            ))
             pos += 3
             continue
         if cmd == CMD_AY8910 and pos + 3 <= n:
@@ -2346,7 +2624,8 @@ def load_vgm(path: Path | str) -> VgmFile:
             "converted as source PCM"
         )
     if (
-        any(p.chip_type != STREAM_C6280 for p in vgm.dac_stream_plays)
+        any(p.chip_type == DAC_STREAM_YM2612
+            for p in vgm.dac_stream_plays)
         and not vgm.dac_data
     ):
         vgm.warnings.append(
@@ -2422,6 +2701,16 @@ def load_vgm(path: Path | str) -> VgmFile:
             "0xA0 AY-8910 register bit 7 selects a second chip without the "
             "dual-instance header bit; it was still treated as chip 1"
         )
+    if stray_pokey_second:
+        vgm.warnings.append(
+            "0xBB POKEY register bit 7 selects a second chip without the "
+            "dual-instance header bit; it was still treated as chip 1"
+        )
+    if any(w.chip == "pokey" for w in vgm.writes) and not vgm.pokey_clock:
+        vgm.warnings.append(
+            "POKEY writes without a header clock; using 1789772 Hz"
+        )
+        vgm.pokey_clock = POKEY_DEFAULT_CLOCK
     if stray_scc_second:
         vgm.warnings.append(
             "0xD2 K051649 port bit 7 selects a second chip without the "
@@ -2471,15 +2760,22 @@ def load_vgm(path: Path | str) -> VgmFile:
     return vgm
 
 
-def assemble_rom(vgm: VgmFile, kind: str, chip_id: int = 0) -> bytes:
-    """Stitch every ROM slice of a kind into one buffer."""
+def assemble_rom(
+    vgm: VgmFile, kind: str, chip_id: int = 0, fill: int = 0,
+) -> bytes:
+    """Stitch every ROM slice of a kind into one buffer.
+
+    `fill` is the erased byte outside the logged slices.  The uPD7759's
+    hardware ROM reads 0xFF there, so its phrase decoder sees the same bytes
+    a real chip would.
+    """
     slices = [s for s in vgm.roms if s.chip == chip_id and s.kind == kind]
     if not slices:
         return b""
     rom_size = max(s.rom_size for s in slices) or 0
     end = max((s.start + len(s.data)) for s in slices)
     size = max(rom_size, end)
-    rom = bytearray(size)
+    rom = bytearray([fill & 0xFF]) * size if fill else bytearray(size)
     for s in slices:
         rom[s.start:s.start + len(s.data)] = s.data
     return bytes(rom)

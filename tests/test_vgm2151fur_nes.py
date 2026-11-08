@@ -32,7 +32,9 @@ def _vgm(writes, roms=(), **kw):
 
 
 def _raw_vgm(cmds: bytes, rom_blocks=(), nes_clock: int = 1789773,
-             ym2413: int = 0) -> bytes:
+             ym2413: int = 0, extra_blocks: bytes = b"") -> bytes:
+    """A loadable VGM. `extra_blocks` is pre-built inline-data command bytes,
+    which is how a test supplies a database whose length carries a chip bit."""
     buf = bytearray(0xC0)
     buf[0:4] = b"Vgm "
     buf[8:12] = (0x161).to_bytes(4, "little")
@@ -41,7 +43,7 @@ def _raw_vgm(cmds: bytes, rom_blocks=(), nes_clock: int = 1789773,
     buf[0x34:0x38] = (0xC0 - 0x34).to_bytes(4, "little")
     # The NES clock lives at 0x84; 0x80 is the Game Boy DMG clock.
     buf[0x84:0x88] = (nes_clock & 0xFFFFFFFF).to_bytes(4, "little")
-    body = bytearray()
+    body = bytearray(extra_blocks)
     for typ, start, data in rom_blocks:
         # Database blocks (< 0x40) carry no start address; ROM/RAM dumps do.
         payload = data if typ < 0x40 else (
@@ -240,11 +242,153 @@ class TestNesTones(unittest.TestCase):
             _nes(1000, 0x02, 0x00), _nes(1000, 0x03, 0x01),
         ]
         writes = base + [
-            _nes(5000, 0x02, 0x00), _nes(5000, 0x03, 0x00),  # octave up
+            _nes(5000, 0x02, 0x08), _nes(5000, 0x03, 0x00),  # octave up
         ]
         hits, _offs, _warn = collect_nes_tones(_vgm(writes))
         self.assertEqual(len(hits), 2)
         self.assertGreater(hits[0].period, hits[1].period)
+
+    def test_parking_a_voice_below_the_audible_floor_is_silence(self):
+        # The console's output filter drops anything above ~16 kHz.  A driver
+        # that parks an unused voice at timer 0 is not playing the top note of
+        # Furnace's range, so the write ends the note instead of starting one.
+        writes = [
+            _nes(1000, 0x15, 0x0F), _nes(1000, 0x00, 0xBF),
+            _nes(1000, 0x02, 0x00), _nes(1000, 0x03, 0x01),
+            _nes(5000, 0x02, 0x00), _nes(5000, 0x03, 0x00),
+        ]
+        hits, offs, _warn = collect_nes_tones(_vgm(writes))
+        self.assertEqual([(h.voice, h.period) for h in hits], [(0, 0x100)])
+        self.assertEqual([o.sample_time for o in offs], [5000])
+
+    def test_zero_length_load_is_a_noise_hit(self):
+        # ``$400F = 0`` loads the table's index 0, which is 10 half-frames: a
+        # driver that marks each drum with that write gets an 83 ms burst, not
+        # silence.  The reference player gates the same way.
+        writes = [
+            _nes(1000, 0x0C, 0x0F), _nes(1000, 0x0E, 0x00),
+            _nes(1000, 0x0F, 0x00),
+        ]
+        hits, offs, _warn = collect_nes_tones(_vgm(writes, nes_clock=1789773))
+        self.assertEqual([(h.voice, h.period) for h in hits], [(3, 0)])
+        self.assertEqual([o.sample_time for o in offs], [1000 + 3675])
+
+    def test_noise_hits_retrigger_after_the_gate_ran_out(self):
+        # Each hit is marked by a ``$400F`` write; the previous 83 ms gate has
+        # already ended, so the write starts a new one.
+        writes = [
+            _nes(1000, 0x0C, 0x0F), _nes(1000, 0x0E, 0x00),
+            _nes(1000, 0x0F, 0x00),
+            _nes(21000, 0x0E, 0x00), _nes(21000, 0x0F, 0x00),
+        ]
+        hits, offs, _warn = collect_nes_tones(_vgm(writes, nes_clock=1789773))
+        self.assertEqual([h.sample_time for h in hits], [1000, 21000])
+        self.assertEqual([o.sample_time for o in offs], [4675, 24675])
+
+    def test_noise_length_reload_every_frame_stays_one_note(self):
+        # A driver that holds the noise alive by rewriting the length register
+        # must not become one note per frame: the gate never runs out.  It ends
+        # one gate after the last rewrite.
+        writes = [_nes(1000, 0x0C, 0x0F), _nes(1000, 0x0E, 0x00)]
+        for i in range(20):
+            writes.append(_nes(1000 + i * 1000, 0x0F, 0xF8))
+        hits, offs, _warn = collect_nes_tones(_vgm(writes, nes_clock=1789773))
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0].sample_time, 1000)
+        # Index 31 is 32 half-frames, so the last reload at 20000 ends at 31760.
+        self.assertEqual([o.sample_time for o in offs], [31760])
+
+    def test_envelope_mode_becomes_a_constant_peak_with_a_decay(self):
+        # Furnace's NES envelope runs once and a later note-on does not restart
+        # it, so a channel whose driver writes $4000 once would fall silent
+        # after the first decay.  Keep the peak as a constant level and carry
+        # the decay on the volume column at the hardware rate.
+        writes = [
+            _nes(1000, 0x00, 0x8F), _nes(1000, 0x02, 0xCA),
+            _nes(1000, 0x03, 0xC0),
+        ]
+        song = analyze(_vgm(writes, nes_clock=1789773))
+        ev = [e for e in song.events if e.on and e.tone_chip == 4][0]
+        self.assertEqual(ev.vol, 15)          # the envelope's peak, not its period
+        levels = [v for _t, v, _p in ev.vol_pts]
+        self.assertGreater(len(levels), 10)
+        self.assertEqual(levels[0], 15)
+        self.assertEqual(levels[-1], 1)
+        self.assertEqual(levels, sorted(levels, reverse=True))
+        # Period 15: one step per 16 quarter frames (240 Hz), so ~1 s in all.
+        self.assertAlmostEqual(
+            ev.vol_pts[-1][0] - ev.sample, 14 * 16 * (44100 / 240.0),
+            delta=3,
+        )
+        mod = parse_fur(write_fur(song, include_pcm=True))
+        fx = [tuple(f) for (_c, _i), rows in mod.patterns.items()
+              for r in rows for f in r.fx]
+        self.assertIn((0x15, 0x03), fx)      # constant volume + length halt
+        vols = [r.vol for (_c, _i), rows in mod.patterns.items()
+                for r in rows if r.vol >= 0]
+        self.assertIn(15, vols)
+        self.assertTrue(any(v < 15 for v in vols))
+
+    def test_triangle_notes_end_at_the_linear_counter(self):
+        # The triangle is gated by its linear counter ((value/240) s), which the
+        # reference player honours: a note the driver does not retrigger in time
+        # ends there instead of ringing on.  $4008 = 0x2F is 47 quarter frames,
+        # 8,636 samples.
+        writes = [
+            _nes(1000, 0x08, 0x2F),
+            _nes(1000, 0x0A, 0xFD), _nes(1000, 0x0B, 0xC1),
+            _nes(22050, 0x0A, 0xA7), _nes(22050, 0x0B, 0xC1),
+        ]
+        hits, offs, _warn = collect_nes_tones(_vgm(writes, nes_clock=1789773))
+        self.assertEqual([h.sample_time for h in hits], [1000, 22050])
+        self.assertEqual(hits[0].off_sample, 1000 + 8636)
+        self.assertEqual(hits[1].off_sample, 22050 + 8636)
+        self.assertEqual(
+            [o.sample_time for o in offs], [1000 + 8636, 22050 + 8636],
+        )
+
+    def test_low_byte_first_does_not_split_a_parked_voice(self):
+        # 270 -> 0 is written as low 0x00 then high 0xC0.  Reading the low write
+        # alone turns 270 into 256, and a "held step" split closed the note
+        # without the note-off the parked write should give (Santa Claus' second
+        # APU: its pulses lost exactly the offs the first chip had).
+        writes = [
+            _nes(1000, 0x00, 0xBF),
+            _nes(1000, 0x02, 0x0E), _nes(1000, 0x03, 0xC1),
+            _nes(20000, 0x02, 0x00), _nes(20000, 0x03, 0xC0),
+        ]
+        hits, offs, _warn = collect_nes_tones(_vgm(writes, nes_clock=1789773))
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0].period, 0x10E)
+        self.assertEqual([o.sample_time for o in offs], [20000])
+
+    def test_module_halts_a_constant_volume_note(self):
+        # Furnace reloads the length counter on note-on, so an un-halted note
+        # dies after a fraction of a second.  A constant-volume voice can take
+        # the halt bit without side effects, so the note lasts until the
+        # driver's next write.
+        writes = [
+            _nes(1000, 0x15, 0x0F), _nes(1000, 0x00, 0xBF),
+            _nes(1000, 0x02, 0x00), _nes(1000, 0x03, 0x01),
+        ]
+        song = analyze(_vgm(writes, nes_clock=1789773))
+        mod = parse_fur(write_fur(song, include_pcm=True))
+        fx = [tuple(f) for (_ch, _i), rows in mod.patterns.items()
+              for r in rows for f in r.fx]
+        self.assertIn((0x15, 0x03), fx)
+
+    def test_module_holds_the_triangle_linear_counter(self):
+        # Without the control bit the linear counter runs out after
+        # (value/240) s and the note stops between the driver's writes.
+        writes = [
+            _nes(1000, 0x08, 0x3C),
+            _nes(1000, 0x0A, 0x5D), _nes(1000, 0x0B, 0xC2),
+        ]
+        song = analyze(_vgm(writes, nes_clock=1789773))
+        mod = parse_fur(write_fur(song, include_pcm=True))
+        fx = [tuple(f) for (_ch, _i), rows in mod.patterns.items()
+              for r in rows for f in r.fx]
+        self.assertIn((0x19, 0xBC), fx)
 
     def test_high_byte_before_low_completes_the_pitch(self):
         # Gimmick! writes $400B (timer high) before $400A (timer low).  The
@@ -614,6 +758,160 @@ class TestNesModule(unittest.TestCase):
         mod = parse_fur(data)
         self.assertEqual(mod.chips, [CHIP_VRC7])
         self.assertEqual(mod.n_ch, 6)
+
+
+class TestDualApu(unittest.TestCase):
+    """Two 2A03s on one ``0xB4`` stream (header bit 30, register bit 7).
+
+    A Famicom cart with a second APU writes the same ``$4000-$4017`` numbers
+    twice per frame, once per chip.  One shared register file makes the pair
+    fight: ``$4015`` from chip 2 closes chip 1's gates and a period write moves
+    the wrong voice.
+    """
+
+    def _writes(self):
+        return [
+            # APU 1's pulse 1, held from 1000 to 7000.
+            _nes(1000, 0x02, 0x40), _nes(1000, 0x03, 0x89),
+            _nes(1000, 0x00, 0xB9),
+            # APU 2's pulse 1 at another pitch, opened while APU 1 sounds.
+            _nes(2000, 0x02, 0x20, chip_id=1), _nes(2000, 0x03, 0xC4, chip_id=1),
+            _nes(2000, 0x00, 0xF5, chip_id=1),
+            # APU 2 mutes its own pulse; APU 1 has to keep sounding.
+            _nes(5000, 0x15, 0xFE, chip_id=1),
+            _nes(7000, 0x15, 0xFE),
+        ]
+
+    def test_the_two_apus_keep_separate_gates(self):
+        hits, offs, _warn = collect_nes_tones(
+            _vgm(self._writes(), nes_clock=1789773),
+        )
+        self.assertEqual(
+            [(h.chip_id, h.voice, h.off_sample) for h in hits],
+            [(0, 0, 7000), (1, 0, 5000)],
+        )
+        self.assertEqual(sorted({o.chip_id for o in offs}), [0, 1])
+
+    def test_module_gets_two_nes_chips_and_ten_columns(self):
+        song = analyze(_vgm(self._writes(), nes_clock=1789773))
+        self.assertEqual(song.nes_ids, [0, 1])
+        data = write_fur(song, include_pcm=True)
+        mod = parse_fur(data)
+        self.assertEqual(mod.chips, [CHIP_NES, CHIP_NES])
+        self.assertEqual(mod.n_ch, 10)
+        notes: dict[int, int] = {}
+        for (ch, _idx), rows in mod.patterns.items():
+            notes[ch] = notes.get(ch, 0) + sum(
+                1 for r in rows if 0 <= r.note < 180
+            )
+        # Each pulse lands on its own chip's first column.
+        self.assertEqual(notes.get(0), 1)
+        self.assertEqual(notes.get(5), 1)
+
+    def test_dual_header_keeps_apu_that_never_plays(self):
+        writes = self._writes()[:3] + [_nes(1500, 0x15, 0x00, chip_id=1)]
+        song = analyze(_vgm(writes, nes_clock=1789773, nes_dual=True))
+        self.assertEqual(song.nes_ids, [0, 1])
+        self.assertTrue(song.nes_present)
+        mod = parse_fur(write_fur(song, include_pcm=True))
+        self.assertEqual(mod.chips, [CHIP_NES, CHIP_NES])
+        self.assertEqual(mod.n_ch, 10)
+
+    def test_dpcm_ram_is_read_per_apu(self):
+        # Both APUs hold the same address with different data: each 2A03 has its
+        # own $C000 window, and clearing one chip's $4015 must not cut the
+        # other's sample.
+        roms = [
+            RomSlice(0, 0x40, 0xC000, b"\xAA" * 0x40, "nes_dpcm"),
+            RomSlice(1, 0x40, 0xC000, b"\x55" * 0x40, "nes_dpcm"),
+        ]
+        writes = [
+            _nes(1000, 0x10, 0x0E), _nes(1000, 0x12, 0x00),
+            _nes(1000, 0x13, 0x00), _nes(1000, 0x15, 0x1F),
+            _nes(2000, 0x10, 0x0E, chip_id=1), _nes(2000, 0x12, 0x00, chip_id=1),
+            _nes(2000, 0x13, 0x00, chip_id=1), _nes(2000, 0x15, 0x1F, chip_id=1),
+            _nes(3000, 0x15, 0x0F),
+        ]
+        samples, hits, warn = collect_nes_dpcm(_vgm(writes, roms))
+        self.assertEqual([s.data for s in samples], [b"\xAA", b"\x55"])
+        self.assertEqual(
+            [(s.chip_id, s.start) for s in samples],
+            [(0, 0xC000), (1, 0xC000)],
+        )
+        self.assertEqual([(h.chip_id, h.end_time) for h in hits],
+                         [(0, 3000), (1, 0)])
+        self.assertEqual(warn, [])
+
+        # Both DMC voices reach the module: one column and one instrument each.
+        song = analyze(_vgm(writes, roms, nes_clock=1789773))
+        self.assertEqual(song.nes_ids, [0, 1])
+        mod = parse_fur(write_fur(song, include_pcm=True))
+        drum: dict[int, list[tuple[int, int]]] = {}
+        for (ch, _idx), rows in mod.patterns.items():
+            got = [(r.note, r.ins) for r in rows if 0 <= r.note < 180]
+            if got:
+                drum[ch] = got
+        self.assertEqual(sorted(drum), [4, 9])
+        self.assertNotEqual(drum[4][0][1], drum[9][0][1])
+        self.assertEqual(
+            {mod.samples[i].data[:1] for i in range(len(mod.samples))},
+            {b"\xAA", b"\x55"},
+        )
+
+    def test_dpcm_bank_offsets_are_per_apu(self):
+        # Two type-0x07 databases (bit 31 of the block length names the chip)
+        # and one 0x68 copy each from offset zero. Without a per-chip base the
+        # second APU reads the first cart's samples.
+        def block(chip: int, data: bytes) -> bytes:
+            size = len(data) | ((chip & 1) << 31)
+            return (
+                bytes([0x67, 0x66, 0x07]) + size.to_bytes(4, "little") + data
+            )
+
+        def copy(chip: int) -> bytes:
+            return bytes([
+                0x68, 0x00, 0x07 | ((chip & 1) << 7),
+                0x00, 0x00, 0x00,              # src 0 of this chip's database
+                0x00, 0xC0, 0x00,              # dest $C000
+                0x01, 0x00, 0x00,              # one byte
+            ])
+
+        cmds = bytearray()
+        for chip in (0, 1):
+            cmds += copy(chip)
+            cmds += bytes([
+                0xB4, 0x10 | (chip << 7), 0x0E,
+                0xB4, 0x12 | (chip << 7), 0x00,
+                0xB4, 0x13 | (chip << 7), 0x00,
+                0xB4, 0x15 | (chip << 7), 0x1F,
+            ])
+        raw = _raw_vgm(
+            bytes(cmds), [], nes_clock=1789773 | 0x40000000,
+            extra_blocks=(block(0, b"\xAA" * 4) + block(1, b"\x55" * 4)),
+        )
+        p = TMP / "dual_dpcm_bank.vgm"
+        p.write_bytes(raw)
+        v = load_vgm(p)
+        self.assertTrue(v.nes_dual)
+        self.assertEqual(v.nes_dpcm_bank_base, {0: 0, 1: 4})
+        samples, hits, warn = collect_nes_dpcm(v)
+        self.assertEqual([s.data for s in samples], [b"\xAA", b"\x55"])
+        self.assertEqual([h.chip_id for h in hits], [0, 1])
+        self.assertEqual(warn, [])
+
+    def test_interleaved_4011_streams_stay_one_per_apu(self):
+        # Chip 1 holds one DAC level, chip 2 another. A single burst detection
+        # over the interleaved writes yields one body with both levels in it.
+        writes = []
+        for i in range(400):
+            writes.append(_nes(100 + i * 8, 0x11, 0x10))
+            writes.append(_nes(104 + i * 8, 0x11, 0x60, chip_id=1))
+        samples, hits, _warn = collect_nes_pcm(_vgm(writes, nes_clock=1789773))
+        self.assertEqual(sorted({h.chip_id for h in hits}), [0, 1])
+        self.assertEqual(len(samples), len(hits))
+        for smp in samples:
+            held = ((smp.chip_id * 0x50 + 0x10) << 1) - 0x80
+            self.assertEqual(set(smp.data), {held & 0xFF})
 
 
 class TestNesPcmBanking(unittest.TestCase):
