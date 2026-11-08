@@ -105,6 +105,28 @@ the real rips are available. Open:
   condense factors. Moving them into the instrument's volume macro is the next
   step (`docs/psg-open-items.md`).
 
+## Atari POKEY
+
+POKEY is in the tree: four voices per chip, dual-chip logs, per-frame AUDC
+volume and waveform instrument macros, AUDCTL macros and `11xx` effects, joined
+16-bit pairs, high-clock/15 kHz/filter modes, silent filter-control notes,
+exact-register pitch inversion and PAL/custom clocks. The seven-rip pack
+(including `porkyspokeys`) covers the common driver shapes, and the modules keep
+the source's unity mix.
+
+Remaining:
+
+- **Volume-only mode.** `AUDC` bit 4 is a DC/DAC level Furnace cannot reproduce;
+  the converter warns and does not emit it.
+- **Two-tone mode.** `SKCTL` bit 7 exists only on the ASAP core; the converter
+  reports it instead of converting it.
+- **Distortion 7.** Furnace's wave map has only the distortion-6 poly4 tap, so
+  source distortion 7 plays as 6 and warns.
+- **Filter-control corpus.** The silent note on the filter clock channel is
+  verified on `combat_vehicle`; broaden the check to other filter-heavy rips.
+- **Silent second chip.** A dual-chip log whose second POKEY never plays drops
+  that system; decide whether to keep it for layout parity.
+
 ## From the 2026-11 batch (PSG default, Ext columns, OPM key-on bits, OKI length)
 
 - **`02 Zero Cop [Opening]` (Batrider) differs in pitch on FM 4-6.** Four runs,
