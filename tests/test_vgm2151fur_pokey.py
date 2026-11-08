@@ -12,6 +12,7 @@ from vgm2151fur.pitch import module_clock, pitch_table
 from vgm2151fur.pokey import (
     POKEY_DEFAULT_CLOCK,
     POKEY_PITCH_MAX,
+    _furnace_wave,
     collect_pokey,
     furnace_written_register,
     pokey_note,
@@ -135,6 +136,25 @@ class TestPokeyCollector(unittest.TestCase):
         )
         self.assertEqual(audctl, [])
         self.assertEqual(waves[0], (0, 0, 0, 5))
+
+    def test_distortion_6_uses_long_poly4_wave(self):
+        # Distortion 6 must use Furnace wave 7: both write AUDC 6, but wave
+        # 6's short snap table cannot represent AUDF 51 (it skips 51/52),
+        # which changes the poly4 sampling phase.  The original modules use
+        # wave 7.
+        self.assertEqual(_furnace_wave(6), 7)
+        writes = [
+            _pokey(0, 8, 0x00),
+            _pokey(0, 2, 51), _pokey(0, 3, 0xCF),
+            _pokey(735 * 4, 3, 0x00),
+        ]
+        hits, _offs, _audctl, _waves, _warn = collect_pokey(_vgm(writes))
+        self.assertEqual(len(hits), 1)
+        hit = hits[0]
+        self.assertEqual(hit.wave, 7)
+        self.assertEqual(
+            furnace_written_register(hit.value, 0, 1, 7, False), 51,
+        )
 
     def test_volume_rise_retriggers(self):
         writes = [

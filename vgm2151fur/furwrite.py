@@ -1002,10 +1002,11 @@ def _write_ins_ay(b: Buf, name: str, ins=None) -> None:
 
 
 def _write_ins_pokey(b: Buf, name: str, ins=None) -> None:
-    """DIV_INS_POKEY: volume + pitch macros, no wave/AUDCTL macros.
+    """DIV_INS_POKEY: volume, AUDCTL, waveform and pitch macros.
 
-    AUDCTL (11xx) and waveform (10xx) are pattern effects, so the instrument
-    only needs the per-frame volume contour and the pitch trajectory.
+    The platform's duty macro is AUDCTL and its wave macro is the AUDC
+    distortion, so each note can carry its timbre as well as its volume and
+    pitch contour.  Pattern 10xx/11xx effects remain as a fallback.
     """
     size_off, start = b.begin_block(b"INS2")
     b.u16(FUR_VERSION)
@@ -1016,7 +1017,7 @@ def _write_ins_pokey(b: Buf, name: str, ins=None) -> None:
     na_start = len(b.b)
     b.strz(name)
     b.b[na_size:na_size + 2] = int(len(b.b) - na_start).to_bytes(2, "little")
-    _write_tone_macros(b, ins or ToneIns(), wave=False)
+    _write_tone_macros(b, ins or ToneIns(), wave=True)
     b.raw(b"EN")
     b.end_block(size_off, start)
 

@@ -2163,6 +2163,12 @@ def _bind_tone_instruments(
             wave_vals, wave_speed, wave_loop = _macro_series(
                 _tick_values(pts, e.sample, ticks, tick_samples),
             )
+            if e.tone_chip == 9 and not wave_vals:
+                # A constant distortion still belongs in the instrument: the
+                # note then carries its own waveform instead of depending on a
+                # 10xx row effect.
+                wave_vals, wave_speed, wave_loop = (
+                    max(0, e.tone_wave),), 1, 255
         column_vol = e.vol
         pce_peak = 0
         saa_peak = 0
@@ -2297,6 +2303,21 @@ def _bind_tone_instruments(
                     e.sample, ticks, tick_samples,
                 ),
             )
+        elif e.tone_chip == 9:
+            # POKEY: AUDCTL is the instrument's duty macro.  A constant value
+            # still gets a one-value macro, so the note re-asserts its clock
+            # and filter state on its own tick instead of relying on a row
+            # effect that may have been moved.
+            audctl_pts = [
+                (t, val) for t, cmd, val in e.tone_fx_pts
+                if cmd == POKEY_FX_AUDCTL
+            ]
+            noise, noise_speed, noise_loop = _macro_if_moving(
+                audctl_pts, e.sample, ticks, tick_samples,
+                merge_gap=_AY_MERGE_GAP,
+            )
+            if not noise and audctl_pts:
+                noise, noise_speed, noise_loop = (audctl_pts[0][1],), 1, 255
         elif e.tone_fx_pts:
             noise, noise_speed, noise_loop = _macro_if_moving(
                 [(t, val) for t, cmd, val in e.tone_fx_pts if cmd == FX_NOISE],
@@ -3455,6 +3476,12 @@ def _emit_pokey_notes(
     carries the per-frame volume contour and the pitch trajectory.
     """
     count = 0
+    wave_by_ch: dict[tuple[int, int], list[tuple[int, int]]] = {}
+    for sample, cid, voice, val in sorted(wave_pts, key=lambda p: p[0]):
+        wave_by_ch.setdefault((cid, voice), []).append((sample, val))
+    audctl_by_cid: dict[int, list[tuple[int, int]]] = {}
+    for sample, cid, val in sorted(audctl_pts, key=lambda p: p[0]):
+        audctl_by_cid.setdefault(cid, []).append((sample, val))
     for h in hits:
         base = at.get(h.chip_id)
         if base is None:
@@ -3462,6 +3489,8 @@ def _emit_pokey_notes(
         ch = base + h.voice
         st = h.sample_time
         gate_end = h.off_sample or (total_samples or st)
+        wpts = wave_by_ch.get((h.chip_id, h.voice), [])
+        apts = audctl_by_cid.get(h.chip_id, [])
         segs = segment_periods(
             [(st, h.value), *h.freq_pts],
             gate_end, h.clock, 1, 0,
@@ -3481,6 +3510,22 @@ def _emit_pokey_notes(
                 (t, v, None)
                 for t, v in h.vol_pts if sst < t < bound
             )
+            # AUDC's distortion and AUDCTL live in the POKEY instrument's
+            # wave and duty macros, so each note carries the timbre state at
+            # its own tick instead of depending only on a row effect.
+            wave_at = _value_at(wpts, sst, 5)
+            wave_steps = (
+                ((sst, wave_at),)
+                + tuple((t, w) for t, w in wpts if sst < t < bound)
+            )
+            audctl_at = _value_at(apts, sst, 0)
+            audctl_steps = (
+                ((sst, POKEY_FX_AUDCTL, audctl_at),)
+                + tuple(
+                    (t, POKEY_FX_AUDCTL, v)
+                    for t, v in apts if sst < t < bound
+                )
+            )
             events.append(NoteEvent(
                 sample=sst,
                 ch=ch,
@@ -3497,6 +3542,9 @@ def _emit_pokey_notes(
                 tone_clock=h.clock,
                 tone_div=1,
                 tone_period_offset=0,
+                tone_wave=wave_at,
+                tone_wave_pts=wave_steps,
+                tone_fx_pts=audctl_steps,
             ))
             count += 1
     for off in offs:

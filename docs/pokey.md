@@ -37,10 +37,16 @@ has bit 30 set.
   while the gate is open is a new hit (a drum roll).
 - **Volume envelope**: the `AUDC` volume steps become a Furnace volume macro,
   one step per driver tick. The pattern column carries the opening level.
-- **Waveform**: `AUDC` distortion becomes a `10xx` waveform effect (0-7).
-  A change while a voice sounds is a row effect at that sample.
-- **AUDCTL**: a `11xx` effect on the chip's first column. The source's
-  high-clock, 15 kHz, filter and join bits are passed through.
+- **Waveform**: `AUDC` distortion becomes a waveform macro on the instrument
+  (and a `10xx` effect at note starts/changes as a fallback). Distortion 6
+  uses Furnace waveform 7: both write AUDC distortion 6, but wave 7's long
+  poly4 snap table can represent the source dividers, while wave 6's short
+  table skips many of them (51/52 among them) and changes the poly4 sampling
+  phase, which is audible as a different bass timbre. The original Furnace
+  modules use wave 7 for the same reason.
+- **AUDCTL**: the instrument's duty macro carries the AUDCTL value at each
+  note tick, so high-clock, filter and join state belong to the note; an
+  `11xx` row effect still carries the chip-wide changes.
 - **Joined pairs**: one voice on the low column. `AUDF_low` is the low byte,
   `AUDF_high` the high byte, and the high channel's `AUDC` supplies volume and
   waveform. This is how VGMPlay and Furnace both read the joined register, so
@@ -58,7 +64,7 @@ has bit 30 set.
 
 - **Volume-only mode** (`AUDC` bit 4) outputs a DC level, not a tone; drivers
   use it for DAC playback. Furnace's POKEY effects have no equivalent. The
-  converter counts those writes and warns; the six test rips do not use it.
+  converter counts those writes and warns; the test rips do not use it.
 - **Two-tone mode** (`SKCTL` bit 7) exists only on Furnace's ASAP core. It is
   reported when seen, not converted.
 - Serial, keyboard and potentiometer registers are ignored.

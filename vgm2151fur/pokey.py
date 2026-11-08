@@ -70,6 +70,18 @@ SNAP_LONG16 = (0, 0, 3, 3, 3, 5, 6, 6, 8, 9, 9, 11, 11, 14, 14)
 SNAP_SHORT16 = (1, 1, 1, 4, 4, 4, 4, 4, 10, 10, 10, 10, 13, 13, 13)
 
 
+def _furnace_wave(dist: int) -> int:
+    """AUDC distortion -> Furnace waveform effect value.
+
+    Furnace's waveforms 6 and 7 both write AUDC distortion 6, but their pitch
+    transforms use different snap tables.  Wave 6's short table skips many
+    source AUDF values (51/52 among them), which changes the poly4 sampling
+    phase and therefore the timbre; wave 7's long table can represent them.
+    The original Furnace modules use 7 for AUDC 6, so keep that mapping.
+    """
+    return 7 if dist >= 6 else dist
+
+
 def _pair_joined(audctl: int, low: int) -> bool:
     return bool(audctl & (0x10 if low == 0 else 0x08))
 
@@ -263,7 +275,7 @@ def collect_pokey(
     }
     state: dict[int, dict] = {cid: _blank_chip() for cid in chips}
     warnings_seen: dict[str, int] = {
-        "volume_only": 0, "two_tone": 0, "glitch": 0,
+        "volume_only": 0, "two_tone": 0, "glitch": 0, "dist7": 0,
     }
 
     def joined_low(voice: int, st: dict) -> int | None:
@@ -420,7 +432,10 @@ def collect_pokey(
         if r in REG_AUDC:
             voice = r // 2
             st["vol"][voice] = val & 0x0F
-            st["wave"][voice] = (val >> 5) & 7
+            dist = (val >> 5) & 7
+            if dist == 7:
+                warnings_seen["dist7"] += 1
+            st["wave"][voice] = _furnace_wave(dist)
             st["volonly"][voice] = bool(val & 0x10)
             if val & 0x10:
                 warnings_seen["volume_only"] += 1
@@ -450,6 +465,11 @@ def collect_pokey(
         warnings.append(
             f"{warnings_seen['two_tone']} POKEY two-tone (SKCTL bit 7) setup "
             "writes are not converted"
+        )
+    if warnings_seen["dist7"]:
+        warnings.append(
+            f"{warnings_seen['dist7']} POKEY AUDC distortion-7 writes play as "
+            "distortion 6 (Furnace's wave map has no separate 7 tap)"
         )
     if warnings_seen["glitch"]:
         warnings.append(
