@@ -7,7 +7,40 @@ preset ROM, converted to `DIV_SYSTEM_VRC7` (`0x9D`).
 ## NES APU registers
 
 VGM command `0xB4` (register, data). The register is `0x00-0x17` = `$4000-$4017`
-and bit 7 selects a second APU instance.
+and bit 7 selects a second APU instance (header `0x84` bit 30 declares it).
+
+
+## Two APUs in one log
+
+A Famicom cart with a second 2A03 writes the same `$4000-$4017` numbers twice
+per frame, once per chip, and only the register's bit 7 says which. The
+collectors therefore run one machine per instance, each with its own:
+
+- **voice gates** — `$4015` on one chip must not close the other's pulse, and a
+  timer write belongs to its own voice;
+- **`$C000` sample RAM** — a type-`0xC2` dump carries the instance in bit 31 of
+  its length, and a DMC trigger reads only that chip's image;
+- **type-`0x07` database** — each 0x68 copy addresses its own cart's bank, so
+  the parser records where every instance's bank starts
+  (`VgmFile.nes_dpcm_bank_base`);
+- **`$4011` stream** — burst detection runs per chip, so two interleaved
+  bit-bang drivers do not halve each other's sample rate.
+
+Each sounding instance becomes its own `DIV_SYSTEM_NES` with five columns
+(`Pulse 1 (2)`..`DPCM (2)`), and its DMC voice is the fifth of that block. An
+APU that the log declares but never plays gets no chip and no columns, which is
+why the Sunsoft 5B pairing looks at `Song.nes_present` (the log's APU) rather
+than at the column list. Sample bodies and DMC/PCM sample maps are shared by
+both chips and deduplicated across them, so a second APU costs columns, not
+sample slots.
+
+Measured on a dual-APU cart log (`V-Dog Jack Russell Terrier`): one shared
+machine wrote 2,115 notes and put every one of them in the first chip's five
+columns — 1,133 on its pulse 1 and 256 drums on its noise — while the second
+chip's block stayed empty, because each frame the two drivers re-gated one
+another. Per-instance machines place 780 notes: 200 on APU 1 and 580 on APU 2,
+and only then does the log's real split show. APU 1 keeps `$400C` at level 0, so
+its noise column is empty and all 224 of its drum rows become APU 2's.
 
 | reg | channel | meaning |
 | --- | --- | --- |

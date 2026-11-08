@@ -4545,10 +4545,17 @@ def write_fur(
             names_long.append(f"PSG {cid + 1}-{voice + 1}")
             names_short.append(f"P{cid + 1}-{voice + 1}")
     nes_labels = ("Pulse 1", "Pulse 2", "Triangle", "Noise", "DPCM")
+    # The label follows the chip's position in the module, not the source
+    # instance number: a rip whose first APU plays nothing leaves no columns,
+    # so its second APU is Furnace's chip 1.
+    nes_slot = {cid: i for i, cid in enumerate(nes_ids)}
     for cid in nes_ids:
         for voice, label in enumerate(nes_labels):
-            names_long.append(f"{label} ({cid + 1})")
-            names_short.append(f"N{cid + 1}-{voice + 1}")
+            n = nes_slot[cid] + 1
+            names_long.append(
+                f"{label} ({n})" if len(nes_ids) > 1 else label
+            )
+            names_short.append(f"N{n}-{voice + 1}")
     pce_labels = ("Wave 1", "Wave 2", "Wave 3", "Wave 4", "Wave 5", "Wave 6")
     for cid in huc6280_ids:
         for voice, label in enumerate(pce_labels):
@@ -4638,7 +4645,9 @@ def write_fur(
     if ay_ids:
         label_parts.append("AY-8910")
     if nes_ids:
-        label_parts.append("NES APU")
+        label_parts.append(
+            f"NES APU x{len(nes_ids)}" if len(nes_ids) > 1 else "NES APU"
+        )
     if huc6280_ids:
         label_parts.append("PC Engine")
     if gb_ids:
@@ -4937,8 +4946,10 @@ def write_fur(
         flag_texts.append(k051649_flag_text(song.vgm.k051649_clock))
     # A Famicom's AY is always a Sunsoft 5B (SEL tied low).  Its module type
     # carries the /2, and the analyzer labelled the notes at half speed so the
-    # tracker's pitch table writes the doubled period.
-    ay_sunsoft5b = bool(nes_ids)
+    # tracker's pitch table writes the doubled period.  The pairing comes from
+    # the analysis, because a rip whose APU played no notes has no NES columns
+    # while its AY stays a 5B.
+    ay_sunsoft5b = bool(nes_ids) or bool(getattr(song, "nes_present", False))
     for cid in ay_ids:
         chips.append(CHIP_AY8910)
         flag_texts.append(ay8910_flag_text(
@@ -5256,6 +5267,7 @@ def write_fur(
     for i, smp in enumerate(nes_dpcm_smps):
         ins_ptrs.append(len(b))
         # Note 60+rate selects the DMC rate; this instrument names the body.
+        # Bodies are deduplicated across the APUs, so the index alone is unique.
         _write_ins_pcm(
             b, f"NES DPCM {i:02d}", nes_dpcm_smp_base + i, INS_NES,
         )

@@ -550,7 +550,11 @@ class VgmFile:
     nes_fds: bool = False
     # DPCM sample data.  The type-0x07 database is concatenated here and the
     # 0x68 commands copy windows of it into the $C000/$D000 RAM as they play.
+    # A dual-APU log carries one database per chip (bit 31 of the block size),
+    # so `nes_dpcm_bank_base` says where each instance's bank starts and a 0x68
+    # address stays inside the cart it names.
     nes_dpcm_bank: bytearray = field(default_factory=bytearray)
+    nes_dpcm_bank_base: dict[int, int] = field(default_factory=dict)
     pcm_ram_writes: list[PcmRamWrite] = field(default_factory=list)
     # HuC6280 (PC Engine) header 0xA4 (VGM 1.61+).  Writes arrive on command
     # 0xB9; the clock is the PSG clock.  Bit 7 of the register selects a
@@ -1488,7 +1492,12 @@ def load_vgm(path: Path | str) -> VgmFile:
             elif typ == NES_DPCM_BANK_TYPE:
                 # NES DPCM database. 0x68 commands copy windows of this flat
                 # bank into the $C000/$D000 sample RAM as the driver switches
-                # banks, so keep the concatenation in file order.
+                # banks, so keep the concatenation in file order.  A dual-APU
+                # log ships one database per chip and each instance's 0x68
+                # source address is relative to its own first block.
+                vgm.nes_dpcm_bank_base.setdefault(
+                    chip_id, len(vgm.nes_dpcm_bank),
+                )
                 vgm.nes_dpcm_bank.extend(payload)
             elif typ == 0x04:
                 # OKIM6258 ADPCM bank. 0x95 block ids index these in order.

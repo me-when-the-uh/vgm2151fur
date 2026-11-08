@@ -133,6 +133,9 @@ class NesHit:
     vol: int                   # $4000/$4004/$400C low nibble
     duty: int                  # pulse duty 0-3; noise mode 0-1
     env_mode: int              # (register >> 4) & 3
+    # A dual-APU log interleaves two chips on one command, so every note keeps
+    # the instance its register file belonged to.
+    chip_id: int = 0
     linear: int = 0            # triangle $4008
     off_sample: int = 0
     pitch_pts: list[tuple[int, int]] = field(default_factory=list)
@@ -146,6 +149,7 @@ class NesHit:
 class NesOff:
     sample_time: int
     voice: int
+    chip_id: int = 0
 
 
 @dataclass
@@ -157,6 +161,7 @@ class NesDpcmSample:
     data: bytes
     rate_index: int
     loop: bool = False
+    chip_id: int = 0
 
 
 @dataclass
@@ -165,6 +170,7 @@ class NesDpcmHit:
     sample_index: int
     rate_index: int
     end_time: int = 0
+    chip_id: int = 0
 
 
 @dataclass
@@ -176,6 +182,7 @@ class NesPcmSample:
     rate: int
     start: int
     end: int
+    chip_id: int = 0
 
 
 @dataclass
@@ -183,6 +190,21 @@ class NesPcmHit:
     sample_time: int
     end_time: int
     sample_index: int
+    chip_id: int = 0
+
+
+def _nes_writes_by_chip(vgm: VgmFile) -> dict[int, list]:
+    """The ``0xB4`` stream split by APU instance (register bit 7).
+
+    Two APUs share one command byte, so every collector keeps their register
+    files apart: a shared machine lets one chip's write close the other's open
+    gate and puts ten voices' notes on five columns.
+    """
+    out: dict[int, list] = {}
+    for w in vgm.writes:
+        if w.chip == "nes":
+            out.setdefault(w.chip_id & 1, []).append(w)
+    return out
 
 
 def _tone_audible(vol: int, env_mode: int) -> bool:
@@ -195,13 +217,43 @@ def _tone_audible(vol: int, env_mode: int) -> bool:
 def collect_nes_tones(
     vgm: VgmFile, clock: int | None = None,
 ) -> tuple[list[NesHit], list[NesOff], list[str]]:
-    """Pulse, triangle and noise notes from the ``0xB4`` register stream."""
-    warnings: list[str] = []
-    writes = [w for w in vgm.writes if w.chip == "nes"]
-    if not writes:
-        return [], [], warnings
-    clock = clock or vgm.nes_clock or NES_DEFAULT_CLOCK
+    """Pulse, triangle and noise notes from the ``0xB4`` register stream.
 
+    A dual-APU log (header bit 30, register bit 7) interleaves two independent
+    register files on the same command, so each instance runs its own machine.
+    One shared machine would let chip 2's ``$4000`` rewrite chip 1's open pulse
+    gate and collapse both APUs onto the same five columns. ``clock`` is kept
+    for symmetry with the other collectors; a hit carries raw timer values and
+    the caller turns them into notes.
+    """
+    warnings: list[str] = []
+    by_cid = _nes_writes_by_chip(vgm)
+    if not by_cid:
+        return [], [], warnings
+
+    hits: list[NesHit] = []
+    offs: list[NesOff] = []
+    glitches = 0
+    for cid in sorted(by_cid):
+        chip_hits, chip_offs, chip_glitches = _nes_tones_one(by_cid[cid], cid)
+        hits.extend(chip_hits)
+        offs.extend(chip_offs)
+        glitches += chip_glitches
+    hits.sort(key=lambda h: (h.sample_time, h.chip_id, h.voice))
+    offs.sort(key=lambda o: (o.sample_time, o.chip_id, o.voice))
+    if glitches:
+        warnings.append(f"NES APU: ignored {glitches} sub-frame tone gates")
+    return hits, offs, warnings
+
+
+def _nes_tones_one(
+    writes: list, chip_id: int,
+) -> tuple[list[NesHit], list[NesOff], int]:
+    """The voice machine of one 2A03 instance.
+
+    `writes` are already limited to that instance and in stream order. Returns
+    (hits, offs, dropped sub-frame gates).
+    """
     period = [0, 0, 0]
     freq_hi = [False, False, False]
     length = [0, 0, 0, 0]
@@ -237,7 +289,7 @@ def collect_nes_tones(
         elif t - hit.sample_time >= NES_MIN_NOTE:
             hits.append(hit)
             if emit_off:
-                offs.append(NesOff(t, voice))
+                offs.append(NesOff(t, voice, chip_id))
         else:
             glitches += 1
         active[voice] = None
@@ -250,12 +302,14 @@ def collect_nes_tones(
             active[voice] = NesHit(
                 sample_time=t, voice=3, period=noise_period,
                 vol=vol[2], duty=noise_mode, env_mode=env_mode[2] & 3,
+                chip_id=chip_id,
             )
         else:
             active[voice] = NesHit(
                 sample_time=t, voice=voice, period=period[voice],
                 vol=vol[voice], duty=duty[voice] if voice < 2 else 0,
                 env_mode=env_mode[voice] & 3,
+                chip_id=chip_id,
                 linear=linear if voice == 2 else 0,
             )
 
@@ -429,22 +483,23 @@ def collect_nes_tones(
     for voice in range(4):
         if active[voice] is not None:
             close(voice, 0, emit_off=False)
-    if glitches:
-        warnings.append(f"NES APU: ignored {glitches} sub-frame tone gates")
-    return hits, offs, warnings
+    return hits, offs, glitches
 
 
-def _dpcm_dumps(vgm: VgmFile) -> list[tuple[int, int, bytes]]:
-    """(stream time, address, data) for every DPCM RAM dump, in order.
+def _dpcm_dumps(vgm: VgmFile, chip_id: int = 0) -> list[tuple[int, int, bytes]]:
+    """(stream time, address, data) for one APU's DPCM RAM dumps, in order.
 
-    A driver may reload the same 4 KB window while the song plays, so the
-    image is only valid from the block's position in the stream. The old code
-    applied every block up front, which left each hit playing whatever the
-    last block happened to contain.
+    Every 2A03 has its own ``$C000`` sample RAM, so a type-``0xC2`` dump only
+    belongs to the instance named by bit 31 of its length. A driver may reload
+    the same 4 KB window while the song plays, so the image is only valid from
+    the block's position in the stream. The old code applied every block up
+    front, which left each hit playing whatever the last block happened to
+    contain.
     """
     out = [
         (getattr(s, "time", 0), s.start & 0xFFFF, s.data)
-        for s in vgm.roms if s.kind == "nes_dpcm"
+        for s in vgm.roms
+        if s.kind == "nes_dpcm" and (getattr(s, "chip", 0) or 0) == chip_id
     ]
     out.sort(key=lambda d: d[0])
     return out
@@ -452,14 +507,21 @@ def _dpcm_dumps(vgm: VgmFile) -> list[tuple[int, int, bytes]]:
 
 def _apply_dpcm_bank(
     ram: bytearray, covered: bytearray, vgm: VgmFile,
-    ram_writes: list, upto: int, cursor: list[int],
+    ram_writes: list, upto: int, cursor: list[int], base: int = 0,
 ) -> None:
-    """Replay 0x68 bank copies whose time has arrived."""
+    """Replay this instance's 0x68 bank copies whose time has arrived.
+
+    `base` is where this APU's own type-``0x07`` database starts inside the
+    concatenated bank. A dual-APU log carries one database per chip and every
+    0x68 source address is relative to the chip it names, so a shared bank
+    would read the other cart's samples.
+    """
     bank = bytes(getattr(vgm, "nes_dpcm_bank", b""))
     while cursor[0] < len(ram_writes) and ram_writes[cursor[0]].sample <= upto:
         r = ram_writes[cursor[0]]
         cursor[0] += 1
-        chunk = bank[r.src:r.src + r.length]
+        start = base + r.src
+        chunk = bank[start:start + r.length]
         for i, b in enumerate(chunk):
             addr = (r.dest + i) & 0xFFFF
             ram[addr] = b
@@ -469,18 +531,61 @@ def _apply_dpcm_bank(
 def collect_nes_dpcm(
     vgm: VgmFile, clock: int | None = None,
 ) -> tuple[list[NesDpcmSample], list[NesDpcmHit], list[str]]:
-    """Standard DPCM playback: ``$4012``/``$4013`` + ``$4015`` bit 4."""
+    """Standard DPCM playback: ``$4012``/``$4013`` + ``$4015`` bit 4.
+
+    Both instances read the module's one sample list, so a body two APUs play
+    is stored once and each hit says which chip plays it. ``clock`` is accepted
+    for symmetry with the other collectors; a hit carries its own ``$4010``
+    rate index and the writer turns that into a Hz value.
+    """
     warnings: list[str] = []
-    writes = [w for w in vgm.writes if w.chip == "nes"]
-    if not writes:
+    by_cid = _nes_writes_by_chip(vgm)
+    if not by_cid:
         return [], [], warnings
-    clock = clock or vgm.nes_clock or NES_DEFAULT_CLOCK
+
+    samples: list[NesDpcmSample] = []
+    hits: list[NesDpcmHit] = []
+    # The same address/length can hold different data after a bank reload, and
+    # the two chips share one body when they play the same window.
+    by_key: dict[tuple[int, int, bool, bytes], int] = {}
+    starts = 0
+    undumped = 0
+    has_data = (
+        any(r.type == 7 for r in getattr(vgm, "pcm_ram_writes", ()))
+        or any(s.kind == "nes_dpcm" for s in vgm.roms)
+    )
+    for cid in sorted(by_cid):
+        chip_starts, chip_undumped = _collect_dpcm_chip(
+            vgm, by_cid[cid], cid, samples, hits, by_key,
+        )
+        starts += chip_starts
+        undumped += chip_undumped
+
+    if starts and not has_data:
+        warnings.append(
+            f"{starts} NES DPCM trigger(s) but no DPCM data block or RAM dump; "
+            "those notes are silent"
+        )
+    elif undumped:
+        warnings.append(
+            f"{undumped} NES DPCM sample(s) point at RAM the VGM does not dump; "
+            "those notes are silent"
+        )
+    return samples, hits, warnings
+
+
+def _collect_dpcm_chip(
+    vgm: VgmFile, writes: list, chip_id: int,
+    samples: list[NesDpcmSample], hits: list[NesDpcmHit],
+    by_key: dict[tuple[int, int, bool, bytes], int],
+) -> tuple[int, int]:
+    """One APU's DMC voice. Returns (triggers, triggers with no dumped data)."""
     # 64 KB CPU-address image of the dumped DPCM RAM (0xAA = silence). RAM
     # dumps and 0x68 bank copies are replayed in stream order, so a hit reads
     # the bank that was loaded when the driver triggered it.
     ram = bytearray(b"\xAA" * 0x10000)
     covered = bytearray(0x10000)
-    dumps = _dpcm_dumps(vgm)
+    dumps = _dpcm_dumps(vgm, chip_id)
     dump_cursor = [0]
 
     def apply_dumps(upto: int) -> None:
@@ -494,11 +599,11 @@ def collect_nes_dpcm(
 
     bank_writes = sorted(
         (r for r in getattr(vgm, "pcm_ram_writes", ())
-         if r.type == 7),          # NES DPCM database
+         if r.type == 7 and (r.chip_id or 0) == chip_id),  # NES DPCM database
         key=lambda r: r.sample,
     )
     bank_cursor = [0]
-    has_data = bool(bank_writes or any(s.kind == "nes_dpcm" for s in vgm.roms))
+    base = int(getattr(vgm, "nes_dpcm_bank_base", {}).get(chip_id, 0))
 
     rate = 0
     loop_bit = False
@@ -506,9 +611,7 @@ def collect_nes_dpcm(
     len_reg = 0
     playing = False
     armed = False
-    hits: list[NesDpcmHit] = []
-    samples: list[NesDpcmSample] = []
-    by_key: dict[tuple[int, int, bool, bytes], int] = {}
+    last_hit: NesDpcmHit | None = None
     undumped = 0
     starts = 0
 
@@ -517,7 +620,7 @@ def collect_nes_dpcm(
         val = w.val & 0xFF
         t = w.sample
         apply_dumps(t)
-        _apply_dpcm_bank(ram, covered, vgm, bank_writes, t, bank_cursor)
+        _apply_dpcm_bank(ram, covered, vgm, bank_writes, t, bank_cursor, base)
         if reg == 0x10:
             rate = val & 0x0F
             loop_bit = bool(val & 0x40)
@@ -539,8 +642,6 @@ def collect_nes_dpcm(
                 if covered_bytes == 0:
                     undumped += 1
                 body = bytes(ram[(addr + i) & 0xFFFF] for i in range(length))
-                # The same address/length can hold different data after a
-                # bank reload, so the body is part of the identity.
                 key = (addr, length, loop_bit, body)
                 idx = by_key.get(key)
                 if idx is None:
@@ -548,26 +649,19 @@ def collect_nes_dpcm(
                     by_key[key] = idx
                     samples.append(NesDpcmSample(
                         start=addr, length=length, data=body,
-                        rate_index=rate, loop=loop_bit,
+                        rate_index=rate, loop=loop_bit, chip_id=chip_id,
                     ))
-                hits.append(NesDpcmHit(
+                last_hit = NesDpcmHit(
                     sample_time=t, sample_index=idx, rate_index=rate,
-                ))
+                    chip_id=chip_id,
+                )
+                hits.append(last_hit)
             elif not bit and playing:
                 playing = False
-                if hits:
-                    hits[-1].end_time = t
-    if starts and not has_data:
-        warnings.append(
-            f"{starts} NES DPCM trigger(s) but no DPCM data block or RAM dump; "
-            "those notes are silent"
-        )
-    elif undumped:
-        warnings.append(
-            f"{undumped} NES DPCM sample(s) point at RAM the VGM does not dump; "
-            "those notes are silent"
-        )
-    return samples, hits, warnings
+                # Only this chip's own last trigger stops.
+                if last_hit is not None:
+                    last_hit.end_time = t
+    return starts, undumped
 
 
 def _median_dt(points: list[tuple[int, int]]) -> int:
@@ -644,30 +738,44 @@ def _pcm_sounding_pieces(data: bytes, rate: int) -> list[tuple[int, bytes]]:
 def collect_nes_pcm(
     vgm: VgmFile, clock: int | None = None,
 ) -> tuple[list[NesPcmSample], list[NesPcmHit], list[str]]:
-    """Direct ``$4011`` bit-bang PCM (the NES equivalent of SSG volume PCM)."""
+    """Direct ``$4011`` bit-bang PCM (the NES equivalent of SSG volume PCM).
+
+    A dual-APU log bit-bangs either chip, and a burst is one chip's stream: two
+    interleaved drivers would look like one burst with doubled gaps and be
+    thrown away. So the writes are grouped per instance first, while the chunk
+    budget and the body list stay shared. ``clock`` is kept for symmetry with
+    the other collectors; a ``$4011`` stream's rate comes from its own write
+    cadence.
+    """
     warnings: list[str] = []
-    writes = [w for w in vgm.writes if w.chip == "nes" and (w.reg & 0x7F) == 0x11]
-    if not writes:
-        return [], [], warnings
-    points: list[tuple[int, int]] = []
-    for w in writes:
+    streams: dict[int, list[tuple[int, int]]] = {}
+    for w in vgm.writes:
+        if w.chip != "nes" or (w.reg & 0x7F) != 0x11:
+            continue
+        points = streams.setdefault(w.chip_id & 1, [])
         value = w.val & 0x7F
         if points and points[-1][0] == w.sample:
             points[-1] = (w.sample, value)
         else:
             points.append((w.sample, value))
-    bursts = _pcm_bursts(points)
-    if not bursts:
+    if not streams:
         return [], [], warnings
     # Join short holes, then split at real pauses.
-    merged: list[list[tuple[int, int]]] = []
-    for burst in bursts:
-        if burst and merged and burst[0][0] - merged[-1][-1][0] < PCM_SPLIT_GAP:
-            merged[-1].extend(burst)
-        elif burst:
-            merged.append(list(burst))
-    prepared: list[tuple[list[tuple[int, int]], int, int, bytes]] = []
-    for seg in merged:
+    merged: list[tuple[int, list[tuple[int, int]]]] = []
+    for cid in sorted(streams):
+        bursts = _pcm_bursts(streams[cid])
+        chip_merged: list[list[tuple[int, int]]] = []
+        for burst in bursts:
+            if (burst and chip_merged
+                    and burst[0][0] - chip_merged[-1][-1][0] < PCM_SPLIT_GAP):
+                chip_merged[-1].extend(burst)
+            elif burst:
+                chip_merged.append(list(burst))
+        merged.extend((cid, seg) for seg in chip_merged)
+    if not merged:
+        return [], [], warnings
+    prepared: list[tuple[int, list[tuple[int, int]], int, int, bytes]] = []
+    for cid, seg in merged:
         if len(seg) < 2:
             continue
         median = _median_dt(seg)
@@ -679,19 +787,20 @@ def collect_nes_pcm(
             continue
         for base_off, piece in _pcm_sounding_pieces(data, rate):
             if piece:
-                prepared.append((seg, rate, base_off, piece))
+                prepared.append((cid, seg, rate, base_off, piece))
     if not prepared:
         return [], [], warnings
-    total_frames = sum(len(piece) for _seg, _rate, _off, piece in prepared)
+    total_frames = sum(len(piece) for _c, _seg, _rate, _off, piece in prepared)
     chunk_frames = NES_PCM_CHUNK_FRAMES
     if total_frames > chunk_frames * NES_PCM_SAMPLE_BUDGET:
         chunk_frames = int(math.ceil(
             total_frames / float(NES_PCM_SAMPLE_BUDGET),
         ))
+    dual = len(streams) > 1
     samples: list[NesPcmSample] = []
     hits: list[NesPcmHit] = []
     by_data: dict[bytes, int] = {}
-    for seg, rate, base_off, data in prepared:
+    for cid, seg, rate, base_off, data in prepared:
         total = len(data)
         for off in range(0, total, chunk_frames):
             part = data[off:off + chunk_frames]
@@ -709,8 +818,10 @@ def collect_nes_pcm(
                 idx = len(samples)
                 by_data[part] = idx
                 samples.append(NesPcmSample(
-                    name=f"NES PCM {idx:02d}", data=part, rate=rate,
-                    start=start_t, end=end_t,
+                    name=(f"NES PCM {cid + 1}-{idx:02d}" if dual
+                          else f"NES PCM {idx:02d}"),
+                    data=part, rate=rate,
+                    start=start_t, end=end_t, chip_id=cid,
                 ))
             hits.append(NesPcmHit(
                 sample_time=start_t,
@@ -718,7 +829,7 @@ def collect_nes_pcm(
                 # chunk of each sounding piece gets the OFF that covers the
                 # following silent gap.
                 end_time=end_t if final else 0,
-                sample_index=idx,
+                sample_index=idx, chip_id=cid,
             ))
     return samples, hits, warnings
 

@@ -892,6 +892,10 @@ class Song:
     # instrument; DPCM bodies are 1-bit (depth 1) and direct `$4011` bodies are
     # 8-bit PCM, each with one sample instrument.
     nes_ids: list[int] = field(default_factory=list)
+    # True when the log carries a 2A03 at all, even one whose gates were all
+    # sub-frame.  A Famicom's AY is a Sunsoft 5B whatever the APU played, so
+    # the half-clock rule follows the hardware pairing and not the column list.
+    nes_present: bool = False
     nes_ins: list[ToneIns] = field(default_factory=list)
     nes_dpcm_samples: list[NesDpcmSample] = field(default_factory=list)
     nes_pcm_samples: list[NesPcmSample] = field(default_factory=list)
@@ -9744,12 +9748,9 @@ def analyze(
     else:
         audible = []
 
-    # NES APU: two pulses, triangle, noise and the DPCM/PCM channel.  Collect
-    # now so the instrument counts are known before the tone list is placed.
-    nes_ids = (
-        sorted({w.chip_id for w in vgm.writes if w.chip == "nes"})
-        if has_nes else []
-    )
+    # NES APU: two pulses, triangle, noise and the DPCM/PCM channel per
+    # instance.  Collect now so the instrument counts are known before the tone
+    # list is placed.
     nes_clock = vgm.nes_clock or NES_DEFAULT_CLOCK
     if has_nes:
         nes_tones, nes_offs, nes_warn = collect_nes_tones(vgm, nes_clock)
@@ -9772,7 +9773,16 @@ def analyze(
                     f"NES raw PCM: lossy sample clustering {before} -> "
                     f"{len(nes_pcm_samples)} bodies"
                 )
+        # Header bit 30 asks for a second APU, but a cart whose extra chip
+        # never plays would only add five silent columns.  The column map is
+        # built from the instances that actually sounded.
+        nes_ids = sorted(
+            {h.chip_id for h in nes_tones} | {o.chip_id for o in nes_offs}
+            | {hit.chip_id for hit in nes_dpcm_hits}
+            | {hit.chip_id for hit in nes_pcm_hits}
+        )
     else:
+        nes_ids = []
         nes_tones, nes_offs = [], []
         nes_dpcm_samples, nes_dpcm_hits = [], []
         nes_pcm_samples, nes_pcm_hits = [], []
@@ -9983,9 +9993,12 @@ def analyze(
     # thing on other platforms.  The tracker's pitch table still runs from the
     # logged clock, so label the notes at half speed; the written period is
     # then doubled and the chip sounds at the real /2 rate.  A rip that
-    # already logged the halved clock is left alone.
+    # already logged the halved clock is left alone.  The pairing is a property
+    # of the hardware, so an APU that played nothing (all gates under one frame)
+    # still says "Famicom".
     nes_clk = vgm.nes_clock or NES_DEFAULT_CLOCK
-    if nes_ids:
+    nes_present = has_nes
+    if nes_present:
         ay_half = abs(ay_clock - nes_clk) <= 16
     else:
         ay_half = bool(getattr(vgm, "ay8910_flags", 0) & 0x10)
@@ -10005,15 +10018,20 @@ def analyze(
             )
         _emit_pcm(ay_pcm, ay_pcm_hits, ay_at)
 
-    # NES APU columns: two pulses, triangle, noise and DPCM/PCM. They follow
-    # the SCC/AY blocks in module order.
+    # NES APU columns: per instance two pulses, triangle, noise and the
+    # DPCM/PCM channel. They follow the SCC/AY blocks in module order, and each
+    # 2A03 keeps its own five columns so Furnace drives it with its own chip.
     if nes_ids:
         nes_base = (
             tone_base + SCC_VOICES * len(scc_ids) + AY_VOICES * len(ay_ids)
         )
+        nes_at = {
+            cid: nes_base + NES_CHANNELS * i
+            for i, cid in enumerate(nes_ids)
+        }
         nes_tone_events: list[NoteEvent] = []
         for h in nes_tones:
-            ch = nes_base + h.voice
+            ch = nes_at.get(h.chip_id, nes_base) + h.voice
             if h.voice == 3:
                 note = nes_noise_note(h.period)
                 e5 = 0x80
@@ -10076,15 +10094,17 @@ def analyze(
             nes_tone_events.append(ev)
         for off in nes_offs:
             events.append(NoteEvent(
-                sample=off.sample_time, ch=nes_base + off.voice, on=False,
-                note=180, ins=-1, vol=-1, e5=0x80, pan=0,
+                sample=off.sample_time,
+                ch=nes_at.get(off.chip_id, nes_base) + off.voice,
+                on=False, note=180, ins=-1, vol=-1, e5=0x80, pan=0,
             ))
         # DPCM: the note value selects the DMC rate (60 + rate index); one
         # instrument per sample body. PCM: note 108 plays an 8-bit body at its
-        # stored rate.
+        # stored rate. Each APU triggers its own DMC voice, so the hit's
+        # instance picks both the column and the mode effect.
         nes_dpcm_events: list[tuple[NoteEvent, int]] = []
         for hit in nes_dpcm_hits:
-            ch = nes_base + 4
+            ch = nes_at.get(hit.chip_id, nes_base) + 4
             channel_fx.append((hit.sample_time, ch, 0x18, 1))
             channel_fx.append((hit.sample_time, ch, 0x11, 0))
             ev = NoteEvent(
@@ -10103,12 +10123,12 @@ def analyze(
                     vol=-1, e5=0x80, pan=0, pcm=True,
                 ))
         nes_pcm_events: list[tuple[NoteEvent, int]] = []
-        pcm_mode_set = False
+        pcm_mode_set: set[int] = set()
         for hit in nes_pcm_hits:
-            ch = nes_base + 4
-            if not pcm_mode_set:
+            ch = nes_at.get(hit.chip_id, nes_base) + 4
+            if hit.chip_id not in pcm_mode_set:
                 channel_fx.append((hit.sample_time, ch, 0x18, 0))
-                pcm_mode_set = True
+                pcm_mode_set.add(hit.chip_id)
             ev = NoteEvent(
                 sample=hit.sample_time, ch=ch, on=True,
                 note=60 + (hit.sample_index % NES_PCM_MAP_SLOTS),
@@ -10156,7 +10176,7 @@ def analyze(
             huc6280_ids.append(cid)
         huc_base = (
             tone_base + SCC_VOICES * len(scc_ids) + AY_VOICES * len(ay_ids)
-            + (NES_CHANNELS if nes_ids else 0)
+            + NES_CHANNELS * len(nes_ids)
         )
         huc_at = {
             cid: huc_base + HUC6280_CHANNELS * i
@@ -10425,7 +10445,7 @@ def analyze(
         gb_ids.append(0)
         gb_base = (
             tone_base + SCC_VOICES * len(scc_ids) + AY_VOICES * len(ay_ids)
-            + (NES_CHANNELS if nes_ids else 0)
+            + NES_CHANNELS * len(nes_ids)
             + (HUC6280_CHANNELS if huc6280_ids else 0)
         )
         gb_waves = list(gb_wave_list)
@@ -10547,7 +10567,7 @@ def analyze(
         vsu_mod_waves = list(vsu_mod_list)
         vsu_base = (
             tone_base + SCC_VOICES * len(scc_ids) + AY_VOICES * len(ay_ids)
-            + (NES_CHANNELS if nes_ids else 0)
+            + NES_CHANNELS * len(nes_ids)
             + (HUC6280_CHANNELS if huc6280_ids else 0)
             + (4 * len(gb_ids))
         )
@@ -10641,7 +10661,7 @@ def analyze(
             saa_ids = sorted({h.chip_id for h in saa_hits})
         saa_base = (
             tone_base + SCC_VOICES * len(scc_ids) + AY_VOICES * len(ay_ids)
-            + (NES_CHANNELS if nes_ids else 0)
+            + NES_CHANNELS * len(nes_ids)
             + (HUC6280_CHANNELS if huc6280_ids else 0)
             + (4 * len(gb_ids))
             + VSU_CHANNELS * len(vsu_ids)
@@ -11386,6 +11406,7 @@ def analyze(
         opll_drums=opll_drums,
         opll_vrc7=opll_vrc7,
         nes_ids=nes_ids,
+        nes_present=nes_present,
         nes_ins=nes_ins,
         nes_dpcm_samples=nes_dpcm_samples,
         nes_pcm_samples=nes_pcm_samples,
@@ -11746,6 +11767,13 @@ def format_report(song: Song) -> str:
             f"{len(song.vsu_waves)} waveforms, {len(song.vsu_ins)} instruments"
             f"{', dynamic waves' if song.vsu_dynamic else ''}, "
             f"{song.vgm.vsu_clock or VSU_DEFAULT_CLOCK} Hz)"
+        )
+    if song.nes_ids:
+        lines.append(
+            f"NES notes   {song.nes_count}  ({len(song.nes_ids)} APU"
+            f"{'s' if len(song.nes_ids) > 1 else ''}, "
+            f"{len(song.nes_dpcm_samples)} DPCM body(ies), "
+            f"{song.vgm.nes_clock or NES_DEFAULT_CLOCK} Hz)"
         )
     if song.ssg_pcm_samples:
         lines.append(
