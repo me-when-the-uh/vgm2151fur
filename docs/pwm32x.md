@@ -35,3 +35,5 @@ sequence.
   never uses the DAC stream has no continuous audio to reconstruct.
 - The PWM output is stored as decoded PCM, so the module does not retain the
   source's per-sample register writes.
+- `--lossy-sample-clustering` compares 16-bit attack bodies after removing
+  each body's DC and keeps at most 32 anchors.

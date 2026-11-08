@@ -10147,7 +10147,7 @@ def analyze(
         # NEC uPD7759: one phrase at a time per chip, rendered to 16-bit PCM
         # and played on a Generic PCM DAC system because Furnace has no native
         # uPD7759 platform.
-        upd_samples, upd_warn = collect_upd7759(vgm)
+        upd_samples, upd_warn = collect_upd7759(vgm, lossy=lossy_samples)
         warnings.extend(upd_warn)
         upd_audible = [s for s in upd_samples if s.hits and s.frames > 0]
         upd_ids = _dual_ids(
@@ -10192,7 +10192,7 @@ def analyze(
 
         # Sega 32X PWM: two streamed PCM channels per chip.  Each side gets a
         # Generic PCM DAC column and a hard pan.
-        pwm_samples, pwm_warn = collect_pwm(vgm)
+        pwm_samples, pwm_warn = collect_pwm(vgm, lossy=lossy_samples)
         warnings.extend(pwm_warn)
         pwm_audible = [s for s in pwm_samples if s.frames > 0]
         pwm_ids = _dual_ids(

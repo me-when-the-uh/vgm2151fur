@@ -44,6 +44,15 @@ def _vgm(**kw) -> VgmFile:
 
 
 class TestPwmCollector(unittest.TestCase):
+    def test_lossy_clustering16(self):
+        from vgm2151fur.samplecluster import cluster_fragments16
+        bodies = [(b"\x00\x00" * 100) + bytes((i, 0)) for i in range(40)]
+        keep, remap = cluster_fragments16(
+            bodies, [PWM_RATE] * 40, {i: 1 for i in range(40)},
+        )
+        self.assertLessEqual(len(keep), 32)
+        self.assertTrue(all(r >= 0 for r in remap))
+
     def test_two_sides(self):
         samples, warn = collect_pwm(_vgm())
         self.assertEqual(warn, [])

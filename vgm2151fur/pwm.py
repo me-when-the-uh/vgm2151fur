@@ -21,6 +21,7 @@ from bisect import bisect_right
 from collections import Counter
 from dataclasses import dataclass, field
 
+from vgm2151fur.samplecluster import cluster_fragments16
 from vgm2151fur.vgm import STREAM_PWM, VGM_RATE, VgmFile
 
 PWM_RATE = 22020
@@ -45,6 +46,7 @@ PWM_ATTACK_MAX_SAMPLES = 480   # above this, use fixed chunks
 PWM_ONSET_WINDOW = 8
 PWM_ONSET_QUIET = 32
 PWM_ONSET_MIN_GAP = 64
+PWM_ONSET_LOOKAHEAD = 64
 
 
 @dataclass
@@ -156,7 +158,6 @@ def _onset_starts(
         env.append(max(window))
     low = width
     high = max(width * 4, peak // 8)
-    jump = max(256, peak // 6)
     starts: list[int] = []
 
     def add(pos: int) -> None:
@@ -165,16 +166,19 @@ def _onset_starts(
 
     if env[0] >= high:
         add(0)
-    quiet = 0
+    low_start: int | None = None
     for i, value in enumerate(env):
         if value <= low:
-            quiet += 1
+            if low_start is None:
+                low_start = i
             continue
-        if quiet >= PWM_ONSET_QUIET and value >= high:
-            add(i)
-        quiet = 0
+        if low_start is not None and i - low_start >= PWM_ONSET_QUIET:
+            look = env[i:i + PWM_ONSET_LOOKAHEAD]
+            if look and max(look) >= high:
+                add(i)
+        low_start = None
     for i in range(1, len(env)):
-        if env[i] >= high and env[i] - env[i - 1] > jump:
+        if env[i] >= high and env[i - 1] <= low:
             add(i)
     return sorted(starts)
 
@@ -244,7 +248,9 @@ def _attack_bodies(
     return out
 
 
-def collect_pwm(vgm: VgmFile) -> tuple[list[PwmSample], list[str]]:
+def collect_pwm(
+    vgm: VgmFile, *, lossy: bool = False,
+) -> tuple[list[PwmSample], list[str]]:
     """Render the VGM's PWM streams into one PCM body per side."""
     warnings: list[str] = []
     plays = [
@@ -442,4 +448,23 @@ def collect_pwm(vgm: VgmFile) -> tuple[list[PwmSample], list[str]]:
         audible.append(chunk)
     if not audible:
         warnings.append("PWM streams decoded to silence")
+    if lossy and len(audible) > 32:
+        keep, remap = cluster_fragments16(
+            [s.data for s in audible],
+            [s.rate for s in audible],
+            {i: len(s.hits) for i, s in enumerate(audible)},
+        )
+        compact = [audible[i] for i in keep]
+        for old, smp in enumerate(audible):
+            new = remap[old]
+            if new < 0 or keep[new] == old:
+                continue
+            compact[new].hits.extend(smp.hits)
+        if len(compact) < len(audible):
+            warnings.append(
+                f"PWM: lossy sample clustering {len(audible)} -> "
+                f"{len(compact)} bodies"
+            )
+        audible = compact
+    warnings = list(dict.fromkeys(warnings))
     return audible, warnings
