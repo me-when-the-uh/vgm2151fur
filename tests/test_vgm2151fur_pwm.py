@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import array
 import unittest
 from pathlib import Path
 
@@ -122,7 +123,39 @@ class TestPwmCollector(unittest.TestCase):
         finally:
             pwmmod.PWM_ATTACK_MAX_SAMPLES = old
 
+    def test_short_attacks_fold_and_long_bodies_split(self):
+        from vgm2151fur import pwm as pwmmod
+        from vgm2151fur.pwm import (
+            PWM_ATTACK_MAX_FRAMES, PWM_ATTACK_MIN_FRAMES, _attack_bodies,
+        )
+        # A short attack, a quiet gap, then one long steady body.
+        short = 100
+        gap = 300
+        old_max = pwmmod.PWM_ATTACK_MAX_FRAMES
+        pwmmod.PWM_ATTACK_MAX_FRAMES = 4 * PWM_ATTACK_MIN_FRAMES
+        try:
+            max_frames = pwmmod.PWM_ATTACK_MAX_FRAMES
+            long = max_frames + PWM_ATTACK_MIN_FRAMES // 2 - (short + gap)
+            vals = array.array("h")
+            for i in range(short):
+                vals.append(900 if i % 2 else -900)
+            vals.extend([0] * gap)
+            for i in range(long):
+                vals.append(900 if i % 2 else -900)
+            bodies = _attack_bodies(
+                vals.tobytes(), vals, 0, 10,
+            )
+        finally:
+            pwmmod.PWM_ATTACK_MAX_FRAMES = old_max
+        self.assertEqual(len(bodies), 2)
+        self.assertEqual(bodies[0][0], 0)  # the short attack was kept
+        self.assertTrue(all(
+            PWM_ATTACK_MIN_FRAMES <= len(body) // 2 <= max_frames
+            for _start, body in bodies
+        ))
+
     def test_attack_bodies_share_repeated_hits(self):
+        from vgm2151fur.pwm import PWM_ATTACK_MIN_FRAMES
         v = _vgm()
         v.dac_stream_plays = [
             DacStreamPlay(
@@ -132,8 +165,9 @@ class TestPwmCollector(unittest.TestCase):
             )
             for reg in (2, 3)
         ]
-        a = bytes((0x00, 0x01)) * 200   # burst A
-        b = bytes((0x00, 0x03)) * 200   # burst B
+        burst = PWM_ATTACK_MIN_FRAMES + 8
+        a = bytes((0x00, 0x01)) * burst  # burst A
+        b = bytes((0x00, 0x03)) * burst  # burst B
         gap = bytes(2) * 300            # 300 frames of silence
         body = a + gap + b + gap + a + gap + b + gap
         v.pwm_bank = bytearray(body)

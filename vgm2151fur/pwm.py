@@ -37,7 +37,9 @@ PWM_MAP_SLOTS = 120
 # cannot become a multi-second sample.  If this yields more unique bodies than
 # fixed chunks, the collector falls back to chunks.
 PWM_ATTACK_SILENCE = 250       # ~11 ms of near-silence splits a hit
-PWM_ATTACK_MIN_FRAMES = 64     # ignore clicks shorter than ~3 ms
+# A body shorter than a quarter chunk (~62 ms at 22020 Hz) is a fragment, not
+# a useful banked sample; it is folded into the following body.
+PWM_ATTACK_MIN_FRAMES = PWM_CHUNK_FRAMES // 4
 PWM_ATTACK_MAX_FRAMES = 44100  # split a sustained body at ~1 s
 PWM_ATTACK_QUIET_DIV = 32      # quiet threshold = peak / 32
 PWM_ATTACK_MAX_SAMPLES = 480   # above this, use fixed chunks
@@ -209,7 +211,9 @@ def _attack_bodies(
             b = starts[i + 1] if i + 1 < len(starts) else len(vals)
             while b > a and quiet(vals[b - 1]):
                 b -= 1
-            if b - a >= PWM_ATTACK_MIN_FRAMES:
+            # Keep short attacks as bounds too: the fold pass below merges
+            # them into the next body, so their transient is not lost.
+            if b > a:
                 bounds.append((a, b))
     else:
         start = 0
@@ -237,13 +241,36 @@ def _attack_bodies(
         if b - a >= PWM_ATTACK_MIN_FRAMES:
             bounds.append((a, b))
     out: list[tuple[int, bytes]] = []
-    for a, b in bounds:
+    # Fold short fragments into the following body so their attack is kept
+    # without spending a sample slot on a few milliseconds of audio.
+    merged: list[tuple[int, int]] = []
+    i = 0
+    while i < len(bounds):
+        a, b = bounds[i]
+        if b - a < PWM_ATTACK_MIN_FRAMES and i + 1 < len(bounds):
+            bounds[i + 1] = (a, bounds[i + 1][1])
+            i += 1
+            continue
+        merged.append((a, b))
+        i += 1
+    if merged and merged[-1][1] - merged[-1][0] < PWM_ATTACK_MIN_FRAMES:
+        if len(merged) > 1:
+            merged[-2] = (merged[-2][0], merged[-1][1])
+            merged.pop()
+        else:
+            merged.pop()
+    for a, b in merged:
         body = data[a * 2:b * 2]
         if not _audible_pcm(body, idle, width):
             continue
         while b - a > PWM_ATTACK_MAX_FRAMES:
-            out.append((a, data[a * 2:(a + PWM_ATTACK_MAX_FRAMES) * 2]))
-            a += PWM_ATTACK_MAX_FRAMES
+            cut = a + PWM_ATTACK_MAX_FRAMES
+            # A tiny tail would become its own sub-minimum sample; split the
+            # body in half instead so both pieces are useful.
+            if b - cut < PWM_ATTACK_MIN_FRAMES:
+                cut = a + (b - a) // 2
+            out.append((a, data[a * 2:cut * 2]))
+            a = cut
         out.append((a, data[a * 2:b * 2]))
     return out
 

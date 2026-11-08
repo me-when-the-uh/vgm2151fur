@@ -113,8 +113,8 @@ Open follow-ups are tracked in [TODO.md](./TODO.md).
   - Unique phrases use 120-slot sample maps, so a speech-heavy rip stays inside the instrument budget.
   - Identical phrases share one body, and rate changes inside a phrase are resampled to the module body's fixed rate.
 - Sega 32X PWM converts streamed 12-bit stereo data to two Generic PCM DAC columns per chip, including n-Bit compressed `0x43` banks.
-  - Candidate starts are detected at attack transients (rises out of the idle level), including inside a long passage; the resulting bodies are trimmed, silence-only pieces are dropped, and repeated bodies share one sample.
-  - Long bodies are cut at 1 second, and identical bodies are stored once, including when the left and right sides carry the same body.
+  - Candidate starts are detected at attack transients (rises out of the idle level), including inside a long passage; bodies shorter than a quarter chunk fold into the next body, silence-only pieces are dropped, and repeated bodies share one sample.
+  - Long bodies are split at about 1 second without leaving a sub-minimum tail, and identical bodies are stored once, including when the left and right sides carry the same body.
   - The PWM data is a streamed duty sequence, so the module stores the decoded left/right PCM rather than the source register writes.
 - Generic PCM DAC mix levels are limited to 2.0 per chip and the song master to 3.0; the source normalizer stops at that ceiling.
 - SegaPCM and C140 follow mid-note volume and frequency writes, while start/end/loop/bank changes stay at the key-on value.
