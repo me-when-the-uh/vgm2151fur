@@ -665,7 +665,7 @@ class TestDualK007232(unittest.TestCase):
             ChipWrite(t, "k007232", cid, 0x14, 0x00),
             ChipWrite(t, "k007232", cid, 0x10, 0x88),
             ChipWrite(t, "k007232", cid, 0x11, 0x88),
-            ChipWrite(t, "k007232", cid, 0x1F, 0x00),
+            ChipWrite(t, "k007232", cid, 0x05, 0x00),
         ]
 
     def test_second_bank_and_voice_are_converted(self):
@@ -683,6 +683,8 @@ class TestDualK007232(unittest.TestCase):
         chans = sorted(e.ch for e in song.events if e.on and e.pcm)
         self.assertEqual(len(chans), 2)
         self.assertEqual(chans[1] - chans[0], 2)
+        # Each short body reaches its 0x80 end marker before the song ends.
+        self.assertEqual(sum(1 for e in song.events if e.pcm and not e.on), 2)
         mod = parse_fur(write_fur(song, include_pcm=True))
         self.assertEqual(
             mod.chips, [CHIP_YM2151, CHIP_K007232, CHIP_K007232],

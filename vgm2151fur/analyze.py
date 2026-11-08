@@ -86,7 +86,13 @@ from vgm2151fur.ym2413 import (
     OPLLState,
     opll_rhythm_plan,
 )
-from vgm2151fur.pcm import PcmSample, build_pcm_bank, pitch_to_note, rate_to_note
+from vgm2151fur.pcm import (
+    PcmSample,
+    build_pcm_bank,
+    k007232_rate,
+    pitch_to_note,
+    rate_to_note,
+)
 from vgm2151fur.multipcm import (
     MULTIPCM_VOICES,
     MultipcmSample,
@@ -9814,6 +9820,19 @@ def analyze(
             (max(h.vol_l, h.vol_r) for s in audible for h in s.hits), default=0
         )
         vol_scale = 255.0 if peak_raw > 16 else 15.0
+        # A K007232 voice stops at the sample's 0x80 end marker unless the
+        # loop-enable register is set.  Emit that natural end as a note-off so
+        # the module does not leave the column hanging.
+        by_ch: dict[tuple[int, int], list] = {}
+        for smp in audible:
+            for h in smp.hits:
+                by_ch.setdefault((smp.chip_id, h.ch), []).append(h)
+        next_on: dict[int, int] = {}
+        for hits_for_ch in by_ch.values():
+            hits_for_ch.sort(key=lambda h: h.sample_time)
+            for i, h in enumerate(hits_for_ch[:-1]):
+                next_on[id(h)] = hits_for_ch[i + 1].sample_time
+        total = vgm.total_samples or 0
         for smp in audible:
             c4p = smp.mode_pitch()
             ins = pcm_ins_base + audible_index[id(smp)]
@@ -9822,9 +9841,10 @@ def analyze(
                 vl = vol15(h.vol_l, vol_scale)
                 vr = vol15(h.vol_r, vol_scale)
                 vol = max(vl, vr)
+                ch = pcm_at.get(smp.chip_id, fm_end) + h.ch
                 events.append(NoteEvent(
                     sample=h.sample_time,
-                    ch=pcm_at.get(smp.chip_id, fm_end) + h.ch,
+                    ch=ch,
                     on=True,
                     note=note,
                     ins=ins,
@@ -9833,6 +9853,26 @@ def analyze(
                     pan=pcm_pan_fx(vl, vr),
                     pcm=True,
                 ))
+                if not h.loop and smp.pcm7:
+                    rate = k007232_rate(clock, h.pitch)
+                    natural = h.sample_time + int(round(
+                        len(smp.pcm7) / rate * VGM_RATE
+                    ))
+                    nxt = next_on.get(id(h))
+                    if nxt is None or nxt > natural:
+                        end = min(natural, total) if total else natural
+                        if end > h.sample_time:
+                            events.append(NoteEvent(
+                                sample=end,
+                                ch=ch,
+                                on=False,
+                                note=180,
+                                ins=-1,
+                                vol=-1,
+                                e5=0x80,
+                                pan=0,
+                                pcm=True,
+                            ))
         if not rom and any(smp.length >= 8 and smp.hits for smp in pcm_samples):
             warnings.append("no K007232 ROM block (0x94); PCM notes will be silent until samples are added")
     else:

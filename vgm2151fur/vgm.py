@@ -164,6 +164,8 @@ YM2610_ADPCM_ROM_TYPE = 0x82  # YM2610 ADPCM-A/B ROM
 YM2610_DELTAT_ROM_TYPE = 0x83  # YM2610 delta-T ROM
 YM2608_DELTAT_ROM_TYPE = 0x81  # YM2608 ADPCM-B (delta-T) ROM
 K053260_ROM_TYPE = 0x8E  # Konami K053260 ROM
+# Real K007232 key-on registers are 0x05 (voice 0) and 0x0B (voice 1).
+# 0x1F is retained only for older synthetic fixtures that used that offset.
 K007232_TRIGGER_REG = 0x1F
 # Extra-header chip ids (libvgm device index). 0x02 is YM2612, 0x2A K007232.
 EXTRA_MSM6258 = 0x16

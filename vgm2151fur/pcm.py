@@ -112,6 +112,9 @@ class PcmHit:
     vol_l: int
     vol_r: int
     chip_id: int = 0
+    # Loop-enable register value at the trigger; looped bodies have no natural
+    # end marker to convert into a note-off.
+    loop: bool = False
 
 
 @dataclass
@@ -160,6 +163,7 @@ def _collect_pcm_chip(writes: list, chip_id: int) -> list[PcmHit]:
     ch_start = [0, 0]
     ch_bank = [0, 0]
     vol = [0, 0, 0, 0]  # 0x10..0x13
+    loop_en = 0
     hits: list[PcmHit] = []
     for w in writes:
         r, v = w.reg, w.val
@@ -189,8 +193,18 @@ def _collect_pcm_chip(writes: list, chip_id: int) -> list[PcmHit]:
             ch_bank[1] = v
         elif 0x10 <= r <= 0x13:
             vol[r - 0x10] = v
-        elif r == K007232_TRIGGER_REG:
-            ch = 1 if (v & 0x7F) == 11 else 0
+        elif r == 0x0D:
+            loop_en = v
+        elif r in (0x05, 0x0B, K007232_TRIGGER_REG):
+            # Registers 0x05 and 0x0B are the real per-voice key-on triggers.
+            # 0x1F is accepted for older synthetic fixtures that used the wrong
+            # offset; the hardware core has no 0x1F trigger.
+            if r == 0x05:
+                ch = 0
+            elif r == 0x0B:
+                ch = 1
+            else:
+                ch = 1 if (v & 0x7F) == 11 else 0
             addr = (ch_start[ch] & 0x1FFFF) | ((ch_bank[ch] & 0xFF) << 17)
             hits.append(PcmHit(
                 sample_time=w.sample,
@@ -201,6 +215,7 @@ def _collect_pcm_chip(writes: list, chip_id: int) -> list[PcmHit]:
                 vol_l=vol[ch * 2],
                 vol_r=vol[ch * 2 + 1],
                 chip_id=chip_id,
+                loop=bool(loop_en),
             ))
     return hits
 
