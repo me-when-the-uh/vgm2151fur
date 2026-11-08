@@ -9845,6 +9845,15 @@ def analyze(
                 vr = vol15(h.vol_r, vol_scale)
                 vol = max(vl, vr)
                 ch = pcm_at.get(smp.chip_id, fm_end) + h.ch
+                vol_pts = tuple(
+                    (
+                        t,
+                        vol15(max(l, r), vol_scale),
+                        pcm_pan_fx(vol15(l, vol_scale), vol15(r, vol_scale)),
+                    )
+                    for t, l, r in h.vol_pts
+                    if t > h.sample_time
+                )
                 events.append(NoteEvent(
                     sample=h.sample_time,
                     ch=ch,
@@ -9855,6 +9864,7 @@ def analyze(
                     e5=e5,
                     pan=pcm_pan_fx(vl, vr),
                     pcm=True,
+                    vol_pts=vol_pts,
                 ))
                 if smp.pcm7:
                     rate = k007232_rate(clock, h.pitch)
@@ -9862,12 +9872,31 @@ def analyze(
                         len(smp.pcm7) / rate * VGM_RATE
                     ))
                     nxt = next_on.get(id(h))
-                    if nxt is not None:
-                        # A new key-on cuts this voice even if the ROM body is
-                        # still running.  Mark the off so the writer can put it
-                        # on the row before the next trigger.
+                    # A volume cut that holds for at least a tick is the
+                    # driver's staccato/rest; convert it to an actual OFF.
+                    zero_cut = None
+                    for i, (t, left, right) in enumerate(h.vol_pts):
+                        if max(left, right) != 0:
+                            continue
+                        after = (
+                            h.vol_pts[i + 1][0]
+                            if i + 1 < len(h.vol_pts)
+                            else (nxt or natural)
+                        )
+                        if after - t >= 64:
+                            zero_cut = t
+                            break
+                    if zero_cut is not None:
+                        end = zero_cut
+                    elif nxt is not None and natural >= nxt:
+                        end = 0
+                    elif not h.loop:
+                        end = min(natural, total) if total else natural
+                    else:
+                        end = 0
+                    if end > h.sample_time:
                         events.append(NoteEvent(
-                            sample=nxt,
+                            sample=end,
                             ch=ch,
                             on=False,
                             note=180,
@@ -9876,22 +9905,7 @@ def analyze(
                             e5=0x80,
                             pan=0,
                             pcm=True,
-                            cut_before=True,
                         ))
-                    elif not h.loop:
-                        end = min(natural, total) if total else natural
-                        if end > h.sample_time:
-                            events.append(NoteEvent(
-                                sample=end,
-                                ch=ch,
-                                on=False,
-                                note=180,
-                                ins=-1,
-                                vol=-1,
-                                e5=0x80,
-                                pan=0,
-                                pcm=True,
-                            ))
         if not rom and any(smp.length >= 8 and smp.hits for smp in pcm_samples):
             warnings.append("no K007232 ROM block (0x94); PCM notes will be silent until samples are added")
     else:
