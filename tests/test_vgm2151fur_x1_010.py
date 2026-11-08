@@ -9,7 +9,12 @@ import unittest
 from pathlib import Path
 
 from vgm2151fur.analyze import analyze
-from vgm2151fur.furio import decompress_fur, iter_blocks, parse_fur
+from vgm2151fur.furio import (
+    decompress_fur,
+    iter_blocks,
+    master_volume,
+    parse_fur,
+)
 from vgm2151fur.furwrite import write_fur
 from vgm2151fur.pitch import frequency_pitch_table, furnace_frequency_note
 from vgm2151fur.vgm import (
@@ -170,7 +175,9 @@ class TestX1Module(unittest.TestCase):
         self.assertEqual(len(song.x1_waves), 1)
         self.assertEqual(len(song.x1_envs), 1)
         self.assertEqual(song.events[0].note, 105)
-        mod = parse_fur(write_fur(song, include_fm=False))
+        data = write_fur(song, include_fm=False)
+        self.assertEqual(master_volume(decompress_fur(data)), 1.0)
+        mod = parse_fur(data)
         self.assertEqual(mod.chips, [0xB0])
         self.assertEqual(mod.n_ch, 16)
         self.assertEqual(mod.samples, [])
