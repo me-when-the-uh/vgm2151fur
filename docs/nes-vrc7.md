@@ -71,6 +71,12 @@ semitone is a new note; smaller changes are a pitch trajectory.
   filter drops; some drivers park an unused voice at 0 between phrases, so
   such a write reads as silence (it ends the open note) instead of becoming
   the top note of Furnace's range.
+- **Timer writes**: a driver that writes the timer low byte first leaves the
+  stale high byte in place for a sample or two (Santa Claus writes 270 -> 0 as
+  low `0x00` then high `0xC0`, which reads as 256 in between). When the
+  matching high write follows within a few samples the low write is not
+  evaluated, so a half-updated period cannot split a note or steal its
+  note-off.
 - **Volume**: the low nibble of `$4000`/`$4004`/`$400C` is the pattern volume
   (0-15) when the constant-volume bit is set.
 - **Duty / noise mode**: `12xx` row effect at the note and on changes.

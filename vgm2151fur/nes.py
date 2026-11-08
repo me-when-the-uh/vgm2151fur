@@ -471,7 +471,25 @@ def _nes_tones_one(
         for voice in range(4):
             evaluate(voice, t)
 
-    for w in writes:
+    def timer_high_follows(index: int, low_reg: int, t: int) -> bool:
+        """True when the next write completes this timer update.
+
+        A driver that writes the timer low byte first leaves a stale high byte
+        for a sample or two.  Evaluating that half-updated period turns a real
+        note into a spurious bend or split: Santa Claus writes 270 -> 0 as
+        low 0x00 (270 & 0x700 = 256) then high 0xC0, and 256 is a held step
+        that closed the note without a note-off.  Let the high write evaluate
+        the combined period instead.
+        """
+        high_reg = {0x02: 0x03, 0x06: 0x07, 0x0A: 0x0B}[low_reg]
+        for nxt in writes[index + 1:index + 4]:
+            if nxt.sample > t + 8:
+                break
+            if (nxt.reg & 0x7F) == high_reg:
+                return True
+        return False
+
+    for index, w in enumerate(writes):
         reg = w.reg & 0x7F
         val = w.val & 0xFF
         t = w.sample
@@ -502,8 +520,10 @@ def _nes_tones_one(
             period[voice] = (period[voice] & 0x700) | val
             # Some drivers write the timer high byte before the low one.  The
             # high write then opened the note on the previous low byte; the
-            # low write is the one that completes this pitch.
-            if freq_hi[voice]:
+            # low write is the one that completes this pitch.  The other order
+            # leaves a stale high byte for a sample or two, so wait for the
+            # high write when one follows.
+            if freq_hi[voice] and not timer_high_follows(index, reg, t):
                 evaluate(voice, t)
         elif reg == 0x03 or reg == 0x07:
             voice = 0 if reg == 0x03 else 1
@@ -516,7 +536,7 @@ def _nes_tones_one(
             evaluate(2, t)
         elif reg == 0x0A:
             period[2] = (period[2] & 0x700) | val
-            if freq_hi[2]:
+            if freq_hi[2] and not timer_high_follows(index, reg, t):
                 evaluate(2, t)
         elif reg == 0x0B:
             period[2] = (period[2] & 0xFF) | ((val & 7) << 8)

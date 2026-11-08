@@ -347,6 +347,21 @@ class TestNesTones(unittest.TestCase):
             [o.sample_time for o in offs], [1000 + 8636, 22050 + 8636],
         )
 
+    def test_low_byte_first_does_not_split_a_parked_voice(self):
+        # 270 -> 0 is written as low 0x00 then high 0xC0.  Reading the low write
+        # alone turns 270 into 256, and a "held step" split closed the note
+        # without the note-off the parked write should give (Santa Claus' second
+        # APU: its pulses lost exactly the offs the first chip had).
+        writes = [
+            _nes(1000, 0x00, 0xBF),
+            _nes(1000, 0x02, 0x0E), _nes(1000, 0x03, 0xC1),
+            _nes(20000, 0x02, 0x00), _nes(20000, 0x03, 0xC0),
+        ]
+        hits, offs, _warn = collect_nes_tones(_vgm(writes, nes_clock=1789773))
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0].period, 0x10E)
+        self.assertEqual([o.sample_time for o in offs], [20000])
+
     def test_module_halts_a_constant_volume_note(self):
         # Furnace reloads the length counter on note-on, so an un-halted note
         # dies after a fraction of a second.  A constant-volume voice can take
