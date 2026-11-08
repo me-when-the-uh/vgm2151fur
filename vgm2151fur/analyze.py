@@ -3929,20 +3929,6 @@ def _emit_x1_wave_notes(
                 h.clock, X1_FREQ_DIV, max(1, value),
                 maximum=X1_MAX_FREQ,
             )
-            tbl = frequency_pitch_table(
-                float(h.clock), X1_FREQ_DIV, maximum=X1_MAX_FREQ,
-            )
-            base_off = (note << 7) + (e5 - E5_CENTER)
-            steps = tuple(
-                (
-                    t,
-                    int(round(
-                        tbl.offset_for(note, per) - base_off
-                    )),
-                )
-                for t, per in intra
-            )
-            steps = tuple((t, v) for t, v in steps if v)
             wave_pts = tuple(
                 (t, wave_map.get(body, wave_idx))
                 for t, body in h.wave_pts if wave_map.get(body, wave_idx) != wave_idx
@@ -3963,7 +3949,7 @@ def _emit_x1_wave_notes(
                 pan=0,
                 end=seg_end,
                 vol_pts=(),
-                tone_pitch_pts=steps,
+                tone_pitch_pts=tuple(intra),
                 tone_chip=11,
                 tone_clock=h.clock,
                 tone_div=X1_FREQ_DIV,

@@ -230,6 +230,23 @@ class TestX1Module(unittest.TestCase):
         self.assertEqual(len(song.x1_waves), 1)
         self.assertEqual(len(song.x1_envs), 1)
 
+    def test_pitch_points_stay_in_register_units(self):
+        writes = _wave_setup()
+        # A mid-note retune.  The collector and NoteEvent keep the raw 16-bit
+        # register; only the instrument builder converts it to pitch offsets.
+        writes[-1:] = [
+            _write(3000, 2, 1900 & 0xFF),
+            _write(3000, 3, (1900 >> 8) & 0xFF),
+        ] + writes[-1:]
+        song = analyze(_vgm(writes))
+        ev = [e for e in song.events if e.on and e.tone_chip == 11][0]
+        self.assertEqual(ev.tone_pitch_pts, ((3000, 1900),))
+        self.assertLess(
+            max((abs(v) for ins in song.x1_010_ins for v in ins.pitch),
+                default=0),
+            2000,
+        )
+
     def test_pcm_only_has_no_wave_assets(self):
         body = bytes((i * 3) & 0xFF for i in range(0x2000))
         writes = [
