@@ -32,6 +32,14 @@ PWM_MAP_SLOTS = 120
 
 
 @dataclass
+class PwmHit:
+    """One chunk occurrence: where to start it and which side plays it."""
+
+    time: int
+    side: int
+
+
+@dataclass
 class PwmSample:
     chip_id: int
     side: int
@@ -39,7 +47,7 @@ class PwmSample:
     rate: int
     loop_start: int | None = None
     loop_end: int | None = None
-    hits: list[int] = field(default_factory=list)  # note-on sample times
+    hits: list[PwmHit] = field(default_factory=list)
     chunk: int = 0
     first_chunk: bool = True
 
@@ -49,8 +57,7 @@ class PwmSample:
 
     @property
     def name(self) -> str:
-        side = "L" if self.side == 0 else "R"
-        return f"PWM{self.chip_id + 1} {side} {self.chunk:03d}"
+        return f"PWM{self.chip_id + 1} {self.chunk:03d}"
 
 
 def _signed12(value: int) -> int:
@@ -238,28 +245,37 @@ def collect_pwm(vgm: VgmFile) -> tuple[list[PwmSample], list[str]]:
                 sample.data = bytes(dst)
 
     audible: list[PwmSample] = []
+    seen: dict[tuple[int, bytes], PwmSample] = {}
     for (cid, side), sample in sorted(samples.items()):
         full = sample.data
         frames = len(full) // 2
         if frames <= 0:
             continue
-        chunk_no = 0
         for start in range(0, frames, PWM_CHUNK_FRAMES):
             end = min(frames, start + PWM_CHUNK_FRAMES)
             body = full[start * 2:end * 2]
             if not any(body):
+                continue
+            hit = PwmHit(
+                time=int(round(start / PWM_RATE * VGM_RATE)),
+                side=side,
+            )
+            key = (cid, body)
+            found = seen.get(key)
+            if found is not None:
+                found.hits.append(hit)
                 continue
             chunk = PwmSample(
                 chip_id=cid,
                 side=side,
                 data=body,
                 rate=PWM_RATE,
-                hits=[int(round(start / PWM_RATE * VGM_RATE))],
-                chunk=chunk_no,
+                hits=[hit],
+                chunk=len(audible),
                 first_chunk=(start == 0),
             )
+            seen[key] = chunk
             audible.append(chunk)
-            chunk_no += 1
     if not audible:
         warnings.append("PWM streams decoded to silence")
     return audible, warnings

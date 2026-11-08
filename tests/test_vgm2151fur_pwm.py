@@ -61,18 +61,54 @@ class TestPwmCollector(unittest.TestCase):
             step=1, step_base=0, bank=3, block=-1,
         )]
         samples, _warn = collect_pwm(v)
-        self.assertEqual(samples[0].data, samples[1].data)
+        self.assertEqual(len(samples), 1)
+        self.assertEqual({h.side for h in samples[0].hits}, {0, 1})
 
     def test_long_stream_is_chunked(self):
         from vgm2151fur.pwm import PWM_CHUNK_FRAMES
         frames = PWM_CHUNK_FRAMES * 2 + 10
         v = _vgm()
+        v.dac_stream_plays = [
+            DacStreamPlay(
+                sample=0, chip_type=STREAM_PWM, chip_id=0, stream=0,
+                port=0, reg=reg, offset=0, length=0, mode=3, rate=PWM_RATE,
+                step=1, step_base=0, bank=3, block=-1,
+            )
+            for reg in (2, 3)
+        ]
         v.pwm_bank = bytearray(_bank(frames))
         v.pwm_blocks = [bytes(v.pwm_bank)]
         v.total_samples = int(frames / PWM_RATE * 44100) + 100
         samples, _warn = collect_pwm(v)
-        self.assertEqual(len(samples), 6)  # three chunks per side
-        self.assertEqual(len({(s.chip_id, s.side) for s in samples}), 2)
+        # Identical left/right chunks share one body.
+        self.assertEqual(len(samples), 3)
+        self.assertEqual(sum(len(s.hits) for s in samples), 6)
+        self.assertEqual(
+            {h.side for s in samples for h in s.hits}, {0, 1},
+        )
+
+    def test_repeated_chunks_share_one_body(self):
+        from vgm2151fur.pwm import PWM_CHUNK_FRAMES
+        v = _vgm()
+        v.dac_stream_plays = [
+            DacStreamPlay(
+                sample=0, chip_type=STREAM_PWM, chip_id=0, stream=0,
+                port=0, reg=reg, offset=0, length=0, mode=3, rate=PWM_RATE,
+                step=1, step_base=0, bank=3, block=-1,
+            )
+            for reg in (2, 3)
+        ]
+        item = bytes((0x00, 0x01))  # a constant 0x100 PWM value
+        chunk = item * PWM_CHUNK_FRAMES
+        body = chunk + chunk
+        v.pwm_bank = bytearray(body)
+        v.pwm_blocks = [body]
+        v.total_samples = int(
+            (2 * PWM_CHUNK_FRAMES) / PWM_RATE * 44100
+        ) + 100
+        samples, _warn = collect_pwm(v)
+        self.assertEqual(len(samples), 1)
+        self.assertEqual(len(samples[0].hits), 4)  # two chunks, two sides
 
 
 class TestPwmModule(unittest.TestCase):

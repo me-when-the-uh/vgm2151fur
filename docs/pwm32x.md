@@ -19,8 +19,11 @@ and scale, and renders one 16-bit PCM body per side.  Because Furnace has no
 right) with hard pan.  The module sample rate is 22020 Hz, matching the chip's
 device rate.  Each side is cut into 0.25-second chunks and grouped through a
 120-slot sample map, the same approach as the YM2612 DAC path, so the module
-stays editable and does not hold one multi-megabyte sample.  When the VGM
-loops, the pattern/order loop repeats the chunk sequence.
+stays editable and does not hold one multi-megabyte sample.  Chunk bodies are
+deduplicated: a repeated chunk is stored once, and a chunk shared by the left
+and right streams (including a fully mono PWM log) is played by both sides
+from one sample.  When the VGM loops, the pattern/order loop repeats the chunk
+sequence.
 
 ## Limits
 

@@ -114,6 +114,7 @@ Open follow-ups are tracked in [TODO.md](./TODO.md).
   - Identical phrases share one body, and rate changes inside a phrase are resampled to the module body's fixed rate.
 - Sega 32X PWM converts streamed 12-bit stereo data to two Generic PCM DAC columns per chip, including n-Bit compressed `0x43` banks.
   - The stream is cut into 0.25-second PCM chunks and grouped through 120-slot sample maps, like the YM2612 DAC path.
+  - Identical chunks are stored once, including when the left and right sides carry the same body.
   - The PWM data is a streamed duty sequence, so the module stores the decoded left/right PCM rather than the source register writes.
 - Generic PCM DAC mix levels are limited to 2.0 per chip and the song master to 3.0; the source normalizer stops at that ceiling.
 - SegaPCM and C140 follow mid-note volume and frequency writes, while start/end/loop/bank changes stay at the key-on value.

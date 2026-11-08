@@ -10209,36 +10209,37 @@ def analyze(
         for i, smp in enumerate(pwm_audible):
             slot = i % 120
             ins_slot = i // 120
-            start = smp.hits[0] if smp.hits else 0
             duration = int(round(smp.frames / smp.rate * VGM_RATE))
-            end = min(start + duration, vgm.total_samples or start + duration)
-            ev = NoteEvent(
-                sample=start,
-                ch=pwm_at.get(smp.chip_id, pwm_base) + smp.side,
-                on=True,
-                note=60 + slot,  # 120-slot map, slot plays at C-4
-                ins=-1,
-                vol=255,
-                e5=0x80,
-                pan=0xF0 if smp.side == 0 else 0x0F,
-                pcm=True,
-                end=end,
-            )
-            events.append(ev)
-            pwm_events.append((ev, ins_slot))
-            pwm_count += 1
-            if end and end < (vgm.total_samples or 0):
-                events.append(NoteEvent(
-                    sample=end,
-                    ch=ev.ch,
-                    on=False,
-                    note=180,
+            for hit in smp.hits:
+                start = hit.time
+                end = min(start + duration, vgm.total_samples or start + duration)
+                ev = NoteEvent(
+                    sample=start,
+                    ch=pwm_at.get(smp.chip_id, pwm_base) + hit.side,
+                    on=True,
+                    note=60 + slot,  # 120-slot map, slot plays at C-4
                     ins=-1,
-                    vol=-1,
+                    vol=255,
                     e5=0x80,
-                    pan=0,
+                    pan=0xF0 if hit.side == 0 else 0x0F,
                     pcm=True,
-                ))
+                    end=end,
+                )
+                events.append(ev)
+                pwm_events.append((ev, ins_slot))
+                pwm_count += 1
+                if end and end < (vgm.total_samples or 0):
+                    events.append(NoteEvent(
+                        sample=end,
+                        ch=ev.ch,
+                        on=False,
+                        note=180,
+                        ins=-1,
+                        vol=-1,
+                        e5=0x80,
+                        pan=0,
+                        pcm=True,
+                    ))
     else:
         audible = []
 
