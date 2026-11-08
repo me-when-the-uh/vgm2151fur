@@ -26,6 +26,7 @@ from vgm2151fur.opl import (
 )
 from vgm2151fur.pcm import pcm7_to_s8, scale_pcm7
 from vgm2151fur.pitch import FURNACE_CLOCK_DEFAULT, module_clock
+from vgm2151fur.pokey import POKEY_VOICES
 from vgm2151fur.saa1099 import (
     SAA_CLOCK_8M, SAA_CLOCK_NTSC, SAA_CLOCK_PAL, SAA_DEFAULT_CLOCK,
 )
@@ -111,6 +112,8 @@ CHIP_C352 = 0xD0
 CHIP_K051649 = 0xA1
 CHIP_K052539 = 0xB4
 CHIP_AY8910 = 0x80
+# DIV_SYSTEM_POKEY: four voices, AUDCTL waveform/filter/join features.
+CHIP_POKEY = 0x94
 # DIV_SYSTEM_SAA1099: six square/noise voices, no software timers.  A pair of
 # these is the Creative Music System / Game Blaster.
 CHIP_SAA1099 = 0x97
@@ -262,6 +265,9 @@ INS_SCC = 18
 # DIV_INS_SAA1099: standard macros, with the raw amplitude carried by the
 # pan-left/pan-right macros and the envelope by ex1.
 INS_SAA = 9
+# DIV_INS_POKEY: volume and pitch macros; AUDCTL and waveform are 11xx/10xx
+# pattern effects (the platform's duty and wave macros share those slots).
+INS_POKEY = 20
 # DIV_INS_PCE: the HuC6280's 32x5-bit wavetable, through the same wave synth
 # as the SCC. Its direct-D/A bodies use DIV_INS_AMIGA (INS_C352 above).
 INS_PCE = 5
@@ -310,7 +316,7 @@ _DEV_DEFAULT_VOLUME = {
     0x00: 0x80,
     0x03: 0x100, 0x04: 0x180, 0x08: 0x100, 0x12: 0x100, 0x16: 0x11E,
     0x18: 0x100, 0x19: 0xA0, 0x1C: 0x100, 0x1D: 0x100, 0x27: 0x40,
-    0x0F: 0x100, 0x22: 0x100,  # VSU
+    0x0F: 0x100, 0x22: 0x100, 0x1E: 0x100,  # VSU, POKEY
 }
 _DEV_CORE_PATCH = {
     0x19: lambda v: v * 8 // 5,  # K051649 SCC core scale
@@ -328,6 +334,9 @@ _FURNACE_VOLUME_SCALE = {
     # MAME shifts the voice product by 6 bits, the Furnace core by 7, so the
     # module needs twice the player's system volume to reach the same level.
     0x1D: 2.0,
+    # POKEY's Furnace core is 3.3x quieter than VGMPlay's at the same system
+    # volume (measured on a constant-volume square).
+    0x1E: 3.3,
     # VBOY's core has a 6x post-amp.  Measured against VGMPlay on Galactic
     # Pinball and Jack Bros: the module is about 2.2x quieter at unity.
     0x22: 2.2,
@@ -340,6 +349,7 @@ _CHIP_DEV = {CHIP_YM2151: 0x03, CHIP_SEGAPCM: 0x04, CHIP_MSM6295: 0x18,
              CHIP_SMS: 0x00, CHIP_T6W28: 0x00,
              CHIP_K051649: 0x19, CHIP_K052539: 0x19,
              CHIP_AY8910: 0x12,
+             CHIP_POKEY: 0x1E,
              CHIP_YM2610: 0x08, CHIP_YM2610B: 0x08}
 
 
@@ -991,6 +1001,26 @@ def _write_ins_ay(b: Buf, name: str, ins=None) -> None:
     b.end_block(size_off, start)
 
 
+def _write_ins_pokey(b: Buf, name: str, ins=None) -> None:
+    """DIV_INS_POKEY: volume + pitch macros, no wave/AUDCTL macros.
+
+    AUDCTL (11xx) and waveform (10xx) are pattern effects, so the instrument
+    only needs the per-frame volume contour and the pitch trajectory.
+    """
+    size_off, start = b.begin_block(b"INS2")
+    b.u16(FUR_VERSION)
+    b.u16(INS_POKEY)
+    b.raw(b"NA")
+    na_size = len(b.b)
+    b.u16(0)
+    na_start = len(b.b)
+    b.strz(name)
+    b.b[na_size:na_size + 2] = int(len(b.b) - na_start).to_bytes(2, "little")
+    _write_tone_macros(b, ins or ToneIns(), wave=False)
+    b.raw(b"EN")
+    b.end_block(size_off, start)
+
+
 def _write_ins_saa(b: Buf, name: str, ins=None) -> None:
     """DIV_INS_SAA1099: standard macros plus the raw pan pair and ex1.
 
@@ -1523,6 +1553,22 @@ def k051649_flag_text(clock: int) -> str:
     if module_clock(clock) != FURNACE_CLOCK_DEFAULT:
         return f"customClock={clock}"
     return ""
+
+
+# Furnace's POKEY clock list: NTSC (default) and PAL.  COLOR_PAL*2/5 is
+# 1773447.5 Hz.
+POKEY_PAL_CLOCK = 1_773_448
+POKEY_DEFAULT_CLOCK = 1_789_772
+
+
+def pokey_flag_text(clock: int) -> str:
+    """POKEY system flags: NTSC default, PAL preset, or a custom clock."""
+    clk = float(clock or POKEY_DEFAULT_CLOCK)
+    if abs(clk - POKEY_PAL_CLOCK) <= 2:
+        return "clockSel=1"
+    if module_clock(clk) == FURNACE_CLOCK_DEFAULT:
+        return ""
+    return f"customClock={int(round(clk))}"
 
 
 def pce_flag_text(clock: int) -> str:
@@ -4136,6 +4182,7 @@ def write_fur(
         or getattr(song, "vsu_ids", ())
         or getattr(song, "saa_ids", ())
         or getattr(song, "psg_ids", ())
+        or getattr(song, "pokey_ids", ())
         # YMZ280B is a sample engine with real module columns; a YMZ-only log
         # must not gain an empty YM2151 placeholder above it.
         or getattr(song, "ymz280b_samples", ())
@@ -4275,6 +4322,8 @@ def write_fur(
     vsu_specs = list(getattr(song, "vsu_ins", ()) or ())
     saa_ids = list(getattr(song, "saa_ids", ()) or ())
     saa_specs = list(getattr(song, "saa_ins", ()) or ())
+    pokey_ids = list(getattr(song, "pokey_ids", ()) or ())
+    pokey_specs = list(getattr(song, "pokey_ins", ()) or ())
     scc_chip = CHIP_K052539 if song.vgm.k051649_plus else CHIP_K051649
     n_scc = 5 * len(scc_ids)
     n_ay = 3 * len(ay_ids)
@@ -4284,6 +4333,7 @@ def write_fur(
     n_gb = 4 * len(gb_ids)
     n_vsu = 6 * len(vsu_ids)
     n_saa = 6 * len(saa_ids)
+    n_pokey = 4 * len(pokey_ids)
     n_nes_dpcm_ins = len(nes_dpcm_smps)
     n_nes_pcm_ins = (len(nes_pcm_smps) + 119) // 120
     n_huc6280_pcm_ins = len(huc6280_pcm_smps)
@@ -4329,6 +4379,7 @@ def write_fur(
         + 24 * len(c140_ids) + 32 * len(c352_ids)
         + 4 * len(k053260_ids) + 8 * len(ymz_ids)
         + n_scc + n_ay + n_nes + n_huc6280 + n_gb + n_vsu + n_saa
+        + n_pokey
     )
     if n_ch == 0:
         raise ValueError("write_fur: need include_fm and/or include_pcm")
@@ -4453,7 +4504,7 @@ def write_fur(
         + len(ymz_smps)
         + len(scc_specs) + len(ay_specs) + len(psg_specs) + len(nes_specs)
         + len(huc6280_specs) + len(gb_specs) + len(vsu_specs)
-        + len(saa_specs)
+        + len(saa_specs) + len(pokey_specs)
     )
     n_smp = (
         len(pcm_smps) + len(oki_smps) + len(adpcm_smps)
@@ -4577,6 +4628,10 @@ def write_fur(
         for voice in range(6):
             names_long.append(f"SAA1099 {cid + 1}-{voice + 1}")
             names_short.append(f"A{cid + 1}-{voice + 1}")
+    for cid in pokey_ids:
+        for voice in range(POKEY_VOICES):
+            names_long.append(f"POKEY {cid + 1}-{voice + 1}")
+            names_short.append(f"PK{cid + 1}{voice + 1}")
 
     label_parts: list[str] = []
     if fm_present:
@@ -4990,6 +5045,14 @@ def write_fur(
     for _cid in saa_ids:
         chips.append(CHIP_SAA1099)
         flag_texts.append(saa1099_flag_text(song.vgm.saa1099_clock))
+    for cid in pokey_ids:
+        chips.append(CHIP_POKEY)
+        clock = (
+            (song.vgm.pokey_clock_2 or song.vgm.pokey_clock)
+            if cid == 1 and getattr(song.vgm, "pokey_clock_2", 0)
+            else (song.vgm.pokey_clock or POKEY_DEFAULT_CLOCK)
+        )
+        flag_texts.append(pokey_flag_text(clock))
     n_chips = len(chips)
 
     info_size_off, info_start = b.begin_block(b"INFO")
@@ -5380,6 +5443,14 @@ def write_fur(
         if spec.noise:
             name += "+noise"
         _write_ins_saa(b, name, spec)
+    for i, spec in enumerate(pokey_specs):
+        ins_ptrs.append(len(b))
+        name = f"POKEY {i:02d}"
+        if spec.pitch:
+            name += "+pitch"
+        if spec.vol:
+            name += "+vol"
+        _write_ins_pokey(b, name, spec)
 
     smp_ptrs: list[int] = []
     for i, smp in enumerate(pcm_smps):

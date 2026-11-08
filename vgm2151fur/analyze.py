@@ -90,6 +90,15 @@ from vgm2151fur.pcm import PcmSample, build_pcm_bank, pitch_to_note, rate_to_not
 from vgm2151fur.pitch import (
     E5_CENTER, NOTE_MAX, furnace_period_note, module_clock, pitch_table,
 )
+from vgm2151fur.pokey import (
+    FX_AUDCTL as POKEY_FX_AUDCTL,
+    FX_WAVE as POKEY_FX_WAVE,
+    POKEY_DEFAULT_CLOCK,
+    POKEY_PITCH_MAX,
+    POKEY_VOICES,
+    collect_pokey,
+    pokey_note,
+)
 from vgm2151fur.scc import (
     SCC_DEFAULT_CLOCK,
     SCC_MIN_PERIOD,
@@ -882,6 +891,12 @@ class Song:
     ay_ids: list[int] = field(default_factory=list)
     ay_ins: list[ToneIns] = field(default_factory=list)
     ay_count: int = 0
+    # Atari POKEY: four voices per instance.  `pokey_ins` holds the volume
+    # contour/pitch instruments; AUDCTL and waveform ride as 10xx/11xx row
+    # effects.
+    pokey_ids: list[int] = field(default_factory=list)
+    pokey_ins: list[ToneIns] = field(default_factory=list)
+    pokey_count: int = 0
     # SSG/PSG PCM streams: volume-register spamming while the voice's mixer
     # bits are off. Each body becomes a DIV_INS_AY sample instrument played at
     # note 108 (C-4), matching the reference modules. One instance per body;
@@ -1087,9 +1102,13 @@ _AY_MERGE_GAP = 16  # low/high byte pair, and a second write in the same tick
 _AY_NOTE_HOLD = 1470  # two frames: a one-frame AY step is the pitch macro
 
 
-def _period_semitones(clock: float, divider: int, period: int, offset: int) -> float:
+def _period_semitones(
+    clock: float, divider: int, period: int, offset: int,
+    maximum: int = 0xFFF,
+) -> float:
     note, e5 = furnace_period_note(
         module_clock(clock), divider, max(1, period), period_offset=offset,
+        maximum=maximum,
     )
     return note + (e5 - E5_CENTER) / 128.0
 
@@ -1104,6 +1123,7 @@ def segment_periods(
     merge_gap: int = _NOTE_HOLD_SAMPLES,
     min_hold: int = _NOTE_HOLD_SAMPLES,
     drop_short: bool = True,
+    maximum: int = 0xFFF,
 ) -> list[tuple[int, int, list[tuple[int, int]]]]:
     """Split a period timeline into notes.
 
@@ -1115,15 +1135,17 @@ def segment_periods(
         return []
     merged = merge_step_writes(list(points), gap=merge_gap)
     cur_t, cur_p = merged[0]
-    cur_s = _period_semitones(clock, divider, cur_p, offset)
+    cur_s = _period_semitones(clock, divider, cur_p, offset, maximum)
     intra: list[tuple[int, int]] = []
     segs: list[tuple[int, int, list[tuple[int, int]]]] = []
     for i in range(1, len(merged)):
         t, period = merged[i]
         hold_until = merged[i + 1][0] if i + 1 < len(merged) else end
         held = hold_until - t
-        step = abs(_period_semitones(clock, divider, period, offset) - cur_s)
-        new_s = _period_semitones(clock, divider, period, offset)
+        step = abs(
+            _period_semitones(clock, divider, period, offset, maximum) - cur_s
+        )
+        new_s = _period_semitones(clock, divider, period, offset, maximum)
         if step >= _NOTE_STEP_SEMITONES and held >= min_hold:
             segs.append((cur_t, cur_p, intra))
             cur_t, cur_p = t, period
@@ -1149,15 +1171,15 @@ def _value_at(pts, start: int, default):
     return cur
 
 
-def _saa_tick_interval(vgm: VgmFile) -> float | None:
-    """Most common gap between SAA1099 writes, in samples.
+def _saa_tick_interval(vgm: VgmFile, chip: str = "saa1099") -> float | None:
+    """Most common gap between a pitched chip's register writes, in samples.
 
-    A Furnace export writes its macros once per tick; the CMS rips do the
-    same at the driver's frame rate.  Using that gap as one row keeps the
+    A Furnace export writes its macros once per tick; the CMS/POKEY rips do
+    the same at the driver's frame rate.  Using that gap as one row keeps the
     macros and the pattern grid on the source's own clock instead of guessing
     a 16th from the note onsets.
     """
-    times = [w.sample for w in vgm.writes if w.chip == "saa1099"]
+    times = [w.sample for w in vgm.writes if w.chip == chip]
     if len(times) < 16:
         return None
     intervals = [
@@ -1876,6 +1898,7 @@ def _bind_tone_instruments(
     gb_ins: list[ToneIns],
     vsu_ins: list[ToneIns],
     saa_ins: list[ToneIns],
+    pokey_ins: list[ToneIns],
     tone_ins_base: int,
     scc_clock: int,
     ay_clock: int,
@@ -1885,6 +1908,7 @@ def _bind_tone_instruments(
     gb_clock: int,
     vsu_clock: int,
     saa_clock: int,
+    pokey_clock: int,
     hz: float,
     total_samples: int,
     use_speed: int = 1,
@@ -1911,13 +1935,14 @@ def _bind_tone_instruments(
     gb_map: dict[ToneIns, int] = {}
     vsu_map: dict[ToneIns, int] = {}
     saa_map: dict[ToneIns, int] = {}
+    pokey_map: dict[ToneIns, int] = {}
     ins_cap = max(1, INS_TARGET - tone_ins_base)
-    # GB and VSU bind last. Reserve a share so a large SCC/AY/PCE list cannot
-    # spend every slot before them; the surplus collapses to plain
+    # GB, VSU and POKEY bind last. Reserve a share so a large SCC/AY/PCE list
+    # cannot spend every slot before them; the surplus collapses to plain
     # per-wave/per-env instruments, the documented "fall back to columns"
     # behavior.
     has_late = any(
-        e.tone_chip in (6, 7, 8) and e.on for e in events
+        e.tone_chip in (6, 7, 8, 9) and e.on for e in events
     )
     early_cap = ins_cap
     if has_late:
@@ -1943,6 +1968,7 @@ def _bind_tone_instruments(
     tone_order += [e for e in events if e.on and e.tone_chip == 6]
     tone_order += [e for e in events if e.on and e.tone_chip == 7]
     tone_order += [e for e in events if e.on and e.tone_chip == 8]
+    tone_order += [e for e in events if e.on and e.tone_chip == 9]
     for e in tone_order:
         end = e.end or track_end
         # 255 macro values times the largest speed byte. Long SSG pads can
@@ -1996,6 +2022,12 @@ def _bind_tone_instruments(
             clock = e.tone_clock or saa_clock or SAA_DEFAULT_CLOCK
             divider = SAA_DIVIDER
             maximum = SAA_PITCH_MAX
+        elif e.tone_chip == 9:
+            # POKEY: the collector's "period" is already the platform's
+            # pitch-table value, with the wave/AUDCTL transform inverted.
+            clock = e.tone_clock or pokey_clock or POKEY_DEFAULT_CLOCK
+            divider = 1
+            maximum = POKEY_PITCH_MAX
         else:
             # AY and the YM2203's SSG share the instrument path but not the
             # clock or Furnace's divider (8 vs 16).
@@ -2004,6 +2036,8 @@ def _bind_tone_instruments(
             maximum = 0xFFF
         if e.tone_chip == 8:
             tbl = pitch_table(saa_module_clock(clock), divider, maximum=maximum)
+        elif e.tone_chip == 9:
+            tbl = pitch_table(module_clock(clock), divider, maximum=maximum)
         else:
             tbl = (
                 pitch_table(float(clock), divider, maximum=maximum)
@@ -2369,12 +2403,20 @@ def _bind_tone_instruments(
                 + len(huc6280_ins) + len(gb_ins) + len(vsu_ins),
                 ins_cap, 8, 0,
             )
+        elif e.tone_chip == 9:
+            idx, kept = take(
+                spec, pokey_map, pokey_ins,
+                len(scc_ins) + len(ay_ins) + len(psg_ins) + len(nes_ins)
+                + len(huc6280_ins) + len(gb_ins) + len(vsu_ins)
+                + len(saa_ins),
+                ins_cap, 9,
+            )
         else:
             # AY runs first, so the SCC list is still empty and `others` is 0.
             idx, kept = take(spec, ay_map, ay_ins, 0, early_cap, 2)
         bound.append((e, idx))
         if (
-            e.tone_chip in (3, 7)
+            e.tone_chip in (3, 7, 9)
             and not e.tone_noise
             and kept != spec
             and not kept.pitch
@@ -2640,6 +2682,7 @@ def _tone_instrument_demand(
     gb_clock: int,
     vsu_clock: int,
     saa_clock: int,
+    pokey_clock: int,
     hz: float,
     total_samples: int,
     use_speed: int = 1,
@@ -2656,18 +2699,20 @@ def _tone_instrument_demand(
     if not tone:
         return 0
     scc, ay, psg, nes, huc, gb, vsu, saa = [], [], [], [], [], [], [], []
+    pokey = []
     _bind_tone_instruments(
-        tone, scc, ay, psg, nes, huc, gb, vsu, saa,
+        tone, scc, ay, psg, nes, huc, gb, vsu, saa, pokey,
         # A negative base leaves the instrument cap effectively unlimited, so
         # every distinct macro shape is counted.
         -1000,
         scc_clock, ay_clock, psg_clock, nes_clock, huc6280_clock,
-        gb_clock, vsu_clock, saa_clock, hz, total_samples, use_speed,
+        gb_clock, vsu_clock, saa_clock, pokey_clock, hz, total_samples,
+        use_speed,
         lfo_loop=lfo_loop,
     )
     return sum(
         len(bucket)
-        for bucket in (scc, ay, psg, nes, huc, gb, vsu, saa)
+        for bucket in (scc, ay, psg, nes, huc, gb, vsu, saa, pokey)
     )
 
 
@@ -3389,6 +3434,93 @@ def _emit_ay_notes(
             sample=off.sample_time, ch=base + off.voice, on=False, note=180,
             ins=-1, vol=-1, e5=0x80, pan=0,
         ))
+    return count
+
+
+def _emit_pokey_notes(
+    events: list[NoteEvent],
+    channel_fx: list[tuple[int, int, int, int]],
+    hits,
+    offs,
+    at: dict[int, int],
+    audctl_pts,
+    wave_pts,
+    ins_base: int,
+    total_samples: int = 0,
+) -> int:
+    """Append notes/key-offs for one POKEY register stream.
+
+    AUDCTL is chip-wide, so one 0x11 effect per change goes on the chip's first
+    column.  Waveform changes are per column (0x10).  The instrument itself
+    carries the per-frame volume contour and the pitch trajectory.
+    """
+    count = 0
+    for h in hits:
+        base = at.get(h.chip_id)
+        if base is None:
+            continue
+        ch = base + h.voice
+        st = h.sample_time
+        gate_end = h.off_sample or (total_samples or st)
+        segs = segment_periods(
+            [(st, h.value), *h.freq_pts],
+            gate_end, h.clock, 1, 0,
+            merge_gap=_AY_MERGE_GAP,
+            min_hold=_AY_NOTE_HOLD,
+            drop_short=False,
+            maximum=POKEY_PITCH_MAX,
+        )
+        for i, (sst, value, intra) in enumerate(segs):
+            nxt = segs[i + 1][0] if i + 1 < len(segs) else 0
+            seg_end = nxt or h.off_sample
+            bound = nxt or gate_end
+            note, e5 = pokey_note(h.clock, value)
+            steps = _tone_steps(intra, sst, 0, _AY_MERGE_GAP)
+            vol = _value_at(h.vol_pts, sst, h.vol)
+            vol_pts = tuple(
+                (t, v, None)
+                for t, v in h.vol_pts if sst < t < bound
+            )
+            events.append(NoteEvent(
+                sample=sst,
+                ch=ch,
+                on=True,
+                note=note,
+                ins=ins_base,
+                vol=vol,
+                e5=e5,
+                pan=0,
+                end=seg_end,
+                vol_pts=vol_pts,
+                tone_pitch_pts=tuple(steps),
+                tone_chip=9,
+                tone_clock=h.clock,
+                tone_div=1,
+                tone_period_offset=0,
+            ))
+            count += 1
+    for off in offs:
+        base = at.get(off.chip_id)
+        if base is None:
+            continue
+        events.append(NoteEvent(
+            sample=off.sample_time, ch=base + off.voice, on=False, note=180,
+            ins=-1, vol=-1, e5=0x80, pan=0,
+        ))
+    for sample, cid, val in audctl_pts:
+        base = at.get(cid)
+        if base is not None:
+            channel_fx.append((sample, base, POKEY_FX_AUDCTL, val))
+    last_wave: dict[int, int] = {}
+    for sample, cid, voice, val in sorted(wave_pts, key=lambda p: p[0]):
+        base = at.get(cid)
+        if base is None:
+            continue
+        ch = base + voice
+        if last_wave.get(ch) == val:
+            continue
+        last_wave[ch] = val
+        channel_fx.append((sample, ch, POKEY_FX_WAVE, val))
     return count
 
 
@@ -10710,6 +10842,37 @@ def analyze(
             vgm.total_samples or 0,
         )
 
+    pokey_ids: list[int] = []
+    pokey_ins: list[ToneIns] = []
+    pokey_count = 0
+    pokey_clock = vgm.pokey_clock or POKEY_DEFAULT_CLOCK
+    (
+        pokey_hits, pokey_offs, pokey_audctl, pokey_waves, pokey_warn,
+    ) = collect_pokey(vgm)
+    warnings.extend(pokey_warn)
+    if pokey_hits or pokey_offs:
+        pokey_ids = sorted(
+            {h.chip_id for h in pokey_hits}
+            | {o.chip_id for o in pokey_offs}
+        )
+        pokey_base = (
+            tone_base + SCC_VOICES * len(scc_ids) + AY_VOICES * len(ay_ids)
+            + NES_CHANNELS * len(nes_ids)
+            + (HUC6280_CHANNELS if huc6280_ids else 0)
+            + (4 * len(gb_ids))
+            + VSU_CHANNELS * len(vsu_ids)
+            + SAA_VOICES * len(saa_ids)
+        )
+        pokey_at = {
+            cid: pokey_base + POKEY_VOICES * i
+            for i, cid in enumerate(pokey_ids)
+        }
+        pokey_count = _emit_pokey_notes(
+            events, channel_fx, pokey_hits, pokey_offs, pokey_at,
+            pokey_audctl, pokey_waves, tone_ins_base,
+            vgm.total_samples or 0,
+        )
+
     # The YM2203 SSG rides in the same six-channel system: 0-2 FM, 3-5 PSG. Its
     # notes share the AY instrument list.
     ssg_pcm, ssg_pcm_hits = _ssg_pcm("ym2203_ssg")
@@ -10850,18 +11013,25 @@ def analyze(
             grid = _grid("pcm", onsets=pcm_onsets, label="sample-trigger lattice")
         if grid is not None:
             tone_only = (
-                scc_count or ay_count or vsu_count or saa_count
+                scc_count or ay_count or vsu_count or saa_count or pokey_count
             ) and not keyon_times and not any(
                 e.on and e.pcm for e in events
             )
             if tone_only:
-                saa_tick = _saa_tick_interval(vgm) if saa_count else None
+                tick_chip = (
+                    "saa1099" if saa_count
+                    else ("pokey" if pokey_count else None)
+                )
+                saa_tick = (
+                    _saa_tick_interval(vgm, tick_chip) if tick_chip else None
+                )
                 if saa_tick:
                     hz = VGM_RATE / saa_tick
                     use_speed = 1
                     row_subdiv = 1.0
                     grid_note = (
-                        f"SAA1099 write lattice ({saa_tick:g} samples/tick), "
+                        f"{'SAA1099' if tick_chip == 'saa1099' else 'POKEY'} "
+                        f"write lattice ({saa_tick:g} samples/tick), "
                         "row = 1 write tick"
                     )
                     tone_hilight = True
@@ -11077,12 +11247,12 @@ def analyze(
     tone_demand = 0
     if (
         scc_ids or ay_ids or psg_ids or nes_ids or huc6280_ids
-        or gb_ids or vsu_ids or saa_ids
+        or gb_ids or vsu_ids or saa_ids or pokey_ids
     ):
         tone_demand = _tone_instrument_demand(
             events, vgm.k051649_clock or SCC_DEFAULT_CLOCK, ay_note_clock,
             psg_clock, nes_clock, huc6280_clock, gb_clock, vsu_clock,
-            saa_clock, hz, vgm.total_samples, use_speed,
+            saa_clock, pokey_clock, hz, vgm.total_samples, use_speed,
             lfo_loop=lfo_loop,
         )
     tone_demand_raw = tone_demand
@@ -11198,7 +11368,7 @@ def analyze(
     )
     tone_merged = _bind_tone_instruments(
         events, scc_ins, ay_ins, psg_ins, nes_ins, huc6280_ins, gb_ins,
-        vsu_ins, saa_ins,
+        vsu_ins, saa_ins, pokey_ins,
         tone_ins_base,
         vgm.k051649_clock or SCC_DEFAULT_CLOCK,
         ay_note_clock,
@@ -11208,6 +11378,7 @@ def analyze(
         gb_clock,
         vsu_clock,
         saa_clock,
+        pokey_clock,
         hz, vgm.total_samples, use_speed,
         merge_tol=tone_merge_tol, lfo_loop=lfo_loop,
     )
@@ -11261,7 +11432,7 @@ def analyze(
         or huc_pcm_samples or ymz_audible
         or any(s.length >= 8 for s in pcm_samples)
         or scc_waves or ay_count or dac_samples or psg_count
-        or saa_ids or saa_count
+        or saa_ids or saa_count or pokey_count
     )
     if not fm_list:
         chip_name = {
@@ -11500,6 +11671,9 @@ def analyze(
         ay_ids=ay_ids,
         ay_ins=ay_ins,
         ay_count=ay_count,
+        pokey_ids=pokey_ids,
+        pokey_ins=pokey_ins,
+        pokey_count=pokey_count,
         ssg_pcm_samples=ssg_pcm_samples,
         ssg_pcm_count=ssg_pcm_count,
         psg_ids=psg_ids,
@@ -11773,6 +11947,13 @@ def format_report(song: Song) -> str:
             f"{'s' if len(song.saa_ids) > 1 else ''}, "
             f"{song.vgm.saa1099_clock or SAA_DEFAULT_CLOCK} Hz, "
             f"{len(song.saa_ins)} instruments)"
+        )
+    if song.pokey_ids:
+        lines.append(
+            f"POKEY notes {song.pokey_count}  ({len(song.pokey_ids)} chip"
+            f"{'s' if len(song.pokey_ids) > 1 else ''}, "
+            f"{song.vgm.pokey_clock or POKEY_DEFAULT_CLOCK} Hz, "
+            f"{len(song.pokey_ins)} instruments)"
         )
     if song.huc6280_ids or song.huc6280_pcm_samples:
         lines.append(

@@ -542,7 +542,7 @@ def build_parser() -> argparse.ArgumentParser:
             "OPL-family (YM3526/YM3812/YMF262) + "
             "sample-chip (K007232, MSM6295, MSM6258, SegaPCM, C140, C352, "
             "K053260, YMZ280B) + Nintendo Virtual Boy (VSU) + Philips "
-            "SAA1099 (Creative Music System / Game Blaster) "
+            "SAA1099 (Creative Music System / Game Blaster) + Atari POKEY "
             "VGMs into Furnace .fur files, and edit the result."
         ),
         epilog=EPILOG,

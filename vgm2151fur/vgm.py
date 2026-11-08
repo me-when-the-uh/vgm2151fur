@@ -122,6 +122,9 @@ CMD_K053260 = 0xBA
 # dual-chip log (Furnace's baseAddr2S rule).
 CMD_VSU = 0xC7
 CMD_SAA1099 = 0xBD
+# Atari POKEY: 0xBB register write. Bit 7 of the register byte selects the
+# second chip (Dual Chip Support #2).
+CMD_POKEY = 0xBB
 VSU_DUAL_BIT = 0x8000
 CMD_DATA_BLOCK = 0x67
 CMD_END = 0x66
@@ -175,6 +178,7 @@ EXTRA_C352 = 0x27
 EXTRA_K007232 = 0x2A
 EXTRA_VSU = 0x22  # Virtual Boy VSU (VGM chip-volume id 34)
 EXTRA_YMZ280B = 0x0F
+EXTRA_POKEY = 0x1E  # Atari POKEY (same id as libvgm's DEVID_POKEY)
 # Main-header clocks (VGMFile.h layout, spec v1.71). 0x98 is MSM6295, 0x90
 # MSM6258, 0x94 its flags. K007232 has no spec field; VGMPlay tools put it at
 # 0xE8 (1.71+). C140 is 0xA8 and its type byte 0x96. AY-8910 is 0x74 with its
@@ -297,6 +301,12 @@ C140_TYPE_OFF = 0x96
 SAA1099_CLOCK_OFF = 0xC8
 SAA1099_DEFAULT_CLOCK = 8_000_000
 SAA1099_DUAL_BIT = 0x40000000
+# Atari POKEY header 0xB0 (VGM 1.50+).  Bit 30 marks a second chip; the second
+# instance selects itself with bit 7 of the 0xBB register byte and normally
+# shares this clock (the extra header can carry a separate one).
+POKEY_CLOCK_OFF = 0xB0
+POKEY_DEFAULT_CLOCK = 1_789_772
+POKEY_DUAL_BIT = 0x40000000
 K053260_CLOCK_OFF = 0xAC  # VGM 1.61+, one clock for both instances
 K053260_DEFAULT_CLOCK = 3579545
 C352_CLOCK_OFF = 0xDC  # VGM 1.71 crystal; bit 31 mutes the rear pair
@@ -679,6 +689,12 @@ class VgmFile:
     ay8910_type: int = 0
     ay8910_flags: int = 0
     ay8910_dual: bool = False
+    # Atari POKEY header 0xB0.  Bit 30 marks two chips, which share the clock
+    # unless the extra header (id 0x1E) gives the second one its own.  Writes
+    # arrive on 0xBB; register bit 7 selects the second instance.
+    pokey_clock: int = 0
+    pokey_clock_2: int = 0
+    pokey_dual: bool = False
     # K051649 / K052539 (SCC) header 0x9C (VGM 1.61+), bit 31 set for the
     # K052539 variant. The clock is the value both libvgm and Furnace run the
     # chip at: pitch = clock / (16 * (period + 1)).
@@ -886,7 +902,7 @@ def chips_in_head(buf: bytes) -> set[str]:
 
     Names match the converter's chips: ym2151, ym2610, msm6295, segapcm, c140,
     c352, k053260, ay8910, k051649 (plus "scc_plus" for the K052539 variant),
-    k007232, ymz280b and vsu (plus "vsu_dual").
+    k007232, ymz280b, vsu (plus "vsu_dual") and pokey (plus "pokey_dual").
     C219 is the C140-family part the converter does not support. It is reported
     apart from c140, and those packs should not be batch-converted. C352 is
     its own chip (32 voices); it is not folded into c140 or c219.
@@ -999,6 +1015,12 @@ def chips_in_head(buf: bytes) -> set[str]:
             kinds.add("ay8910")
             if raw & 0x40000000:
                 kinds.add("ay8910_dual")
+    if version >= 0x150 and _field_in_header(buf, POKEY_CLOCK_OFF, 4):
+        pokey_raw = _header_raw(buf, POKEY_CLOCK_OFF)
+        if 100_000 <= (pokey_raw & 0x3FFFFFFF) <= 40_000_000:
+            kinds.add("pokey")
+            if pokey_raw & POKEY_DUAL_BIT:
+                kinds.add("pokey_dual")
     # The OPL family joined the header in 1.51. A YM3812 field with bit 30 set
     # carries a second chip on command 0xAA. Bit 31 is the Sound Blaster Pro
     # hard-pan of that pair, and it is reported apart from the chip itself.
@@ -1311,6 +1333,14 @@ def load_vgm(path: Path | str) -> VgmFile:
         buf[AY8910_FLAGS_OFF]
         if ver >= 0x151 and _field_in_header(buf, AY8910_FLAGS_OFF, 1) else 0
     )
+    pokey_raw = _header_raw(buf, POKEY_CLOCK_OFF) if ver >= 0x150 else 0
+    pokey_clock = _sane_clock(pokey_raw)
+    pokey_dual = bool(pokey_raw & POKEY_DUAL_BIT)
+    if not pokey_clock:
+        pokey_clock = _sane_clock(clocks.get(EXTRA_POKEY, 0))
+    # The second instance normally shares the clock; the extra header can give
+    # it a separate one.
+    pokey_clock_2 = _sane_clock(clocks.get(EXTRA_POKEY, 0)) if pokey_dual else 0
     k051_clock = 0
     k051_plus = False
     k051649_dual = False
@@ -1412,6 +1442,9 @@ def load_vgm(path: Path | str) -> VgmFile:
         ay8910_type=ay_type,
         ay8910_flags=ay_flags,
         ay8910_dual=ay8910_dual,
+        pokey_clock=pokey_clock,
+        pokey_clock_2=pokey_clock_2,
+        pokey_dual=pokey_dual,
         k051649_clock=k051_clock,
         k051649_plus=k051_plus,
         k051649_dual=k051649_dual,
@@ -1443,6 +1476,7 @@ def load_vgm(path: Path | str) -> VgmFile:
     stray_c140_second = False
     stray_k053260_second = False
     stray_ay_second = False
+    stray_pokey_second = False
     stray_scc_second = False
     stray_saa_second = False
     stray_ymz_second = False
@@ -1986,6 +2020,18 @@ def load_vgm(path: Path | str) -> VgmFile:
             vgm.writes.append(ChipWrite(sample, "k007232", cid, aa & 0x7F, buf[pos + 2]))
             pos += 3
             continue
+        if cmd == CMD_POKEY and pos + 3 <= n:
+            # 0xBB: register, then data. Bit 7 of the register selects the
+            # second chip (Dual Chip Support #2); the register is 4 bits.
+            rr = buf[pos + 1]
+            cid = (rr >> 7) & 1
+            if cid and not pokey_dual:
+                stray_pokey_second = True
+            vgm.writes.append(ChipWrite(
+                sample, "pokey", cid, rr & 0x0F, buf[pos + 2],
+            ))
+            pos += 3
+            continue
         if cmd == CMD_AY8910 and pos + 3 <= n:
             # 0xA0: register, then data. Bit 7 of the register selects the
             # second chip instance (libvgm reads it the same way).
@@ -2431,6 +2477,16 @@ def load_vgm(path: Path | str) -> VgmFile:
             "0xA0 AY-8910 register bit 7 selects a second chip without the "
             "dual-instance header bit; it was still treated as chip 1"
         )
+    if stray_pokey_second:
+        vgm.warnings.append(
+            "0xBB POKEY register bit 7 selects a second chip without the "
+            "dual-instance header bit; it was still treated as chip 1"
+        )
+    if any(w.chip == "pokey" for w in vgm.writes) and not vgm.pokey_clock:
+        vgm.warnings.append(
+            "POKEY writes without a header clock; using 1789772 Hz"
+        )
+        vgm.pokey_clock = POKEY_DEFAULT_CLOCK
     if stray_scc_second:
         vgm.warnings.append(
             "0xD2 K051649 port bit 7 selects a second chip without the "

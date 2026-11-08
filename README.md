@@ -14,6 +14,7 @@ Supported chips:
 - Yamaha YMF278B (OPL4): OPL3 FM plus 24 wave channels. ROM wave samples are extracted into the module from a YRW801 image (`VGM2151FUR_YRW801`)
 - Yamaha YM2149 / General Instrument AY-3-8910 (PSG), including volume-register SSGPCM playback
 - Philips SAA1099 (Creative Music System / Game Blaster)
+- Atari POKEY (four channels, including dual-chip logs and the 16-bit/filter AUDCTL modes)
 - Texas Instruments SN76489 (PSG), including dual-chip logs
 - Toshiba T6W28 (Neo Geo Pocket Color stereo SN76489 variant): one four-channel system with independent left/right attenuation
 - Konami K007232 (experimental), including dual-chip logs
