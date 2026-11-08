@@ -560,6 +560,9 @@ class NoteEvent:
     # PCM pan 0x00 is a real "both off"; OKI/MSM6258 are mono and must not
     # write 08xx.
     no_pan: bool = False
+    # A K007232 retrigger cuts the previous sample; keep an explicit note-off
+    # on the row before the next trigger when the grid has room.
+    cut_before: bool = False
     # C352 quad output: the four volume registers (front L/R, rear L/R),
     # 0-255. When set, they carry the level and the volume column is pinned.
     quad: tuple[int, int, int, int] | None = None
@@ -9853,13 +9856,29 @@ def analyze(
                     pan=pcm_pan_fx(vl, vr),
                     pcm=True,
                 ))
-                if not h.loop and smp.pcm7:
+                if smp.pcm7:
                     rate = k007232_rate(clock, h.pitch)
                     natural = h.sample_time + int(round(
                         len(smp.pcm7) / rate * VGM_RATE
                     ))
                     nxt = next_on.get(id(h))
-                    if nxt is None or nxt > natural:
+                    if nxt is not None:
+                        # A new key-on cuts this voice even if the ROM body is
+                        # still running.  Mark the off so the writer can put it
+                        # on the row before the next trigger.
+                        events.append(NoteEvent(
+                            sample=nxt,
+                            ch=ch,
+                            on=False,
+                            note=180,
+                            ins=-1,
+                            vol=-1,
+                            e5=0x80,
+                            pan=0,
+                            pcm=True,
+                            cut_before=True,
+                        ))
+                    elif not h.loop:
                         end = min(natural, total) if total else natural
                         if end > h.sample_time:
                             events.append(NoteEvent(

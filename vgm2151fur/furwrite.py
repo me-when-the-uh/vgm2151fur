@@ -2895,7 +2895,10 @@ def _assign_pcm_rows(
             off_row, off_delay = song.place(off.sample, stats)
             off_row, off_delay = wrapped(off_row, off_delay, off.sample)
             if off_row >= next_row:
-                continue
+                if getattr(off, "cut_before", False) and next_row > on_row + 1:
+                    off_row, off_delay = next_row - 1, 0
+                else:
+                    continue
             if off_row <= on_row:
                 off_row, off_delay = on_row + 1, 0
             if off_row >= next_row or off_row >= total_rows:
