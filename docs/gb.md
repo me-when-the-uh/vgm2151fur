@@ -32,8 +32,8 @@ Furnace's GB core divides the clock by 16 and writes `2048 - freq` to
 NRx3/NRx4. The analyzer inverts that (`gb_note`) so the exported register
 matches the source exactly.
 
-An NRx4/NR44 trigger starts a normal note. A pulse frequency write without a
-trigger is handled by size:
+An NRx4/NR44 trigger starts a normal note. A pulse or wave frequency write
+without a trigger is handled by size:
 
 - a clear jump of about 0.75 semitone or more becomes its own note cell with
   Furnace's `EAxx` legato effect. The cell changes pitch without restarting

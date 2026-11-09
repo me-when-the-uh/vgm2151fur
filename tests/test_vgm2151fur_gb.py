@@ -338,6 +338,21 @@ class TestGbWave(unittest.TestCase):
     def _wave_cmds(sample, image: bytes):
         return [_gb(sample, 0x20 + i, b) for i, b in enumerate(image)]
 
+    def test_wave_large_pitch_jump_is_a_legato_note(self):
+        # The wave voice uses the same legato split as the pulses: a clear
+        # period jump after the refit window changes pitch without a trigger.
+        writes = [
+            _gb(0, 0x0A, 0x80), _gb(0, 0x0C, 0x40),
+            _gb(0, 0x0D, 0x00), _gb(0, 0x0E, 0x86),
+            _gb(2000, 0x0D, 0x20), _gb(2000, 0x0E, 0x07),
+        ]
+        hits, _o, _w, _warn = collect_gb(_vgm(writes))
+        wave = [h for h in hits if h.voice == 2]
+        self.assertEqual(len(wave), 2)
+        self.assertTrue(wave[1].legato)
+        self.assertEqual(wave[1].sample_time, 2000)
+        self.assertEqual(wave[1].period, 0x720)
+
     def test_wave_trigger_while_muted_starts_at_the_level_rise(self):
         # Kirby's Dream Land 2 starts the wave voice with NR32 = 0 and raises
         # the output level a few samples later. The rise starts the note.

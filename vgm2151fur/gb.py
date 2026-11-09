@@ -481,7 +481,7 @@ def collect_gb(
         # restarting the hardware envelope. Slow slides stay in pitch_pts and
         # become row effects later.
         if (
-            voice in (0, 1)
+            voice != 3
             and abs(gb_period_delta(old_period, period[voice]))
             >= GB_LEGATO_UNITS
         ):

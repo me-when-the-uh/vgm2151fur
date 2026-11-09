@@ -173,7 +173,7 @@ Open follow-ups are tracked in [TODO.md](./TODO.md).
   - Furnace stores at most 64 KB per PCM body, ADPCM bodies are one-shot, and filter/DSP-mode registers are not exposed.
   - A body outside the supplied ROM blocks is emitted as silence; bodies are repacked, so original ROM addresses are not preserved.
 - Game Boy converts two pulses, wave and noise, with per-note hardware/zombie envelopes and wave-RAM changes as a wave macro.
-  - Clear pulse attacks and large held pitch jumps become note cells; pitch-only jumps carry `EAxx` legato so the hardware envelope keeps running. Slower bends become `E8xx`/`E9xx`/`E5xx` row effects, and only sub-row motion falls back to a pitch macro.
+  - Clear pulse/wave attacks and large held pitch jumps become note cells; pitch-only jumps carry `EAxx` legato so the hardware envelope keeps running. Slower bends become `E8xx`/`E9xx`/`E5xx` row effects, and only sub-row motion falls back to a pitch macro.
   - The noise note is a hardware table index, so the fastest NR43 entries fold onto C-5 and are not bit-exact on export.
 - HuC6280 converts six wavetable voices, with periodic noise split into a transient and tone tail and DAC-stream bodies as 8-bit samples.
 - Atari POKEY converts four voices per chip, including dual-chip logs, per-frame AUDC volume/waveform macros, AUDCTL macros/effects, joined 16-bit pairs, high-clock/15 kHz/filter modes and silent filter-control notes.
