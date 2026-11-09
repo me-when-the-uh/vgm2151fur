@@ -36,6 +36,7 @@ from vgm2151fur.msm5232 import (
     msm5232_attack_fx,
     msm5232_decay_fx,
 )
+from vgm2151fur.es5503 import collect_es5503
 from vgm2151fur.k054539 import (
     FORMAT_8BIT,
     FORMAT_16BIT,
@@ -499,6 +500,124 @@ class TestGa20Msm5205Msm5232(unittest.TestCase):
         self.assertIn(CHIP_PCM_DAC, mod.chips)
         self.assertEqual(mod.n_ch, 1)
         self.assertTrue(all(x.depth == 16 for x in mod.samples))
+
+
+class TestEs5503(unittest.TestCase):
+    def _rom(self, body: bytes) -> list[RomSlice]:
+        return [RomSlice(0, 0x20000, 0, body, "es5503")]
+
+    def _writes(self, control: int = 0x02) -> list[ChipWrite]:
+        return [
+            _write(0, "es5503", 0xE1, 62),
+            _write(0, "es5503", 0x00, 0x00),
+            _write(0, "es5503", 0x20, 0x04),   # freq 0x400
+            _write(0, "es5503", 0x40, 0xFF),   # volume 255
+            _write(0, "es5503", 0x80, 0x00),   # wave pointer 0
+            _write(0, "es5503", 0xC0, 0x00),   # 256 bytes, resolution 0
+            _write(10, "es5503", 0xA0, control),
+            _write(900, "es5503", 0xA0, 0x03),
+        ]
+
+    def test_es5503_body_and_note(self):
+        # Unsigned 0xFF/0x01 becomes signed +127/-127; no 0x00 to stop it.
+        rom = bytes([0xFF] * 128 + [0x01] * 128)
+        song = _vgm(
+            self._writes(), total=1000, roms=self._rom(rom),
+            es5503_clock=7_159_090, es5503_channels=2,
+        )
+        samples, offs, _warn = collect_es5503(song)
+        self.assertEqual(len(samples), 1)
+        self.assertEqual(samples[0].length, 256)
+        self.assertEqual(samples[0].data[:2], b"\x7f\x7f")
+        self.assertEqual(samples[0].data[-2:], b"\x81\x81")
+        self.assertEqual(samples[0].c4_rate, 52_640)
+        self.assertEqual(len(offs), 1)
+
+        analysed = analyze(song)
+        self.assertEqual(analysed.es5503_count, 1)
+        notes = [e for e in analysed.events if e.on and e.pcm]
+        self.assertEqual(len(notes), 1)
+        self.assertEqual(notes[0].note, 108)
+        self.assertEqual(notes[0].vol, 255)
+        self.assertEqual(notes[0].pan, 0xF0)
+        self.assertEqual(notes[0].ins, 0)
+        self.assertEqual(notes[0].ch, 8)
+
+        mod = parse_fur(write_fur(analysed))
+        self.assertEqual(mod.chips.count(CHIP_PCM_DAC), 1)
+        self.assertEqual(mod.n_ch, 1)
+        self.assertEqual(len(mod.samples), 1)
+        self.assertEqual(mod.samples[0].depth, 8)
+        self.assertEqual(mod.samples[0].n_frames, 256)
+        rows = [
+            row for (_ch, _pat), rs in mod.patterns.items() for row in rs
+            if row.note not in (-1, 180)
+        ]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].note, 108)
+        self.assertEqual(rows[0].vol, 255)
+        self.assertTrue(any(fx == 0x08 and value == 0xF0
+                            for fx, value in rows[0].fx))
+
+    def test_es5503_pan_uses_second_output(self):
+        song = _vgm(
+            self._writes(0x12), total=1000,
+            roms=self._rom(bytes([0xFF] * 128 + [0x01] * 128)),
+            es5503_clock=7_159_090, es5503_channels=2,
+        )
+        analysed = analyze(song)
+        note = next(e for e in analysed.events if e.on and e.pcm)
+        self.assertEqual(note.pan, 0x0F)
+        mod = parse_fur(write_fur(analysed))
+        row = next(
+            row for (_ch, _pat), rs in mod.patterns.items() for row in rs
+            if row.note not in (-1, 180)
+        )
+        self.assertTrue(any(fx == 0x08 and value == 0x0F
+                            for fx, value in row.fx))
+
+    def test_es5503_body_stops_at_zero_and_empty_drops(self):
+        song = _vgm(
+            self._writes(), total=1000,
+            roms=self._rom(bytes((0x90, 0x91, 0x00, 0x92))),
+            es5503_clock=7_159_090, es5503_channels=2,
+        )
+        samples, _offs, _warn = collect_es5503(song)
+        self.assertEqual(len(samples), 1)
+        self.assertEqual(samples[0].data, bytes((0x10, 0x11)))
+
+        silent = _vgm(
+            self._writes(), total=1000,
+            roms=self._rom(bytes((0x00, 0x90, 0x91))),
+            es5503_clock=7_159_090, es5503_channels=2,
+        )
+        samples, _offs, warn = collect_es5503(silent)
+        self.assertEqual(samples, [])
+        self.assertTrue(any("empty" in text for text in warn))
+
+    def test_es5503_raw_vgm_header_and_ram_block(self):
+        rom = bytes((0x80, 0x81, 0x82))
+        payload = (0).to_bytes(4, "little") + rom
+        body = (
+            bytes((0x67, 0x66, 0xE1)) + len(payload).to_bytes(4, "little")
+            + payload
+            + bytes((0xD5, 0x00, 0xE1, 62, 0xD5, 0x00, 0x40, 0x20))
+        )
+        raw = _raw_vgm(body, clock_off=0xCC, clock=7_159_090)
+        raw = raw[:0xD4] + b"\x02" + raw[0xD5:]
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "es5503.vgm"
+            p.write_bytes(raw)
+            v = load_vgm(p)
+        self.assertEqual(v.es5503_clock, 7_159_090)
+        self.assertEqual(v.es5503_channels, 2)
+        self.assertEqual([w.chip for w in v.writes], ["es5503", "es5503"])
+        self.assertEqual([(w.reg, w.val) for w in v.writes],
+                         [(0xE1, 62), (0x40, 0x20)])
+        self.assertEqual([r.kind for r in v.roms], ["es5503"])
+        self.assertEqual(v.roms[0].start, 0)
+        self.assertEqual(v.roms[0].data, rom)
+        self.assertEqual(v.roms[0].rom_size, 0x20000)
 
 
 if __name__ == "__main__":

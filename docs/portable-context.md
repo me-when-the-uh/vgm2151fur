@@ -2,7 +2,7 @@
 
 `vgm2151fur` is a Python 3.11+ converter from VGM/VGZ rips to Furnace Tracker modules on Windows and Linux. Furnace is needed for the volume fit and for `render`, `compare` and `--verify`; put it in `furnace/` or set `VGM2151FUR_FURNACE`.
 
-Layout: `vgm.py` parses commands and data blocks; `analyze.py` contains the chip state machines; `ym2610.py` holds the OPNB FM/SSG state and the ADPCM-A/B collectors; `ym2612dac.py` builds DAC samples; `fds.py`, `wonderswan.py`, `qsound.py`, `c219.py`, `k054539.py`, `ga20.py`, `msm5205.py` and `msm5232.py` hold the newer chip collectors; `furwrite.py` writes the `.fur`; `furio.py`, `audit.py` and `diag.py` read and verify it. Helpers are in `tools/`, tests in `tests/`, chip notes in `docs/`.
+Layout: `vgm.py` parses commands and data blocks; `analyze.py` contains the chip state machines; `ym2610.py` holds the OPNB FM/SSG state and the ADPCM-A/B collectors; `ym2612dac.py` builds DAC samples; `fds.py`, `wonderswan.py`, `qsound.py`, `c219.py`, `k054539.py`, `ga20.py`, `msm5205.py`, `msm5232.py` and `es5503.py` hold the newer chip collectors; `furwrite.py` writes the `.fur`; `furio.py`, `audit.py` and `diag.py` read and verify it. Helpers are in `tools/`, tests in `tests/`, chip notes in `docs/`.
 
 Current behavior:
 
@@ -23,6 +23,7 @@ Current behavior:
 - Irem GA20 (`docs/ga20.md`) uses native system `0xC7` with four 8-bit sample voices. Bodies stop at the first zero byte; the fixed C-4 reference makes note/E5 match Furnace's GA20 pitch table.
 - OKI MSM5205 (`docs/msm5205.md`) decodes its streamed 3/4-bit ADPCM through libvgm's reset/FIFO/prescaler state, then splits the 44.1 kHz PCM at attacks and silences for Generic PCM DAC banks. Lossy clustering stays opt-in.
 - OKI MSM5232 (`docs/msm5232.md`) uses native system `0xBC` with eight tone/noise voices. Pitch maps to note `72+pitch`, and group control/attack/decay/noise travel as `10xy`/`12xx`/`13xx`/`11xx` effects.
+- Ensoniq ES5503 (`docs/es5503.md`) reconstructs 128 KB wave RAM from `0xE1` blocks and puts each used oscillator on its own Generic PCM DAC system. Bodies stop at `0x00`; note/E5 comes from the source playback rate, and control output masks become `08xy` panning.
 
 Commands:
 

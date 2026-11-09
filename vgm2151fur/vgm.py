@@ -408,6 +408,14 @@ MSM5232_CLOCK_OFF = 0xF4
 MSM5232_DEFAULT_CLOCK = 2_119_040
 MSM5232_DUAL_BIT = 0x40000000
 CMD_MSM5232 = 0x43
+# Ensoniq ES5503 header 0xCC (VGM 1.71+), output-channel count at 0xD4.
+# Command 0xD5 is an 8-bit port (chip), 8-bit register and byte of data.
+# Wave RAM arrives as data-block type 0xE1: a 32-bit start address and bytes.
+ES5503_CLOCK_OFF = 0xCC
+ES5503_CHANNELS_OFF = 0xD4
+ES5503_DEFAULT_CLOCK = 7_159_090
+ES5503_RAM_TYPE = 0xE1
+CMD_ES5503 = 0xD5
 CMD_MSM5232_LEGACY = 0x2D
 EXTRA_MSM5232 = 0x2D
 AY8910_DEFAULT_CLOCK = 1789772  # COLOR_NTSC/2, the MSX/ZX PSG clock
@@ -854,6 +862,11 @@ class VgmFile:
     # OKI MSM5232 header 0xF4 (VGM 1.72+).  Eight tone/noise voices.
     msm5232_clock: int = 0
     msm5232_dual: bool = False
+    # Ensoniq ES5503 header 0xCC (VGM 1.71+).  Thirty-two oscillators read
+    # 8-bit unsigned wave data out of a 128 KB RAM; the header's 0xD4 byte is
+    # the number of output channels (1-8).
+    es5503_clock: int = 0
+    es5503_channels: int = 0
     # Extra-header clocks, raw (bit 31 kept). Keyed by libvgm chip id.
     extra_clocks: dict[int, int] = field(default_factory=dict)
     # Extra-header volume mix: chip id -> (flags, raw value, 0x100 = 1.0).
@@ -1158,6 +1171,10 @@ def chips_in_head(buf: bytes) -> set[str]:
             kinds.add("ga20")
             if raw & GA20_DUAL_BIT:
                 kinds.add("ga20_dual")
+    if version >= 0x171 and _field_in_header(buf, ES5503_CLOCK_OFF, 4):
+        raw = _header_raw(buf, ES5503_CLOCK_OFF)
+        if 100_000 <= (raw & 0x3FFFFFFF) <= 40_000_000:
+            kinds.add("es5503")
     if version >= 0x172 and _field_in_header(buf, MSM5205_CLOCK_OFF, 4):
         raw = _header_raw(buf, MSM5205_CLOCK_OFF)
         if 100_000 <= (raw & 0x3FFFFFFF) <= 40_000_000:
@@ -1763,6 +1780,12 @@ def load_vgm(path: Path | str) -> VgmFile:
     msm5232_clock = _sane_clock(msm5232_raw)
     if not msm5232_clock:
         msm5232_clock = _sane_clock(clocks.get(EXTRA_MSM5232, 0))
+    # Ensoniq ES5503 clock 0xCC and output-channel count 0xD4 (VGM 1.71+).
+    es5503_raw = _header_raw(buf, ES5503_CLOCK_OFF) if ver >= 0x171 else 0
+    es5503_clock = _sane_clock(es5503_raw)
+    es5503_channels = 0
+    if ver >= 0x171 and _field_in_header(buf, ES5503_CHANNELS_OFF, 1):
+        es5503_channels = buf[ES5503_CHANNELS_OFF] & 0xFF
 
     main_volume = 0.0
     # Bytes past the declared command offset are not header fields. Synthetic
@@ -1813,6 +1836,8 @@ def load_vgm(path: Path | str) -> VgmFile:
         msm5205_dual=msm5205_dual,
         msm5232_clock=msm5232_clock,
         msm5232_dual=msm5232_dual,
+        es5503_clock=es5503_clock,
+        es5503_channels=es5503_channels,
         gb_dmg_clock=gb_dmg_clock,
         gb_dmg_dual=gb_dmg_dual,
         huc6280_clock=huc6280_clock,
@@ -2016,6 +2041,16 @@ def load_vgm(path: Path | str) -> VgmFile:
                     )
                     vgm.roms.append(RomSlice(
                         chip_id, 0, start, payload[2:], kind, time=sample,
+                    ))
+            elif typ == ES5503_RAM_TYPE:
+                # E0-FF RAM writes carry a 32-bit start address.  The ES5503
+                # has 128 KB of wave RAM and the dump may cover only the part
+                # the driver uses, so allocate the whole space.
+                if len(payload) >= 4:
+                    start = int.from_bytes(payload[0:4], "little")
+                    vgm.roms.append(RomSlice(
+                        chip_id, 0x20000, start, payload[4:], "es5503",
+                        time=sample,
                     ))
             else:
                 kind = {
@@ -2765,6 +2800,16 @@ def load_vgm(path: Path | str) -> VgmFile:
             ))
             pos += 4
             continue
+        if cmd == CMD_ES5503 and pos + 4 <= n:
+            # 0xD5 pp aa dd: pp bit 7 is the chip id (libvgm's port form),
+            # aa is the 8-bit register, dd the value.  0x00-0x1F are the
+            # oscillator registers; 0xE1 enables oscillators.
+            port = buf[pos + 1]
+            vgm.writes.append(ChipWrite(
+                sample, "es5503", (port >> 7) & 1, buf[pos + 2], buf[pos + 3],
+            ))
+            pos += 4
+            continue
         if cmd == CMD_C352 and pos + 5 <= n:
             # 0xE1: uint16 BE address, uint16 BE data. Bit 15 of the address
             # is the chip id. 0x202 strobes the latched key on/off bits.
@@ -2888,6 +2933,10 @@ def load_vgm(path: Path | str) -> VgmFile:
     if any(w.chip == "msm5232" for w in vgm.writes) and not vgm.msm5232_clock:
         vgm.warnings.append(
             f"MSM5232 clock is missing or out of range; using {MSM5232_DEFAULT_CLOCK}"
+        )
+    if any(w.chip == "es5503" for w in vgm.writes) and not vgm.es5503_clock:
+        vgm.warnings.append(
+            f"ES5503 clock is missing or out of range; using {ES5503_DEFAULT_CLOCK}"
         )
     if any(w.chip == "c352" for w in vgm.writes) and not vgm.c352_clock:
         vgm.warnings.append("C352 clock is missing or out of range; using 24192000")

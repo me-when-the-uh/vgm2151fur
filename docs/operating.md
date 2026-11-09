@@ -218,11 +218,13 @@ they can be run from anywhere.
   native chip 0xCF; do not fold it into the C140 target. K054539 uses eight
   Generic PCM DAC columns. MSM5205 uses one Generic PCM DAC column per chip
   and GA20 its native 0xC7 four-column system; MSM5232 is native 0xBC with
-  eight columns. C352 converts as chip 0xD0; a Furnace build with a C352 core
+  eight columns. ES5503 uses one Generic PCM DAC column per used oscillator.
+  C352 converts as chip 0xD0; a Furnace build with a C352 core
   can play it. YM2203 converts as chip 0x8D (3 FM + 3 SSG voices per chip);
   YM2612 as chip 0x83 (6 FM) or 0xA0 when the source uses the
   channel-3-operator layout. See docs/c219.md, docs/k054539.md, docs/ga20.md,
-  docs/msm5205.md, docs/msm5232.md, docs/c352.md, docs/scc-ay8910.md,
+  docs/msm5205.md, docs/msm5232.md, docs/es5503.md, docs/c352.md,
+  docs/scc-ay8910.md,
   docs/ym2203.md and docs/ym2612.md.
 
 ## Environment

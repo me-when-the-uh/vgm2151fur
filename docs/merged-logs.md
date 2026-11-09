@@ -70,9 +70,10 @@ the previous real body supplies the gap instead of a visible padding sample.
 OKI MSM5205 and Irem GA20 follow the sample-engine order: MSM5205 uses one
 Generic PCM DAC system per chip, while GA20 is native system `0xC7` with four
 columns. OKI MSM5232 is the first pitched system after the sample engines
-(`0xBC`, eight columns). A log containing only these chips suppresses the
-legacy YM2151 placeholder. See `docs/msm5205.md`, `docs/ga20.md` and
-`docs/msm5232.md`.
+(`0xBC`, eight columns). Ensoniq ES5503 follows MSM5232 with one Generic PCM
+DAC system per used oscillator. A log containing only these chips suppresses
+the legacy YM2151 placeholder. See `docs/msm5205.md`, `docs/ga20.md`,
+`docs/msm5232.md` and `docs/es5503.md`.
 
 Famicom Disk System (`0x8A`, one wave column), WonderSwan (`0x96`, four
 wave/PCM columns) and Capcom QSound (`0xE0`, sixteen PCM plus three ADPCM

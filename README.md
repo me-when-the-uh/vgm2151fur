@@ -17,6 +17,7 @@ Supported chips:
 - OKI: MSM5205, MSM5232, MSM6295 and MSM6258.
 - Namco: C140, C219 and C352.
 - Irem: GA20.
+- Ensoniq: ES5503.
 - Ricoh: RF5C68 and RF5C164.
 
 A log that mixes several chip families is written as one module when the combination is supported. `docs/merged-logs.md` lists the rules. A clock field's dual bit keeps both chip instances, even when one never sounds a note; T6W28 is the exception, since its two bits describe one stereo chip.
@@ -139,6 +140,10 @@ Open follow-ups are tracked in [TODO.md](./TODO.md).
 - OKI MSM5232 converts eight tone/noise voices per chip on Furnace's native `0xBC` system.
   - Pitch bytes map directly to note `72+pitch`; group control rides a one-value instrument duty macro, attack/decay become `12xx`/`13xx` (inverted through Furnace's tables), and noise becomes `11xx`.
   - TA7630 group volume (`0x1E/0x1F`) drives the channel volume columns, including mid-note changes.
+- Ensoniq ES5503 converts up to 32 oscillators, each on its own Generic PCM DAC system.
+  - Wave RAM (data block `0xE1`) is reconstructed and each 8-bit body stops at the chip's `0x00` terminator.
+  - Playback rate follows `output_rate * freq / 2^(9 + resolution - size_class)`; the most common rate per body is the C-4 reference, then note/E5 carries each hit's exact pitch.
+  - Volume stays the source's linear 0-255 value, and the control-register output mask becomes `08xy` panning. Sync/AM and swap modes are approximated as one-shot with a warning.
 - RF5C68 and RF5C164 share one Furnace system selected by `chipType`, and a looping SSG PCM DAC stream plays once because the AY sample instrument is one-shot.
 - SN76489 converts as four channels, and extreme periods or two notes on the same channel/row are approximated.
   - The default system volume is 0.500, and an absolute VGM extra-header volume entry still overrides it.

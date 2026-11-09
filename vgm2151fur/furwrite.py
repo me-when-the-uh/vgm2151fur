@@ -4707,6 +4707,7 @@ def write_fur(
         or getattr(song, "ga20_ids", ())
         or getattr(song, "msm5205_ids", ())
         or getattr(song, "msm5232_ids", ())
+        or getattr(song, "es5503_ids", ())
     )
     if ym2610 or ym2608:
         fm_present = (include_fm or include_pcm) and bool(ym_ids)
@@ -4808,6 +4809,16 @@ def write_fur(
     )
     if msm5232_ids and not msm5232_controls:
         msm5232_controls = [0x0F]
+    es5503_smps = (
+        [s for s in getattr(song, "es5503_samples", ()) or ()
+         if include_pcm and s.hits and s.length > 0]
+    )
+    es5503_oscs = (
+        list(getattr(song, "es5503_oscs", ()) or ())
+        if include_pcm and es5503_smps else []
+    )
+    es5503_ids = sorted({smp.chip_id for smp in es5503_smps})
+    n_es5503_ins = len(es5503_smps)
     n_upd_ins = (len(upd7759_smps) + 119) // 120
     n_pwm_ins = (len(pwm_smps) + 119) // 120
     n_msm5205_ins = (len(msm5205_smps) + 119) // 120
@@ -5000,6 +5011,7 @@ def write_fur(
         + 2 * len(pwm_ids)
         + len(msm5205_ids) + 4 * len(ga20_ids) + 8 * len(msm5232_ids)
         + 16 * len(c219_ids) + 8 * len(k054539_ids)
+        + len(es5503_oscs)
         + n_scc + n_ay + n_nes + n_huc6280 + n_gb + n_vsu + n_saa
         + n_pokey + n_mikey + n_x1 + n_fds + n_wonderswan + n_qsound
     )
@@ -5025,7 +5037,7 @@ def write_fur(
         + n_y8950_b_ins + n_opl4_wave_ins + n_ssg_pcm_ins
         + n_nes_dpcm_ins + n_nes_pcm_ins + n_huc6280_pcm_ins
         + len(ymz_smps) + len(multipcm_smps) + n_upd_ins + n_pwm_ins
-        + n_msm5205_ins + n_ga20_ins + n_msm5232_ins
+        + n_msm5205_ins + n_ga20_ins + n_msm5232_ins + n_es5503_ins
         + len(c219_real) + len(k054539_smps)
         + n_mikey_ins + n_x1_ins
         + len(scc_specs) + len(ay_specs) + len(psg_specs) + len(nes_specs)
@@ -5043,7 +5055,7 @@ def write_fur(
         + len(ymz_smps) + len(multipcm_smps) + len(upd7759_smps)
         + len(pwm_smps) + len(mikey_smps) + len(x1_smps)
         + len(msm5205_smps) + len(ga20_smps)
-        + len(c219_all) + len(k054539_smps)
+        + len(c219_all) + len(k054539_smps) + len(es5503_smps)
         + len(qsound_smps) + len(wonderswan_pcm_smps)
     )
     n_wav = (
@@ -5137,7 +5149,8 @@ def write_fur(
     ga20_smp_base = msm5205_smp_base + len(msm5205_smps)
     c219_smp_base = ga20_smp_base + len(ga20_smps)
     k054539_smp_base = c219_smp_base + len(c219_all)
-    mikey_smp_base = k054539_smp_base + len(k054539_smps)
+    es5503_smp_base = k054539_smp_base + len(k054539_smps)
+    mikey_smp_base = es5503_smp_base + len(es5503_smps)
     wonderswan_pcm_smp_base = mikey_smp_base + len(mikey_smps)
     qsound_smp_base = wonderswan_pcm_smp_base + len(wonderswan_pcm_smps)
     x1_smp_base = qsound_smp_base + len(qsound_smps)
@@ -5150,7 +5163,7 @@ def write_fur(
         + n_y8950_b_ins + n_opl4_wave_ins + n_ssg_pcm_ins
         + n_nes_dpcm_ins + n_nes_pcm_ins + n_huc6280_pcm_ins
         + len(ymz_smps) + len(multipcm_smps) + n_upd_ins + n_pwm_ins
-        + n_msm5205_ins + n_ga20_ins + n_msm5232_ins
+        + n_msm5205_ins + n_ga20_ins + n_msm5232_ins + n_es5503_ins
         + len(c219_real) + len(k054539_smps)
         + n_mikey_ins + len(wonderswan_pcm_smps) + n_x1_ins
         + len(scc_specs) + len(ay_specs) + len(psg_specs) + len(nes_specs)
@@ -5170,7 +5183,7 @@ def write_fur(
         + len(ymz_smps) + len(multipcm_smps) + len(upd7759_smps)
         + len(pwm_smps) + len(mikey_smps) + len(x1_smps)
         + len(msm5205_smps) + len(ga20_smps)
-        + len(c219_all) + len(k054539_smps)
+        + len(c219_all) + len(k054539_smps) + len(es5503_smps)
         + len(qsound_smps) + len(wonderswan_pcm_smps)
     )
 
@@ -5278,6 +5291,9 @@ def write_fur(
         for voice in range(8):
             names_long.append(f"MSM5232 {cid + 1}-{voice + 1}")
             names_short.append(f"MSM{cid + 1}-{voice + 1}")
+    for cid, osc in es5503_oscs:
+        names_long.append(f"ES5503 {cid + 1}-{osc + 1}")
+        names_short.append(f"E{cid + 1}-{osc + 1}")
     for cid in scc_ids:
         for voice in range(5):
             names_long.append(f"SCC {cid + 1}-{voice + 1}")
@@ -5783,6 +5799,12 @@ def write_fur(
         msm5232_sys[cid] = len(chips)
         chips.append(CHIP_MSM5232)
         flag_texts.append(msm5232_flag_text(song.vgm.msm5232_clock or 2_119_040))
+    es5503_sys: dict[tuple[int, int], int] = {}
+    es5503_rate = int(getattr(song, "es5503_rate", 0) or 44100)
+    for cid, osc in es5503_oscs:
+        es5503_sys[(cid, osc)] = len(chips)
+        chips.append(CHIP_PCM_DAC)
+        flag_texts.append(pcm_dac_flag_text(es5503_rate, stereo=True))
     for cid in scc_ids:
         chips.append(scc_chip)
         flag_texts.append(k051649_flag_text(song.vgm.k051649_clock))
@@ -5933,6 +5955,7 @@ def write_fur(
         idx for systems_for_chip in k054539_sys.values()
         for idx in systems_for_chip
     }
+    es5503_set = set(es5503_sys.values())
     msm5205_set = set(msm5205_sys.values())
     for i, chip in enumerate(chips):
         # Twin16 K007232 sits under the OPM; the rip's mix says how far. Every
@@ -5951,6 +5974,10 @@ def write_fur(
             cv = 0.25 * _player_chip_volume(
                 song.vgm, 0x1A, max(1, len(k054539_ids)),
             )
+        elif i in es5503_set:
+            # One PCM DAC system per oscillator.  Keep every system at unity;
+            # dividing by the system count would make a 28-voice module 0.02x.
+            cv = 1.0
         elif i in msm5205_set:
             # Generic PCM DAC is unity in Furnace; MSM5205's player default
             # is 0x100.  The decoded body already carries the chip level.
@@ -6017,7 +6044,14 @@ def write_fur(
     for name in names_short:
         b.strz(name)
     b.strz(comment)
-    b.f32(master_gain)
+    # ES5503 logs carry the source gain in the VGM's main-volume field.  Keep
+    # each PCM DAC system at 1.0 and put that gain on the module master.
+    master_out = master_gain
+    if es5503_oscs:
+        vgm_gain = float(getattr(song.vgm, "main_volume", 0.0) or 1.0)
+        if vgm_gain > 0.0:
+            master_out *= vgm_gain
+    b.f32(master_out)
     _compat_phase2(b)
     b.u16(150)
     b.u16(150)
@@ -6304,6 +6338,12 @@ def write_fur(
         _write_ins_psg(
             b, f"MSM5232 {i + 1}",
             ToneIns(duty=(control & 0x1F,)), INS_MSM5232,
+        )
+    for i, smp in enumerate(es5503_smps):
+        ins_ptrs.append(len(b))
+        _write_ins_pcm(
+            b, f"ES5503 {smp.ptr:05x}", es5503_smp_base + i,
+            INS_AMIGA,
         )
     for group in range(n_mikey_ins):
         ins_ptrs.append(len(b))
@@ -6755,6 +6795,17 @@ def write_fur(
         _write_sample_s8(
             b, f"k054539_{i:03d}_{smp.start:06x}", smp.data,
             rate, loop=loop, depth=smp.depth,
+            render_masks=(0, 0, 0, 0),
+        )
+    for i, smp in enumerate(es5503_smps):
+        smp_ptrs.append(len(b))
+        rate = max(
+            1, int(round(smp.c4_rate * DAC_RATE_COMPENSATION)),
+        )
+        loop = (0, smp.length) if smp.loop else (None, None)
+        _write_sample_s8(
+            b, f"es5503_{i:03d}_{smp.ptr:05x}", smp.data,
+            rate, loop=loop, depth=SMP_DEPTH_8BIT,
             render_masks=(0, 0, 0, 0),
         )
     for smp in mikey_smps:

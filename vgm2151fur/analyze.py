@@ -134,6 +134,13 @@ from vgm2151fur.ga20 import (
     collect_ga20,
     ga20_note,
 )
+from vgm2151fur.es5503 import (
+    Es5503Sample,
+    collect_es5503,
+    es5503_pan_fx,
+    es5503_play_rate,
+    es5503_volume_fx,
+)
 from vgm2151fur.msm5205 import (
     Msm5205Sample,
     collect_msm5205,
@@ -989,6 +996,14 @@ class Song:
     msm5232_ids: list[int] = field(default_factory=list)
     msm5232_controls: list[int] = field(default_factory=list)
     msm5232_count: int = 0
+    # Ensoniq ES5503: up to 32 oscillators, each on its own Generic PCM DAC
+    # system.  One instrument per distinct wave body, shared by the
+    # oscillators that play it.
+    es5503_samples: list[Es5503Sample] = field(default_factory=list)
+    es5503_ids: list[int] = field(default_factory=list)
+    es5503_oscs: list[tuple[int, int]] = field(default_factory=list)
+    es5503_rate: int = 0
+    es5503_count: int = 0
     # Standalone channel volume changes (MSM5232 group volume).
     channel_vol_events: list[tuple[int, int, int]] = field(
         default_factory=list
@@ -10302,11 +10317,20 @@ def analyze(
     msm5232_vols: list = []
     channel_vol_events: list[tuple[int, int, int]] = []
     msm5232_count = 0
+    es5503_samples: list[Es5503Sample] = []
+    es5503_ids: list[int] = []
+    es5503_hits: list = []
+    es5503_offs: list = []
+    es5503_events: list[tuple[NoteEvent, int]] = []
+    es5503_oscs: list[tuple[int, int]] = []
+    es5503_rate = 0
+    es5503_count = 0
     n_upd_ins = 0
     n_pwm_ins = 0
     n_msm5205_ins = 0
     n_ga20_ins = 0
     n_msm5232_ins = 0
+    n_es5503_ins = 0
     # Set where the C352 runs and the source drives its rear pair.
     c352_quad_events = False
     if pcm:
@@ -11438,6 +11462,17 @@ def analyze(
                 pan=0,
                 pcm=True,
             ))
+
+        # Ensoniq ES5503: one wave body per distinct (pointer, size class)
+        # and one Generic PCM DAC system per oscillator that plays.
+        es5503_samples, es5503_offs, es5503_warn = collect_es5503(vgm)
+        warnings.extend(es5503_warn)
+        es5503_hits = [
+            hit for smp in es5503_samples for hit in smp.hits
+            if hit.sample_index >= 0
+        ]
+        es5503_ids = sorted({smp.chip_id for smp in es5503_samples})
+        n_es5503_ins = len(es5503_samples)
     else:
         audible = []
 
@@ -11691,6 +11726,93 @@ def analyze(
             channel_vol_events.append(
                 (vol.sample_time, base + 4 * vol.group + slot, level)
             )
+
+    # Ensoniq ES5503.  Each oscillator is one Generic PCM DAC system; the
+    # oscillators appear after MSM5232 and before the SCC/AY tone block.
+    es5503_base = tone_base
+    es5503_oscs = []
+    for cid in sorted({smp.chip_id for smp in es5503_samples}):
+        used = sorted({
+            hit.osc for smp in es5503_samples if smp.chip_id == cid
+            for hit in smp.hits
+            if hit.sample_index >= 0 and hit.freq > 0
+        })
+        es5503_oscs.extend((cid, osc) for osc in used)
+    tone_base += len(es5503_oscs)
+    es5503_at = {
+        key: es5503_base + index for index, key in enumerate(es5503_oscs)
+    }
+    if es5503_hits:
+        output_channels = vgm.es5503_channels or 2
+        es5503_rate = Counter(
+            hit.out_rate for hit in es5503_hits
+        ).most_common(1)[0][0]
+        for smp in es5503_samples:
+            for hit in smp.hits:
+                if hit.sample_index < 0 or hit.freq <= 0:
+                    continue
+                ch = es5503_at.get((hit.chip_id, hit.osc))
+                if ch is None:
+                    continue
+                base_rate = es5503_play_rate(
+                    hit.out_rate, hit.freq, hit.resolution,
+                    hit.size_class,
+                )
+                note, e5 = rate_to_note(base_rate, smp.c4_rate)
+                sweep: tuple[tuple[int, int], ...] = ()
+                if hit.freq_pts and base_rate:
+                    deltas = tuple(
+                        (
+                            t,
+                            int(round(64.0 * 12.0 * math.log2(
+                                es5503_play_rate(
+                                    hit.out_rate, freq, hit.resolution,
+                                    hit.size_class,
+                                ) / base_rate
+                            ))),
+                        )
+                        for t, freq in hit.freq_pts
+                        if freq > 0
+                    )
+                    values = [delta for _t, delta in deltas]
+                    if deltas and max(values + [0]) - min(values + [0]) >= 4:
+                        sweep = deltas
+                pts = tuple(
+                    (t, es5503_volume_fx(value), None)
+                    for t, value in hit.vol_pts
+                )
+                ev = NoteEvent(
+                    sample=hit.sample_time,
+                    ch=ch,
+                    on=True,
+                    note=note,
+                    ins=-1,
+                    vol=es5503_volume_fx(hit.vol),
+                    e5=e5,
+                    pan=es5503_pan_fx(hit.chan_mask, output_channels),
+                    pcm=True,
+                    end=hit.off_sample,
+                    sweep=sweep,
+                    vol_pts=pts,
+                )
+                events.append(ev)
+                es5503_events.append((ev, hit.sample_index))
+                es5503_count += 1
+        for off in es5503_offs:
+            ch = es5503_at.get((off.chip_id, off.osc))
+            if ch is None:
+                continue
+            events.append(NoteEvent(
+                sample=off.sample_time,
+                ch=ch,
+                on=False,
+                note=180,
+                ins=-1,
+                vol=-1,
+                e5=0x80,
+                pan=0,
+                pcm=True,
+            ))
 
     # Count the final DAC maps once, below; the collector's list is transient.
     n_ym2610_a_ins = (len(ym2610_a_samples) + YM2610_MAP_SLOTS - 1) // YM2610_MAP_SLOTS
@@ -13251,6 +13373,8 @@ def analyze(
     tone_ins_base += len(k054539_samples)
     msm5232_ins_base = tone_ins_base
     tone_ins_base += n_msm5232_ins
+    es5503_ins_base = tone_ins_base
+    tone_ins_base += n_es5503_ins
     mikey_ins_base = tone_ins_base
     tone_ins_base += n_mikey_ins
     wonderswan_pcm_ins_base = tone_ins_base
@@ -13636,6 +13760,8 @@ def analyze(
         tone_ins_base += len(k054539_samples)
         msm5232_ins_base = tone_ins_base
         tone_ins_base += n_msm5232_ins
+        es5503_ins_base = tone_ins_base
+        tone_ins_base += n_es5503_ins
         mikey_ins_base = tone_ins_base
         tone_ins_base += n_mikey_ins
         wonderswan_pcm_ins_base = tone_ins_base
@@ -13750,6 +13876,8 @@ def analyze(
         ev.ins = c219_ins_base + idx
     for ev, idx in k054539_events:
         ev.ins = k054539_ins_base + idx
+    for ev, idx in es5503_events:
+        ev.ins = es5503_ins_base + idx
     for ev, idx in mikey_sample_events:
         ev.ins = mikey_ins_base + idx
     for ev, idx in wonderswan_pcm_events:
@@ -13773,6 +13901,7 @@ def analyze(
         or huc_pcm_samples or ymz_audible
         or multipcm_audible or upd_audible or pwm_audible
         or c219_ins_count or k054539_samples
+        or es5503_samples
         or mikey_ids or x1_ids
         or any(s.length >= 8 for s in pcm_samples)
         or scc_waves or ay_count or dac_samples or psg_count
@@ -13943,6 +14072,11 @@ def analyze(
         msm5232_ids=msm5232_ids,
         msm5232_controls=msm5232_controls,
         msm5232_count=msm5232_count,
+        es5503_samples=es5503_samples,
+        es5503_ids=es5503_ids,
+        es5503_oscs=es5503_oscs,
+        es5503_rate=es5503_rate,
+        es5503_count=es5503_count,
         channel_vol_events=channel_vol_events,
         mikey_samples=mikey_samples,
         mikey_ids=mikey_ids,
