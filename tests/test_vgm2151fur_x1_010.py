@@ -166,6 +166,31 @@ class TestX1Collector(unittest.TestCase):
         self.assertEqual(pcm[0].rate, x1_pcm_rate(16_000_000, 16))
         self.assertEqual(len(offs), 1)
 
+    def test_pcm_key_on_after_natural_end_is_a_new_note(self):
+        # The voice keys itself off when it reaches the ROM end, so a later
+        # key-on write restarts the sample even though the status byte was
+        # never rewritten to 0.
+        body = bytes((i * 7) & 0xFF for i in range(0x1000))
+        writes = [
+            _write(0, 1, 0xEE),
+            _write(0, 2, 16),
+            _write(0, 4, 0),
+            _write(0, 5, 0xFF),
+            _write(0, 0, 1),
+            _write(10_000, 0, 1),   # after the first natural end
+            _write(10_001, 0, 1),   # duplicate start burst, same note
+            _write(20_000, 0, 0),
+        ]
+        hits, pcm, _offs, _warnings = collect_x1_010(
+            _vgm(writes, total=21_000, rom=body),
+        )
+        self.assertEqual(hits, [])
+        self.assertEqual(len(pcm), 2)
+        self.assertEqual(pcm[0].sample_time, 0)
+        self.assertEqual(pcm[1].sample_time, 10_000)
+        self.assertLess(pcm[0].natural_end, pcm[1].sample_time)
+        self.assertEqual(pcm[1].natural_end, pcm[1].sample_time + 5_780)
+
 
 class TestX1Module(unittest.TestCase):
     def test_wave_module_and_instrument(self):

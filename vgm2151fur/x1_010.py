@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from vgm2151fur.vgm import X1_010_DEFAULT_CLOCK, VgmFile, assemble_rom
+from vgm2151fur.vgm import VGM_RATE, X1_010_DEFAULT_CLOCK, VgmFile, assemble_rom
 
 X1_CHANNELS = 16
 # Furnace's DivPlatformX1_010 uses this as the pitch-table frequency base.
@@ -101,6 +101,18 @@ class X1PcmHit:
     @property
     def rate(self) -> int:
         return x1_pcm_rate(self.clock, self.freq)
+
+    @property
+    def natural_end(self) -> int:
+        """Source sample where the voice keys itself off at the ROM end.
+
+        The X1-010 clears status bit 0 when PCM playback reaches the end
+        address. A later key-on write is then a real 0 -> 1 edge even when
+        the register byte still reads 1, which is how drivers retrigger a
+        sample without writing an explicit off first.
+        """
+        frames = len(self.data)
+        return self.sample_time + int(round(frames * VGM_RATE / self.rate))
 
 
 @dataclass
@@ -274,6 +286,14 @@ def collect_x1_010(
         if reg == REG_STATUS:
             was_on = bool(old_status & 0x01)
             now_on = bool(val & 0x01)
+            if isinstance(hit, X1PcmHit) and t >= hit.natural_end:
+                # PCM playback keys itself off at the ROM end address even
+                # though the status byte still reads 1. A later key-on write
+                # is therefore a real 0 -> 1 edge: drivers retrigger a sample
+                # without writing an explicit off first.
+                close(cid, ch, hit.natural_end, emit_off=not now_on)
+                hit = None
+                was_on = False
             if now_on and not was_on:
                 close(cid, ch, t, emit_off=False)
                 open_hit(cid, ch, t, val)
