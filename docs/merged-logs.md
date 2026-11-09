@@ -61,6 +61,12 @@ and PWM use Generic PCM DAC systems because Furnace has no native platform
 (`docs/upd7759.md`, `docs/pwm32x.md`).  A log with only these chips likewise
 suppresses the legacy YM2151 placeholder.
 
+Namco C219 follows PWM as its native 16-column system (`0xCF`). Konami
+K054539 follows C219 as eight Generic PCM DAC systems, one per hardware voice;
+a K054539-only log suppresses the legacy placeholder just like C219. C219
+keeps each source sample bank in its own Furnace bank; trailing silence in
+the previous real body supplies the gap instead of a visible padding sample.
+
 Famicom Disk System (`0x8A`, one wave column), WonderSwan (`0x96`, four
 wave/PCM columns) and Capcom QSound (`0xE0`, sixteen PCM plus three ADPCM
 columns) follow X1-010 in that order. FDS and WonderSwan bind through the tone

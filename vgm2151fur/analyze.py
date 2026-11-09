@@ -29,6 +29,25 @@ from vgm2151fur.c352 import (
     hit_played_freq as c352_played_freq,
     merge_step_writes as c352_merge_steps,
 )
+from vgm2151fur.c219 import (
+    C219_DEFAULT_CLOCK,
+    C219Sample,
+    c219_layout_warnings,
+    c219_rate,
+    collect_c219,
+    hit_played_freq as c219_played_freq,
+    layout_c219_samples,
+    merge_step_writes as c219_merge_steps,
+)
+from vgm2151fur.k054539 import (
+    K054539_DEFAULT_CLOCK,
+    K054539Sample,
+    collect_k054539,
+    hit_played_delta as k054539_played_delta,
+    k054539_pan_fx,
+    k054539_rate,
+    k054539_volume_fx,
+)
 from vgm2151fur.fm import (
     CARRIERS, FMPatch, OpRegs, OPN_CARRIERS, OPM_OP_TO_MASK, OPN_ORDERED_OPS,
     carriers_for, opn_tl_op,
@@ -597,6 +616,10 @@ class NoteEvent:
     # A K007232 retrigger cuts the previous sample; keep an explicit note-off
     # on the row before the next trigger when the grid has room.
     cut_before: bool = False
+    # C219 only: channel control bits that are part of the key-on.  `11xx`
+    # selects noise, `12xy` carries surround (left invert) and invert.
+    c219_noise: bool = False
+    c219_mode: int = 0
     # C352 quad output: the four volume registers (front L/R, rear L/R),
     # 0-255. When set, they carry the level and the volume column is pinned.
     quad: tuple[int, int, int, int] | None = None
@@ -902,8 +925,15 @@ class Song:
     rf5c68_samples: list[Rf5cSample] = field(default_factory=list)
     rf5c164_samples: list[Rf5cSample] = field(default_factory=list)
     c140_samples: list[C140Sample] = field(default_factory=list)
+    c219_samples: list[C219Sample] = field(default_factory=list)
+    c219_ids: list[int] = field(default_factory=list)
+    c219_count: int = 0
     c352_samples: list[C352Sample] = field(default_factory=list)
     k053260_samples: list[K053260Sample] = field(default_factory=list)
+    # Konami K054539: one Generic PCM DAC system per hardware voice.
+    k054539_samples: list[K054539Sample] = field(default_factory=list)
+    k054539_ids: list[int] = field(default_factory=list)
+    k054539_count: int = 0
     # YMZ280B (PCMD8): one sample body per distinct ROM range/loop/depth.
     # `ymz280b_ids` are the chip instances in channel order.
     ymz280b_samples: list[YmzSample] = field(default_factory=list)
@@ -10192,8 +10222,17 @@ def analyze(
     rf5c68_ids: list[int] = []
     rf5c164_ids: list[int] = []
     c140_audible: list[C140Sample] = []
+    c219_samples: list[C219Sample] = []
+    c219_ids: list[int] = []
+    c219_events: list[tuple[NoteEvent, int]] = []
+    c219_ins_count = 0
+    c219_count = 0
     c352_audible: list[C352Sample] = []
     k053260_audible: list[K053260Sample] = []
+    k054539_samples: list[K054539Sample] = []
+    k054539_ids: list[int] = []
+    k054539_events: list[tuple[NoteEvent, int]] = []
+    k054539_count = 0
     ymz_audible: list[YmzSample] = []
     ymz_offs: list[YmzOff] = []
     ymz_ids: list[int] = []
@@ -11065,6 +11104,178 @@ def analyze(
                         pan=0,
                         pcm=True,
                     ))
+
+        # Namco ASIC219: 16 native voices per chip.  The source VGM uses the
+        # same 0xD4 command as the C140, but the C219's bank groups and mode
+        # bits differ.  Furnace packs the real sample bodies itself.
+        c219_clock = vgm.c140_clock or C219_DEFAULT_CLOCK
+        c219_collected, c219_offs, c219_warn = collect_c219(vgm)
+        warnings.extend(c219_warn)
+        c219_samples = (
+            layout_c219_samples(c219_collected) if c219_collected else []
+        )
+        warnings.extend(c219_layout_warnings(c219_samples))
+        c219_real = [
+            (i, smp) for i, smp in enumerate(c219_samples)
+            if smp.hits and smp.length > 0
+        ]
+        c219_ins_count = len(c219_real)
+        for _pos, smp in c219_real:
+            for h in smp.hits:
+                if h.chip_id not in c219_ids:
+                    c219_ids.append(h.chip_id)
+        c219_ids = _dual_ids(
+            c219_ids, bool(getattr(vgm, "c140_dual", False)),
+        )
+        c219_base = pwm_base + PWM_SIDES * len(pwm_ids)
+        c219_at = {cid: c219_base + 16 * i for i, cid in enumerate(c219_ids)}
+        for real_idx, (_pos, smp) in enumerate(c219_real):
+            ref = smp.c4_rate(c219_clock)
+            for h in smp.hits:
+                base_f = c219_played_freq(h)
+                steps = c219_merge_steps(h.freq_pts)
+                note, e5 = rate_to_note(c219_rate(c219_clock, base_f), ref)
+                sweep: tuple[tuple[int, int], ...] = ()
+                if steps and base_f:
+                    deltas = tuple(
+                        (t, int(round(64.0 * 12.0 * math.log2(f / base_f))))
+                        for t, f in steps if f
+                    )
+                    vals = [d for _t, d in deltas]
+                    if deltas and max(vals + [0]) - min(vals + [0]) >= 4:
+                        sweep = deltas
+                vl = vol15(h.vol_l, 255.0)
+                vr = vol15(h.vol_r, 255.0)
+                vol = max(h.vol_l, h.vol_r) & 0xFF
+                pts = tuple(
+                    (t, max(a, b) & 0xFF,
+                     pcm_pan_fx(vol15(a, 255.0), vol15(b, 255.0))
+                     if max(a, b) else None)
+                    for t, a, b in h.vol_pts
+                )
+                fade_in = vol == 0 and any(v > 0 for _t, v, _p in pts)
+                ev = NoteEvent(
+                    sample=h.sample_time,
+                    ch=c219_at.get(h.chip_id, c219_base) + h.voice,
+                    on=True,
+                    note=note,
+                    ins=-1,
+                    vol=(0 if fade_in else vol if vol else 15),
+                    e5=e5,
+                    pan=0 if fade_in else pcm_pan_fx(vl, vr),
+                    pcm=True,
+                    end=h.off_sample,
+                    sweep=sweep,
+                    vol_pts=pts,
+                    no_pan=fade_in,
+                    c219_noise=h.noise,
+                    c219_mode=(
+                        (0x10 if h.left_invert else 0)
+                        | (0x01 if h.invert else 0)
+                    ),
+                )
+                events.append(ev)
+                c219_events.append((ev, real_idx))
+                c219_count += 1
+        for off in c219_offs:
+            base = c219_at.get(off.chip_id)
+            if base is None:
+                continue
+            events.append(NoteEvent(
+                sample=off.sample_time,
+                ch=base + off.voice,
+                on=False,
+                note=180,
+                ins=-1,
+                vol=-1,
+                e5=0x80,
+                pan=0,
+                pcm=True,
+            ))
+
+        # Konami K054539: eight hardware voices, each on its own 1-channel
+        # Generic PCM DAC system.  One sample instrument per distinct body;
+        # note value carries the pitch, so no 120-slot sample map is needed.
+        k054539_clock = vgm.k054539_clock or K054539_DEFAULT_CLOCK
+        k054539_collected, k054539_offs, k054539_warn = collect_k054539(vgm)
+        warnings.extend(k054539_warn)
+        k054539_samples = [
+            s for s in k054539_collected if s.hits and s.length > 0
+        ]
+        for smp in k054539_samples:
+            for h in smp.hits:
+                if h.chip_id not in k054539_ids:
+                    k054539_ids.append(h.chip_id)
+        k054539_ids = _dual_ids(
+            k054539_ids, bool(getattr(vgm, "k054539_dual", False)),
+        )
+        k054539_base = (
+            c219_base + 16 * len(c219_ids)
+        )
+        k054539_at = {
+            cid: k054539_base + 8 * i
+            for i, cid in enumerate(k054539_ids)
+        }
+        for i, smp in enumerate(k054539_samples):
+            ref = smp.c4_rate(k054539_clock)
+            for h in smp.hits:
+                base_delta = k054539_played_delta(h)
+                note, e5 = rate_to_note(
+                    k054539_rate(k054539_clock, base_delta), ref,
+                )
+                sweep: tuple[tuple[int, int], ...] = ()
+                if h.freq_pts and base_delta:
+                    base_rate = k054539_rate(k054539_clock, base_delta)
+                    deltas = tuple(
+                        (t, int(round(64.0 * 12.0 * math.log2(
+                            k054539_rate(k054539_clock, delta) / base_rate
+                        ))))
+                        for t, delta in h.freq_pts
+                        if delta and k054539_rate(k054539_clock, delta)
+                    )
+                    vals = [d for _t, d in deltas]
+                    if deltas and max(vals + [0]) - min(vals + [0]) >= 4:
+                        sweep = deltas
+                pts = tuple(
+                    (
+                        t,
+                        k054539_volume_fx(v),
+                        k054539_pan_fx(p) if p else None,
+                    )
+                    for t, v, p in h.vol_pts
+                )
+                ev = NoteEvent(
+                    sample=h.sample_time,
+                    ch=k054539_at.get(h.chip_id, k054539_base) + h.voice,
+                    on=True,
+                    note=note,
+                    ins=-1,
+                    vol=k054539_volume_fx(h.vol),
+                    e5=e5,
+                    pan=k054539_pan_fx(h.pan),
+                    pcm=True,
+                    end=h.off_sample,
+                    sweep=sweep,
+                    vol_pts=pts,
+                )
+                events.append(ev)
+                k054539_events.append((ev, i))
+                k054539_count += 1
+        for off in k054539_offs:
+            base = k054539_at.get(off.chip_id)
+            if base is None:
+                continue
+            events.append(NoteEvent(
+                sample=off.sample_time,
+                ch=base + off.voice,
+                on=False,
+                note=180,
+                ins=-1,
+                vol=-1,
+                e5=0x80,
+                pan=0,
+                pcm=True,
+            ))
     else:
         audible = []
 
@@ -11230,6 +11441,8 @@ def analyze(
         + MULTIPCM_VOICES * len(multipcm_ids)
         + len(upd_ids)
         + PWM_SIDES * len(pwm_ids)
+        + 16 * len(c219_ids)
+        + 8 * len(k054539_ids)
     )
     # Count the final DAC maps once, below; the collector's list is transient.
     n_ym2610_a_ins = (len(ym2610_a_samples) + YM2610_MAP_SLOTS - 1) // YM2610_MAP_SLOTS
@@ -12780,6 +12993,10 @@ def analyze(
     tone_ins_base += n_upd_ins
     pwm_ins_base = tone_ins_base
     tone_ins_base += n_pwm_ins
+    c219_ins_base = tone_ins_base
+    tone_ins_base += c219_ins_count
+    k054539_ins_base = tone_ins_base
+    tone_ins_base += len(k054539_samples)
     mikey_ins_base = tone_ins_base
     tone_ins_base += n_mikey_ins
     wonderswan_pcm_ins_base = tone_ins_base
@@ -13027,6 +13244,7 @@ def analyze(
         + len(spcm_audible) + len(c140_audible) + len(c352_audible)
         + len(k053260_audible) + n_ym2610_a_ins + n_ym2610_b_ins
         + n_ym2608_rhythm_ins + n_ym2608_b_ins + len(ymz_audible)
+        + c219_ins_count + len(k054539_samples)
     )
     for ins, ramps in held_lfo.items():
         if not (0 <= ins < len(patch_order)):
@@ -13154,6 +13372,10 @@ def analyze(
         tone_ins_base += n_upd_ins
         pwm_ins_base = tone_ins_base
         tone_ins_base += n_pwm_ins
+        c219_ins_base = tone_ins_base
+        tone_ins_base += c219_ins_count
+        k054539_ins_base = tone_ins_base
+        tone_ins_base += len(k054539_samples)
         mikey_ins_base = tone_ins_base
         tone_ins_base += n_mikey_ins
         wonderswan_pcm_ins_base = tone_ins_base
@@ -13258,6 +13480,10 @@ def analyze(
         ev.ins = upd_ins_base + idx
     for ev, idx in pwm_events:
         ev.ins = pwm_ins_base + idx
+    for ev, idx in c219_events:
+        ev.ins = c219_ins_base + idx
+    for ev, idx in k054539_events:
+        ev.ins = k054539_ins_base + idx
     for ev, idx in mikey_sample_events:
         ev.ins = mikey_ins_base + idx
     for ev, idx in wonderswan_pcm_events:
@@ -13280,6 +13506,7 @@ def analyze(
         or nes_ids or nes_dpcm_samples or nes_pcm_samples
         or huc_pcm_samples or ymz_audible
         or multipcm_audible or upd_audible or pwm_audible
+        or c219_ins_count or k054539_samples
         or mikey_ids or x1_ids
         or any(s.length >= 8 for s in pcm_samples)
         or scc_waves or ay_count or dac_samples or psg_count
@@ -13344,6 +13571,7 @@ def analyze(
         + n_ym2608_rhythm_ins + n_ym2608_b_ins
         + n_ssg_pcm + len(ymz_audible)
         + len(multipcm_audible) + n_upd_ins + n_pwm_ins
+        + c219_ins_count + len(k054539_samples)
     )
     # Before trimming anything for the hard limit, share an instrument whose
     # macros only differ by a longer tail with its shorter copies. A short
@@ -13377,6 +13605,7 @@ def analyze(
         + len(ym2608_b_samples) + len(ssg_pcm_samples)
         + len(ymz_audible)
         + len(multipcm_audible) + len(upd_audible) + len(pwm_audible)
+        + len(c219_samples) + len(k054539_samples)
     )
     if n_total_smp > 65535:
         warnings.append(
@@ -13419,8 +13648,14 @@ def analyze(
         rf5c68_samples=rf5c68_audible,
         rf5c164_samples=rf5c164_audible,
         c140_samples=c140_audible,
+        c219_samples=c219_samples,
+        c219_ids=c219_ids,
+        c219_count=c219_count,
         c352_samples=c352_audible,
         k053260_samples=k053260_audible,
+        k054539_samples=k054539_samples,
+        k054539_ids=k054539_ids,
+        k054539_count=k054539_count,
         ymz280b_samples=ymz_audible,
         ymz280b_ids=ymz_ids,
         ymz280b_count=ymz_count,
@@ -13812,7 +14047,9 @@ def format_report(song: Song) -> str:
         len(song.pcm_samples) + len(song.segapcm_samples)
         + len(song.rf5c68_samples) + len(song.rf5c164_samples)
         + len(song.c140_samples)
+        + len(song.c219_samples)
         + len(song.c352_samples) + len(song.k053260_samples)
+        + len(song.k054539_samples)
         + len(song.ym2610_a_samples) + len(song.ym2610_b_samples)
         + len(song.ymz280b_samples)
     )
@@ -13919,8 +14156,10 @@ def format_report(song: Song) -> str:
         ("RF5C68", song.rf5c68_samples),
         ("RF5C164", song.rf5c164_samples),
         ("C140", song.c140_samples),
+        ("C219", song.c219_samples),
         ("C352", song.c352_samples),
         ("K053260", song.k053260_samples),
+        ("K054539", song.k054539_samples),
         ("YMZ280B", song.ymz280b_samples),
     ):
         if not smps:

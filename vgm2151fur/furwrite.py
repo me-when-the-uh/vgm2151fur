@@ -15,6 +15,7 @@ from dataclasses import dataclass, replace
 
 from vgm2151fur.analyze import Song, ToneIns
 from vgm2151fur.c140 import c140_furnace_clock
+from vgm2151fur.c219 import C219_DEFAULT_CLOCK, c219_furnace_clock
 from vgm2151fur.c352 import C352_DEFAULT_CLOCK
 from vgm2151fur.fm import CARRIERS, OPN_CARRIERS
 from vgm2151fur.nes import nes_dpcm_rate
@@ -102,6 +103,8 @@ CHIP_SEGAPCM = 0x9B
 # The chipType flag picks the variant: 0 = RF5C68, 1 = RF5C164.
 CHIP_RF5C68 = 0x95
 CHIP_C140 = 0xCE
+# DIV_SYSTEM_C219: sixteen 8-bit/mu-law PCM voices with noise and surround.
+CHIP_C219 = 0xCF
 CHIP_K053260 = 0xCC
 # DIV_SYSTEM_YMZ280B: eight PCM/ADPCM sample voices.
 CHIP_YMZ280B = 0xB8
@@ -279,6 +282,7 @@ INS_MULTIPCM = 28
 INS_K007232 = 45
 INS_K053260 = 50
 INS_C140 = 53
+INS_C219 = 54
 # DIV_INS_AMIGA. C140 channels already accept this sample type, so a future
 # C352 core copied from c140.cpp can play the bodies. There is no DIV_INS_C352.
 INS_C352 = 4
@@ -318,6 +322,8 @@ SMP_DEPTH_8BIT = 8
 SMP_DEPTH_12BIT = 12
 SMP_DEPTH_16BIT = 16
 SMP_DEPTH_VOX = 10
+# C219 mu-law bodies are expanded to 8-bit linear in `c219.py`; there is no
+# separate sample depth for them here.
 # Default sample-upload masks. write_fur narrows this when a MultiPCM system
 # is present so unrelated bodies do not fill its 2 MB sample memory.
 _DEFAULT_RENDER_MASKS = (
@@ -351,7 +357,8 @@ PAT_TAIL_ROWS = 10
 _DEV_DEFAULT_VOLUME = {
     0x00: 0x80,
     0x03: 0x100, 0x04: 0x180, 0x08: 0x100, 0x12: 0x100, 0x16: 0x11E,
-    0x18: 0x100, 0x19: 0xA0, 0x1C: 0x100, 0x1D: 0x100, 0x27: 0x40,
+    0x18: 0x100, 0x19: 0xA0, 0x1A: 0x100, 0x1C: 0x100, 0x1D: 0x100,
+    0x27: 0x40,
     0x14: 0xC0,  # NES APU family; the FDS shares its output stage
     0x0F: 0x100, 0x22: 0x100, 0x1E: 0x100,  # VSU, POKEY
     0x26: 0x100,  # Seta X1-010
@@ -390,7 +397,8 @@ _FURNACE_VOLUME_SCALE = {
 # MSM6258's player default is 0x11E; its Furnace core is 1.64x louder, so
 # 0.61 lands the sample at the source level. The MSM6295 (0x18) is unity.
 _CHIP_DEV = {CHIP_YM2151: 0x03, CHIP_SEGAPCM: 0x04, CHIP_MSM6295: 0x18,
-             CHIP_MSM6258: 0x16, CHIP_C140: 0x1C, CHIP_C352: 0x27,
+             CHIP_MSM6258: 0x16, CHIP_C140: 0x1C, CHIP_C219: 0x1C,
+             CHIP_C352: 0x27,
              CHIP_K053260: 0x1D, CHIP_YMZ280B: 0x0F, CHIP_VBOY: 0x22,
              CHIP_QSOUND: 0x1F, CHIP_SWAN: 0x21, CHIP_FDS: 0x14,
              CHIP_SMS: 0x00, CHIP_T6W28: 0x00,
@@ -430,6 +438,11 @@ def _sample_chip_volume(song: "Song", chip: int, instances: int) -> float:
         # default is 0x11E; MSM6258 shares that id but has its own core scale,
         # so do not inherit the 0x16 entry from _FURNACE_VOLUME_SCALE.
         return 0.6 * _player_chip_volume(song.vgm, 0x16, instances)
+    if chip == CHIP_C219:
+        # The C219 shares VGMPlay's C140 device volume patch, but its Furnace
+        # core scales each voice by one bit more than libvgm's.  Measured on
+        # the Slow Brew reference: 1.4x the player level matches the source.
+        return 1.4 * _player_chip_volume(song.vgm, 0x1C, instances)
     if chip == CHIP_MULTIPCM:
         # Match the player's lone-chip MultiPCM output without halving a
         # dual-header pair: both systems run at the 2.0 mixer ceiling.
@@ -1948,6 +1961,11 @@ def c140_flag_text(clock: int, c140_type: int) -> str:
     if clk != C140_FURNACE_DEFAULT_CLOCK:
         parts.append(f"customClock={clk}")
     return "\n".join(parts)
+
+
+def c219_flag_text(clock: int) -> str:
+    """C219 system flags: Furnace-notation custom clock only."""
+    return f"customClock={c219_furnace_clock(clock)}"
 
 
 def ay8910_flag_text(
@@ -3673,6 +3691,10 @@ def _build_patterns(song: Song, n_ch: int, pat_len_max: int, fx_cols: int,
         elif (ev.pcm or ev.pan or ev.tone_chip in (7, 10)) and not ev.no_pan:
             # VSU LRV 0 is "both sides off", not "leave the previous pan".
             _add_fx(cell, 0x08, ev.pan & 0xFF, fx_cols, stats)
+        if ev.c219_noise:
+            _add_fx(cell, 0x11, 1, fx_cols, stats)
+        if ev.c219_mode:
+            _add_fx(cell, 0x12, ev.c219_mode & 0xFF, fx_cols, stats)
 
     # A PCM note still sounding at the last content row gets an explicit off.
     # At a loop seam a note whose source stop lies past the wrap keeps
@@ -4633,6 +4655,10 @@ def write_fur(
         or getattr(song, "ymz280b_samples", ())
         or getattr(song, "multipcm_samples", ())
         or getattr(song, "upd7759_samples", ())
+        # Native/sample-only C219 and K054539 modules own the first column;
+        # an empty YM2151 placeholder would add eight silent columns.
+        or getattr(song, "c219_ids", ())
+        or getattr(song, "k054539_ids", ())
     )
     if ym2610 or ym2608:
         fm_present = (include_fm or include_pcm) and bool(ym_ids)
@@ -4667,10 +4693,27 @@ def write_fur(
         [s for s in song.rf5c164_samples if s.length >= 8] if include_pcm else []
     )
     c140_smps = [s for s in song.c140_samples if s.length >= 8] if include_pcm else []
+    c219_all = (
+        list(getattr(song, "c219_samples", ()) or ()) if include_pcm else []
+    )
+    c219_real = [
+        (i, s) for i, s in enumerate(c219_all)
+        if s.hits and s.length > 0
+    ]
+    c219_ids = (
+        list(getattr(song, "c219_ids", ()) or ()) if include_pcm else []
+    ) or sorted({h.chip_id for _i, s in c219_real for h in s.hits})
     c352_smps = [s for s in song.c352_samples if s.length >= 8] if include_pcm else []
     k053260_smps = (
         [s for s in song.k053260_samples if s.length >= 8] if include_pcm else []
     )
+    k054539_smps = (
+        [s for s in getattr(song, "k054539_samples", ()) or ()
+         if include_pcm and s.hits and s.length > 0]
+    )
+    k054539_ids = (
+        list(getattr(song, "k054539_ids", ()) or ()) if include_pcm else []
+    ) or sorted({h.chip_id for s in k054539_smps for h in s.hits})
     ymz_smps = (
         list(getattr(song, "ymz280b_samples", ()) or ())
         if include_pcm else []
@@ -4884,6 +4927,7 @@ def write_fur(
         + 4 * len(k053260_ids) + 8 * len(ymz_ids)
         + 28 * len(multipcm_ids) + len(upd7759_ids)
         + 2 * len(pwm_ids)
+        + 16 * len(c219_ids) + 8 * len(k054539_ids)
         + n_scc + n_ay + n_nes + n_huc6280 + n_gb + n_vsu + n_saa
         + n_pokey + n_mikey + n_x1 + n_fds + n_wonderswan + n_qsound
     )
@@ -4895,6 +4939,8 @@ def write_fur(
     rf5c68_clock = song.vgm.rf5c68_clock or 8000000
     rf5c164_clock = song.vgm.rf5c164_clock or 12500000
     c140_clock = song.vgm.c140_clock or 12288000
+    c219_clock = song.vgm.c140_clock or C219_DEFAULT_CLOCK
+    k054539_clock = song.vgm.k054539_clock or 18_432_000
     c352_clock = song.vgm.c352_clock or C352_DEFAULT_CLOCK
     k053260_clock = song.vgm.k053260_clock or 3579545
 
@@ -4907,6 +4953,7 @@ def write_fur(
         + n_y8950_b_ins + n_opl4_wave_ins + n_ssg_pcm_ins
         + n_nes_dpcm_ins + n_nes_pcm_ins + n_huc6280_pcm_ins
         + len(ymz_smps) + len(multipcm_smps) + n_upd_ins + n_pwm_ins
+        + len(c219_real) + len(k054539_smps)
         + n_mikey_ins + n_x1_ins
         + len(scc_specs) + len(ay_specs) + len(psg_specs) + len(nes_specs)
         + len(huc6280_specs) + len(gb_specs) + len(vsu_specs)
@@ -4922,6 +4969,7 @@ def write_fur(
         + len(nes_dpcm_smps) + len(nes_pcm_smps) + len(huc6280_pcm_smps)
         + len(ymz_smps) + len(multipcm_smps) + len(upd7759_smps)
         + len(pwm_smps) + len(mikey_smps) + len(x1_smps)
+        + len(c219_all) + len(k054539_smps)
         + len(qsound_smps) + len(wonderswan_pcm_smps)
     )
     n_wav = (
@@ -5011,7 +5059,9 @@ def write_fur(
     multipcm_smp_base = ymz_smp_base + len(ymz_smps)
     upd7759_smp_base = multipcm_smp_base + len(multipcm_smps)
     pwm_smp_base = upd7759_smp_base + len(upd7759_smps)
-    mikey_smp_base = pwm_smp_base + len(pwm_smps)
+    c219_smp_base = pwm_smp_base + len(pwm_smps)
+    k054539_smp_base = c219_smp_base + len(c219_all)
+    mikey_smp_base = k054539_smp_base + len(k054539_smps)
     wonderswan_pcm_smp_base = mikey_smp_base + len(mikey_smps)
     qsound_smp_base = wonderswan_pcm_smp_base + len(wonderswan_pcm_smps)
     x1_smp_base = qsound_smp_base + len(qsound_smps)
@@ -5024,6 +5074,7 @@ def write_fur(
         + n_y8950_b_ins + n_opl4_wave_ins + n_ssg_pcm_ins
         + n_nes_dpcm_ins + n_nes_pcm_ins + n_huc6280_pcm_ins
         + len(ymz_smps) + len(multipcm_smps) + n_upd_ins + n_pwm_ins
+        + len(c219_real) + len(k054539_smps)
         + n_mikey_ins + len(wonderswan_pcm_smps) + n_x1_ins
         + len(scc_specs) + len(ay_specs) + len(psg_specs) + len(nes_specs)
         + len(huc6280_specs) + len(gb_specs) + len(vsu_specs)
@@ -5041,6 +5092,7 @@ def write_fur(
         + len(nes_dpcm_smps) + len(nes_pcm_smps) + len(huc6280_pcm_smps)
         + len(ymz_smps) + len(multipcm_smps) + len(upd7759_smps)
         + len(pwm_smps) + len(mikey_smps) + len(x1_smps)
+        + len(c219_all) + len(k054539_smps)
         + len(qsound_smps) + len(wonderswan_pcm_smps)
     )
 
@@ -5128,6 +5180,14 @@ def write_fur(
         names_short.append(f"PW{cid + 1}L")
         names_long.append(f"PWM Right{suffix}")
         names_short.append(f"PW{cid + 1}R")
+    for cid in c219_ids:
+        for voice in range(16):
+            names_long.append(f"C219 {cid + 1}-{voice + 1}")
+            names_short.append(f"X{cid + 1}-{voice + 1}")
+    for cid in k054539_ids:
+        for voice in range(8):
+            names_long.append(f"K054539 {cid + 1}-{voice + 1}")
+            names_short.append(f"K{cid + 1}-{voice + 1}")
     for cid in scc_ids:
         for voice in range(5):
             names_long.append(f"SCC {cid + 1}-{voice + 1}")
@@ -5267,6 +5327,13 @@ def write_fur(
         label_parts.append("uPD7759")
     if pwm_ids:
         label_parts.append("32X PWM")
+    if c219_ids:
+        label_parts.append("C219")
+    if k054539_ids:
+        label_parts.append(
+            f"K054539 x{len(k054539_ids)}" if len(k054539_ids) > 1
+            else "K054539"
+        )
     if scc_ids:
         label_parts.append("SCC+" if song.vgm.k051649_plus else "SCC")
     if ay_ids:
@@ -5599,6 +5666,18 @@ def write_fur(
             pwm_sys[(cid, side)] = len(chips)
             chips.append(CHIP_PCM_DAC)
             flag_texts.append(pcm_dac_flag_text(22020, stereo=True))
+    for cid in c219_ids:
+        chips.append(CHIP_C219)
+        flag_texts.append(c219_flag_text(c219_clock))
+    k054539_out = max(1000, int(round(k054539_clock / 384)))
+    k054539_sys: dict[int, list[int]] = {}
+    for cid in k054539_ids:
+        systems_for_chip: list[int] = []
+        for _voice in range(8):
+            systems_for_chip.append(len(chips))
+            chips.append(CHIP_PCM_DAC)
+            flag_texts.append(pcm_dac_flag_text(k054539_out, stereo=True))
+        k054539_sys[cid] = systems_for_chip
     for cid in scc_ids:
         chips.append(scc_chip)
         flag_texts.append(k051649_flag_text(song.vgm.k051649_clock))
@@ -5745,6 +5824,10 @@ def write_fur(
     chip_counts = Counter(chips)
     pwm_pan = {idx: (-1.0 if side == 0 else 1.0)
                for (_cid, side), idx in pwm_sys.items()}
+    k054539_set = {
+        idx for systems_for_chip in k054539_sys.values()
+        for idx in systems_for_chip
+    }
     for i, chip in enumerate(chips):
         # Twin16 K007232 sits under the OPM; the rip's mix says how far. Every
         # other sample chip uses the player's mix (defaults + extra-header
@@ -5755,6 +5838,13 @@ def write_fur(
             # VGMPlay's 32X PWM default is 0xE0 for the stereo chip; each
             # module system carries one side.
             cv = _player_chip_volume(song.vgm, 0x11, 1)
+        elif i in k054539_set:
+            # The K054539 core always applies its own /4 voice gain.  Eight
+            # one-voice PCM DAC systems each carry that share; the song master
+            # stays at 1.0.
+            cv = 0.25 * _player_chip_volume(
+                song.vgm, 0x1A, max(1, len(k054539_ids)),
+            )
         elif chip in _CHIP_DEV:
             cv = _sample_chip_volume(song, chip, chip_counts[chip])
         else:
@@ -6067,6 +6157,17 @@ def write_fur(
         ]
         _write_ins_sample_map(
             b, f"PWM PCM {group + 1}", 0, maps, INS_AMIGA, flags=0x03,
+        )
+    for pos, smp in c219_real:
+        ins_ptrs.append(len(b))
+        _write_ins_pcm(
+            b, f"C219 {smp.start:04x}", pos, INS_C219,
+        )
+    for i, smp in enumerate(k054539_smps):
+        ins_ptrs.append(len(b))
+        _write_ins_pcm(
+            b, f"K054539 {smp.start:06x}", k054539_smp_base + i,
+            INS_AMIGA,
         )
     for group in range(n_mikey_ins):
         ins_ptrs.append(len(b))
@@ -6476,6 +6577,34 @@ def write_fur(
         _write_sample_s8(
             b, smp.name, smp.data, smp.rate, loop=loop,
             depth=SMP_DEPTH_16BIT, render_masks=(0, 0, 0, 0),
+        )
+    for i, smp in enumerate(c219_all):
+        smp_ptrs.append(len(b))
+        loop = (
+            (smp.loop_start, smp.loop_end)
+            if smp.loop_start is not None and smp.loop_end is not None
+            else (None, None)
+        )
+        _write_sample_s8(
+            b, f"c219_{i:03d}_{smp.start:04x}", smp.data,
+            smp.c4_rate(c219_clock), loop=loop, depth=smp.depth,
+        )
+    for i, smp in enumerate(k054539_smps):
+        smp_ptrs.append(len(b))
+        loop = (
+            (smp.loop_start, smp.loop_end)
+            if smp.loop_start is not None and smp.loop_end is not None
+            else (None, None)
+        )
+        rate = max(
+            1, int(round(
+                smp.c4_rate(k054539_clock) * DAC_RATE_COMPENSATION
+            )),
+        )
+        _write_sample_s8(
+            b, f"k054539_{i:03d}_{smp.start:06x}", smp.data,
+            rate, loop=loop, depth=smp.depth,
+            render_masks=(0, 0, 0, 0),
         )
     for smp in mikey_smps:
         smp_ptrs.append(len(b))

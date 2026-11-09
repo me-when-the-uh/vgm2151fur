@@ -118,8 +118,10 @@ def _sample_counts(info: dict) -> str:
         ("rf5c68_samples", "RF5C68"),
         ("rf5c164_samples", "RF5C164"),
         ("c140_samples", "C140"),
+        ("c219_samples", "C219"),
         ("c352_samples", "C352"),
         ("k053260_samples", "K053260"),
+        ("k054539_samples", "K054539"),
         ("ymz280b_samples", "YMZ280B"),
         ("multipcm_samples", "MultiPCM"),
         ("upd7759_samples", "uPD7759"),
@@ -547,8 +549,9 @@ def build_parser() -> argparse.ArgumentParser:
         description=(
             "Transcribe YM2151 (OPM), YM2203 (OPN), YM2612 (OPN2), YM2610 and "
             "OPL-family (YM3526/YM3812/YMF262) + "
-            "sample-chip (K007232, MSM6295, MSM6258, SegaPCM, C140, C352, "
-            "K053260, YMZ280B, YMW258-F MultiPCM, uPD7759, 32X PWM) + "
+            "sample-chip (K007232, K054539, MSM6295, MSM6258, SegaPCM, C140, "
+            "C219, C352, K053260, YMZ280B, YMW258-F MultiPCM, uPD7759, "
+            "32X PWM) + "
             "Nintendo Virtual Boy (VSU) + Philips "
             "SAA1099 (Creative Music System / Game Blaster) + Atari POKEY "
             "and Lynx/Mikey + Seta X1-010 + Nintendo FDS + Bandai WonderSwan "

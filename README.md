@@ -4,7 +4,7 @@ Converts arcade and console VGM/VGZ rips into Furnace Tracker modules.
 Supported chips:
 - Yamaha: YM2151, YM2203, YM2612, YM2610/YM2610B, YM2608, YM2413, YM3526, YM3812, YMF262, Y8950, YMF278B, YMZ280B, YMW258-F (MultiPCM) and YM2149.
 - General Instrument: AY-3-8910.
-- Konami: VRC7, K007232, K053260 and SCC/SCC+.
+- Konami: VRC7, K007232, K053260, K054539 and SCC/SCC+.
 - Atari: POKEY and Lynx/Mikey.
 - Seta: X1-010.
 - Capcom: QSound.
@@ -15,7 +15,7 @@ Supported chips:
 - Sega: SegaPCM and 32X PWM.
 - Nintendo: NES APU (2A03), Famicom Disk System, Game Boy DMG, Virtual Boy VSU and Hudson HuC6280 (PC Engine).
 - OKI: MSM6295 and MSM6258.
-- Namco: C140 and C352.
+- Namco: C140, C219 and C352.
 - Ricoh: RF5C68 and RF5C164.
 
 A log that mixes several chip families is written as one module when the combination is supported. `docs/merged-logs.md` lists the rules. A clock field's dual bit keeps both chip instances, even when one never sounds a note; T6W28 is the exception, since its two bits describe one stereo chip.
@@ -88,11 +88,11 @@ The suite runs without game packs. Tests that need Furnace skip when it is missi
 ```
 vgm2151fur/     the package: analyze, furwrite, convert, edit, diag
 tools/          standalone helpers, including fur2vgm and fur2wav
-tests/          pytest suite
+tests/          unittest suite
 docs/           operating guide, format notes, chip notes
 ```
 
-Project state and workflow are in `docs/portable-context.md` and `docs/implementation-notes.md`. Chip details are in `docs/opm-notes.md`, `docs/ym2203.md`, `docs/ym2612.md`, `docs/ym2610.md`, `docs/opna-opll.md`, `docs/opl.md`, `docs/k053260.md`, `docs/scc-ay8910.md`, `docs/segapcm-c140.md`, `docs/ssg-pcm.md`, `docs/nes-vrc7.md`, `docs/fds.md`, `docs/gb.md`, `docs/huc6280.md`, `docs/c352.md`, `docs/ymz280b.md`, `docs/multipcm.md`, `docs/upd7759.md`, `docs/pwm32x.md`, `docs/pokey.md`, `docs/mikey.md`, `docs/x1-010.md`, `docs/wonderswan.md`, `docs/qsound.md` and `docs/vsu.md`. `docs/merged-logs.md` covers multi-family modules, and `docs/psg-open-items.md` tracks the remaining AY accuracy gaps.
+Project state and workflow are in `docs/portable-context.md` and `docs/implementation-notes.md`. Chip details are in `docs/opm-notes.md`, `docs/ym2203.md`, `docs/ym2612.md`, `docs/ym2610.md`, `docs/opna-opll.md`, `docs/opl.md`, `docs/k053260.md`, `docs/scc-ay8910.md`, `docs/segapcm-c140.md`, `docs/c219.md`, `docs/k054539.md`, `docs/ssg-pcm.md`, `docs/nes-vrc7.md`, `docs/fds.md`, `docs/gb.md`, `docs/huc6280.md`, `docs/c352.md`, `docs/ymz280b.md`, `docs/multipcm.md`, `docs/upd7759.md`, `docs/pwm32x.md`, `docs/pokey.md`, `docs/mikey.md`, `docs/x1-010.md`, `docs/wonderswan.md`, `docs/qsound.md` and `docs/vsu.md`. `docs/merged-logs.md` covers multi-family modules, and `docs/psg-open-items.md` tracks the remaining AY accuracy gaps.
 
 Open follow-ups are tracked in [TODO.md](./TODO.md).
 
@@ -120,8 +120,15 @@ Open follow-ups are tracked in [TODO.md](./TODO.md).
   - Long bodies are split at about 1 second without leaving a sub-minimum tail, and identical bodies are stored once, including when the left and right sides carry the same body.
   - The PWM data is a streamed duty sequence, so the module stores the decoded left/right PCM rather than the source register writes.
 - Generic PCM DAC mix levels are limited to 2.0 per chip and the song master to 3.0; the source normalizer stops at that ceiling.
-- SegaPCM and C140 follow mid-note volume and frequency writes, while start/end/loop/bank changes stay at the key-on value.
+- SegaPCM, C140 and C219 follow mid-note volume and frequency writes, while start/end/loop/bank changes stay at the key-on value.
   - The C140 sign-flip and sign-magnitude mode bits are ignored, as libvgm ignores them.
+- C219 converts sixteen voices per chip on Furnace's native `0xCF` system, including word addresses, bank groups, noise, invert/surround and C219 mu-law.
+  - Mu-law bodies are decoded to 8-bit linear because Furnace's C219 depth-12 upload path only reaches four bytes per body.
+  - Silent constant bodies are dropped, and source sample banks stay in separate Furnace banks by appending trailing silence to the previous one-shot body instead of adding visible padding samples.
+  - The layout mirrors Furnace's even-length and bank-crossing rules, then replays the key-ons to warn when a group-bank switch would silence an active voice.
+- K054539 converts eight voices per chip, each on its own Generic PCM DAC system, with 8-bit PCM, 16-bit PCM and 4-bit DPCM bodies.
+  - Start/end markers, loop points, key-on/key-off, pitch, attenuation and panning are kept; reverb send is reported and omitted.
+  - Each system carries one quarter of the chip's voice gain and the song master stays at 1.0.
 - RF5C68 and RF5C164 share one Furnace system selected by `chipType`, and a looping SSG PCM DAC stream plays once because the AY sample instrument is one-shot.
 - SN76489 converts as four channels, and extreme periods or two notes on the same channel/row are approximated.
   - The default system volume is 0.500, and an absolute VGM extra-header volume entry still overrides it.
@@ -160,7 +167,6 @@ Open follow-ups are tracked in [TODO.md](./TODO.md).
   - AUDC distortion 7 has no separate Furnace wave tap and plays as distortion 6 with a warning.
 - Seta X1-010 converts sixteen wavetable/PCM voices per chip using Furnace's native wave/envelope macros and 8-bit ROM sample maps.
 - C352 needs a Furnace build with the ported core.
-- C219 logs are detected but not converted.
 - K053260 loops the whole sample, and mid-note loop, KADPCM or direction changes use the key-on value.
   - A voice keyed with pan 0 is written silent and raised when its pan moves.
 - Chip volumes above unity only exist in INF2 files.

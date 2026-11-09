@@ -1,8 +1,8 @@
 """VGM / VGZ loader and command walker.
 
 Chips: YM2151, YM2203, YM2612, YM2610, YM3526 (OPL), YM3812 (OPL2),
-YMF262 (OPL3), RF5C68, RF5C164, K007232, MSM6295, MSM6258, SegaPCM, C140,
-C352, K053260, YMZ280B, Nintendo Virtual Boy (VSU), AY-3-8910,
+YMF262 (OPL3), RF5C68, RF5C164, K007232, K054539, MSM6295, MSM6258, SegaPCM,
+C140, C219, C352, K053260, YMZ280B, Nintendo Virtual Boy (VSU), AY-3-8910,
 K051649/K052539 (SCC), SN76489 and its stereo T6W28 variant.
 """
 
@@ -113,6 +113,9 @@ CMD_RF5C164_MEM = 0xC2
 # wave slots (10 registers each, 0x08-0xF7).
 CMD_YMF278B = 0xD0
 CMD_SCC = 0xD2
+# 0xD3 is the Konami K054539: 16-bit big-endian offset (bit 15 selects the
+# second chip), then one byte of data.
+CMD_K054539 = 0xD3
 CMD_C140 = 0xD4
 CMD_C352 = 0xE1
 CMD_K053260 = 0xBA
@@ -159,7 +162,8 @@ YMF278B_RAM_TYPE = 0x87  # YMF278B (OPL4) RAM image
 YMZ280B_ROM_TYPE = 0x86  # YMZ280B external sample ROM
 MULTIPCM_ROM_TYPE = 0x89  # YMW258-F (MultiPCM) ROM image
 UPD7759_ROM_TYPE = 0x8A  # uPD7759 phrase ROM image
-C140_ROM_TYPE = 0x8D  # Namco C140 ROM
+K054539_ROM_TYPE = 0x8C  # Konami K054539 sample ROM
+C140_ROM_TYPE = 0x8D  # Namco C140 / C219 ROM
 C352_ROM_TYPE = 0x92  # Namco C352 ROM
 YM2610_ADPCM_ROM_TYPE = 0x82  # YM2610 ADPCM-A/B ROM
 YM2610_DELTAT_ROM_TYPE = 0x83  # YM2610 delta-T ROM
@@ -179,6 +183,7 @@ EXTRA_AY8910 = 0x12
 EXTRA_K051649 = 0x19
 EXTRA_HUC6280 = 0x1B
 EXTRA_C140 = 0x1C
+EXTRA_K054539 = 0x1A
 EXTRA_K053260 = 0x1D
 EXTRA_C352 = 0x27
 EXTRA_K007232 = 0x2A
@@ -372,6 +377,14 @@ C352_DIV_OFF = 0xD6  # hardware divider / 4; 72 means a divider of 288
 SEGAPCM_CLOCK_X = 4000000  # X board / Hang-On
 SEGAPCM_CLOCK_Y = 4026987  # Y board: 32215900/8
 C140_DEFAULT_CLOCK = 12288000  # System 2/21 rips with a bogus header field
+C219_DEFAULT_CLOCK = 25_056_500  # libvgm's fallback for a missing C219 clock
+C219_CLOCK_MAX = 100_000_000
+# Konami K054539 header 0xA0.  The flag byte at 0x95 is copied by libvgm into
+# the core configuration; the clock field has bit 30 for a second chip.
+K054539_CLOCK_OFF = 0xA0
+K054539_FLAGS_OFF = 0x95
+K054539_DEFAULT_CLOCK = 18_432_000
+K054539_DUAL_BIT = 0x40000000
 AY8910_DEFAULT_CLOCK = 1789772  # COLOR_NTSC/2, the MSX/ZX PSG clock
 K051649_DEFAULT_CLOCK = 1789772  # MSX SCC (half the 3.579545 MHz slot clock)
 CLOCK_MIN = 100_000
@@ -700,6 +713,12 @@ class VgmFile:
     c140_clock: int = 0
     c140_type: int = 0
     c140_dual: bool = False
+    # Konami K054539 header 0xA0, flags 0x95.  Bit 30 selects the second
+    # instance; its clock can live in the extra-header list (id 0x1A).
+    k054539_clock: int = 0
+    k054539_clock_2: int = 0
+    k054539_dual: bool = False
+    k054539_flags: int = 0
     # RF5C68 header 0x40 and RF5C164 header 0x6C (VGM 1.51+). One register
     # interface, two clocks: FM Towns runs the 68 at 8 MHz, Sega CD the 164 at
     # 12.5 MHz. Furnace hosts both as the RF5C68 system with a chipType flag.
@@ -878,6 +897,26 @@ def _c140_effective_clock(raw: int) -> int:
     return C140_DEFAULT_CLOCK
 
 
+def _c219_effective_clock(raw: int) -> int:
+    """Resolve an ASIC219 clock, whose range is wider than the C140's."""
+    raw &= 0x3FFFFFFF
+    if CLOCK_MIN <= raw < 1_000_000:
+        raw *= 576
+    if CLOCK_MIN <= raw <= C219_CLOCK_MAX:
+        return raw
+    return C219_DEFAULT_CLOCK
+
+
+def _k054539_effective_clock(raw: int) -> int:
+    """Resolve a K054539 clock, including libvgm's legacy rate form."""
+    raw &= 0x3FFFFFFF
+    if CLOCK_MIN <= raw < 1_000_000:
+        raw *= 384
+    if CLOCK_MIN <= raw <= CLOCK_MAX:
+        return raw
+    return K054539_DEFAULT_CLOCK
+
+
 def c352_effective_clock(raw: int, divider: int) -> int:
     """Crystal a /288 C352 core should run at.
 
@@ -995,11 +1034,11 @@ def chips_in_head(buf: bytes) -> set[str]:
     """Chip kinds visible in a VGM header, no command stream read.
 
     Names match the converter's chips: ym2151, ym2610, msm6295, segapcm, c140,
-    c352, k053260, ay8910, k051649 (plus "scc_plus" for the K052539 variant),
-    k007232, ymz280b, vsu (plus "vsu_dual") and pokey (plus "pokey_dual").
-    C219 is the C140-family part the converter does not support. It is reported
-    apart from c140, and those packs should not be batch-converted. C352 is
-    its own chip (32 voices); it is not folded into c140 or c219.
+    c219, k054539, c352, k053260, ay8910, k051649 (plus "scc_plus" for the
+    K052539 variant), k007232, ymz280b, vsu (plus "vsu_dual") and pokey (plus
+    "pokey_dual").  C219 is the 16-voice C140-family part selected by header
+    type 2; it is reported apart from c140.  C352 is its own chip (32 voices);
+    it is not folded into c140 or c219.
     """
     if buf[:4] != b"Vgm ":
         return set()
@@ -1198,6 +1237,12 @@ def chips_in_head(buf: bytes) -> set[str]:
     if ctype == 2:
         kinds.discard("c140")
         kinds.add("c219")
+    if version >= 0x151 and _field_in_header(buf, K054539_CLOCK_OFF, 4):
+        raw = _header_raw(buf, K054539_CLOCK_OFF)
+        if 100_000 <= (raw & 0x3FFFFFFF) <= 40_000_000:
+            kinds.add("k054539")
+            if raw & K054539_DUAL_BIT:
+                kinds.add("k054539_dual")
     if version >= 0x161 and _field_in_header(buf, K053260_CLOCK_OFF, 4):
         raw = _header_raw(buf, K053260_CLOCK_OFF)
         if 100_000 <= (raw & 0x3FFFFFFF) <= 40_000_000:
@@ -1237,7 +1282,9 @@ def chips_in_head(buf: bytes) -> set[str]:
         if clocks.get(EXTRA_K051649, 0):
             kinds.add("k051649")
         if clocks.get(EXTRA_C140, 0):
-            kinds.add("c140")
+            kinds.add("c219" if ctype == 2 else "c140")
+        if clocks.get(EXTRA_K054539, 0):
+            kinds.add("k054539")
         if clocks.get(EXTRA_K053260, 0):
             kinds.add("k053260")
         if clocks.get(EXTRA_MSM6295, 0):
@@ -1477,12 +1524,6 @@ def load_vgm(path: Path | str) -> VgmFile:
     c140_raw = c140_header & 0x3FFFFFFF
     if not c140_raw:
         c140_raw = clocks.get(EXTRA_C140, 0) & 0x3FFFFFFF
-    c140_clock = _c140_effective_clock(c140_raw)
-    k053260_raw = _header_raw(buf, K053260_CLOCK_OFF) if ver >= 0x161 else 0
-    k053260_clock = _sane_clock(k053260_raw)
-    k053260_dual = bool(k053260_raw & 0x40000000)
-    if not k053260_clock:
-        k053260_clock = _sane_clock(clocks.get(EXTRA_K053260, 0))
     c140_type = 0
     if ver >= 0x161 and _field_in_header(buf, C140_TYPE_OFF, 1):
         c140_type = buf[C140_TYPE_OFF] & 0x03
@@ -1490,6 +1531,35 @@ def load_vgm(path: Path | str) -> VgmFile:
         # Pre-1.61 System 21 rips log the legacy 8MHz/374 rate instead of a
         # clock; their register stream still needs the System 21 mapping.
         c140_type = 1
+    c140_clock = (
+        _c219_effective_clock(c140_raw) if c140_type == 2
+        else _c140_effective_clock(c140_raw)
+    )
+    # K054539 clock 0xA0 and flag byte 0x95 (VGM 1.51+).  The condition flags
+    # are copied into the core by libvgm; bit 30 marks a second chip whose
+    # clock can live in the extra-header list (id 0x1A).
+    k054539_raw = _header_raw(buf, K054539_CLOCK_OFF) if ver >= 0x151 else 0
+    k054539_dual = bool(k054539_raw & K054539_DUAL_BIT)
+    if not (k054539_raw & 0x3FFFFFFF):
+        k054539_raw = clocks.get(EXTRA_K054539, 0)
+    k054539_clock = _k054539_effective_clock(k054539_raw)
+    k054539_clock_2 = 0
+    if k054539_dual:
+        extra_clock = clocks.get(EXTRA_K054539, 0)
+        k054539_clock_2 = (
+            _k054539_effective_clock(extra_clock) if extra_clock
+            else k054539_clock
+        )
+    k054539_flags = (
+        buf[K054539_FLAGS_OFF]
+        if ver >= 0x151 and _field_in_header(buf, K054539_FLAGS_OFF, 1)
+        else 0
+    )
+    k053260_raw = _header_raw(buf, K053260_CLOCK_OFF) if ver >= 0x161 else 0
+    k053260_clock = _sane_clock(k053260_raw)
+    k053260_dual = bool(k053260_raw & 0x40000000)
+    if not k053260_clock:
+        k053260_clock = _sane_clock(clocks.get(EXTRA_K053260, 0))
     c352_clock = 0
     c352_divider = 0
     c352_mute_rear = False
@@ -1689,6 +1759,10 @@ def load_vgm(path: Path | str) -> VgmFile:
         c140_clock=c140_clock,
         c140_type=c140_type,
         c140_dual=c140_dual,
+        k054539_clock=k054539_clock,
+        k054539_clock_2=k054539_clock_2,
+        k054539_dual=k054539_dual,
+        k054539_flags=k054539_flags,
         k053260_clock=k053260_clock,
         k053260_dual=k053260_dual,
         c352_clock=c352_clock,
@@ -1744,6 +1818,7 @@ def load_vgm(path: Path | str) -> VgmFile:
     stray_segapcm_second = False
     stray_k007232_second = False
     stray_c140_second = False
+    stray_k054539_second = False
     stray_k053260_second = False
     stray_ay_second = False
     stray_pokey_second = False
@@ -1852,7 +1927,10 @@ def load_vgm(path: Path | str) -> VgmFile:
                     MULTIPCM_ROM_TYPE: "multipcm",
                     UPD7759_ROM_TYPE: "upd7759",
                     SEGAPCM_ROM_TYPE: "segapcm",
-                    C140_ROM_TYPE: "c140",
+                    K054539_ROM_TYPE: "k054539",
+                    C140_ROM_TYPE: (
+                        "c219" if c140_type == 2 else "c140"
+                    ),
                     C352_ROM_TYPE: "c352",
                     K053260_ROM_TYPE: "k053260",
                     YM2610_ADPCM_ROM_TYPE: "ym2610_adpcm",
@@ -2562,16 +2640,30 @@ def load_vgm(path: Path | str) -> VgmFile:
             vgm.writes.append(ChipWrite(sample, "k051649", cid, reg, buf[pos + 3]))
             pos += 4
             continue
+        if cmd == CMD_K054539 and pos + 4 <= n:
+            # 0xD3: 16-bit big-endian offset, then data.  Bit 15 of the
+            # offset selects the second chip; libvgm masks the low 15 bits.
+            addr = int.from_bytes(buf[pos + 1:pos + 3], "big")
+            cid = (addr >> 15) & 1
+            if cid and not k054539_dual:
+                stray_k054539_second = True
+            vgm.writes.append(ChipWrite(
+                sample, "k054539", cid, addr & 0x7FFF, buf[pos + 3],
+            ))
+            pos += 4
+            continue
         if cmd == CMD_C140 and pos + 4 <= n:
             # 0xD4: 16-bit big-endian address, then data.  Bit 15 is the chip
             # select Furnace writes for a second instance; the register is the
-            # low nine bits.
+            # low nine bits.  The type byte at 0x96 turns the same command
+            # into the 16-voice ASIC219 stream.
             addr = int.from_bytes(buf[pos + 1:pos + 3], "big")
             cid = (addr >> 15) & 1
             if cid and not c140_dual:
                 stray_c140_second = True
             vgm.writes.append(ChipWrite(
-                sample, "c140", cid, addr & 0x1FF, buf[pos + 3],
+                sample, "c219" if c140_type == 2 else "c140",
+                cid, addr & 0x1FF, buf[pos + 3],
             ))
             pos += 4
             continue
@@ -2864,6 +2956,11 @@ def load_vgm(path: Path | str) -> VgmFile:
             "0xD4 C140 address bit 15 selects a second chip without the "
             "dual-instance header bit; it was still treated as chip 1"
         )
+    if stray_k054539_second:
+        vgm.warnings.append(
+            "0xD3 K054539 offset bit 15 selects a second chip without the "
+            "dual-instance header bit; it was still treated as chip 1"
+        )
     if stray_k053260_second:
         vgm.warnings.append(
             "0xBA K053260 register bit 7 selects a second chip without the "
@@ -2884,6 +2981,12 @@ def load_vgm(path: Path | str) -> VgmFile:
             "POKEY writes without a header clock; using 1789772 Hz"
         )
         vgm.pokey_clock = POKEY_DEFAULT_CLOCK
+    if (any(w.chip == "k054539" for w in vgm.writes)
+            and not (_header_raw(buf, K054539_CLOCK_OFF) & 0x3FFFFFFF)
+            and not clocks.get(EXTRA_K054539, 0)):
+        vgm.warnings.append(
+            "K054539 writes without a header clock; using 18432000 Hz"
+        )
     if stray_scc_second:
         vgm.warnings.append(
             "0xD2 K051649 port bit 7 selects a second chip without the "
@@ -2935,22 +3038,32 @@ def load_vgm(path: Path | str) -> VgmFile:
 
 def assemble_rom(
     vgm: VgmFile, kind: str, chip_id: int = 0, fill: int = 0,
+    *, swap16: bool = False, declared_size: bool = True,
 ) -> bytes:
     """Stitch every ROM slice of a kind into one buffer.
 
     `fill` is the erased byte outside the logged slices.  The uPD7759's
     hardware ROM reads 0xFF there, so its phrase decoder sees the same bytes
-    a real chip would.
+    a real chip would.  `swap16` applies VGMPlay's C219 payload byte swap;
+    `declared_size=False` allocates only the dumped span, which keeps a C219
+    file whose header declares the 32 MB address space from allocating it all.
     """
     slices = [s for s in vgm.roms if s.chip == chip_id and s.kind == kind]
     if not slices:
         return b""
     rom_size = max(s.rom_size for s in slices) or 0
     end = max((s.start + len(s.data)) for s in slices)
-    size = max(rom_size, end)
+    size = max(rom_size, end) if declared_size else end
     rom = bytearray([fill & 0xFF]) * size if fill else bytearray(size)
     for s in slices:
-        rom[s.start:s.start + len(s.data)] = s.data
+        data = bytes(s.data)
+        if swap16:
+            out = bytearray(len(data) & ~1)
+            for i in range(0, len(out), 2):
+                out[i] = data[i + 1]
+                out[i + 1] = data[i]
+            data = bytes(out)
+        rom[s.start:s.start + len(data)] = data
     return bytes(rom)
 
 
