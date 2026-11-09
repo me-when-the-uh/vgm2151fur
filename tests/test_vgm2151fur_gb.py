@@ -124,14 +124,47 @@ class TestGbNotes(unittest.TestCase):
         self.assertEqual([o.sample_time for o in offs], [2000])
 
     def test_frequency_write_without_a_trigger_is_a_bend(self):
-        # Arpeggios rewrite NRx3/NRx4 without a trigger, so the hardware
-        # envelope keeps running. Splitting there would restart the envelope
-        # and hold notes the source lets decay.
+        # Slow slides rewrite NRx3/NRx4 without a trigger, so the hardware
+        # envelope keeps running. They stay in pitch_pts and become row pitch
+        # steps, not a new note.
         writes = _note(1000, 0x61)
-        writes += [_gb(2000, 0x03, 0x86), _gb(2000, 0x04, 0x06)]
+        writes += [_gb(2000, 0x03, 0x10), _gb(2000, 0x04, 0x06)]
         hits, _o, _w, _warn = collect_gb(_vgm(writes))
         self.assertEqual(len(hits), 1)
         self.assertTrue(hits[0].pitch_pts)
+
+    def test_large_pitch_jump_is_a_legato_note(self):
+        # A clear semitone-or-more jump without a trigger is a legato melody
+        # move. It gets its own note cell with EAxx so the envelope continues.
+        writes = _note(1000, 0x61)
+        writes += [_gb(2000, 0x03, 0x86), _gb(2000, 0x04, 0x06)]
+        hits, _o, _w, _warn = collect_gb(_vgm(writes))
+        self.assertEqual(len(hits), 2)
+        self.assertTrue(hits[1].legato)
+        self.assertEqual(hits[1].sample_time, 2000)
+        self.assertEqual(hits[1].period, 0x686)
+
+    def test_two_byte_pitch_jump_uses_the_final_period(self):
+        # The low byte arrives first; splitting there would keep the old high
+        # byte and start the legato note on a lower pitch.
+        writes = _note(1000, 0x61)
+        writes += [_gb(2000, 0x03, 0x20), _gb(2000, 0x04, 0x07)]
+        hits, _o, _w, _warn = collect_gb(_vgm(writes))
+        self.assertEqual(len(hits), 2)
+        self.assertTrue(hits[1].legato)
+        self.assertEqual(hits[1].period, 0x720)
+        self.assertEqual(gb_note(4194304, hits[1].period), (122, 112))
+
+    def test_mid_note_volume_attack_is_a_note(self):
+        # A mid-note NRx2 write that raises the level is a software attack,
+        # not a zombie volume step inside the same note.
+        writes = _note(1000, 0x60)
+        writes += [_gb(3000, 0x02, 0x90)]
+        hits, _o, _w, _warn = collect_gb(_vgm(writes))
+        self.assertEqual(len(hits), 2)
+        self.assertFalse(hits[1].legato)
+        self.assertEqual(hits[1].sample_time, 3000)
+        self.assertEqual(hits[1].vol, 9)
 
     def test_note_off_on_dac_disable(self):
         writes = _note(1000, 0xF0)

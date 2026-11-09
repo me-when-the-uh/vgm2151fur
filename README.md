@@ -147,6 +147,8 @@ Open follow-ups are tracked in [TODO.md](./TODO.md).
   - Sync/AM and swap modes are approximated as one-shot with a warning.
 - RF5C68 and RF5C164 share one Furnace system selected by `chipType`, and a looping SSG PCM DAC stream plays once because the AY sample instrument is one-shot.
 - SN76489 converts as four channels, and extreme periods or two notes on the same channel/row are approximated.
+  - A clear attenuation jump back up becomes a note-on in the pattern; gradual swells stay in the volume column.
+  - Held period motion becomes `E8xx`/`E9xx`/`E5xx` row effects when it fits the rows, with pitch macros reserved for sub-row motion.
   - The default system volume is 0.500, and an absolute VGM extra-header volume entry still overrides it.
   - A dual SN76489 log becomes two independent systems, while a T6W28 log is one four-channel stereo chip with `08xy` panning.
 - YM2612 DAC keeps bank source samples: runs are grouped by bank offset and pitch cluster, and the longest read in each cluster is stored once.
@@ -171,6 +173,7 @@ Open follow-ups are tracked in [TODO.md](./TODO.md).
   - Furnace stores at most 64 KB per PCM body, ADPCM bodies are one-shot, and filter/DSP-mode registers are not exposed.
   - A body outside the supplied ROM blocks is emitted as silence; bodies are repacked, so original ROM addresses are not preserved.
 - Game Boy converts two pulses, wave and noise, with per-note hardware/zombie envelopes and wave-RAM changes as a wave macro.
+  - Clear pulse attacks and large held pitch jumps become note cells; pitch-only jumps carry `EAxx` legato so the hardware envelope keeps running. Slower bends become `E8xx`/`E9xx`/`E5xx` row effects, and only sub-row motion falls back to a pitch macro.
   - The noise note is a hardware table index, so the fastest NR43 entries fold onto C-5 and are not bit-exact on export.
 - HuC6280 converts six wavetable voices, with periodic noise split into a transient and tone tail and DAC-stream bodies as 8-bit samples.
 - Atari POKEY converts four voices per chip, including dual-chip logs, per-frame AUDC volume/waveform macros, AUDCTL macros/effects, joined 16-bit pairs, high-clock/15 kHz/filter modes and silent filter-control notes.

@@ -3555,6 +3555,8 @@ def _build_patterns(song: Song, n_ch: int, pat_len_max: int, fx_cols: int,
     # percussive attack can be kept when the following hit rounds onto the
     # same row.
     note_ev: dict[tuple[int, int], object] = {}
+    # Channels currently in Furnace's EAxx legato mode (GB pitch-only splits).
+    legato_on: dict[int, bool] = {}
     # The next key-on per channel, in source order. A cut that would reach
     # that key-on must not be written: it would cut the following note. The
     # next key-on already ends the previous note.
@@ -3688,7 +3690,15 @@ def _build_patterns(song: Song, n_ch: int, pat_len_max: int, fx_cols: int,
             else:
                 _bump(stats, "note_collision")
         cell.note = ev.note if ev.note != 180 else NOTE_OFF
-        if ev.ins >= 0:
+        if getattr(ev, "legato", False):
+            # A pitch-only GB split: EAxx suppresses the note-on so the
+            # hardware envelope keeps running while the pitch changes.
+            _add_fx(cell, 0xEA, 1, fx_cols, stats)
+            legato_on[ev_ch] = True
+        elif legato_on.pop(ev_ch, False):
+            # Clear the channel's legato mode on the next normal note.
+            _add_fx(cell, 0xEA, 0, fx_cols, stats)
+        if ev.ins >= 0 and not getattr(ev, "legato", False):
             cell.ins = ev.ins
         if ev.vol >= 0:
             if ev.vol_slide:

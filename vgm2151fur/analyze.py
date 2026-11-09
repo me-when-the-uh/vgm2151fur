@@ -601,6 +601,9 @@ class NoteEvent:
     e5: int  # 0x80 = none
     pan: int  # 0xLR, 0 means omit
     pcm: bool = False
+    # The note changes pitch without keying the voice.  The writer puts EAxx
+    # on the cell so Furnace uses its legato path and keeps the envelope.
+    legato: bool = False
     # YM2612 DAC sample on FM6.  The note value indexes the instrument's
     # sample map, not a musical pitch.
     dac: bool = False
@@ -2494,6 +2497,36 @@ def _bind_tone_instruments(
                 e.sweep_div = 2.0
                 e.e5_lo = 0x00
                 e.e5_hi = 0xFF
+        elif e.tone_chip in (3, 6) and e.tone_pitch_pts and not e.tone_noise:
+            # SN76489 and Game Boy drivers play legato melodies and arpeggios
+            # by rewriting the period without a gate/trigger. A 254-entry
+            # pitch macro turns that into a coarse staircase; when the writes
+            # fit the row grid, keep them as E8/E9/E5 pitch steps instead.
+            # Dense sub-row vibrato still falls through to the macro path.
+            row_len = tick_samples * max(1, use_speed)
+            rows = {
+                int((t - e.sample) // row_len)
+                for t, _per in e.tone_pitch_pts
+            }
+            if row_len > 0 and len(rows) * 3 >= len(e.tone_pitch_pts) * 2:
+                steps = tuple(
+                    (
+                        t,
+                        int(round((
+                            tbl.offset_for(
+                                e.note, per + e.tone_period_offset,
+                            ) - base_off
+                        ) / 2.0)),
+                    )
+                    for t, per in e.tone_pitch_pts
+                )
+                steps = tuple((t, v) for t, v in steps if v)
+                if steps:
+                    e.pitch_steps = steps
+                    e.tone_pitch_pts = ()
+                    e.sweep_div = 2.0
+                    e.e5_lo = 0x00
+                    e.e5_hi = 0xFF
         pitch: tuple[int, ...] = ()
         pitch_speed, pitch_loop = 1, 255
         pitch_delay = 0
@@ -12596,6 +12629,7 @@ def analyze(
                 gb_env_dir=h.env_dir,
                 gb_env_len=h.env_len,
                 gb_sound_len=h.sound_len,
+                legato=getattr(h, "legato", False),
             )
             events.append(ev)
             gb_count += 1

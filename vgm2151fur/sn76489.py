@@ -40,6 +40,7 @@ T6W28_NOISE_DIVIDER = 15
 PSG_MAX_PERIOD = 0x3FF
 PSG_MIN_NOTE = 100          # shorter gates are driver housekeeping
 PSG_NOTE_JUMP_ST = 1.0      # a larger period jump is a new note
+PSG_ATTACK_STEP = 2         # a volume rise this large is a new attack
 
 
 @dataclass
@@ -270,13 +271,20 @@ def _collect_plain(
                     return
                 if not hit.pitch_pts or hit.pitch_pts[-1][1] != period:
                     hit.pitch_pts.append((t, period))
-        if hit.vol != 15 - vol[voice]:
-            level = 15 - vol[voice]
+        level = 15 - vol[voice]
+        last_level = hit.vol_pts[-1][1] if hit.vol_pts else hit.vol
+        if last_level != level:
             if t == hit.sample_time:
                 hit.vol = level
-            else:
-                if not hit.vol_pts or hit.vol_pts[-1][1] != level:
-                    hit.vol_pts.append((t, level))
+            elif level >= last_level + PSG_ATTACK_STEP:
+                # A clear attenuation jump back up is a new attack, not
+                # just a volume step. Put a note on the row so it shows in
+                # the pattern; the SN76489 has no envelope to restart.
+                close(voice, t, emit_off=False)
+                open_hit(voice, t)
+                return
+            elif not hit.vol_pts or hit.vol_pts[-1][1] != level:
+                hit.vol_pts.append((t, level))
 
     def evaluate_noise(t: int) -> None:
         on = vol[3] < 15
@@ -297,9 +305,16 @@ def _collect_plain(
         if (noise_mode & 3) == 3:
             set_noise_period(hit, t)
         level = 15 - vol[3]
-        if hit.vol != level:
+        last_level = hit.vol_pts[-1][1] if hit.vol_pts else hit.vol
+        if last_level != level:
             if t == hit.sample_time:
                 hit.vol = level
+            elif level >= last_level + PSG_ATTACK_STEP:
+                # Same attack rule as the tone voices: a clear jump back
+                # up is a new note, not a volume step inside one note.
+                close(3, t, emit_off=False)
+                open_hit(3, t)
+                return
             elif not hit.vol_pts or hit.vol_pts[-1][1] != level:
                 hit.vol_pts.append((t, level))
 

@@ -30,10 +30,23 @@ falls back to `4194304`.
 
 Furnace's GB core divides the clock by 16 and writes `2048 - freq` to
 NRx3/NRx4. The analyzer inverts that (`gb_note`) so the exported register
-matches the source exactly. Only an NRx4/NR44 trigger starts a new note; a
-frequency write without a trigger keeps the hardware envelope running, so it
-becomes a pitch macro (this is how the drivers build arpeggios). Splitting
-those would restart the envelope and hold notes the source lets decay.
+matches the source exactly.
+
+An NRx4/NR44 trigger starts a normal note. A pulse frequency write without a
+trigger is handled by size:
+
+- a clear jump of about 0.75 semitone or more becomes its own note cell with
+  Furnace's `EAxx` legato effect. The cell changes pitch without restarting
+  the hardware envelope, so the pattern shows the melody note while the
+  source's decay keeps running;
+- a slower slide stays inside the note and becomes `E8xx`/`E9xx`/`E5xx` row
+  effects when the writes fit the pattern rows;
+- only sub-row motion that cannot reach the row grid falls back to a pitch
+  macro.
+
+A clear mid-note NRx2 write that raises the initial volume is a software
+attack and starts a normal note cell. Ordinary decay-rate changes and zombie
+volume ramps keep their existing split/macro handling.
 
 Writes that share a VGM sample are applied to the chip in stream order. A
 merged or re-exported log can keep the sample group but put the trigger byte
