@@ -25,7 +25,7 @@ It runs on Windows and Linux with Python 3.11 or newer.
 ## Requirements
 
 - Python 3.11 or newer
-- Furnace, for the volume fit and the `render`, `compare`, and `--verify` checks. Put a Furnace build in `furnace/` next to the project, or set `VGM2151FUR_FURNACE` to the executable. Any build works: the tools run it with `-console`. The normal release also includes a console build (`furnace-...-win64-console.zip`) if you want one, but you don't need it. Without Furnace, `convert --no-normalize` still writes modules, just without the level fit
+- Furnace, for the volume fit and the `render`, `compare`, and `--verify` checks. Put a Furnace build in `furnace/` next to the project, or set `VGM2151FUR_FURNACE` to the executable. Any build works: the tools run it with `-console`. The normal release also includes a console build (`furnace-...-win64-console.zip`) if you want one, but you don't need it. Without Furnace, `convert --no-normalize` still writes modules, just without the level fit.
 
 ## Quick start
 
@@ -78,10 +78,10 @@ python -m vgm2151fur render out/01.Track.fur --loops 2
 
 ```
 cd vgm2151fur
-python -m pytest tests -q
+python -m unittest discover -s tests
 ```
 
-The suite runs without game packs. Tests that need Furnace skip when it is missing.
+The suite runs without game packs. Tests that need Furnace skip when it is missing. The current tree has three known unrelated failures in the condense and level-fit tests.
 
 ## Layout
 
@@ -92,7 +92,7 @@ tests/          pytest suite
 docs/           operating guide, format notes, chip notes
 ```
 
-Project state and workflow are in `docs/portable-context.md` and `docs/implementation-notes.md`. Chip details are in `docs/opm-notes.md`, `docs/ym2203.md`, `docs/ym2612.md`, `docs/ym2610.md`, `docs/opna-opll.md`, `docs/opl.md`, `docs/k053260.md`, `docs/scc-ay8910.md`, `docs/segapcm-c140.md`, `docs/ssg-pcm.md`, `docs/nes-vrc7.md`, `docs/gb.md`, `docs/huc6280.md`, `docs/c352.md`, `docs/ymz280b.md`, `docs/multipcm.md`, `docs/upd7759.md`, `docs/pwm32x.md`, `docs/pokey.md`, `docs/mikey.md`, `docs/x1-010.md` and `docs/vsu.md`. `docs/merged-logs.md` covers multi-family modules, and `docs/psg-open-items.md` tracks the remaining AY accuracy gaps.
+Project state and workflow are in `docs/portable-context.md` and `docs/implementation-notes.md`. Chip details are in `docs/opm-notes.md`, `docs/ym2203.md`, `docs/ym2612.md`, `docs/ym2610.md`, `docs/opna-opll.md`, `docs/opl.md`, `docs/k053260.md`, `docs/scc-ay8910.md`, `docs/segapcm-c140.md`, `docs/ssg-pcm.md`, `docs/nes-vrc7.md`, `docs/fds.md`, `docs/gb.md`, `docs/huc6280.md`, `docs/c352.md`, `docs/ymz280b.md`, `docs/multipcm.md`, `docs/upd7759.md`, `docs/pwm32x.md`, `docs/pokey.md`, `docs/mikey.md`, `docs/x1-010.md`, `docs/wonderswan.md`, `docs/qsound.md` and `docs/vsu.md`. `docs/merged-logs.md` covers multi-family modules, and `docs/psg-open-items.md` tracks the remaining AY accuracy gaps.
 
 Open follow-ups are tracked in [TODO.md](./TODO.md).
 
@@ -138,6 +138,15 @@ Open follow-ups are tracked in [TODO.md](./TODO.md).
   - `$4011` bit-bang PCM becomes 8-bit samples split at long silence and into budgeted chunks.
   - A dual-APU log becomes two NES systems with independent gates, `$C000` RAM, `0x68` windows and `$4011` streams.
   - Tone notes are halted, timers above ~16 kHz read as silence, envelope-mode decays ride the volume column, and noise/triangle notes end with their hardware counters.
+- Famicom Disk System converts its single 64-step wavetable voice per chip, with either frequency-byte order, volume macros and the modulation table.
+  - Hardware volume envelopes become software volume steps, only increasing modulation is available, and master volume `$4089` is folded into chip volume.
+  - Volume-zero and silence writes produce note-offs; a log with both the NES APU and FDS becomes two systems.
+- WonderSwan converts four wavetable/PCM voices per chip, including big-endian `0xC6` wave RAM, independent left/right volumes, sweep, noise and streamed PCM.
+  - Streamed `0x89` writes become native 8-bit PCM on channel 2; a DMA-only stream is silent, and PCM timing is quantized to the detected rate and row grid.
+  - Notes split on roughly semitone pitch jumps and volume attacks; global speaker volume `0x91` is ignored in stereo output.
+- Capcom QSound converts sixteen 8-bit PCM voices and three 4-bit ADPCM voices per chip, with start/phase retriggers, loops, pan/surround and echo.
+  - Furnace stores at most 64 KB per PCM body, ADPCM bodies are one-shot, and filter/DSP-mode registers are not exposed.
+  - A body outside the supplied ROM blocks is emitted as silence; bodies are repacked, so original ROM addresses are not preserved.
 - Game Boy converts two pulses, wave and noise, with per-note hardware/zombie envelopes and wave-RAM changes as a wave macro.
   - The noise note is a hardware table index, so the fastest NR43 entries fold onto C-5 and are not bit-exact on export.
 - HuC6280 converts six wavetable voices, with periodic noise split into a transient and tone tail and DAC-stream bodies as 8-bit samples.

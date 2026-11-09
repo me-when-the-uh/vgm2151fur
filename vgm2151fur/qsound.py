@@ -22,7 +22,7 @@ QSOUND_ADPCM_VOICES = 3
 QSOUND_CHANNELS = QSOUND_PCM_VOICES + QSOUND_ADPCM_VOICES
 # One ADPCM voice is updated every third output sample, one nibble per update.
 QSOUND_ADPCM_NIBBLE_RATE = QSOUND_OUT_RATE / 3.0
-# Writes this close after a phase key-on belong to the same note.
+# Writes this close after a phase or start key-on belong to the same note.
 QSOUND_SETTLE = 256
 QSOUND_MIN_NOTE = 64
 # QSound drivers use a 15-byte "loop" for one-shot bodies.

@@ -18,7 +18,8 @@ FDS_FREQ_DIV = 262_144
 FDS_MAX_FREQ = 0xFFFF
 FDS_WAVE_LEN = 64
 FDS_MOD_LEN = 32
-# A frequency jump this large (1/64 semitone units) starts a new note.
+# A raw frequency-register jump this large starts a new note; a smaller
+# change is treated as a bend.
 FDS_NOTE_JUMP = 64
 # Shorter than this is a click or a re-attack of the same note.
 FDS_MIN_NOTE = 64

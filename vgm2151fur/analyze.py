@@ -2239,7 +2239,8 @@ def _bind_tone_instruments(
             seen_qs.add(base)
             qsound_map[base] = len(qsound_ins)
             qsound_ins.append(base)
-    # GB, VSU and POKEY bind last. Reserve a share so a large SCC/AY/PCE list
+    # The later families (GB, VSU, POKEY, X1, FDS, WonderSwan, QSound) bind
+    # after the early ones. Reserve a share so a large SCC/AY/PCE list
     # cannot spend every slot before them; the surplus collapses to plain
     # per-wave/per-env instruments, the documented "fall back to columns"
     # behavior.

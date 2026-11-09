@@ -2,7 +2,7 @@
 
 `vgm2151fur` is a Python 3.11+ converter from VGM/VGZ rips to Furnace Tracker modules on Windows and Linux. Furnace is needed for the volume fit and for `render`, `compare` and `--verify`; put it in `furnace/` or set `VGM2151FUR_FURNACE`.
 
-Layout: `vgm.py` parses commands and data blocks; `analyze.py` contains the chip state machines; `ym2610.py` holds the OPNB FM/SSG state and the ADPCM-A/B collectors; `ym2612dac.py` builds DAC samples; `furwrite.py` writes the `.fur`; `furio.py`, `audit.py` and `diag.py` read and verify it. Helpers are in `tools/`, tests in `tests/`, chip notes in `docs/`.
+Layout: `vgm.py` parses commands and data blocks; `analyze.py` contains the chip state machines; `ym2610.py` holds the OPNB FM/SSG state and the ADPCM-A/B collectors; `ym2612dac.py` builds DAC samples; `fds.py`, `wonderswan.py` and `qsound.py` hold the newer chip collectors; `furwrite.py` writes the `.fur`; `furio.py`, `audit.py` and `diag.py` read and verify it. Helpers are in `tools/`, tests in `tests/`, chip notes in `docs/`.
 
 Current behavior:
 
@@ -18,6 +18,7 @@ Current behavior:
 - A chip that only received its init block earns no system at all, and says so: `_family_sounds()` needs a rising key-on, a tuned SSG voice, a rhythm latch with a trigger bit or an ADPCM-A trigger. The same test drops a SN76489 whose four attenuations never lift instead of adding four dead columns.
 - YM2610 support covers the base 14-channel layout and the 16-channel B variant. The FM pitch model uses `fmFreqBase = 9440540`. ADPCM-A uses a fixed `clock/432` rate. ADPCM-B stores the source rate with the `8363/8372` correction. The reference packs are Night Striker, Viewpoint and Metal Slug 3; `docs/ym2610.md` has the audit method and residuals.
 - The OPL family (YM3526/OPL, YM3812/OPL2, YMF262/OPL3) is converted with Furnace's own channel and slot tables; `docs/opl.md` has the details. Rhythm mode is its own system (`0xA2`/`0xA3`/`0xA4`) because bank A's last FM channels become the kit, and four-operator voices stay inside `0x91`: an OPL3's `chanMap` interleaves each pair, so only an even column heads a voice and its algorithm is read from two `0xCn` registers. Key bits are deferred to the end of a same-sample group (as on the YM2612) - an attack comparison that reads registers inside a sample reports diffs that are not there, which `diag.opl_attacks()` exists to avoid.
+- Famicom Disk System (`docs/fds.md`), WonderSwan (`docs/wonderswan.md`) and Capcom QSound (`docs/qsound.md`) use native Furnace systems and keep their output volume at the player default. FDS keeps either frequency-byte order and its modulation table; WonderSwan keeps big-endian wave RAM, independent left/right volumes, semitone note splits, noise and streamed PCM; QSound keeps PCM/ADPCM bodies, start/phase retriggers, pan/surround and echo.
 
 Commands:
 
@@ -30,7 +31,7 @@ python tools/fur2vgm.py out/track.fur -o out/track.vgm
 python tools/fur_soundcheck.py "track.vgz" out/track.fur
 ```
 
-Read `implementation-notes.md` before changing the pipeline and the relevant chip note before changing a state machine. Run the tests with `python -m unittest discover -s tests` (455 passed, 4 skipped in the current tree; no test-runner package is installed - a bare `pytest` fails, and `python -m unittest tests.test_vgm2151fur_opl` is the OPL-family subset). Furnace is needed for the round-trip tests; without it those skip. Regenerate affected packs after a converter change; do not commit generated modules or `.fur` files unless asked.
+Read `implementation-notes.md` before changing the pipeline and the relevant chip note before changing a state machine. Run the tests with `python -m unittest discover -s tests` (1,090 tests in the current tree, with three known unrelated failures in condense and level-fit and one skip; no test-runner package is installed - a bare `pytest` fails, and `python -m unittest tests.test_vgm2151fur_opl` is the OPL-family subset). Furnace is needed for the round-trip tests; without it those skip. Regenerate affected packs after a converter change; do not commit generated modules or `.fur` files unless asked.
 
 ## Accuracy gate
 

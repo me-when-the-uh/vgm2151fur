@@ -25,8 +25,8 @@ WS_VOICES = 4
 WS_NOTE_JUMP_ST = 0.9
 WS_MIN_NOTE = 48
 # A level jump this large while the gate stays open is a retriggered drum or
-# a new note.  Hard-left/hard-right flips are also separate hits even when the
-# peak level does not rise.
+# a new note.  Opposite-side volume flips are separate hits even when the peak
+# level does not rise.
 WS_RETRIGGER_RISE = 4
 # Memory writes closer than this are one wave upload burst.
 WS_WAVE_BURST = 256
@@ -264,8 +264,8 @@ def collect_wonderswan(
                 (newmax - oldmax >= WS_RETRIGGER_RISE and not hard_flip)
                 or hard_flip
             ) and when - hit.sample_time >= WS_MIN_NOTE:
-                # A gate jump or a hard-left/hard-right flip is a new hit, not
-                # a pan step in a long instrument macro.
+                # A gate jump or an opposite-side volume flip is a new hit,
+                # not a volume step in a long instrument macro.
                 close(cid, voice, when, off=False)
                 open_hit(cid, voice, when)
                 return

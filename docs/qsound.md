@@ -13,9 +13,14 @@ with a 16-bit big-endian payload followed by the register byte. Data block
 - PCM frequency is written through Furnace's frequency-mode pitch table
   (divider 4096), and repeated bodies are shared while each note carries its
   own pitch.
+- A phase write starts a note, and a start-address rewrite retriggers an
+  already-enabled voice; a start/phase pair is kept as one note.
 - Panning uses `08xy` plus `12xx` for the surround/linear algorithm; both
   register layouts are mapped.
 - Per-voice echo send uses `11xx`; feedback and delay use `10xx`/`3xxx`.
+- Every distinct sample keeps a base instrument before macro copies are
+  allocated, so a note never falls back to another sample body.
+- The chip output volume stays at unity.
 
 ## known limits
 

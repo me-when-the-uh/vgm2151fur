@@ -10,13 +10,14 @@ header `0x84`; the FDS bit in that field marks the mapper.
 - The 64x6-bit wave table becomes a Furnace wavetable; repeated images share
   one block.
 - The 12-bit frequency register is written through Furnace's frequency-mode
-  pitch table (`CHIP_FREQBASE` 262144).
+  pitch table (`CHIP_FREQBASE` 262144); either high/low byte order is handled.
 - `$4080` volume becomes instrument volume macros or column steps, with a
   note-off when the level reaches zero.
 - The 32-byte modulation table and its depth/speed/position start state ride
   the FDS instrument feature; live changes use `11xx-14xx`.
 - NTSC, PAL and Dendy clocks map to `clockSel`; other clocks use
   `customClock`.
+- Dense logs keep their measured fast tick instead of falling back to 60 Hz.
 
 ## known limits
 
