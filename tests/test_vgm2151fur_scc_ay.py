@@ -9,7 +9,7 @@ from pathlib import Path
 
 from vgm2151fur.analyze import _fold_saw, _saw_anchors, _unit_saw, analyze
 from vgm2151fur.ay8910 import (
-    FX_MODE, FX_NOISE, ay_note, ay_rate, collect_ay8910,
+    FX_ENV_SET, FX_MODE, FX_NOISE, ay_note, ay_rate, collect_ay8910,
 )
 from vgm2151fur.furio import CHIP_CHANNELS, iter_blocks, parse_fur
 from vgm2151fur.furwrite import (
@@ -304,6 +304,32 @@ class TestAyCollect(unittest.TestCase):
         ]
         hits, _offs, _warn = collect_ay8910(_vgm(writes, ay8910_clock=1789773))
         self.assertEqual(hits[0].vol, 4)
+
+    def test_opening_envelope_cleared_in_the_burst_becomes_fixed_volume(self):
+        # The gate opens while the previous note's envelope bit is still set,
+        # then the real fixed volume arrives a few samples later. Keeping the
+        # queued shape/period would re-enable the generator after the mode-off
+        # write and make the note click or follow the envelope instead of its
+        # fixed level.
+        writes = [
+            ChipWrite(0, "ay8910", 0, 7, 0xFE),
+            ChipWrite(0, "ay8910", 0, 0, 254),
+            ChipWrite(0, "ay8910", 0, 1, 0),
+            ChipWrite(0, "ay8910", 0, 11, 66),
+            ChipWrite(0, "ay8910", 0, 12, 0),
+            ChipWrite(0, "ay8910", 0, 13, 8),
+            ChipWrite(100, "ay8910", 0, 8, 0x12),  # envelope, level 2
+            ChipWrite(103, "ay8910", 0, 8, 0x08),  # fixed level 8
+            ChipWrite(6000, "ay8910", 0, 8, 0),
+        ]
+        hits, _offs, _warn = collect_ay8910(_vgm(writes, ay8910_clock=1789773))
+        hit = hits[0]
+        self.assertEqual(hit.vol, 8)
+        self.assertFalse(hit.env)
+        self.assertFalse(any(fx == FX_ENV_SET for _t, fx, _v in hit.fx_pts))
+        modes = [val for _t, fx, val in hit.fx_pts if fx == FX_MODE]
+        self.assertTrue(modes)
+        self.assertEqual((modes[-1] + 1) & 4, 0)
 
     def test_noise_enable_carries_the_period_written_while_off(self):
         # A snare often sets the noise period and then turns the mixer's noise

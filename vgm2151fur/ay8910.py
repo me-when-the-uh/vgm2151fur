@@ -218,6 +218,37 @@ def collect_ay8910(
             fx.append((FX_ENV_HI, (env_period(reg) >> 8) & 0xFF))
         return fx
 
+    def drop_env_fx(hit: AyHit) -> None:
+        """Remove a note-start envelope setup that a volume write turned off.
+
+        The note opens while the previous envelope bit is still set, so
+        `note_fx` queues the shape/period. If the real volume write a few
+        samples later clears bit 4, keeping that setup would turn the envelope
+        back on after the mode-off write and make the note follow the generator
+        instead of its fixed level.
+        """
+        hit.fx_pts = [
+            entry for entry in hit.fx_pts
+            if entry[1] not in (FX_ENV_SET, FX_ENV_LO, FX_ENV_HI)
+        ]
+
+    def settle_env_off(hit: AyHit, sample: int) -> None:
+        """Turn the note's opening state into fixed volume.
+
+        Used when the envelope bit clears inside the opening write burst. The
+        pattern row can only carry the settled state, so drop the envelope
+        setup and replace the opening mode value rather than appending a
+        second mode write: the last value on the row wins.
+        """
+        hit.env = False
+        drop_env_fx(hit)
+        off_mode = ay_mode(hit.tone, hit.noise, False) - 1
+        for i, (t, fx, _val) in enumerate(hit.fx_pts):
+            if fx == FX_MODE and t <= hit.sample_time:
+                hit.fx_pts[i] = (t, fx, off_mode)
+                return
+        hit.fx_pts.append((sample, FX_MODE, off_mode))
+
     def open_hit(st: dict, cid: int, voice: int, t: int) -> None:
         reg = st["reg"]
         env = bool(reg[REG_VOL[voice]] & 0x10)
@@ -332,16 +363,19 @@ def collect_ay8910(
                 window = hit.sample_time + AY_GATE_PAIR
                 hit.vol_pts = [p for p in hit.vol_pts if p[0] > window]
                 if hit.env:
-                    hit.env = False
-                    hit.fx_pts.append((
-                        w.sample, FX_MODE,
-                        ay_mode(hit.tone, hit.noise, False) - 1,
-                    ))
+                    settle_env_off(hit, w.sample)
                 continue
             if hit.env:
-                # The level write also clears the envelope bit; the channel
-                # mode has to follow or the register keeps using the
-                # generator.
+                # The level write also clears the envelope bit. Inside the
+                # opening burst, the settled fixed level is the note's real
+                # start. After that the envelope has run for several rows, so
+                # keep its note-start setup and append the mode-off write.
+                if w.sample - hit.sample_time <= AY_GATE_PAIR:
+                    hit.vol = level
+                    window = hit.sample_time + AY_GATE_PAIR
+                    hit.vol_pts = [p for p in hit.vol_pts if p[0] > window]
+                    settle_env_off(hit, w.sample)
+                    continue
                 hit.env = False
                 hit.fx_pts.append((
                     w.sample, FX_MODE, ay_mode(hit.tone, hit.noise, False) - 1,

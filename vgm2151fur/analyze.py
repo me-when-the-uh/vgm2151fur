@@ -4090,13 +4090,26 @@ def _emit_ay_notes(
         # envelope (the phase-reset macro), turning one percussion decay into
         # several attacks. Keep the whole hit as one note and put the pitch
         # motion on its macro instead.
-        env_hit = h.env or any(
-            cmd == FX_MODE and ((val + 1) & 4) for _t, cmd, val in h.fx_pts
+        modes = [
+            (t, val) for t, cmd, val in h.fx_pts if cmd == FX_MODE
+        ]
+        # The state on the note row is the last mode write in the opening
+        # burst, not the first. A driver can open a note while the previous
+        # envelope bit is still set and clear it a few samples later; the
+        # pattern can represent only the settled state.
+        opening = None
+        for t, val in modes:
+            if t <= st + _AY_MERGE_GAP:
+                opening = val
+        if opening is None and modes:
+            opening = modes[0][1]
+        env_open = h.env or (
+            opening is not None and ((opening + 1) & 4) != 0
         )
-        first_mode = next(
-            (val for _t, cmd, val in h.fx_pts if cmd == FX_MODE), None,
+        env_hit = env_open or any(
+            (t > st + _AY_MERGE_GAP and ((val + 1) & 4))
+            for t, val in modes
         )
-        env_open = first_mode is not None and ((first_mode + 1) & 4)
         if (h.opened_tone or h.freq_pts) and not env_hit:
             segs = segment_periods(
                 [(h.sample_time, h.period), *h.freq_pts],
