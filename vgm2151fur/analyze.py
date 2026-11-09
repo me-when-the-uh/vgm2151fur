@@ -4782,13 +4782,16 @@ def _row_steppable(
 
     A vibrato written once per driver tick at speed 1 can ride the row's E5/E8
     effects exactly.  A macro would have to thin it to fit 255 entries, which
-    turns a 60 Hz wobble into a slow staircase.
+    turns a 60 Hz wobble into a slow staircase.  Source and row rates can be
+    close enough that one write per row on average still collides now and
+    then; losing less than a row of timing is fine, while an aliased macro is
+    not.  Require roughly two thirds of the writes to have their own row.
     """
     if row_ticks <= 0 or tick_samples <= 0:
         return False
     row_len = tick_samples * row_ticks
     rows = {int((t - start) // row_len) for t, _b, _f in pts}
-    return len(rows) * 5 >= len(pts) * 4
+    return len(rows) * 3 >= len(pts) * 2
 
 
 def _bind_opll_macros(
