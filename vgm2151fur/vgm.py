@@ -385,6 +385,31 @@ K054539_CLOCK_OFF = 0xA0
 K054539_FLAGS_OFF = 0x95
 K054539_DEFAULT_CLOCK = 18_432_000
 K054539_DUAL_BIT = 0x40000000
+# Irem GA20 header 0xE0 (VGM 1.71+).  Four 8-bit sample voices; command 0xBF
+# writes one register, and ROM block 0x93 carries the sample ROM.
+GA20_CLOCK_OFF = 0xE0
+GA20_DEFAULT_CLOCK = 3_579_545
+GA20_DUAL_BIT = 0x40000000
+GA20_ROM_TYPE = 0x93
+CMD_GA20 = 0xBF
+EXTRA_GA20 = 0x28
+# OKI MSM5205 header 0xF0 (VGM 1.72+).  The CPU streams ADPCM nibbles through
+# command 0x32; there is no sample ROM block.
+MSM5205_CLOCK_OFF = 0xF0
+MSM5205_DEFAULT_CLOCK = 384_000
+MSM5205_DUAL_BIT = 0x40000000
+MSM5205_FLAGS_OFF = 0xD7
+CMD_MSM5205 = 0x32
+EXTRA_MSM5205 = 0x2C
+# OKI MSM5232 header 0xF4 (VGM 1.72+).  Eight tone/noise voices with two
+# four-channel envelope groups; command 0x43 writes one register.  Some older
+# libvgm builds used 0x2D, so accept that spelling too.
+MSM5232_CLOCK_OFF = 0xF4
+MSM5232_DEFAULT_CLOCK = 2_119_040
+MSM5232_DUAL_BIT = 0x40000000
+CMD_MSM5232 = 0x43
+CMD_MSM5232_LEGACY = 0x2D
+EXTRA_MSM5232 = 0x2D
 AY8910_DEFAULT_CLOCK = 1789772  # COLOR_NTSC/2, the MSX/ZX PSG clock
 K051649_DEFAULT_CLOCK = 1789772  # MSX SCC (half the 3.579545 MHz slot clock)
 CLOCK_MIN = 100_000
@@ -398,7 +423,7 @@ UNCONVERTED_SAMPLE_CMDS = {
 # Commands defined by the VGM spec. 0x60/0x64/0x65/0x69-0x6F are undefined;
 # 0x00-0x2F are reserved. Anything outside this set stops parsing.
 KNOWN_CMDS = (
-    {0x61, 0x62, 0x63, 0x66, 0x67, 0x68}
+    {0x2D, 0x61, 0x62, 0x63, 0x66, 0x67, 0x68}
     | set(range(0x30, 0x60))
     | set(range(0x70, 0x96))
     | set(range(0xA0, 0x100))
@@ -427,7 +452,10 @@ def cmd_size(cmd: int) -> int:
         return 1
     if cmd in (0x4F, 0x50, 0x94) or 0x30 <= cmd <= 0x3F:
         return 2
-    if cmd == 0x61 or 0x40 <= cmd <= 0x4E or 0x51 <= cmd <= 0x5F or 0xA0 <= cmd <= 0xBF:
+    if (
+        cmd in (0x2D, 0x61) or 0x40 <= cmd <= 0x4E
+        or 0x51 <= cmd <= 0x5F or 0xA0 <= cmd <= 0xBF
+    ):
         return 3
     if 0xC0 <= cmd <= 0xDF:
         return 4
@@ -816,6 +844,16 @@ class VgmFile:
     # instance bit, 0xC6 writes the 16 KB internal RAM.
     wonderswan_clock: int = 0
     wonderswan_dual: bool = False
+    # Irem GA20 header 0xE0 (VGM 1.71+).  Four 8-bit sample voices.
+    ga20_clock: int = 0
+    ga20_dual: bool = False
+    # OKI MSM5205 header 0xF0 (VGM 1.72+).  One streamed ADPCM voice per chip.
+    msm5205_clock: int = 0
+    msm5205_flags: int = 0
+    msm5205_dual: bool = False
+    # OKI MSM5232 header 0xF4 (VGM 1.72+).  Eight tone/noise voices.
+    msm5232_clock: int = 0
+    msm5232_dual: bool = False
     # Extra-header clocks, raw (bit 31 kept). Keyed by libvgm chip id.
     extra_clocks: dict[int, int] = field(default_factory=dict)
     # Extra-header volume mix: chip id -> (flags, raw value, 0x100 = 1.0).
@@ -1114,6 +1152,24 @@ def chips_in_head(buf: bytes) -> set[str]:
             kinds.add("wonderswan")
             if ws_raw & WSWAN_DUAL_BIT:
                 kinds.add("wonderswan_dual")
+    if version >= 0x171 and _field_in_header(buf, GA20_CLOCK_OFF, 4):
+        raw = _header_raw(buf, GA20_CLOCK_OFF)
+        if 100_000 <= (raw & 0x3FFFFFFF) <= 40_000_000:
+            kinds.add("ga20")
+            if raw & GA20_DUAL_BIT:
+                kinds.add("ga20_dual")
+    if version >= 0x172 and _field_in_header(buf, MSM5205_CLOCK_OFF, 4):
+        raw = _header_raw(buf, MSM5205_CLOCK_OFF)
+        if 100_000 <= (raw & 0x3FFFFFFF) <= 40_000_000:
+            kinds.add("msm5205")
+            if raw & MSM5205_DUAL_BIT:
+                kinds.add("msm5205_dual")
+    if version >= 0x172 and _field_in_header(buf, MSM5232_CLOCK_OFF, 4):
+        raw = _header_raw(buf, MSM5232_CLOCK_OFF)
+        if 100_000 <= (raw & 0x3FFFFFFF) <= 100_000_000:
+            kinds.add("msm5232")
+            if raw & MSM5232_DUAL_BIT:
+                kinds.add("msm5232_dual")
     if version >= 0x151 and _field_in_header(buf, SEGAPCM_CLOCK_OFF, 4):
         raw = _header_raw(buf, SEGAPCM_CLOCK_OFF)
         if 100_000 <= (raw & 0x3FFFFFFF) <= 40_000_000:
@@ -1297,6 +1353,12 @@ def chips_in_head(buf: bytes) -> set[str]:
             kinds.add("c352")
         if clocks.get(EXTRA_YMZ280B, 0):
             kinds.add("ymz280b")
+        if clocks.get(EXTRA_GA20, 0):
+            kinds.add("ga20")
+        if clocks.get(EXTRA_MSM5205, 0):
+            kinds.add("msm5205")
+        if clocks.get(EXTRA_MSM5232, 0):
+            kinds.add("msm5232")
     if version >= 0x171 and _field_in_header(buf, C352_CLOCK_OFF, 4):
         raw = _header_raw(buf, C352_CLOCK_OFF) & 0x3FFFFFFF
         if 1000 <= raw <= 50_000_000:
@@ -1676,6 +1738,31 @@ def load_vgm(path: Path | str) -> VgmFile:
     wonderswan_clock = _sane_clock(ws_raw)
     if not wonderswan_clock:
         wonderswan_clock = _sane_clock(clocks.get(EXTRA_WSWAN, 0))
+    # Irem GA20 clock 0xE0 (VGM 1.71+).  Bit 30 marks a second chip; command
+    # 0xBF carries the instance in bit 7 of the register byte.
+    ga20_raw = _header_raw(buf, GA20_CLOCK_OFF) if ver >= 0x171 else 0
+    ga20_dual = bool(ga20_raw & GA20_DUAL_BIT)
+    ga20_clock = _sane_clock(ga20_raw)
+    if not ga20_clock:
+        ga20_clock = _sane_clock(clocks.get(EXTRA_GA20, 0))
+    # OKI MSM5205 clock 0xF0 and OKI MSM5232 clock 0xF4 (VGM 1.72+).  Both are
+    # in the block that 1.71 left reserved, so do not read them from an older
+    # header.  Their flag bytes are 0xD7 and no per-chip flag byte.
+    msm5205_raw = (
+        _header_raw(buf, MSM5205_CLOCK_OFF) if ver >= 0x172 else 0
+    )
+    msm5205_dual = bool(msm5205_raw & MSM5205_DUAL_BIT)
+    msm5205_clock = _sane_clock(msm5205_raw)
+    if not msm5205_clock:
+        msm5205_clock = _sane_clock(clocks.get(EXTRA_MSM5205, 0))
+    msm5205_flags = buf[MSM5205_FLAGS_OFF] if len(buf) > MSM5205_FLAGS_OFF else 0
+    msm5232_raw = (
+        _header_raw(buf, MSM5232_CLOCK_OFF) if ver >= 0x172 else 0
+    )
+    msm5232_dual = bool(msm5232_raw & MSM5232_DUAL_BIT)
+    msm5232_clock = _sane_clock(msm5232_raw)
+    if not msm5232_clock:
+        msm5232_clock = _sane_clock(clocks.get(EXTRA_MSM5232, 0))
 
     main_volume = 0.0
     # Bytes past the declared command offset are not header fields. Synthetic
@@ -1719,6 +1806,13 @@ def load_vgm(path: Path | str) -> VgmFile:
         qsound_clock=qsound_clock,
         wonderswan_clock=wonderswan_clock,
         wonderswan_dual=wonderswan_dual,
+        ga20_clock=ga20_clock,
+        ga20_dual=ga20_dual,
+        msm5205_clock=msm5205_clock,
+        msm5205_flags=msm5205_flags,
+        msm5205_dual=msm5205_dual,
+        msm5232_clock=msm5232_clock,
+        msm5232_dual=msm5232_dual,
         gb_dmg_clock=gb_dmg_clock,
         gb_dmg_dual=gb_dmg_dual,
         huc6280_clock=huc6280_clock,
@@ -1828,6 +1922,9 @@ def load_vgm(path: Path | str) -> VgmFile:
     stray_vsu_second = False
     stray_msm6258_second = False
     stray_msm6295_second = False
+    stray_ga20_second = False
+    stray_msm5205_second = False
+    stray_msm5232_second = False
     saw_end = False
     saw_adpcm_compressed = False
     # stream id -> setup recorded by 0x90/0x91/0x92
@@ -1942,6 +2039,7 @@ def load_vgm(path: Path | str) -> VgmFile:
                     YMZ280B_ROM_TYPE: "ymz280b",
                     X1_010_ROM_TYPE: "x1_010",
                     QSOUND_ROM_TYPE: "qsound",
+                    GA20_ROM_TYPE: "ga20",
                 }.get(typ) if len(payload) >= 8 else None
                 if kind:
                     rom_size = int.from_bytes(payload[0:4], "little")
@@ -2689,6 +2787,43 @@ def load_vgm(path: Path | str) -> VgmFile:
             ))
             pos += 3
             continue
+        if cmd == CMD_GA20 and pos + 3 <= n:
+            # 0xBF: register, data.  Bit 7 of the register selects the second
+            # instance; the GA20 has four voices at registers 0x00-0x1F.
+            aa = buf[pos + 1]
+            cid = (aa >> 7) & 1
+            if cid and not ga20_dual:
+                stray_ga20_second = True
+            vgm.writes.append(ChipWrite(
+                sample, "ga20", cid, aa & 0x7F, buf[pos + 2],
+            ))
+            pos += 3
+            continue
+        if cmd == CMD_MSM5205 and pos + 2 <= n:
+            # 0x32: (register << 4) | data, bit 7 selects the second chip.
+            # The chip consumes one ADPCM nibble per data write.
+            aa = buf[pos + 1]
+            cid = (aa >> 7) & 1
+            if cid and not msm5205_dual:
+                stray_msm5205_second = True
+            vgm.writes.append(ChipWrite(
+                sample, "msm5205", cid, (aa >> 4) & 0x07, aa & 0x0F,
+            ))
+            pos += 2
+            continue
+        if cmd in (CMD_MSM5232, CMD_MSM5232_LEGACY) and pos + 3 <= n:
+            # 0x43 (and the older libvgm 0x2D spelling): register, data.  Bit
+            # 7 of the register selects the second instance; the register space
+            # is 0x00-0x0D.
+            aa = buf[pos + 1]
+            cid = (aa >> 7) & 1
+            if cid and not msm5232_dual:
+                stray_msm5232_second = True
+            vgm.writes.append(ChipWrite(
+                sample, "msm5232", cid, aa & 0x7F, buf[pos + 2],
+            ))
+            pos += 3
+            continue
         if cmd == CMD_STREAM_SETUP:
             vgm.stream_setups += 1
         if cmd == 0x68 and pos + 12 <= n:
@@ -2741,6 +2876,18 @@ def load_vgm(path: Path | str) -> VgmFile:
     if any(w.chip == "x1_010" for w in vgm.writes) and not vgm.x1_010_clock:
         vgm.warnings.append(
             "X1-010 clock is missing or out of range; using 16000000"
+        )
+    if any(w.chip == "ga20" for w in vgm.writes) and not vgm.ga20_clock:
+        vgm.warnings.append(
+            f"GA20 clock is missing or out of range; using {GA20_DEFAULT_CLOCK}"
+        )
+    if any(w.chip == "msm5205" for w in vgm.writes) and not vgm.msm5205_clock:
+        vgm.warnings.append(
+            f"MSM5205 clock is missing or out of range; using {MSM5205_DEFAULT_CLOCK}"
+        )
+    if any(w.chip == "msm5232" for w in vgm.writes) and not vgm.msm5232_clock:
+        vgm.warnings.append(
+            f"MSM5232 clock is missing or out of range; using {MSM5232_DEFAULT_CLOCK}"
         )
     if any(w.chip == "c352" for w in vgm.writes) and not vgm.c352_clock:
         vgm.warnings.append("C352 clock is missing or out of range; using 24192000")
@@ -3000,6 +3147,21 @@ def load_vgm(path: Path | str) -> VgmFile:
     if stray_msm6258_second:
         vgm.warnings.append(
             "0xB7 MSM6258 register bit 7 selects a second chip without the "
+            "dual-instance header bit; it was still treated as chip 1"
+        )
+    if stray_ga20_second:
+        vgm.warnings.append(
+            "0xBF GA20 register bit 7 selects a second chip without the "
+            "dual-instance header bit; it was still treated as chip 1"
+        )
+    if stray_msm5205_second:
+        vgm.warnings.append(
+            "0x32 MSM5205 bit 7 selects a second chip without the "
+            "dual-instance header bit; it was still treated as chip 1"
+        )
+    if stray_msm5232_second:
+        vgm.warnings.append(
+            "MSM5232 register bit 7 selects a second chip without the "
             "dual-instance header bit; it was still treated as chip 1"
         )
     if stray_ymz_second:

@@ -2,7 +2,7 @@
 
 `vgm2151fur` is a Python 3.11+ converter from VGM/VGZ rips to Furnace Tracker modules on Windows and Linux. Furnace is needed for the volume fit and for `render`, `compare` and `--verify`; put it in `furnace/` or set `VGM2151FUR_FURNACE`.
 
-Layout: `vgm.py` parses commands and data blocks; `analyze.py` contains the chip state machines; `ym2610.py` holds the OPNB FM/SSG state and the ADPCM-A/B collectors; `ym2612dac.py` builds DAC samples; `fds.py`, `wonderswan.py`, `qsound.py`, `c219.py` and `k054539.py` hold the newer chip collectors; `furwrite.py` writes the `.fur`; `furio.py`, `audit.py` and `diag.py` read and verify it. Helpers are in `tools/`, tests in `tests/`, chip notes in `docs/`.
+Layout: `vgm.py` parses commands and data blocks; `analyze.py` contains the chip state machines; `ym2610.py` holds the OPNB FM/SSG state and the ADPCM-A/B collectors; `ym2612dac.py` builds DAC samples; `fds.py`, `wonderswan.py`, `qsound.py`, `c219.py`, `k054539.py`, `ga20.py`, `msm5205.py` and `msm5232.py` hold the newer chip collectors; `furwrite.py` writes the `.fur`; `furio.py`, `audit.py` and `diag.py` read and verify it. Helpers are in `tools/`, tests in `tests/`, chip notes in `docs/`.
 
 Current behavior:
 
@@ -20,6 +20,9 @@ Current behavior:
 - The OPL family (YM3526/OPL, YM3812/OPL2, YMF262/OPL3) is converted with Furnace's own channel and slot tables; `docs/opl.md` has the details. Rhythm mode is its own system (`0xA2`/`0xA3`/`0xA4`) because bank A's last FM channels become the kit, and four-operator voices stay inside `0x91`: an OPL3's `chanMap` interleaves each pair, so only an even column heads a voice and its algorithm is read from two `0xCn` registers. Key bits are deferred to the end of a same-sample group (as on the YM2612) - an attack comparison that reads registers inside a sample reports diffs that are not there, which `diag.opl_attacks()` exists to avoid.
 - Famicom Disk System (`docs/fds.md`), WonderSwan (`docs/wonderswan.md`), Capcom QSound (`docs/qsound.md`) and Namco C219 (`docs/c219.md`) use native Furnace systems and keep their output volume at the player default. FDS keeps either frequency-byte order and its modulation table; WonderSwan keeps big-endian wave RAM, independent left/right volumes, semitone note splits, noise and streamed PCM; QSound keeps PCM/ADPCM bodies, start/phase retriggers, pan/surround and echo; C219 keeps word addresses, bank groups, noise, invert/surround and mu-law decoded to 8-bit; its source banks stay separate through trailing silence in one-shot bodies, and the conversion warns when Furnace's uploader or a group-bank switch would cut a sample.
 - Konami K054539 (`docs/k054539.md`) uses one Generic PCM DAC system per hardware voice. 8-bit PCM, 16-bit PCM and 4-bit DPCM bodies keep their markers, loops and key-offs; reverb send is omitted with a warning, and each system carries one quarter of the chip's voice gain.
+- Irem GA20 (`docs/ga20.md`) uses native system `0xC7` with four 8-bit sample voices. Bodies stop at the first zero byte; the fixed C-4 reference makes note/E5 match Furnace's GA20 pitch table.
+- OKI MSM5205 (`docs/msm5205.md`) decodes its streamed 3/4-bit ADPCM through libvgm's reset/FIFO/prescaler state, then splits the 44.1 kHz PCM at attacks and silences for Generic PCM DAC banks. Lossy clustering stays opt-in.
+- OKI MSM5232 (`docs/msm5232.md`) uses native system `0xBC` with eight tone/noise voices. Pitch maps to note `72+pitch`, and group control/attack/decay/noise travel as `10xy`/`12xx`/`13xx`/`11xx` effects.
 
 Commands:
 
@@ -32,7 +35,7 @@ python tools/fur2vgm.py out/track.fur -o out/track.vgm
 python tools/fur_soundcheck.py "track.vgz" out/track.fur
 ```
 
-Read `implementation-notes.md` before changing the pipeline and the relevant chip note before changing a state machine. Run the tests with `python -m unittest discover -s tests` (1,103 tests in the current tree, with three known unrelated failures in condense and level-fit and one skip; no test-runner package is installed - a bare `pytest` fails, and `python -m unittest tests.test_vgm2151fur_opl` is the OPL-family subset). Furnace is needed for the round-trip tests; without it those skip. Regenerate affected packs after a converter change; do not commit generated modules or `.fur` files unless asked.
+Read `implementation-notes.md` before changing the pipeline and the relevant chip note before changing a state machine. Run the tests with `python -m unittest discover -s tests` (1,106 tests in the current tree, with three known unrelated failures in condense and level-fit and one skip; no test-runner package is installed - a bare `pytest` fails, and `python -m unittest tests.test_vgm2151fur_opl` is the OPL-family subset). Furnace is needed for the round-trip tests; without it those skip. Regenerate affected packs after a converter change; do not commit generated modules or `.fur` files unless asked.
 
 ## Accuracy gate
 

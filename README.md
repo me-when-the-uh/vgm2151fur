@@ -14,8 +14,9 @@ Supported chips:
 - NEC: uPD7759 (stand-alone phrase ROMs and slave streams).
 - Sega: SegaPCM and 32X PWM.
 - Nintendo: NES APU (2A03), Famicom Disk System, Game Boy DMG, Virtual Boy VSU and Hudson HuC6280 (PC Engine).
-- OKI: MSM6295 and MSM6258.
+- OKI: MSM5205, MSM5232, MSM6295 and MSM6258.
 - Namco: C140, C219 and C352.
+- Irem: GA20.
 - Ricoh: RF5C68 and RF5C164.
 
 A log that mixes several chip families is written as one module when the combination is supported. `docs/merged-logs.md` lists the rules. A clock field's dual bit keeps both chip instances, even when one never sounds a note; T6W28 is the exception, since its two bits describe one stereo chip.
@@ -92,7 +93,7 @@ tests/          unittest suite
 docs/           operating guide, format notes, chip notes
 ```
 
-Project state and workflow are in `docs/portable-context.md` and `docs/implementation-notes.md`. Chip details are in `docs/opm-notes.md`, `docs/ym2203.md`, `docs/ym2612.md`, `docs/ym2610.md`, `docs/opna-opll.md`, `docs/opl.md`, `docs/k053260.md`, `docs/scc-ay8910.md`, `docs/segapcm-c140.md`, `docs/c219.md`, `docs/k054539.md`, `docs/ssg-pcm.md`, `docs/nes-vrc7.md`, `docs/fds.md`, `docs/gb.md`, `docs/huc6280.md`, `docs/c352.md`, `docs/ymz280b.md`, `docs/multipcm.md`, `docs/upd7759.md`, `docs/pwm32x.md`, `docs/pokey.md`, `docs/mikey.md`, `docs/x1-010.md`, `docs/wonderswan.md`, `docs/qsound.md` and `docs/vsu.md`. `docs/merged-logs.md` covers multi-family modules, and `docs/psg-open-items.md` tracks the remaining AY accuracy gaps.
+Project state and workflow are in `docs/portable-context.md` and `docs/implementation-notes.md`. Chip details are in `docs/opm-notes.md`, `docs/ym2203.md`, `docs/ym2612.md`, `docs/ym2610.md`, `docs/opna-opll.md`, `docs/opl.md`, `docs/k053260.md`, `docs/scc-ay8910.md`, `docs/segapcm-c140.md`, `docs/c219.md`, `docs/k054539.md`, `docs/ga20.md`, `docs/msm5205.md`, `docs/msm5232.md`, `docs/ssg-pcm.md`, `docs/nes-vrc7.md`, `docs/fds.md`, `docs/gb.md`, `docs/huc6280.md`, `docs/c352.md`, `docs/ymz280b.md`, `docs/multipcm.md`, `docs/upd7759.md`, `docs/pwm32x.md`, `docs/pokey.md`, `docs/mikey.md`, `docs/x1-010.md`, `docs/wonderswan.md`, `docs/qsound.md` and `docs/vsu.md`. `docs/merged-logs.md` covers multi-family modules, and `docs/psg-open-items.md` tracks the remaining AY accuracy gaps.
 
 Open follow-ups are tracked in [TODO.md](./TODO.md).
 
@@ -129,6 +130,15 @@ Open follow-ups are tracked in [TODO.md](./TODO.md).
 - K054539 converts eight voices per chip, each on its own Generic PCM DAC system, with 8-bit PCM, 16-bit PCM and 4-bit DPCM bodies.
   - Start/end markers, loop points, key-on/key-off, pitch, attenuation and panning are kept; reverb send is reported and omitted.
   - Each system carries one quarter of the chip's voice gain and the song master stays at 1.0.
+- Irem GA20 converts four native sample voices per chip on Furnace's system `0xC7`.
+  - ROM bodies stop at the first zero byte, as the chip does; the end register is not used to truncate playback.
+  - Volume and mid-note frequency writes are kept, and the fixed C-4 reference matches Furnace's GA20 pitch table.
+- OKI MSM5205 decodes its streamed 3/4-bit ADPCM into 16-bit PCM and splits it at attacks/silences for Generic PCM DAC banks.
+  - The decoder mirrors libvgm's reset/FIFO/prescaler state, then reuses the YM2612-DAC/PWM chunking path.
+  - `--lossy-sample-clustering` can reduce the bank further; it is off by default.
+- OKI MSM5232 converts eight tone/noise voices per chip on Furnace's native `0xBC` system.
+  - Pitch bytes map directly to note `72+pitch`; group control, attack, decay and noise become `10xy`, `12xx`, `13xx` and `11xx` effects.
+  - TA7630 group volume (`0x1E/0x1F`) drives the channel volume columns, including mid-note changes.
 - RF5C68 and RF5C164 share one Furnace system selected by `chipType`, and a looping SSG PCM DAC stream plays once because the AY sample instrument is one-shot.
 - SN76489 converts as four channels, and extreme periods or two notes on the same channel/row are approximated.
   - The default system volume is 0.500, and an absolute VGM extra-header volume entry still overrides it.

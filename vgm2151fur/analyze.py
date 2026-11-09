@@ -129,6 +129,21 @@ from vgm2151fur.pwm import (
     PwmSample,
     collect_pwm,
 )
+from vgm2151fur.ga20 import (
+    Ga20Sample,
+    collect_ga20,
+    ga20_note,
+)
+from vgm2151fur.msm5205 import (
+    Msm5205Sample,
+    collect_msm5205,
+)
+from vgm2151fur.msm5232 import (
+    Msm5232Fx,
+    Msm5232Hit,
+    collect_msm5232,
+    msm5232_volume_fx,
+)
 from vgm2151fur.mikey import (
     MIKEY_DEFAULT_CLOCK,
     MIKEY_DIVIDER,
@@ -292,7 +307,13 @@ from vgm2151fur.timing import (
     place_tick,
     refine_pcm_grid,
 )
-from vgm2151fur.vgm import VGM_RATE, VgmFile, assemble_rom
+from vgm2151fur.vgm import (
+    GA20_DEFAULT_CLOCK,
+    MSM5232_DEFAULT_CLOCK,
+    VGM_RATE,
+    VgmFile,
+    assemble_rom,
+)
 from vgm2151fur.ym2610 import (
     ADPCM_MAP_SLOTS as YM2610_MAP_SLOTS,
     YM2610_DEFAULT_CLOCK,
@@ -955,6 +976,22 @@ class Song:
     pwm_samples: list[PwmSample] = field(default_factory=list)
     pwm_ids: list[int] = field(default_factory=list)
     pwm_count: int = 0
+    # OKI MSM5205 streamed ADPCM: 16-bit PCM bodies on one Generic PCM DAC
+    # system per chip.
+    msm5205_samples: list[Msm5205Sample] = field(default_factory=list)
+    msm5205_ids: list[int] = field(default_factory=list)
+    msm5205_count: int = 0
+    # Irem GA20: four native 8-bit sample voices per chip.
+    ga20_samples: list[Ga20Sample] = field(default_factory=list)
+    ga20_ids: list[int] = field(default_factory=list)
+    ga20_count: int = 0
+    # OKI MSM5232: eight native tone/noise voices per chip.
+    msm5232_ids: list[int] = field(default_factory=list)
+    msm5232_count: int = 0
+    # Standalone channel volume changes (MSM5232 group volume).
+    channel_vol_events: list[tuple[int, int, int]] = field(
+        default_factory=list
+    )
     # Atari Lynx Mikey: four voices per chip.  `mikey_ins` holds the LFSR
     # tone instruments (volume/pitch/duty/LFSR macros); streamed output
     # bytes become native 8-bit sample-map bodies in `mikey_samples`.
@@ -10250,8 +10287,24 @@ def analyze(
     pwm_ids: list[int] = []
     pwm_events: list[tuple[NoteEvent, int]] = []
     pwm_count = 0
+    msm5205_audible: list[Msm5205Sample] = []
+    msm5205_ids: list[int] = []
+    msm5205_events: list[tuple[NoteEvent, int]] = []
+    msm5205_count = 0
+    ga20_samples: list[Ga20Sample] = []
+    ga20_ids: list[int] = []
+    ga20_events: list[tuple[NoteEvent, int]] = []
+    ga20_count = 0
+    msm5232_ids: list[int] = []
+    msm5232_events: list[tuple[NoteEvent, int]] = []
+    msm5232_vols: list = []
+    channel_vol_events: list[tuple[int, int, int]] = []
+    msm5232_count = 0
     n_upd_ins = 0
     n_pwm_ins = 0
+    n_msm5205_ins = 0
+    n_ga20_ins = 0
+    n_msm5232_ins = 0
     # Set where the C352 runs and the source drives its rear pair.
     c352_quad_events = False
     if pcm:
@@ -11105,6 +11158,113 @@ def analyze(
                         pcm=True,
                     ))
 
+        # OKI MSM5205: streamed ADPCM decoded to one 16-bit PCM track per chip,
+        # split at attacks/silences and banked through Generic PCM DAC sample
+        # maps, like the YM2612 DAC and 32X PWM paths.
+        msm5205_audible, msm5205_warn = collect_msm5205(
+            vgm, lossy=lossy_samples,
+        )
+        warnings.extend(msm5205_warn)
+        msm5205_ids = _dual_ids(
+            sorted({s.chip_id for s in msm5205_audible})
+            or ([0] if vgm.msm5205_clock else []),
+            bool(getattr(vgm, "msm5205_dual", False)),
+        )
+        msm5205_base = pwm_base + PWM_SIDES * len(pwm_ids)
+        msm5205_at = {
+            cid: msm5205_base + i for i, cid in enumerate(msm5205_ids)
+        }
+        n_msm5205_ins = (len(msm5205_audible) + 119) // 120
+        for i, smp in enumerate(msm5205_audible):
+            slot = i % 120
+            ins_slot = i // 120
+            duration = smp.frames
+            for hit in smp.hits:
+                start = hit.time
+                end = min(
+                    start + duration,
+                    vgm.total_samples or start + duration,
+                )
+                ev = NoteEvent(
+                    sample=start,
+                    ch=msm5205_at.get(smp.chip_id, msm5205_base),
+                    on=True,
+                    note=60 + slot,
+                    ins=-1,
+                    vol=255,
+                    e5=0x80,
+                    pan=0,
+                    pcm=True,
+                    end=end,
+                )
+                events.append(ev)
+                msm5205_events.append((ev, ins_slot))
+                msm5205_count += 1
+                if end and end < (vgm.total_samples or 0):
+                    events.append(NoteEvent(
+                        sample=end,
+                        ch=ev.ch,
+                        on=False,
+                        note=180,
+                        ins=-1,
+                        vol=-1,
+                        e5=0x80,
+                        pan=0,
+                        pcm=True,
+                    ))
+
+        # Irem GA20: four native sample voices per chip.  One instrument per
+        # distinct ROM body; note value plus E5 carries each hit's pitch.
+        ga20_clock = vgm.ga20_clock or GA20_DEFAULT_CLOCK
+        ga20_samples, ga20_offs, ga20_warn = collect_ga20(vgm)
+        warnings.extend(ga20_warn)
+        ga20_ids = _dual_ids(
+            sorted({s.chip_id for s in ga20_samples})
+            or ([0] if vgm.ga20_clock else []),
+            bool(getattr(vgm, "ga20_dual", False)),
+        )
+        ga20_base = msm5205_base + len(msm5205_ids)
+        ga20_at = {cid: ga20_base + 4 * i for i, cid in enumerate(ga20_ids)}
+        n_ga20_ins = len(ga20_samples)
+        for i, smp in enumerate(ga20_samples):
+            for h in smp.hits:
+                note, e5 = ga20_note(h, smp, ga20_clock)
+                pts = tuple(
+                    (t, max(0, min(255, v)), None) for t, v in h.vol_pts
+                )
+                ev = NoteEvent(
+                    sample=h.sample_time,
+                    ch=ga20_at.get(h.chip_id, ga20_base) + h.voice,
+                    on=True,
+                    note=note,
+                    ins=-1,
+                    vol=max(0, min(255, h.volume)),
+                    e5=e5,
+                    pan=0,
+                    pcm=True,
+                    end=h.off_sample,
+                    vol_pts=pts,
+                    no_pan=True,
+                )
+                events.append(ev)
+                ga20_events.append((ev, i))
+                ga20_count += 1
+        for off in ga20_offs:
+            base = ga20_at.get(off.chip_id)
+            if base is None:
+                continue
+            events.append(NoteEvent(
+                sample=off.sample_time,
+                ch=base + off.voice,
+                on=False,
+                note=180,
+                ins=-1,
+                vol=-1,
+                e5=0x80,
+                pan=0,
+                pcm=True,
+            ))
+
         # Namco ASIC219: 16 native voices per chip.  The source VGM uses the
         # same 0xD4 command as the C140, but the C219's bank groups and mode
         # bits differ.  Furnace packs the real sample bodies itself.
@@ -11279,6 +11439,22 @@ def analyze(
     else:
         audible = []
 
+    # OKI MSM5232: eight native tone/noise voices per chip.  Group
+    # attack/decay/control writes become pattern effects, and each pitch byte
+    # maps directly to note 72+pitch.  This chip is a tone generator, so it
+    # converts under --melody-only as well.
+    msm5232_clock = vgm.msm5232_clock or MSM5232_DEFAULT_CLOCK
+    msm5232_hits, msm5232_offs, msm5232_fx, msm5232_vols, msm5232_warn = (
+        collect_msm5232(vgm)
+    )
+    warnings.extend(msm5232_warn)
+    msm5232_ids = _dual_ids(
+        sorted({h.chip_id for h in msm5232_hits})
+        or ([0] if vgm.msm5232_clock else []),
+        bool(getattr(vgm, "msm5232_dual", False)),
+    )
+    n_msm5232_ins = len(msm5232_ids)
+
     # Atari Lynx Mikey: LFSR tones always convert; streamed output bytes are
     # native 8-bit samples and follow --melody-only/--pcm-only like the other
     # sample engines.
@@ -11441,9 +11617,73 @@ def analyze(
         + MULTIPCM_VOICES * len(multipcm_ids)
         + len(upd_ids)
         + PWM_SIDES * len(pwm_ids)
+        + len(msm5205_ids)
+        + 4 * len(ga20_ids)
         + 16 * len(c219_ids)
         + 8 * len(k054539_ids)
     )
+    # MSM5232 is the first pitched system after the sample engines.
+    msm5232_base = tone_base
+    tone_base += 8 * len(msm5232_ids)
+    msm5232_at = {
+        cid: msm5232_base + 8 * i for i, cid in enumerate(msm5232_ids)
+    }
+    msm5232_index = {cid: i for i, cid in enumerate(msm5232_ids)}
+    for h in msm5232_hits:
+        base = msm5232_at.get(h.chip_id)
+        if base is None:
+            continue
+        pitch = 0 if h.noise else min(0x57, h.pitch)
+        note = min(179, 72 + pitch)
+        ch = base + h.voice
+        ev = NoteEvent(
+            sample=h.sample_time,
+            ch=ch,
+            on=True,
+            note=note,
+            ins=-1,
+            vol=msm5232_volume_fx(h.volume),
+            e5=0x80,
+            pan=0,
+            end=h.off_sample,
+        )
+        events.append(ev)
+        msm5232_events.append((ev, msm5232_index.get(h.chip_id, 0)))
+        channel_fx.append((
+            h.sample_time, ch, 0x11, 1 if h.noise else 0,
+        ))
+        msm5232_count += 1
+    for off in msm5232_offs:
+        base = msm5232_at.get(off.chip_id)
+        if base is None:
+            continue
+        events.append(NoteEvent(
+            sample=off.sample_time,
+            ch=base + off.voice,
+            on=False,
+            note=180,
+            ins=-1,
+            vol=-1,
+            e5=0x80,
+            pan=0,
+        ))
+    for fx in msm5232_fx:
+        base = msm5232_at.get(fx.chip_id)
+        if base is None:
+            continue
+        channel_fx.append((
+            fx.sample_time, base + 4 * fx.group, fx.code, fx.value,
+        ))
+    for vol in msm5232_vols:
+        base = msm5232_at.get(vol.chip_id)
+        if base is None:
+            continue
+        level = msm5232_volume_fx(vol.value)
+        for slot in range(4):
+            channel_vol_events.append(
+                (vol.sample_time, base + 4 * vol.group + slot, level)
+            )
+
     # Count the final DAC maps once, below; the collector's list is transient.
     n_ym2610_a_ins = (len(ym2610_a_samples) + YM2610_MAP_SLOTS - 1) // YM2610_MAP_SLOTS
     n_ym2610_b_ins = (len(ym2610_b_samples) + YM2610_MAP_SLOTS - 1) // YM2610_MAP_SLOTS
@@ -12993,10 +13233,16 @@ def analyze(
     tone_ins_base += n_upd_ins
     pwm_ins_base = tone_ins_base
     tone_ins_base += n_pwm_ins
+    msm5205_ins_base = tone_ins_base
+    tone_ins_base += n_msm5205_ins
+    ga20_ins_base = tone_ins_base
+    tone_ins_base += n_ga20_ins
     c219_ins_base = tone_ins_base
     tone_ins_base += c219_ins_count
     k054539_ins_base = tone_ins_base
     tone_ins_base += len(k054539_samples)
+    msm5232_ins_base = tone_ins_base
+    tone_ins_base += n_msm5232_ins
     mikey_ins_base = tone_ins_base
     tone_ins_base += n_mikey_ins
     wonderswan_pcm_ins_base = tone_ins_base
@@ -13372,10 +13618,16 @@ def analyze(
         tone_ins_base += n_upd_ins
         pwm_ins_base = tone_ins_base
         tone_ins_base += n_pwm_ins
+        msm5205_ins_base = tone_ins_base
+        tone_ins_base += n_msm5205_ins
+        ga20_ins_base = tone_ins_base
+        tone_ins_base += n_ga20_ins
         c219_ins_base = tone_ins_base
         tone_ins_base += c219_ins_count
         k054539_ins_base = tone_ins_base
         tone_ins_base += len(k054539_samples)
+        msm5232_ins_base = tone_ins_base
+        tone_ins_base += n_msm5232_ins
         mikey_ins_base = tone_ins_base
         tone_ins_base += n_mikey_ins
         wonderswan_pcm_ins_base = tone_ins_base
@@ -13480,6 +13732,12 @@ def analyze(
         ev.ins = upd_ins_base + idx
     for ev, idx in pwm_events:
         ev.ins = pwm_ins_base + idx
+    for ev, idx in msm5205_events:
+        ev.ins = msm5205_ins_base + idx
+    for ev, idx in ga20_events:
+        ev.ins = ga20_ins_base + idx
+    for ev, idx in msm5232_events:
+        ev.ins = msm5232_ins_base + idx
     for ev, idx in c219_events:
         ev.ins = c219_ins_base + idx
     for ev, idx in k054539_events:
@@ -13668,6 +13926,15 @@ def analyze(
         pwm_samples=pwm_audible,
         pwm_ids=pwm_ids,
         pwm_count=pwm_count,
+        msm5205_samples=msm5205_audible,
+        msm5205_ids=msm5205_ids,
+        msm5205_count=msm5205_count,
+        ga20_samples=ga20_samples,
+        ga20_ids=ga20_ids,
+        ga20_count=ga20_count,
+        msm5232_ids=msm5232_ids,
+        msm5232_count=msm5232_count,
+        channel_vol_events=channel_vol_events,
         mikey_samples=mikey_samples,
         mikey_ids=mikey_ids,
         mikey_ins=mikey_ins,
@@ -14212,6 +14479,21 @@ def format_report(song: Song) -> str:
                 f"  {s.name:<10}  frames {s.frames:7d}  "
                 f"{'loop' if s.loop_start is not None else 'one-shot'}"
             )
+    if song.msm5205_samples:
+        lines.append(
+            f"MSM5205     {len(song.msm5205_samples)} PCM chunks  "
+            f"{song.msm5205_count} note(s)"
+        )
+    if song.ga20_ids or song.ga20_samples:
+        lines.append(
+            f"Irem GA20   {len(song.ga20_ids)} chip(s)  "
+            f"{song.ga20_count} note(s)  {len(song.ga20_samples)} sample(s)"
+        )
+    if song.msm5232_ids:
+        lines.append(
+            f"OKI MSM5232 {len(song.msm5232_ids)} chip(s)  "
+            f"{song.msm5232_count} note(s)"
+        )
     if song.mikey_ids or song.mikey_ins or song.mikey_samples:
         lines.append(
             f"Atari Lynx  {len(song.mikey_ids)} chip(s)  "

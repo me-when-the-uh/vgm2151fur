@@ -20,11 +20,16 @@ from vgm2151fur.c219 import (
 from vgm2151fur.furio import parse_fur
 from vgm2151fur.furwrite import (
     CHIP_C219,
+    CHIP_GA20,
+    CHIP_MSM5232,
     CHIP_PCM_DAC,
     INS_C219,
     c219_flag_text,
     write_fur,
 )
+from vgm2151fur.ga20 import collect_ga20
+from vgm2151fur.msm5205 import collect_msm5205
+from vgm2151fur.msm5232 import collect_msm5232
 from vgm2151fur.k054539 import (
     FORMAT_8BIT,
     FORMAT_16BIT,
@@ -366,6 +371,94 @@ class TestK054539(unittest.TestCase):
         ]
         self.assertEqual(len(notes), 1)
         self.assertTrue(any(fx == 0x08 for fx, _v in notes[0].fx))
+
+
+class TestGa20Msm5205Msm5232(unittest.TestCase):
+    def test_ga20_body_and_fur(self):
+        rom = [RomSlice(
+            0, 4, 0, bytes((0x80, 0x90, 0xA0, 0x00)), "ga20",
+        )]
+        writes = [
+            _write(0, "ga20", 0x06, 0x00),
+            _write(0, "ga20", 0x07, 0x00),
+            _write(0, "ga20", 0x02, 0x00),
+            _write(0, "ga20", 0x03, 0x00),
+            _write(0, "ga20", 0x04, 0x80),
+            _write(0, "ga20", 0x05, 0xC0),
+            _write(10, "ga20", 0x06, 0x02),   # key on
+            _write(900, "ga20", 0x06, 0x00),  # key off
+        ]
+        song = _vgm(writes, total=1000, roms=rom, ga20_clock=3_579_545)
+        samples, offs, _warn = collect_ga20(song)
+        self.assertEqual(len(samples), 1)
+        # ROM 0x80/0x90/0xA0 becomes signed 0x00/0x10/0x20; zero terminates.
+        self.assertEqual(samples[0].data, bytes((0x00, 0x10, 0x20)))
+        self.assertEqual(len(offs), 1)
+
+        analysed = analyze(song)
+        self.assertEqual(analysed.ga20_count, 1)
+        mod = parse_fur(write_fur(analysed))
+        self.assertIn(CHIP_GA20, mod.chips)
+        self.assertEqual(len(mod.samples), 1)
+        self.assertEqual(mod.samples[0].depth, 8)
+        notes = [
+            row for (_ch, _pat), rows in mod.patterns.items() for row in rows
+            if row.note not in (-1, 180)
+        ]
+        self.assertEqual(len(notes), 1)
+
+    def test_msm5232_note_and_group_fx(self):
+        writes = [
+            _write(0, "msm5232", 0x0C, 0x0F),
+            _write(0, "msm5232", 0x08, 0x03),
+            _write(0, "msm5232", 0x0A, 0x05),
+            _write(10, "msm5232", 0x00, 0xA1),  # key on pitch 0x21
+            _write(900, "msm5232", 0x00, 0x00),  # key off
+        ]
+        writes.append(_write(500, "msm5232", 0x1E, 0x08))
+        song = _vgm(writes, total=1000, msm5232_clock=2_000_000)
+        hits, offs, fx, vols, _warn = collect_msm5232(song)
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(len(vols), 1)
+        self.assertEqual(vols[0].value, 8)
+        self.assertEqual(hits[0].pitch, 0x21)
+        self.assertFalse(hits[0].noise)
+        self.assertEqual(len(offs), 1)
+        self.assertTrue(any(e.code == 0x12 and e.value == 3 for e in fx))
+        self.assertTrue(any(e.code == 0x13 and e.value == 5 for e in fx))
+
+        analysed = analyze(song)
+        self.assertEqual(analysed.msm5232_count, 1)
+        mod = parse_fur(write_fur(analysed))
+        self.assertIn(CHIP_MSM5232, mod.chips)
+        self.assertEqual(mod.n_ch, 8)
+        notes = [
+            row for (_ch, _pat), rows in mod.patterns.items() for row in rows
+            if row.note not in (-1, 180)
+        ]
+        self.assertEqual(len(notes), 1)
+        self.assertEqual(notes[0].note, 72 + 0x21)
+
+    def test_msm5205_streams_to_pcm_dac(self):
+        writes = [
+            _write(0, "msm5205", 0, 1),   # reset
+            _write(0, "msm5205", 4, 2),   # S2 prescaler
+            _write(0, "msm5205", 5, 1),   # 4-bit
+        ]
+        for i in range(40):
+            writes.append(_write(i + 1, "msm5205", 1, i & 0x0F))
+        writes.append(_write(100, "msm5205", 0, 0))  # release
+        song = _vgm(
+            writes, total=2000, msm5205_clock=384_000,
+            msm5205_flags=0x06,
+        )
+        samples, _warn = collect_msm5205(song)
+        self.assertTrue(samples)
+        self.assertTrue(all(s.rate == 44100 for s in samples))
+        mod = parse_fur(write_fur(analyze(song)))
+        self.assertIn(CHIP_PCM_DAC, mod.chips)
+        self.assertEqual(mod.n_ch, 1)
+        self.assertTrue(all(x.depth == 16 for x in mod.samples))
 
 
 if __name__ == "__main__":

@@ -140,6 +140,12 @@ INS_SWAN = 22
 # DIV_SYSTEM_QSOUND: sixteen PCM and three ADPCM voices.
 CHIP_QSOUND = 0xE0
 INS_QSOUND = 40
+# DIV_SYSTEM_GA20: Irem's four-voice 8-bit sample player.
+CHIP_GA20 = 0xC7
+INS_GA20 = 46
+# DIV_SYSTEM_MSM5232: OKI's eight-voice tone/noise generator.
+CHIP_MSM5232 = 0xBC
+INS_MSM5232 = 43
 # DIV_SYSTEM_SAA1099: six square/noise voices, no software timers.  A pair of
 # these is the Creative Music System / Game Blaster.
 CHIP_SAA1099 = 0x97
@@ -366,6 +372,9 @@ _DEV_DEFAULT_VOLUME = {
     0x21: 0x100,  # Bandai WonderSwan
     0x11: 0xE0,  # Sega 32X PWM
     0x15: 0x40,  # YMW258-F / MultiPCM
+    0x28: 0x280,  # Irem GA20
+    0x2C: 0x100,  # OKI MSM5205
+    0x2D: 0x100,  # OKI MSM5232
 }
 _DEV_CORE_PATCH = {
     0x19: lambda v: v * 8 // 5,  # K051649 SCC core scale
@@ -393,6 +402,7 @@ _FURNACE_VOLUME_SCALE = {
     # The new systems stay at the player's own default mix; do not raise the
     # song master above 1.0 for them.
     0x1F: 1.0, 0x21: 1.0, 0x14: 1.0,
+    0x28: 1.0, 0x2D: 1.0,
 }
 # MSM6258's player default is 0x11E; its Furnace core is 1.64x louder, so
 # 0.61 lands the sample at the source level. The MSM6295 (0x18) is unity.
@@ -406,6 +416,7 @@ _CHIP_DEV = {CHIP_YM2151: 0x03, CHIP_SEGAPCM: 0x04, CHIP_MSM6295: 0x18,
              CHIP_AY8910: 0x12,
              CHIP_POKEY: 0x1E,
              CHIP_X1_010: 0x26,
+             CHIP_GA20: 0x28, CHIP_MSM5232: 0x2D,
              CHIP_MULTIPCM: 0x15, CHIP_PCM_DAC: 0x16,
              CHIP_YM2610: 0x08, CHIP_YM2610B: 0x08}
 
@@ -1966,6 +1977,16 @@ def c140_flag_text(clock: int, c140_type: int) -> str:
 def c219_flag_text(clock: int) -> str:
     """C219 system flags: Furnace-notation custom clock only."""
     return f"customClock={c219_furnace_clock(clock)}"
+
+
+def ga20_flag_text(clock: int) -> str:
+    """Irem GA20 system flags."""
+    return "" if abs(clock - 3_579_545) <= 2 else f"customClock={clock}"
+
+
+def msm5232_flag_text(clock: int) -> str:
+    """OKI MSM5232 system flags."""
+    return "" if abs(clock - 2_119_040) <= 2 else f"customClock={clock}"
 
 
 def ay8910_flag_text(
@@ -4182,6 +4203,26 @@ def _build_patterns(song: Song, n_ch: int, pat_len_max: int, fx_cols: int,
 
     orders: list[list[int]] = [[] for _ in range(n_ch)]
     patterns: list[tuple[int, int, list[Row | None]]] = []
+    # Standalone volume changes (MSM5232 TA7630 group volume).  They are
+    # channel state, not effects: write the volume column on each affected
+    # channel at the row where the source write lands.
+    for sample, ch, level in getattr(song, "channel_vol_events", ()) or ():
+        ch += ch_offset
+        if not 0 <= ch < n_ch:
+            continue
+        if content_cut is not None and sample >= content_cut:
+            continue
+        row, delay = song.place(sample, stats)
+        if delay and row + 1 < total_rows:
+            row, delay = row + 1, 0
+        if row < 0 or row >= total_rows:
+            continue
+        cell = grid[ch].get(row)
+        if cell is None:
+            cell = _blank_row()
+            grid[ch][row] = cell
+        cell.vol = max(0, min(255, level))
+
     for ch in range(n_ch):
         for oi in range(n_ord):
             start_row = bounds[oi]
@@ -4659,6 +4700,9 @@ def write_fur(
         # an empty YM2151 placeholder would add eight silent columns.
         or getattr(song, "c219_ids", ())
         or getattr(song, "k054539_ids", ())
+        or getattr(song, "ga20_ids", ())
+        or getattr(song, "msm5205_ids", ())
+        or getattr(song, "msm5232_ids", ())
     )
     if ym2610 or ym2608:
         fm_present = (include_fm or include_pcm) and bool(ym_ids)
@@ -4740,8 +4784,26 @@ def write_fur(
     pwm_ids = (
         list(getattr(song, "pwm_ids", ()) or ()) if include_pcm else []
     ) or sorted({s.chip_id for s in pwm_smps})
+    msm5205_smps = (
+        list(getattr(song, "msm5205_samples", ()) or ())
+        if include_pcm else []
+    )
+    msm5205_ids = (
+        list(getattr(song, "msm5205_ids", ()) or ()) if include_pcm else []
+    ) or sorted({s.chip_id for s in msm5205_smps})
+    ga20_smps = (
+        list(getattr(song, "ga20_samples", ()) or ())
+        if include_pcm else []
+    )
+    ga20_ids = (
+        list(getattr(song, "ga20_ids", ()) or ()) if include_pcm else []
+    ) or sorted({s.chip_id for s in ga20_smps})
+    msm5232_ids = list(getattr(song, "msm5232_ids", ()) or ())
     n_upd_ins = (len(upd7759_smps) + 119) // 120
     n_pwm_ins = (len(pwm_smps) + 119) // 120
+    n_msm5205_ins = (len(msm5205_smps) + 119) // 120
+    n_ga20_ins = len(ga20_smps)
+    n_msm5232_ins = len(msm5232_ids)
     mikey_smps = (
         list(getattr(song, "mikey_samples", ()) or ())
         if include_pcm else []
@@ -4927,6 +4989,7 @@ def write_fur(
         + 4 * len(k053260_ids) + 8 * len(ymz_ids)
         + 28 * len(multipcm_ids) + len(upd7759_ids)
         + 2 * len(pwm_ids)
+        + len(msm5205_ids) + 4 * len(ga20_ids) + 8 * len(msm5232_ids)
         + 16 * len(c219_ids) + 8 * len(k054539_ids)
         + n_scc + n_ay + n_nes + n_huc6280 + n_gb + n_vsu + n_saa
         + n_pokey + n_mikey + n_x1 + n_fds + n_wonderswan + n_qsound
@@ -4953,6 +5016,7 @@ def write_fur(
         + n_y8950_b_ins + n_opl4_wave_ins + n_ssg_pcm_ins
         + n_nes_dpcm_ins + n_nes_pcm_ins + n_huc6280_pcm_ins
         + len(ymz_smps) + len(multipcm_smps) + n_upd_ins + n_pwm_ins
+        + n_msm5205_ins + n_ga20_ins + n_msm5232_ins
         + len(c219_real) + len(k054539_smps)
         + n_mikey_ins + n_x1_ins
         + len(scc_specs) + len(ay_specs) + len(psg_specs) + len(nes_specs)
@@ -4969,6 +5033,7 @@ def write_fur(
         + len(nes_dpcm_smps) + len(nes_pcm_smps) + len(huc6280_pcm_smps)
         + len(ymz_smps) + len(multipcm_smps) + len(upd7759_smps)
         + len(pwm_smps) + len(mikey_smps) + len(x1_smps)
+        + len(msm5205_smps) + len(ga20_smps)
         + len(c219_all) + len(k054539_smps)
         + len(qsound_smps) + len(wonderswan_pcm_smps)
     )
@@ -5059,7 +5124,9 @@ def write_fur(
     multipcm_smp_base = ymz_smp_base + len(ymz_smps)
     upd7759_smp_base = multipcm_smp_base + len(multipcm_smps)
     pwm_smp_base = upd7759_smp_base + len(upd7759_smps)
-    c219_smp_base = pwm_smp_base + len(pwm_smps)
+    msm5205_smp_base = pwm_smp_base + len(pwm_smps)
+    ga20_smp_base = msm5205_smp_base + len(msm5205_smps)
+    c219_smp_base = ga20_smp_base + len(ga20_smps)
     k054539_smp_base = c219_smp_base + len(c219_all)
     mikey_smp_base = k054539_smp_base + len(k054539_smps)
     wonderswan_pcm_smp_base = mikey_smp_base + len(mikey_smps)
@@ -5074,6 +5141,7 @@ def write_fur(
         + n_y8950_b_ins + n_opl4_wave_ins + n_ssg_pcm_ins
         + n_nes_dpcm_ins + n_nes_pcm_ins + n_huc6280_pcm_ins
         + len(ymz_smps) + len(multipcm_smps) + n_upd_ins + n_pwm_ins
+        + n_msm5205_ins + n_ga20_ins + n_msm5232_ins
         + len(c219_real) + len(k054539_smps)
         + n_mikey_ins + len(wonderswan_pcm_smps) + n_x1_ins
         + len(scc_specs) + len(ay_specs) + len(psg_specs) + len(nes_specs)
@@ -5092,6 +5160,7 @@ def write_fur(
         + len(nes_dpcm_smps) + len(nes_pcm_smps) + len(huc6280_pcm_smps)
         + len(ymz_smps) + len(multipcm_smps) + len(upd7759_smps)
         + len(pwm_smps) + len(mikey_smps) + len(x1_smps)
+        + len(msm5205_smps) + len(ga20_smps)
         + len(c219_all) + len(k054539_smps)
         + len(qsound_smps) + len(wonderswan_pcm_smps)
     )
@@ -5180,6 +5249,14 @@ def write_fur(
         names_short.append(f"PW{cid + 1}L")
         names_long.append(f"PWM Right{suffix}")
         names_short.append(f"PW{cid + 1}R")
+    for cid in msm5205_ids:
+        suffix = f" ({cid + 1})" if len(msm5205_ids) > 1 else ""
+        names_long.append(f"MSM5205{suffix}")
+        names_short.append(f"M{cid + 1}")
+    for cid in ga20_ids:
+        for voice in range(4):
+            names_long.append(f"GA20 {cid + 1}-{voice + 1}")
+            names_short.append(f"G{cid + 1}-{voice + 1}")
     for cid in c219_ids:
         for voice in range(16):
             names_long.append(f"C219 {cid + 1}-{voice + 1}")
@@ -5188,6 +5265,10 @@ def write_fur(
         for voice in range(8):
             names_long.append(f"K054539 {cid + 1}-{voice + 1}")
             names_short.append(f"K{cid + 1}-{voice + 1}")
+    for cid in msm5232_ids:
+        for voice in range(8):
+            names_long.append(f"MSM5232 {cid + 1}-{voice + 1}")
+            names_short.append(f"MSM{cid + 1}-{voice + 1}")
     for cid in scc_ids:
         for voice in range(5):
             names_long.append(f"SCC {cid + 1}-{voice + 1}")
@@ -5666,6 +5747,16 @@ def write_fur(
             pwm_sys[(cid, side)] = len(chips)
             chips.append(CHIP_PCM_DAC)
             flag_texts.append(pcm_dac_flag_text(22020, stereo=True))
+    msm5205_sys: dict[int, int] = {}
+    for cid in msm5205_ids:
+        msm5205_sys[cid] = len(chips)
+        chips.append(CHIP_PCM_DAC)
+        flag_texts.append(pcm_dac_flag_text(44100))
+    ga20_sys: dict[int, int] = {}
+    for cid in ga20_ids:
+        ga20_sys[cid] = len(chips)
+        chips.append(CHIP_GA20)
+        flag_texts.append(ga20_flag_text(song.vgm.ga20_clock or 3_579_545))
     for cid in c219_ids:
         chips.append(CHIP_C219)
         flag_texts.append(c219_flag_text(c219_clock))
@@ -5678,6 +5769,11 @@ def write_fur(
             chips.append(CHIP_PCM_DAC)
             flag_texts.append(pcm_dac_flag_text(k054539_out, stereo=True))
         k054539_sys[cid] = systems_for_chip
+    msm5232_sys: dict[int, int] = {}
+    for cid in msm5232_ids:
+        msm5232_sys[cid] = len(chips)
+        chips.append(CHIP_MSM5232)
+        flag_texts.append(msm5232_flag_text(song.vgm.msm5232_clock or 2_119_040))
     for cid in scc_ids:
         chips.append(scc_chip)
         flag_texts.append(k051649_flag_text(song.vgm.k051649_clock))
@@ -5828,6 +5924,7 @@ def write_fur(
         idx for systems_for_chip in k054539_sys.values()
         for idx in systems_for_chip
     }
+    msm5205_set = set(msm5205_sys.values())
     for i, chip in enumerate(chips):
         # Twin16 K007232 sits under the OPM; the rip's mix says how far. Every
         # other sample chip uses the player's mix (defaults + extra-header
@@ -5844,6 +5941,12 @@ def write_fur(
             # stays at 1.0.
             cv = 0.25 * _player_chip_volume(
                 song.vgm, 0x1A, max(1, len(k054539_ids)),
+            )
+        elif i in msm5205_set:
+            # Generic PCM DAC is unity in Furnace; MSM5205's player default
+            # is 0x100.  The decoded body already carries the chip level.
+            cv = _player_chip_volume(
+                song.vgm, 0x2C, max(1, len(msm5205_ids)),
             )
         elif chip in _CHIP_DEV:
             cv = _sample_chip_volume(song, chip, chip_counts[chip])
@@ -6158,6 +6261,21 @@ def write_fur(
         _write_ins_sample_map(
             b, f"PWM PCM {group + 1}", 0, maps, INS_AMIGA, flags=0x03,
         )
+    for group in range(n_msm5205_ins):
+        ins_ptrs.append(len(b))
+        first = group * 120
+        maps = [
+            msm5205_smp_base + first + slot
+            for slot in range(min(120, len(msm5205_smps) - first))
+        ]
+        _write_ins_sample_map(
+            b, f"MSM5205 {group + 1}", 0, maps, INS_AMIGA, flags=0x03,
+        )
+    for i, smp in enumerate(ga20_smps):
+        ins_ptrs.append(len(b))
+        _write_ins_pcm(
+            b, f"GA20 {smp.start:05x}", ga20_smp_base + i, INS_GA20,
+        )
     for pos, smp in c219_real:
         ins_ptrs.append(len(b))
         _write_ins_pcm(
@@ -6168,6 +6286,11 @@ def write_fur(
         _write_ins_pcm(
             b, f"K054539 {smp.start:06x}", k054539_smp_base + i,
             INS_AMIGA,
+        )
+    for i, cid in enumerate(msm5232_ids):
+        ins_ptrs.append(len(b))
+        _write_ins_psg(
+            b, f"MSM5232 {cid + 1}", ToneIns(), INS_MSM5232,
         )
     for group in range(n_mikey_ins):
         ins_ptrs.append(len(b))
@@ -6577,6 +6700,21 @@ def write_fur(
         _write_sample_s8(
             b, smp.name, smp.data, smp.rate, loop=loop,
             depth=SMP_DEPTH_16BIT, render_masks=(0, 0, 0, 0),
+        )
+    for smp in msm5205_smps:
+        smp_ptrs.append(len(b))
+        _write_sample_s8(
+            b, smp.name, smp.data, smp.rate, depth=SMP_DEPTH_16BIT,
+            render_masks=(0, 0, 0, 0),
+        )
+    for i, smp in enumerate(ga20_smps):
+        smp_ptrs.append(len(b))
+        sys = ga20_sys.get(smp.chip_id, 0)
+        masks = ((1 << sys) if sys < 32 else 0, 0, 0, 0)
+        _write_sample_s8(
+            b, f"GA20 {i:03d} {smp.start:05x}", smp.data,
+            smp.c4_rate(song.vgm.ga20_clock or 3_579_545),
+            depth=SMP_DEPTH_8BIT, render_masks=masks,
         )
     for i, smp in enumerate(c219_all):
         smp_ptrs.append(len(b))

@@ -59,6 +59,7 @@ SKIP = {"output", "third_party", ".git", "__pycache__", ".commandcode",
         "node_modules", "soundcheck"}
 
 CENSUS_KINDS = {"segapcm", "c140", "c219", "c352", "k053260", "ymz280b",
+                "ga20", "msm5205", "msm5232",
                 "vsu", "vsu_dual", "k051649",
                 "scc_plus", "ay8910", "ym2203", "ym2612",
                 # The OPL family is FM rather than a sample chip, but a census

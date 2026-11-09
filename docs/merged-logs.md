@@ -67,6 +67,13 @@ a K054539-only log suppresses the legacy placeholder just like C219. C219
 keeps each source sample bank in its own Furnace bank; trailing silence in
 the previous real body supplies the gap instead of a visible padding sample.
 
+OKI MSM5205 and Irem GA20 follow the sample-engine order: MSM5205 uses one
+Generic PCM DAC system per chip, while GA20 is native system `0xC7` with four
+columns. OKI MSM5232 is the first pitched system after the sample engines
+(`0xBC`, eight columns). A log containing only these chips suppresses the
+legacy YM2151 placeholder. See `docs/msm5205.md`, `docs/ga20.md` and
+`docs/msm5232.md`.
+
 Famicom Disk System (`0x8A`, one wave column), WonderSwan (`0x96`, four
 wave/PCM columns) and Capcom QSound (`0xE0`, sixteen PCM plus three ADPCM
 columns) follow X1-010 in that order. FDS and WonderSwan bind through the tone
