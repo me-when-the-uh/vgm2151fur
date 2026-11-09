@@ -7,7 +7,9 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from vgm2151fur.analyze import _fold_saw, _saw_anchors, _unit_saw, analyze
+from vgm2151fur.analyze import (
+    _fold_saw, _saw_anchors, _tone_pitch_tick_scale, _unit_saw, analyze,
+)
 from vgm2151fur.ay8910 import (
     FX_ENV_SET, FX_MODE, FX_NOISE, ay_note, ay_rate, collect_ay8910,
 )
@@ -330,6 +332,48 @@ class TestAyCollect(unittest.TestCase):
         modes = [val for _t, fx, val in hit.fx_pts if fx == FX_MODE]
         self.assertTrue(modes)
         self.assertEqual((modes[-1] + 1) & 4, 0)
+
+    def test_opening_shape_change_settles_on_the_note_row(self):
+        # The gate opens with the previous shape 8, then the real shape 9
+        # arrives 17 samples later in the same opening burst. A whole-tick
+        # shape-8 macro would restart the hardware envelope at the wrong
+        # waveform, so the settled row value must be shape 9.
+        writes = [
+            ChipWrite(0, "ay8910", 0, 7, 0xFE),
+            ChipWrite(0, "ay8910", 0, 0, 254),
+            ChipWrite(0, "ay8910", 0, 1, 0),
+            ChipWrite(0, "ay8910", 0, 11, 160),
+            ChipWrite(0, "ay8910", 0, 12, 0),
+            ChipWrite(0, "ay8910", 0, 13, 8),
+            ChipWrite(100, "ay8910", 0, 8, 0x12),
+            ChipWrite(117, "ay8910", 0, 13, 9),
+            ChipWrite(6000, "ay8910", 0, 8, 0),
+        ]
+        song = analyze(_vgm(writes, ay8910_clock=1789773))
+        ev = [e for e in song.events if e.on and e.tone_chip == 2][0]
+        fx = {cmd: val for _t, cmd, val in ev.tone_fx_pts}
+        self.assertEqual(fx[FX_ENV_SET], 0x91)
+        ins = song.ay_ins[ev.ins - len(song.scc_ins)]
+        self.assertEqual(ins.env_shape, ())
+
+    def test_tick_scale_uses_the_fastest_active_tone_voice(self):
+        # Voice 0 writes every ~700 samples and voice 1 is sparse. A combined
+        # median picks the sparse voice and leaves the row tick too coarse.
+        writes: list[ChipWrite] = [
+            ChipWrite(0, "ay8910", 0, 7, 0x38),
+        ]
+        for i in range(10):
+            writes.append(ChipWrite(i * 700, "ay8910", 0, 0, i))
+            writes.append(ChipWrite(i * 700, "ay8910", 0, 2, i))
+        writes.append(ChipWrite(0, "ay8910", 0, 2, 0))
+        for i in range(10):
+            writes.append(ChipWrite(10000 + i * 10000, "ay8910", 0, 2, i))
+        self.assertEqual(
+            _tone_pitch_tick_scale(
+                _vgm(writes, ay8910_clock=1789773), 60.0, 1,
+            ),
+            2,
+        )
 
     def test_noise_enable_carries_the_period_written_while_off(self):
         # A snare often sets the noise period and then turns the mixer's noise

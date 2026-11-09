@@ -1401,6 +1401,10 @@ def _tone_steps(
 _NOTE_STEP_SEMITONES = 0.75
 _NOTE_HOLD_SAMPLES = 735  # one 60 Hz frame; SCC merge gap and minimum hold
 _AY_MERGE_GAP = 16  # low/high byte pair, and a second write in the same tick
+# A note's opening register burst can trail the gate by more than the byte-pair
+# gap (a drum writes its envelope shape/period a few dozen samples later).
+# Those values belong to the note row, not to the next tick's macro.
+_AY_OPEN_WINDOW = 64
 _AY_NOTE_HOLD = 1470  # two frames: a one-frame AY step is the pitch macro
 
 
@@ -1574,8 +1578,21 @@ def _tone_pitch_tick_scale(vgm: VgmFile, hz: float, speed: int) -> int:
         intervals += [max(1, int(round(vsu_env)))] * 8
     if len(intervals) < 8:
         return 1
-    intervals.sort()
-    median = intervals[len(intervals) // 2]
+    # Use the fastest active channel, not the median across every voice. A
+    # sparse or idle voice otherwise dominates the combined median and hides
+    # the dense driver that needs the finer tick.
+    group_medians: list[int] = []
+    for times in groups.values():
+        gaps = sorted(
+            b - a for a, b in zip(times, times[1:]) if b - a >= 8
+        )
+        if len(gaps) >= 8:
+            group_medians.append(gaps[len(gaps) // 2])
+    if group_medians:
+        median = min(group_medians)
+    else:
+        intervals.sort()
+        median = intervals[len(intervals) // 2]
     if vsu_env:
         # The envelope step is a hard timing requirement, not just another
         # note lattice: a 769-sample tick would miss a 1.3k-sample decay.
@@ -4099,7 +4116,7 @@ def _emit_ay_notes(
         # pattern can represent only the settled state.
         opening = None
         for t, val in modes:
-            if t <= st + _AY_MERGE_GAP:
+            if t <= st + _AY_OPEN_WINDOW:
                 opening = val
         if opening is None and modes:
             opening = modes[0][1]
@@ -4107,7 +4124,7 @@ def _emit_ay_notes(
             opening is not None and ((opening + 1) & 4) != 0
         )
         env_hit = env_open or any(
-            (t > st + _AY_MERGE_GAP and ((val + 1) & 4))
+            (t > st + _AY_OPEN_WINDOW and ((val + 1) & 4))
             for t, val in modes
         )
         if (h.opened_tone or h.freq_pts) and not env_hit:
@@ -4149,18 +4166,27 @@ def _emit_ay_notes(
             )
             prev_st = segs[i - 1][0] if i else -1
             latest: dict[int, int] = {}
+            later: list[tuple[int, int, int]] = []
             for t, fx, val in buckets[i]:
                 # A source register burst often lands a sample or two after
                 # the gate. It belongs to this note's opening state, not the
                 # next tick, or a snare would start on the previous hit's
                 # noise period.
-                if t > sst + _AY_MERGE_GAP:
+                if t > sst + _AY_OPEN_WINDOW:
+                    later.append((t, fx, val))
                     continue
                 if fx == FX_ENV_SET and i > 0 and t <= prev_st:
                     continue
                 latest[fx] = val
             for fx, val in latest.items():
                 channel_fx.append((sst, ch, fx, val))
+            # The row effect carries the settled opening value. Keep the same
+            # value in the note's effect list so the instrument macro cannot
+            # replay a stale earlier value (a shape-8 write followed by shape
+            # 9 within the burst used to restart the envelope at shape 8 for a
+            # whole tick).
+            settled_fx = [(sst, fx, val) for fx, val in latest.items()]
+            settled_fx += later
             events.append(NoteEvent(
                 sample=sst,
                 ch=ch,
@@ -4176,7 +4202,7 @@ def _emit_ay_notes(
                 tone_chip=2,
                 tone_clock=clock,
                 tone_div=divider,
-                tone_fx_pts=tuple(buckets[i]),
+                tone_fx_pts=tuple(settled_fx),
             ))
             count += 1
     for off in offs:
