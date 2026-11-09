@@ -233,6 +233,7 @@ def _collect_pcm_voice(
     state = {
         "bank": 0x8000, "start": 0, "end": 0, "loop": 0,
         "freq": 0, "vol": 0, "pan": 0x120, "echo": 0,
+        "enabled": False, "phase_t": -100000, "start_t": -100000,
     }
     active: QSoundPcmHit | None = None
 
@@ -315,6 +316,59 @@ def _collect_pcm_voice(
         smp.hits.append(hit)
         active = hit
 
+    def trigger(t: int, i: int) -> None:
+        """Open a note, looking ahead for the driver's companion writes."""
+        close(t, off=True)
+        start = state["start"]
+        end = state["end"]
+        loop = state["loop"]
+        bank = state["bank"]
+        freq = state["freq"]
+        vol = state["vol"]
+        pan = state["pan"]
+        echo = state["echo"]
+        first_freq = False
+        first_vol = False
+        j = i + 1
+        while j < len(writes):
+            tt, rr, vv = writes[j]
+            if tt - t > QSOUND_SETTLE:
+                break
+            if rr == 3 and (vv & 0x8000):
+                if tt - t > QSOUND_SETTLE:
+                    break
+                # A start and phase written for the same note are one event.
+                j += 1
+                continue
+            if rr == 1:
+                start = vv
+            elif rr == 5:
+                end = vv
+            elif rr == 4:
+                loop = vv
+            elif rr == 8:
+                bank = vv
+            elif rr == 2:
+                if vv and not first_freq:
+                    # A zero frequency is the driver clearing the previous
+                    # note; the following nonzero write is this note's pitch.
+                    freq = vv
+                    first_freq = True
+            elif rr == 6:
+                if vv and not first_vol:
+                    vol = vv
+                    first_vol = True
+            elif rr == 9:
+                pan = vv
+            elif rr == 10:
+                echo = vv
+            j += 1
+        state.update({
+            "start": start, "end": end, "loop": loop, "bank": bank,
+            "freq": freq, "vol": vol, "pan": pan, "echo": echo,
+        })
+        open_hit(t, start, end, loop, bank, freq, vol, pan, echo)
+
     i = 0
     while i < len(writes):
         t, reg, val = writes[i]
@@ -324,66 +378,33 @@ def _collect_pcm_voice(
             continue
         if reg == 3:
             if not (val & 0x8000):
+                state["enabled"] = False
                 if active is not None:
                     close(t, off=True)
                 i += 1
                 continue
-            # Key-on: look ahead for this note's initial parameters.
-            close(t, off=True)
-            j = i + 1
-            start = state["start"]
-            end = state["end"]
-            loop = state["loop"]
-            bank = state["bank"]
-            freq = state["freq"]
-            vol = state["vol"]
-            pan = state["pan"]
-            echo = state["echo"]
-            first_freq = False
-            first_vol = False
-            while j < len(writes):
-                tt, rr, vv = writes[j]
-                if tt - t > QSOUND_SETTLE:
-                    break
-                if rr == 3 and (vv & 0x8000):
-                    break
-                if rr == 1:
-                    start = vv
-                elif rr == 5:
-                    end = vv
-                elif rr == 4:
-                    loop = vv
-                elif rr == 8:
-                    bank = vv
-                elif rr == 2:
-                    if not first_freq:
-                        freq = vv
-                        first_freq = True
-                elif rr == 6:
-                    if not first_vol:
-                        vol = vv
-                        first_vol = True
-                elif rr == 9:
-                    pan = vv
-                elif rr == 10:
-                    echo = vv
-                j += 1
-            state.update({
-                "start": start, "end": end, "loop": loop, "bank": bank,
-                "freq": freq, "vol": vol, "pan": pan, "echo": echo,
-            })
-            open_hit(t, start, end, loop, bank, freq, vol, pan, echo)
-            # Continue after the key-on; the writes already read by the
-            # look-ahead are applied again, and later volume/frequency writes
-            # become the note's live points (including a zero-volume cut).
+            state["enabled"] = True
+            # A phase write paired with a very recent start write belongs to
+            # the note that start already opened.
+            if not (
+                active is not None
+                and t - state["start_t"] <= QSOUND_SETTLE
+            ):
+                trigger(t, i)
+            state["phase_t"] = t
             i += 1
             continue
         if reg == 1:
             state["start"] = val
-            if active is not None and val != 0:
-                # A start rewrite while sounding is the driver's next note;
-                # keep it for the next phase write.
-                pass
+            # QSound keeps a voice enabled and many drivers rewrite the start
+            # address to retrigger it.  Treat that as a key-on unless a phase
+            # write opened the same note just before.
+            if (
+                state["enabled"]
+                and t - state["phase_t"] > QSOUND_SETTLE
+            ):
+                trigger(t, i)
+                state["start_t"] = t
             i += 1
             continue
         if reg == 2:

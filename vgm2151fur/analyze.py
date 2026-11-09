@@ -1777,6 +1777,10 @@ def _tone_close(a: ToneIns, b: ToneIns, tol: int) -> bool:
         "env", "env_speed", "env_loop",
         "gb_soft_env", "gb_env_vol", "gb_env_dir", "gb_env_len",
         "gb_sound_len", "gb_wave", "vsu_mod",
+        # Sample-backed tone families (QSound) must never share an instrument
+        # across sample bodies.  FDS modulation tables are part of the timbre.
+        "sample", "sample_kind",
+        "fds_mod", "fds_mod_depth", "fds_mod_speed", "fds_mod_pos",
     )
     if any(getattr(a, f) != getattr(b, f) for f in exact):
         return False
@@ -2214,6 +2218,27 @@ def _bind_tone_instruments(
     wonderswan_map: dict[ToneIns, int] = {}
     qsound_map: dict[ToneIns, int] = {}
     ins_cap = max(1, INS_TARGET - tone_ins_base)
+    # QSound is sample-based: every distinct sample needs a base instrument
+    # before pitch/volume macro copies can spend the budget.  Otherwise a late
+    # note whose sample has no plain instrument falls back to bucket[0] and
+    # plays the wrong sound.
+    if not qsound_ins:
+        seen_qs: set[ToneIns] = set()
+        for event in events:
+            if not (
+                event.on and event.tone_chip in (14, 15)
+                and event.tone_sample >= 0
+            ):
+                continue
+            base = ToneIns(
+                sample=int(event.tone_sample),
+                sample_kind=str(event.tone_sample_kind),
+            )
+            if base in seen_qs:
+                continue
+            seen_qs.add(base)
+            qsound_map[base] = len(qsound_ins)
+            qsound_ins.append(base)
     # GB, VSU and POKEY bind last. Reserve a share so a large SCC/AY/PCE list
     # cannot spend every slot before them; the surplus collapses to plain
     # per-wave/per-env instruments, the documented "fall back to columns"
@@ -12460,7 +12485,9 @@ def analyze(
                 tone_amp_pts=tuple(h.vol_pts),
             ))
             wonderswan_count += 1
-            if h.noise:
+            if h.voice == 3:
+                # Channel 4 keeps its noise mode across notes in Furnace, so a
+                # tone hit must explicitly write 0 as well.
                 channel_fx.append((h.sample_time, ch, 0x11, h.noise))
             for t, noise in h.noise_pts:
                 channel_fx.append((t, ch, 0x11, noise))

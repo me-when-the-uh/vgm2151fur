@@ -383,9 +383,9 @@ _FURNACE_VOLUME_SCALE = {
     # VBOY's core has a 6x post-amp.  Measured against VGMPlay on Galactic
     # Pinball and Jack Bros: the module is about 2.2x quieter at unity.
     0x22: 2.2,
-    # QSound and WonderSwan are about 3.3x and 6x quieter than the player's
-    # default mix in Furnace; FDS is 1.74x quieter.
-    0x1F: 3.3, 0x21: 6.0, 0x14: 1.74,
+    # The new systems stay at the player's own default mix; do not raise the
+    # song master above 1.0 for them.
+    0x1F: 1.0, 0x21: 1.0, 0x14: 1.0,
 }
 # MSM6258's player default is 0x11E; its Furnace core is 1.64x louder, so
 # 0.61 lands the sample at the source level. The MSM6295 (0x18) is unity.

@@ -85,7 +85,7 @@ class TestParsing(unittest.TestCase):
         self.assertEqual(vgm.wonderswan_clock, 3_072_000)
         self.assertEqual(len(vgm.writes), 2)
         self.assertEqual(vgm.writes[0].reg, 0x81)
-        self.assertEqual(vgm.writes[1].reg, 0x18000)
+        self.assertEqual(vgm.writes[1].reg, 0x10080)
 
     def test_qsound_command_is_big_endian_and_rom(self):
         payload = (0x10000).to_bytes(4, "little") + (0).to_bytes(4, "little") + b"\x01\x02"
@@ -198,6 +198,19 @@ class TestWonderSwan(unittest.TestCase):
         self.assertEqual(hits[0].off_sample, 200)
         self.assertEqual(pcm, [])
 
+    def test_pcm_pan_decodes_low_right_bits(self):
+        writes = [_write(0, "wonderswan", 0x90, 0x22)]
+        writes.append(_write(1, "wonderswan", 0x94, 0x0F))
+        for i in range(20):
+            writes.append(_write(2 + i * 4, "wonderswan", 0x89, 128 + i))
+        writes.append(_write(200, "wonderswan", 0x90, 0x00))
+        _hits, pcm, _ = collect_wonderswan(
+            _vgm(writes, total=300, wonderswan_clock=3_072_000)
+        )
+        self.assertEqual(len(pcm), 1)
+        self.assertEqual(pcm[0].hits[0].pan_l, 15)
+        self.assertEqual(pcm[0].hits[0].pan_r, 15)
+
     def test_pcm_stream(self):
         writes = [_write(0, "wonderswan", 0x90, 0x22)]
         for i in range(40):
@@ -262,6 +275,28 @@ class TestQSound(unittest.TestCase):
         self.assertEqual(linear, 13)
         self.assertEqual(surround, 0)
         self.assertEqual(hit.off_sample, 100)
+
+    def test_start_address_retriggers_while_enabled(self):
+        roms = [RomSlice(0, 0x1000, 0, self._rom(), "qsound")]
+        writes = [
+            _write(0, "qsound", 0x78, 0x8000),
+            _write(1, "qsound", 0x01, 0x0100),
+            _write(2, "qsound", 0x05, 0x0200),
+            _write(3, "qsound", 0x04, 0x40),
+            _write(4, "qsound", 0x06, 1200),
+            _write(5, "qsound", 0x02, 4096),
+            _write(6, "qsound", 0x03, 0x8000),
+            # Phase stays enabled; a start rewrite is the next key-on.
+            _write(1000, "qsound", 0x01, 0x0100),
+            _write(1001, "qsound", 0x06, 900),
+            _write(1002, "qsound", 0x02, 4096),
+        ]
+        pcm, _adpcm, _samples, _ = collect_qsound(
+            _vgm(writes, total=1200, roms=roms, qsound_clock=60_000_000)
+        )
+        self.assertEqual(len(pcm), 2)
+        self.assertEqual(pcm[0].sample_time, 6)
+        self.assertEqual(pcm[1].sample_time, 1000)
 
     def test_adpcm_hit(self):
         roms = [RomSlice(0, 0x10000, 0, self._rom(), "qsound")]

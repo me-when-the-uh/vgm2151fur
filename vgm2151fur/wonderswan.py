@@ -21,8 +21,15 @@ WS_VOICES = 4
 # A period jump this large (1/64 semitone) is a new note, not a bend.
 WS_NOTE_JUMP = 48
 WS_MIN_NOTE = 48
+# A level jump this large while the gate stays open is a retriggered drum or
+# a new note.  Hard-left/hard-right flips are also separate hits even when the
+# peak level does not rise.
+WS_RETRIGGER_RISE = 4
 # Memory writes closer than this are one wave upload burst.
 WS_WAVE_BURST = 256
+# A volume write this close to a note's period-driven start is that note's
+# initial level, not a mid-note step.
+WS_SETTLE = 8
 # PCM write gaps larger than this split one stream into separate sample runs.
 WS_PCM_GAP = 2_000
 WS_PCM_MIN_RATE = 2_000
@@ -187,6 +194,24 @@ def collect_wonderswan(
         raw = ch["period_raw"]
         if raw == 0xFFFF:
             return None
+        prev = ch.get("last_hit")
+        if prev is not None and prev.sample_time == when:
+            # Two gate/register paths can identify the same attack (for
+            # example the noise-enable bit and the noise-reset write).  Keep
+            # one hit with the final state instead of two notes on one row.
+            prev.period = period_of(raw)
+            prev.wave = body_for(cid, voice)
+            prev.vol_l = ch["vol_l"]
+            prev.vol_r = ch["vol_r"]
+            prev.noise = (
+                (st["noise"] & 7) + 1
+                if voice == 3 and (st["snd"] & 0x80) else 0
+            )
+            prev.sweep_time = st["sweep_time"]
+            prev.sweep_amount = st["sweep_amount"]
+            prev.off_sample = 0
+            ch["active"] = prev
+            return prev
         hit = WsHit(
             sample_time=when,
             chip_id=cid,
@@ -201,6 +226,7 @@ def collect_wonderswan(
         )
         hits.append(hit)
         ch["active"] = hit
+        ch["last_hit"] = hit
         ch["last_note_t"] = when
         return hit
 
@@ -213,34 +239,61 @@ def collect_wonderswan(
         if ch["vol_l"] == 0 and ch["vol_r"] == 0:
             close(cid, voice, when, off=True)
             return
-        if (ch["vol_l"], ch["vol_r"]) != (hit.vol_l, hit.vol_r):
-            hit.vol_pts.append((when, ch["vol_l"], ch["vol_r"]))
-            hit.vol_l = ch["vol_l"]
-            hit.vol_r = ch["vol_r"]
+        last_l = hit.vol_pts[-1][1] if hit.vol_pts else hit.vol_l
+        last_r = hit.vol_pts[-1][2] if hit.vol_pts else hit.vol_r
+        if (ch["vol_l"], ch["vol_r"]) != (last_l, last_r):
+            newmax = max(ch["vol_l"], ch["vol_r"])
+            oldmax = max(last_l, last_r)
+            hard_flip = (
+                (ch["vol_l"] > 0 and ch["vol_r"] == 0
+                 and last_l == 0 and last_r > 0)
+                or (ch["vol_r"] > 0 and ch["vol_l"] == 0
+                    and last_r == 0 and last_l > 0)
+            )
+            if when - hit.sample_time <= WS_SETTLE and not hit.vol_pts:
+                # The period write opened the note a sample or two before the
+                # driver wrote its companion volume byte.
+                hit.vol_l = ch["vol_l"]
+                hit.vol_r = ch["vol_r"]
+            elif (
+                (newmax - oldmax >= WS_RETRIGGER_RISE and not hard_flip)
+                or hard_flip
+            ) and when - hit.sample_time >= WS_MIN_NOTE:
+                # A gate jump or a hard-left/hard-right flip is a new hit, not
+                # a pan step in a long instrument macro.
+                close(cid, voice, when, off=False)
+                open_hit(cid, voice, when)
+                return
+            else:
+                hit.vol_pts.append((when, ch["vol_l"], ch["vol_r"]))
         raw = ch["period_raw"]
         if raw != 0xFFFF:
             per = period_of(raw)
-            if abs(per - hit.period) >= WS_NOTE_JUMP:
+            last_per = (
+                hit.period_pts[-1][1] if hit.period_pts else hit.period
+            )
+            if abs(per - last_per) >= WS_NOTE_JUMP:
                 close(cid, voice, when, off=True)
                 open_hit(cid, voice, when)
-            elif per != hit.period:
+            elif per != last_per:
                 hit.period_pts.append((when, per))
-                hit.period = per
         st = state[cid]
         if voice == 3:
             noise = (st["noise"] & 7) + 1 if (st["snd"] & 0x80) else 0
-            if noise != hit.noise:
+            last_noise = (
+                hit.noise_pts[-1][1] if hit.noise_pts else hit.noise
+            )
+            if noise != last_noise:
                 hit.noise_pts.append((when, noise))
-                hit.noise = noise
         if voice == 2:
-            if (st["sweep_time"], st["sweep_amount"]) != (
-                hit.sweep_time, hit.sweep_amount,
-            ):
+            last_sweep = (
+                (hit.sweep_pts[-1][1], hit.sweep_pts[-1][2])
+                if hit.sweep_pts else (hit.sweep_time, hit.sweep_amount)
+            )
+            if (st["sweep_time"], st["sweep_amount"]) != last_sweep:
                 hit.sweep_pts.append((
                     when, st["sweep_time"], st["sweep_amount"],
                 ))
-                hit.sweep_time = st["sweep_time"]
-                hit.sweep_amount = st["sweep_amount"]
 
     def flush_waves(cid: int, when: int) -> None:
         st = state[cid]
@@ -252,9 +305,11 @@ def collect_wonderswan(
             if hit is None:
                 continue
             body = body_for(cid, voice)
-            if body != hit.wave:
+            last_wave = (
+                hit.wave_pts[-1][1] if hit.wave_pts else hit.wave
+            )
+            if body != last_wave:
                 hit.wave_pts.append((when, body))
-                hit.wave = body
 
     def finish_pcm(cid: int, when: int) -> None:
         st = state[cid]
@@ -298,8 +353,10 @@ def collect_wonderswan(
         for t, v in points:
             if t <= when:
                 raw = v
+        # The WS PCM volume register packs left in bits 2-3 and right in
+        # bits 0-1 (core: PCMVolumeRight = ((value<<2)&0xc)*2).
         left = (raw >> 2) & 3
-        right = (raw >> 4) & 3
+        right = raw & 3
         level = max(left, right)
         vol = 15 if level >= 3 else 10 if level == 2 else 0
         return vol, left * 5, right * 5
@@ -331,9 +388,11 @@ def collect_wonderswan(
                 hit = st["ch"][voice]["active"]
                 if hit is not None:
                     body = body_for(cid, voice)
-                    if body != hit.wave:
+                    last_wave = (
+                        hit.wave_pts[-1][1] if hit.wave_pts else hit.wave
+                    )
+                    if body != last_wave:
                         hit.wave_pts.append((t, body))
-                        hit.wave = body
             continue
         if reg == 0x90:
             old = st["snd"]
@@ -356,8 +415,12 @@ def collect_wonderswan(
                 st["pcm_on"] = False
                 st["pcm_end"] = t
                 finish_pcm(cid, t)
-            if val & 0x80:
-                st["noise"] = st["noise"]
+            if (val & 0x80) and not (old & 0x80):
+                hit = st["ch"][3]["active"]
+                if hit is not None and t - hit.sample_time >= WS_MIN_NOTE:
+                    # Turning the noise generator on is a new percussion hit.
+                    close(cid, 3, t, off=False)
+                    open_hit(cid, 3, t)
             refresh(cid, 3, t)
             refresh(cid, 2, t)
             continue
@@ -400,6 +463,14 @@ def collect_wonderswan(
             continue
         if reg == 0x8E:
             st["noise"] = val
+            hit = st["ch"][3]["active"]
+            if (val & 0x08) and hit is not None and (
+                t - hit.sample_time >= WS_MIN_NOTE
+            ):
+                # The noise reset bit is written once per percussion hit.
+                close(cid, 3, t, off=False)
+                open_hit(cid, 3, t)
+                continue
             refresh(cid, 3, t)
             continue
         if reg == 0x89 and st["pcm_on"]:

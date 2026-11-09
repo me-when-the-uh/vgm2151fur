@@ -2219,10 +2219,11 @@ def load_vgm(path: Path | str) -> VgmFile:
             pos += 3
             continue
         if cmd == CMD_WSWAN_MEM and pos + 4 <= n:
-            # 0xC6 address16 data.  The sound chip sees a 16 KB mirror; keep
-            # the address flat (0x10000+) so it cannot collide with a port
-            # number.  The collector applies the 0x3FFF mask.
-            addr = int.from_bytes(buf[pos + 1:pos + 3], "little")
+            # 0xC6 address16 data.  The address is big-endian (libvgm masks
+            # the top bit and reads BE16).  The sound chip sees a 16 KB mirror;
+            # keep the address flat (0x10000+) so it cannot collide with a
+            # port number.  The collector applies the 0x3FFF mask.
+            addr = int.from_bytes(buf[pos + 1:pos + 3], "big") & 0x7FFF
             vgm.writes.append(ChipWrite(
                 sample, "wonderswan", 0, 0x10000 + addr, buf[pos + 3],
             ))
