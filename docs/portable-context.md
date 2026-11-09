@@ -32,7 +32,7 @@ python tools/fur2vgm.py out/track.fur -o out/track.vgm
 python tools/fur_soundcheck.py "track.vgz" out/track.fur
 ```
 
-Read `implementation-notes.md` before changing the pipeline and the relevant chip note before changing a state machine. Run the tests with `python -m unittest discover -s tests` (1,102 tests in the current tree, with three known unrelated failures in condense and level-fit and one skip; no test-runner package is installed - a bare `pytest` fails, and `python -m unittest tests.test_vgm2151fur_opl` is the OPL-family subset). Furnace is needed for the round-trip tests; without it those skip. Regenerate affected packs after a converter change; do not commit generated modules or `.fur` files unless asked.
+Read `implementation-notes.md` before changing the pipeline and the relevant chip note before changing a state machine. Run the tests with `python -m unittest discover -s tests` (1,103 tests in the current tree, with three known unrelated failures in condense and level-fit and one skip; no test-runner package is installed - a bare `pytest` fails, and `python -m unittest tests.test_vgm2151fur_opl` is the OPL-family subset). Furnace is needed for the round-trip tests; without it those skip. Regenerate affected packs after a converter change; do not commit generated modules or `.fur` files unless asked.
 
 ## Accuracy gate
 

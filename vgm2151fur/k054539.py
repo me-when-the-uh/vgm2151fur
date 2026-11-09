@@ -449,6 +449,14 @@ def collect_k054539(
                         hit.freq_pts.append((w.sample, delta))
                         freq_last[(cid, ch)] = delta
 
+    # A key-on that is closed at the same VGM sample produces no audio: both
+    # register writes take effect before the next hardware tick.  Some logs
+    # start with a full key-on/key-off mask pair to reset every voice; those
+    # zero-length hits must not become samples or notes.
+    hits = [
+        h for h in hits
+        if not (h.off_sample and h.off_sample <= h.sample_time)
+    ]
     if not hits:
         return [], offs, warnings
     if not any(roms.values()):

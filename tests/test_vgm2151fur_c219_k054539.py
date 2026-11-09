@@ -321,6 +321,19 @@ class TestK054539(unittest.TestCase):
                     struct.pack("<hhhh", 0x200, 0x300, 0xB00, 0xF00),
                 )
 
+    def test_k054539_immediate_keyoff_is_silent(self):
+        # Some logs begin with a full key-on/key-off mask pair to reset every
+        # voice. Both writes land on the same VGM sample, so no audio plays.
+        writes, rom = self._writes(FORMAT_8BIT)
+        writes[-1] = _write(10, "k054539", 0x215, 0x01)
+        song = _vgm(writes, total=1000, roms=rom,
+                    k054539_clock=18_432_000)
+        samples, _offs, _warn = collect_k054539(song)
+        self.assertEqual(samples, [])
+        analysed = analyze(song)
+        self.assertEqual(analysed.k054539_count, 0)
+        self.assertEqual(analysed.k054539_samples, [])
+
     def test_k054539_loop_and_value_maps(self):
         writes, rom = self._writes(FORMAT_8BIT, loop=True)
         song = _vgm(writes, total=1000, roms=rom,
