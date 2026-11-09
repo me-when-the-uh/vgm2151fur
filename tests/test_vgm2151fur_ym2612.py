@@ -25,7 +25,10 @@ from vgm2151fur.furwrite import (
     write_fur,
 )
 from vgm2151fur.furnace import export_vgm, find_furnace
-from vgm2151fur.vgm import ChipWrite, VgmFile, chips_in_head, load_vgm
+from vgm2151fur.vgm import (
+    ChipWrite, VgmFile, _decompress_data_block, _parse_compression_table,
+    chips_in_head, load_vgm,
+)
 from vgm2151fur.sn76489 import (
     collect_sn76489, psg_note, psg_pitch_table,
 )
@@ -179,6 +182,27 @@ class TestYm2612Parsing(unittest.TestCase):
         self.assertIn("ym2612_dual", kinds)
         # The YM2151 lives at 0x30; a YM2612-only header must not claim it.
         self.assertNotIn("ym2151", kinds)
+
+    def test_compressed_dac_block_uses_the_7f_table(self):
+        # Type 0x40 is the compressed form of the YM2612 PCM bank. Some
+        # rips compress it with 4-bit Delta-PCM and a 0x7F table.
+        table_payload = (
+            bytes((0x01, 0x00, 0x08, 0x04))
+            + (4).to_bytes(2, "little")
+            + bytes((1, 2, 0xFF, 0))
+        )
+        table = _parse_compression_table(table_payload)
+        self.assertEqual(table, (1, 0, 8, 4, [1, 2, 255, 0]))
+        # four 8-bit outputs from 0x80, deltas +1, +2, -1, 0
+        block = (
+            bytes((0x01, 0x04, 0x00, 0x00, 0x00, 0x08, 0x04, 0x00,
+                   0x80, 0x00))
+            + bytes((0x01, 0x23))
+        )
+        self.assertEqual(
+            _decompress_data_block(0x40, block, table),
+            bytes((0x81, 0x83, 0x82, 0x82)),
+        )
 
     def test_stray_second_chip_is_first_with_warning(self):
         p = TMP / "ym2612_stray.vgm"

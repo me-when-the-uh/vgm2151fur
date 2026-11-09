@@ -1394,33 +1394,37 @@ def _k007232_clock(buf: bytes, extra: dict[int, int], ym_clock: int, version: in
     return ym_clock or 3579545
 
 
-def _decompress_data_block(typ: int, payload: bytes) -> bytes | None:
+def _decompress_data_block(
+    typ: int, payload: bytes, table: tuple | None = None,
+) -> bytes | None:
     """Decode a compressed VGM data block (types 0x40-0x7E).
 
-    Only the n-Bit formats used by streamed PWM banks are implemented here.
-    Returns None when the compression type or sub-type is unsupported.
+    Implements both n-Bit and Delta-PCM compression.  The table forms need
+    the most recent type-0x7F block; `table` is
+    ``(comp, sub, bits_dec, bits_cmp, entries)``.  Returns None when the
+    compression type, sub-type or table is unsupported.
     """
     if not (0x40 <= typ <= 0x7E) or len(payload) < 10:
         return None
     comp = payload[0]
     size = int.from_bytes(payload[1:5], "little")
-    if comp != 0x00:  # 0 = n-Bit; DPCM (1) needs the table bank
-        return None
     bd = payload[5]
     bc = payload[6]
-    sub = payload[7]
-    add = int.from_bytes(payload[8:10], "little")
     if bd <= 0 or bc <= 0 or bd > 16 or bc > 16:
         return None
+    val_size = (bd + 7) // 8
+    count = size // val_size
     src = payload[10:]
-    count = size // 2
-    out = bytearray(count * 2)
+    out = bytearray(count * val_size)
     bitpos = 0
     total_bits = len(src) * 8
     mask = (1 << bc) - 1
-    for i in range(count):
+    out_mask = (1 << bd) - 1
+
+    def read_bits() -> int | None:
+        nonlocal bitpos
         if bitpos + bc > total_bits:
-            break
+            return None
         # libvgm's READ_BITS assembles a value from chunks of up to 8 bits,
         # placing the first chunk in the low byte.  This is not a plain
         # MSB-first integer read.
@@ -1431,24 +1435,83 @@ def _decompress_data_block(typ: int, payload: bytes) -> bytes | None:
             raw = (raw << 1) | ((byte >> bit) & 1)
             bitpos += 1
         if bc <= 8:
-            value = raw
-        else:
-            rem = bc - 8
-            chunk0 = raw >> rem
-            chunk1 = raw & ((1 << rem) - 1)
-            value = chunk0 | (chunk1 << 8)
-        if sub == 0:
-            value &= mask
-        elif sub == 1:
-            value = (value & mask) << (bd - bc)
-        elif sub == 2:
-            return None  # table-compressed values need data block 0x7F
-        else:
+            return raw
+        rem = bc - 8
+        chunk0 = raw >> rem
+        chunk1 = raw & ((1 << rem) - 1)
+        return chunk0 | (chunk1 << 8)
+
+    tbl_values: list[int] = []
+    if table is not None:
+        _tcomp, _tsub, tbd, tbc, entries = table
+        if tbd == bd and tbc == bc:
+            tbl_values = list(entries)
+
+    if comp == 0x00:
+        sub = payload[7]
+        add = int.from_bytes(payload[8:10], "little")
+        if sub == 2 and not tbl_values:
             return None
-        value = (value + add) & ((1 << bd) - 1)
-        out[i * 2] = value & 0xFF
-        out[i * 2 + 1] = (value >> 8) & 0xFF
-    return bytes(out)
+        for i in range(count):
+            value = read_bits()
+            if value is None:
+                break
+            if sub == 0:
+                value &= mask
+            elif sub == 1:
+                value = (value & mask) << (bd - bc)
+            elif sub == 2:
+                if value >= len(tbl_values):
+                    return None
+                value = tbl_values[value]
+            else:
+                return None
+            value = (value + add) & out_mask
+            for k in range(val_size):
+                out[i * val_size + k] = (value >> (8 * k)) & 0xFF
+        return bytes(out)
+
+    if comp == 0x01:
+        # Delta-PCM: each compressed index names a signed delta in the
+        # 0x7F table.  The value wraps in the bit depth, like VGMPlay.
+        if not tbl_values:
+            return None
+        value = int.from_bytes(payload[8:10], "little") & out_mask
+        for i in range(count):
+            index = read_bits()
+            if index is None:
+                break
+            if index >= len(tbl_values):
+                return None
+            value = (value + tbl_values[index]) & out_mask
+            for k in range(val_size):
+                out[i * val_size + k] = (value >> (8 * k)) & 0xFF
+        return bytes(out)
+
+    return None
+
+
+def _parse_compression_table(payload: bytes) -> tuple | None:
+    """Decode a VGM type-0x7F compression table block."""
+    if len(payload) < 6:
+        return None
+    comp = payload[0]
+    sub = payload[1]
+    bd = payload[2]
+    bc = payload[3]
+    count = int.from_bytes(payload[4:6], "little")
+    val_size = (bd + 7) // 8
+    if bd <= 0 or bc <= 0 or bd > 16 or bc > 16 or val_size > 2:
+        return None
+    if len(payload) < 6 + count * val_size:
+        return None
+    entries = [
+        int.from_bytes(
+            payload[6 + i * val_size:6 + (i + 1) * val_size], "little",
+        )
+        for i in range(count)
+    ]
+    return comp, sub, bd, bc, entries
 
 
 def load_vgm(path: Path | str) -> VgmFile:
@@ -1954,6 +2017,8 @@ def load_vgm(path: Path | str) -> VgmFile:
     saw_adpcm_compressed = False
     # stream id -> setup recorded by 0x90/0x91/0x92
     streams: dict[int, dict] = {}
+    # Most recent type-0x7F compression table, shared by later blocks.
+    compression_table: tuple | None = None
     active_adpcm: dict[int, Msm6258Play] = {}
     # Generic 0x93 plays that a 0x94 (or the next 0x93) ends. The stream's
     # declared length is usually the same span, but a driver may stop early.
@@ -1984,7 +2049,23 @@ def load_vgm(path: Path | str) -> VgmFile:
             chip_id = (size >> 31) & 1
             size &= 0x7FFFFFFF
             payload = buf[pos + 7:pos + 7 + size]
-            if typ == 0x00:
+            if typ == 0x7F:
+                compression_table = _parse_compression_table(payload)
+            elif 0x40 <= typ <= 0x7E and (typ & 0x3F) == 0x00:
+                # Compressed YM2612 PCM bank. The old VGM players decode the
+                # 0x40 block through the 0x7F table before the 0xE0/0x80
+                # stream commands, and the modern 0x95 ids index the same
+                # decoded bank.
+                data = _decompress_data_block(typ, payload, compression_table)
+                if data is None:
+                    vgm.warnings.append(
+                        f"YM2612 PCM data block type {typ:#04x}: unsupported "
+                        "compression; DAC stream will be silent"
+                    )
+                else:
+                    vgm.dac_blocks.append(data)
+                    vgm.dac_data.extend(data)
+            elif typ == 0x00:
                 # YM2612 PCM sample bank. The payload is unsigned 8-bit PCM;
                 # the old stream reads it through 0xE0/0x80-0x8F, the modern
                 # one through 0x95 block ids.
@@ -3078,11 +3159,6 @@ def load_vgm(path: Path | str) -> VgmFile:
     ):
         vgm.warnings.append(
             "YM2612 direct 0x2A DAC writes are not converted (no PCM bank)"
-        )
-    if vgm.dac_block_plays and not vgm.dac_events:
-        vgm.warnings.append(
-            "modern 0x95 DAC stream control is parsed for the audit but not "
-            "converted as source PCM"
         )
     if (
         any(p.chip_type == DAC_STREAM_YM2612
