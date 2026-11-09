@@ -5881,15 +5881,18 @@ def write_fur(
     for _cid in x1_ids:
         chips.append(CHIP_X1_010)
         clock = song.vgm.x1_010_clock or 16_000_000
+        # The X1-010 output is stereo. Enable the platform's stereo path so
+        # the 08xy pan effects and per-side envelope levels reach the mix.
+        parts = ["stereo=true"]
         if abs(clock - 16_000_000) <= 2:
-            flags = ""
+            pass
         elif abs(clock - 50_000_000 / 3) <= 2:
-            flags = "clockSel=1"
+            parts.append("clockSel=1")
         elif abs(clock - 14_318_180) <= 2:
-            flags = "clockSel=2"
+            parts.append("clockSel=2")
         else:
-            flags = f"customClock={clock}"
-        flag_texts.append(flags)
+            parts.append(f"customClock={clock}")
+        flag_texts.append("\n".join(parts))
     for _cid in fds_ids:
         chips.append(CHIP_FDS)
         clock = song.vgm.nes_clock or 1_789_773

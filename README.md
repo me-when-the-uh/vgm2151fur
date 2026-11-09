@@ -184,7 +184,7 @@ Open follow-ups are tracked in [TODO.md](./TODO.md).
   - Volume-only mode (AUDC bit 4) is not converted because Furnace has no DC/DAC mode.
   - Two-tone mode (SKCTL bit 7) exists only on Furnace's ASAP core and is not converted.
   - AUDC distortion 7 has no separate Furnace wave tap and plays as distortion 6 with a warning.
-- Seta X1-010 converts sixteen wavetable/PCM voices per chip using Furnace's native wave/envelope macros and 8-bit ROM sample maps; held pitch slides become `E8xx`/`E9xx`/`E5xx` row steps when they fit the row grid, so they do not spend the instrument budget.
+- Seta X1-010 converts sixteen stereo wavetable/PCM voices per chip using Furnace's native wave/envelope macros and 8-bit ROM sample maps; left/right envelope and PCM nibble pairs become `08xy` pan, and held pitch slides become `E8xx`/`E9xx`/`E5xx` row steps when they fit the row grid, so they do not spend the instrument budget.
 - C352 needs a Furnace build with the ported core.
 - K053260 loops the whole sample, and mid-note loop, KADPCM or direction changes use the key-on value.
   - A voice keyed with pan 0 is written silent and raised when its pan moves.

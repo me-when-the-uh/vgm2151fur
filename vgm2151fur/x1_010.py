@@ -78,6 +78,9 @@ class X1Hit:
     # Period-0 envelopes hold envelope byte 0.  Some drivers rewrite that byte
     # while a note sounds, so keep the resulting mono level steps.
     env_level_pts: list[tuple[int, int]] = field(default_factory=list)
+    # Live left/right levels of that byte (left, right, 0-15).  Period-0 shape
+    # switches also land here because they select another constant byte pair.
+    env_lr_pts: list[tuple[int, int, int]] = field(default_factory=list)
 
 
 @dataclass
@@ -97,6 +100,8 @@ class X1PcmHit:
     off_sample: int = 0
     freq_pts: list[tuple[int, int]] = field(default_factory=list)
     vol_pts: list[tuple[int, int]] = field(default_factory=list)
+    # Live left/right volume nibbles, (sample, left, right).
+    lr_pts: list[tuple[int, int, int]] = field(default_factory=list)
 
     @property
     def rate(self) -> int:
@@ -273,6 +278,18 @@ def collect_x1_010(
                         )
                         if level != last:
                             hit.env_level_pts.append((t, level))
+                        left = (val >> 4) & 0x0F
+                        right = val & 0x0F
+                        last_lr = (
+                            (hit.env_lr_pts[-1][1], hit.env_lr_pts[-1][2])
+                            if hit.env_lr_pts
+                            else (
+                                (hit.env_data[0] >> 4) & 0x0F,
+                                hit.env_data[0] & 0x0F,
+                            )
+                        )
+                        if (left, right) != last_lr:
+                            hit.env_lr_pts.append((t, left, right))
                     else:
                         warnings_seen["env_live"] = (
                             warnings_seen.get("env_live", 0) + 1
@@ -348,6 +365,19 @@ def collect_x1_010(
                 if body != last:
                     hit.env_shape = shape
                     hit.env_pts.append((t, body))
+                    if hit.env_period == 0 and body:
+                        left = (body[0] >> 4) & 0x0F
+                        right = body[0] & 0x0F
+                        last_lr = (
+                            (hit.env_lr_pts[-1][1], hit.env_lr_pts[-1][2])
+                            if hit.env_lr_pts
+                            else (
+                                (hit.env_data[0] >> 4) & 0x0F,
+                                hit.env_data[0] & 0x0F,
+                            )
+                        )
+                        if (left, right) != last_lr:
+                            hit.env_lr_pts.append((t, left, right))
             elif reg == REG_START_ENVPERIOD:
                 last = (
                     hit.env_period_pts[-1][1]
@@ -370,6 +400,13 @@ def collect_x1_010(
                 last = hit.vol_pts[-1][1] if hit.vol_pts else hit.volume
                 if volume != last:
                     hit.vol_pts.append((t, volume))
+                last_lr = (
+                    (hit.lr_pts[-1][1], hit.lr_pts[-1][2])
+                    if hit.lr_pts
+                    else ((hit.pan >> 4) & 0x0F, hit.pan & 0x0F)
+                )
+                if (left, right) != last_lr:
+                    hit.lr_pts.append((t, left, right))
             elif reg == REG_START_ENVPERIOD or reg == REG_END_ENVSHAPE:
                 warnings_seen["range"] += 1
 
@@ -394,7 +431,7 @@ def collect_x1_010(
     if warnings_seen["volume"]:
         warnings.append(
             f"{warnings_seen['volume']} X1-010 PCM volume write(s) have "
-            "different left/right nibbles; the mono average is used"
+            "different left/right nibbles; they are kept as stereo pan"
         )
     if warnings_seen.get("wave_live"):
         warnings.append(

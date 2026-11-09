@@ -255,6 +255,45 @@ class TestX1Module(unittest.TestCase):
         self.assertEqual(len(song.x1_waves), 1)
         self.assertEqual(len(song.x1_envs), 1)
 
+    def test_stereo_envelope_levels_become_pan(self):
+        # Wave envelope byte 0 is a left/right nibble pair. The loud side is
+        # the note level and the ratio is the 08xy pan.
+        writes = [
+            _write(0, 0x80 + i, 0x0F) for i in range(128)  # L0 R15
+        ] + _wave_setup()[128:]
+        writes.insert(-2, _write(0, 4, 0))
+        song = analyze(_vgm(writes))
+        ev = [e for e in song.events if e.on and e.tone_chip == 11][0]
+        self.assertEqual(ev.vol, 15)
+        self.assertEqual(ev.pan, 0x0F)
+        data = write_fur(song)
+        self.assertIn(b"stereo=true", decompress_fur(data))
+        mod = parse_fur(data)
+        rows = [
+            row for (ch, _pat), pat in mod.patterns.items()
+            if ch == 0 for row in pat
+        ]
+        self.assertTrue(any(
+            row.note >= 0 and any(cmd == 0x08 and val == 0x0F
+                                  for cmd, val in row.fx)
+            for row in rows
+        ))
+
+    def test_pcm_register_nibbles_become_pan(self):
+        body = bytes((i * 7) & 0xFF for i in range(0x2000))
+        writes = [
+            _write(0, 1, 0xE0),  # PCM L14 R0
+            _write(0, 2, 16),
+            _write(0, 4, 0),
+            _write(0, 5, 0xFE),
+            _write(0, 0, 1),
+            _write(8000, 0, 0),
+        ]
+        song = analyze(_vgm(writes, total=9000, rom=body))
+        ev = [e for e in song.events if e.on and e.pcm][0]
+        self.assertEqual(ev.vol, 14)
+        self.assertEqual(ev.pan, 0xF0)
+
     def test_pitch_point_becomes_a_row_step(self):
         writes = _wave_setup()
         # A mid-note retune. The collector and NoteEvent keep the raw 16-bit
@@ -346,7 +385,7 @@ class TestX1Module(unittest.TestCase):
         song = analyze(_vgm(writes))
         ev = [e for e in song.events if e.on and e.tone_chip == 11][0]
         self.assertEqual(ev.vol, 15)
-        self.assertEqual(ev.vol_pts, ((3000, 9, None),))
+        self.assertEqual(ev.vol_pts, ((3000, 9, 0xFF),))
         self.assertFalse(any(ins.vol for ins in song.x1_010_ins))
 
     def test_period_zero_envelope_rewrites_become_volume_steps(self):
@@ -360,7 +399,7 @@ class TestX1Module(unittest.TestCase):
         song = analyze(_vgm(writes))
         ev = [e for e in song.events if e.on and e.tone_chip == 11][0]
         self.assertEqual(ev.vol, 1)
-        self.assertEqual(ev.vol_pts, ((3000, 9, None),))
+        self.assertEqual(ev.vol_pts, ((3000, 9, 0xFF),))
         self.assertFalse(any(ins.vol for ins in song.x1_010_ins))
 
     def test_pitch_macros_are_not_lfo_looped(self):

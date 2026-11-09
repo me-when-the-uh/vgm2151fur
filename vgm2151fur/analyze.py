@@ -4336,9 +4336,21 @@ def _emit_x1_wave_notes(
         env_idx = env_map.get(h.env_data, 0)
         const_env = env_map.get(bytes([0xFF]) * 128, env_idx)
         period_zero = h.env_period == 0
-        initial_level = (
-            (((h.env_data[0] >> 4) & 0x0F) + (h.env_data[0] & 0x0F) + 1) // 2
-            if period_zero else 15
+        initial_lr = (
+            ((h.env_data[0] >> 4) & 0x0F, h.env_data[0] & 0x0F)
+            if period_zero else (15, 15)
+        )
+        # A period-0 envelope holds the first byte of whichever shape is
+        # selected. Drivers use that byte as a stereo level and switch shapes
+        # or rewrite the byte to ramp or pan the note, so keep the left/right
+        # pair rather than a mono average.
+        lr_by_time: dict[int, tuple[int, int]] = {}
+        if period_zero:
+            for t, left, right in getattr(h, "env_lr_pts", ()):
+                lr_by_time[t] = (left, right)
+        lr_pts = sorted(
+            (t, left, right)
+            for t, (left, right) in lr_by_time.items()
         )
         for i, (sst, value, intra) in enumerate(segs):
             nxt = segs[i + 1][0] if i + 1 < len(segs) else 0
@@ -4356,32 +4368,18 @@ def _emit_x1_wave_notes(
                 (t, env_map.get(body, env_idx))
                 for t, body in h.env_pts if env_map.get(body, env_idx) != env_idx
             )
-            levels: list[tuple[int, int]] = []
-            if period_zero:
-                # A period-0 envelope holds the first byte of whichever shape
-                # is selected, so drivers ramp the level by switching the
-                # shape register mid-note. Those shape changes are volume
-                # steps, not timbre changes.
-                levels = list(h.env_level_pts)
-                levels += [
-                    (
-                        t,
-                        (((body[0] >> 4) & 0x0F)
-                         + (body[0] & 0x0F) + 1) // 2,
-                    )
-                    for t, body in h.env_pts if body
-                ]
-                levels.sort()
+            left, right = initial_lr
+            for t, l, r in lr_pts:
+                if t <= sst:
+                    left, right = l, r
+            level = max(left, right) if period_zero else 15
+            pan = pcm_pan_fx(left, right) if period_zero else 0
             vol_pts = (
                 tuple(
-                    (t, level, None)
-                    for t, level in levels if sst < t < bound
+                    (t, max(l, r), pcm_pan_fx(l, r))
+                    for t, l, r in lr_pts if sst < t < bound
                 )
                 if period_zero else ()
-            )
-            level = (
-                _value_at(levels, sst, initial_level)
-                if period_zero else 15
             )
             mode = 1 | (2 if h.env_oneshot else 0)
             events.append(NoteEvent(
@@ -4392,7 +4390,7 @@ def _emit_x1_wave_notes(
                 ins=-1,
                 vol=level,
                 e5=e5,
-                pan=0,
+                pan=pan,
                 end=seg_end,
                 vol_pts=vol_pts,
                 tone_pitch_pts=tuple(intra),
@@ -12925,17 +12923,27 @@ def analyze(
                 natural_end,
                 total or natural_end,
             )
+            left = (h.pan >> 4) & 0x0F
+            right = h.pan & 0x0F
+            lr_pts = [
+                (t, l, r) for t, l, r in getattr(h, "lr_pts", ())
+            ]
             ev = NoteEvent(
                 sample=h.sample_time,
                 ch=ch,
                 on=True,
                 note=60 + slot,
                 ins=-1,
-                vol=h.volume,
+                vol=max(left, right),
                 e5=0x80,
-                pan=0,
+                pan=pcm_pan_fx(left, right),
                 pcm=True,
                 end=end,
+                vol_pts=tuple(
+                    (t, max(l, r), pcm_pan_fx(l, r))
+                    for t, l, r in lr_pts
+                    if h.sample_time < t < end
+                ),
             )
             events.append(ev)
             x1_sample_events.append((ev, ins_slot))
