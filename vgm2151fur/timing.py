@@ -359,13 +359,27 @@ def estimate_grid(
     candidates = {c for c in candidates if c > 0}
 
     scored: list[tuple[float, float]] = []  # (unit, coverage)
+    fine_scored: list[tuple[float, float]] = []
     folded_scored: list[tuple[float, float]] = []
+    shortest = min(deltas)
     for c in candidates:
         t = _refine_unit(deltas, c)
         if 800.0 <= t <= 8000.0:
             scored.append((t, _lattice_coverage(deltas, t)))
             continue
         if t < 800.0:
+            # A few drivers (notably fast FDS engines) tick far faster than a
+            # musical 16th.  Accept such a unit only when the stream is large
+            # and almost every interval sits on it, so ordinary ornamental
+            # notes and stray writes cannot become the song grid.
+            if (
+                t >= 64.0
+                and len(deltas) >= 64
+                and shortest <= 1.5 * t
+            ):
+                cov = _lattice_coverage(deltas, t)
+                if cov >= 0.9:
+                    fine_scored.append((t, cov))
             continue
         # Out of band, too coarse.  A slow track's *fastest* note value can
         # still be longer than a 16th note: some drivers run 9.5k-19k samples
@@ -406,6 +420,8 @@ def estimate_grid(
                     recovered.append((ts, cov))
         if recovered:
             folded_scored.append(max(recovered))
+    if not scored:
+        scored = fine_scored
     if not scored:
         scored = folded_scored
     if not scored:

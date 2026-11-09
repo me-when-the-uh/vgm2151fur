@@ -143,6 +143,30 @@ class TestFds(unittest.TestCase):
         self.assertEqual(len(hits), 1)
         self.assertEqual(hits[0].freq, 0x444)
 
+    def test_fast_tick_lattice(self):
+        writes = []
+        for i in range(64):
+            writes.append(_write(0, "fds", 0x40 + i, (i * 3) & 0x3F))
+        writes.append(_write(0, "fds", 0x80, 0x80 | 20))
+        for i in range(100):
+            t = i * 110
+            freq = 500 + (i % 16) * 37
+            writes.append(_write(t, "fds", 0x82, freq & 0xFF))
+            writes.append(_write(t, "fds", 0x83, (freq >> 8) & 0x0F))
+        song = _vgm(
+            writes, total=100 * 110 + 1000, nes_clock=1_789_773,
+        )
+        s = analyze(song)
+        self.assertEqual(s.speed, 1)
+        self.assertGreater(s.hz, 350)
+        self.assertEqual(s.fds_count, 100)
+        mod = parse_fur(write_fur(s))
+        notes = sum(
+            1 for rows in mod.patterns.values() for r in rows
+            if r.note not in (-1, 180)
+        )
+        self.assertEqual(notes, 100)
+
     def test_conversion(self):
         mod = parse_fur(write_fur(analyze(self._song())))
         self.assertEqual(mod.chips, [0x8A])
