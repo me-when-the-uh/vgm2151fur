@@ -151,10 +151,15 @@ def collect_fds(vgm: VgmFile) -> tuple[list[FdsHit], list[str]]:
         if reg == 0x82:
             st["low"] = val
             hit = st["active"]
-            if hit is not None and not hit.freq_pts:
-                # A low-byte rewrite on its own is half a pitch write; wait for
-                # the high byte so the pair is logged once.
-                pass
+            if (
+                hit is not None
+                and not hit.freq_pts
+                and t - hit.sample_time <= FDS_SETTLE
+            ):
+                # Some drivers write $4083 (high) before $4082 (low).  The
+                # key-on therefore opened with the previous low byte; fold the
+                # paired low write into the note before it becomes audible.
+                hit.freq = current_freq(st)
             continue
         if reg == 0x83:
             old_high = st["high"]

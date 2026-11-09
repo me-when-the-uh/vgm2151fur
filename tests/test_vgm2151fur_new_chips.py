@@ -130,6 +130,19 @@ class TestFds(unittest.TestCase):
         self.assertEqual(hits[1].freq, 0x380)
         self.assertEqual(hits[1].off_sample, 400)
 
+    def test_high_byte_before_low_byte(self):
+        writes = []
+        for i in range(64):
+            writes.append(_write(0, "fds", 0x40 + i, i & 0x3F))
+        writes += [
+            _write(10, "fds", 0x80, 0x80 | 20),
+            _write(20, "fds", 0x83, 0x04),
+            _write(20, "fds", 0x82, 0x44),
+        ]
+        hits, _ = collect_fds(_vgm(writes, total=100, nes_clock=1_789_773))
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0].freq, 0x444)
+
     def test_conversion(self):
         mod = parse_fur(write_fur(analyze(self._song())))
         self.assertEqual(mod.chips, [0x8A])
