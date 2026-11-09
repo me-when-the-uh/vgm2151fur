@@ -2654,10 +2654,13 @@ def _bind_tone_instruments(
         vol_speed, vol_loop = 1, 255
         vol_delay = 0
         series: list[int] = []
-        if e.vol_pts and e.tone_chip not in (3,) and not (
+        if e.vol_pts and e.tone_chip not in (3, 11) and not (
                 e.tone_chip == 6 and e.tone_gb_wave):
             # PSG volume is the raw 4-bit register and the SMS platform reads
             # it straight from the column; a std.vol macro would scale it.
+            # X1-010 period-0 envelopes switch constant shapes to ramp the
+            # level, so those steps belong on the column too: a per-note
+            # macro would spend an instrument on every decay shape.
             # The PCE envelope benefits from the tick-rate macro: its balance
             # writes can move several times inside one pattern row.
             pts = [(e.sample, max(0, e.vol))] + [
@@ -4353,15 +4356,31 @@ def _emit_x1_wave_notes(
                 (t, env_map.get(body, env_idx))
                 for t, body in h.env_pts if env_map.get(body, env_idx) != env_idx
             )
+            levels: list[tuple[int, int]] = []
+            if period_zero:
+                # A period-0 envelope holds the first byte of whichever shape
+                # is selected, so drivers ramp the level by switching the
+                # shape register mid-note. Those shape changes are volume
+                # steps, not timbre changes.
+                levels = list(h.env_level_pts)
+                levels += [
+                    (
+                        t,
+                        (((body[0] >> 4) & 0x0F)
+                         + (body[0] & 0x0F) + 1) // 2,
+                    )
+                    for t, body in h.env_pts if body
+                ]
+                levels.sort()
             vol_pts = (
                 tuple(
                     (t, level, None)
-                    for t, level in h.env_level_pts if sst < t < bound
+                    for t, level in levels if sst < t < bound
                 )
                 if period_zero else ()
             )
             level = (
-                _value_at(h.env_level_pts, sst, initial_level)
+                _value_at(levels, sst, initial_level)
                 if period_zero else 15
             )
             mode = 1 | (2 if h.env_oneshot else 0)

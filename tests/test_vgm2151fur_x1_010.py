@@ -320,6 +320,35 @@ class TestX1Module(unittest.TestCase):
             self.assertEqual(song.x1_010_ins[e.ins].wave, e.tone_wave)
         self.assertEqual(notes[-1].tone_wave, 1)
 
+    def test_period_zero_envelope_shape_changes_become_volume_steps(self):
+        # With a zero envelope period the hardware holds the first byte of the
+        # selected shape. Drivers ramp the level by switching to another
+        # constant shape; that is a volume column step, not an instrument
+        # macro that would be stuck at the note's starting level.
+        writes: list[ChipWrite] = []
+        for i in range(128):
+            writes.append(_write(0, 0x80 + i, 0xFF))   # shape 1: level 15
+            writes.append(_write(0, 0x100 + i, 0x99))  # shape 2: level 9
+        for i in range(128):
+            writes.append(_write(
+                0, 0x1000 + i, int(80 * math.sin(2 * math.pi * i / 128)) & 0xFF,
+            ))
+        writes += [
+            _write(0, 1, 0),
+            _write(0, 2, 1845 & 0xFF),
+            _write(0, 3, (1845 >> 8) & 0xFF),
+            _write(0, 4, 0),
+            _write(0, 5, 1),
+            _write(0, 0, 3),
+            _write(3000, 5, 2),
+            _write(9000, 0, 0),
+        ]
+        song = analyze(_vgm(writes))
+        ev = [e for e in song.events if e.on and e.tone_chip == 11][0]
+        self.assertEqual(ev.vol, 15)
+        self.assertEqual(ev.vol_pts, ((3000, 9, None),))
+        self.assertFalse(any(ins.vol for ins in song.x1_010_ins))
+
     def test_period_zero_envelope_rewrites_become_volume_steps(self):
         # Replace the constant envelope with a low starting level, then
         # rewrite envelope byte 0 while the note is sounding.
@@ -330,12 +359,9 @@ class TestX1Module(unittest.TestCase):
         writes.insert(-1, _write(3_000, 0x80, 0x99))
         song = analyze(_vgm(writes))
         ev = [e for e in song.events if e.on and e.tone_chip == 11][0]
-        ins = song.x1_010_ins[ev.ins]
-        self.assertTrue(ins.vol)
-        self.assertEqual(ins.vol[0], 1)
-        self.assertIn(9, ins.vol)
-        self.assertEqual(ev.vol, 15)
-        self.assertEqual(ev.vol_pts, ())
+        self.assertEqual(ev.vol, 1)
+        self.assertEqual(ev.vol_pts, ((3000, 9, None),))
+        self.assertFalse(any(ins.vol for ins in song.x1_010_ins))
 
     def test_pitch_macros_are_not_lfo_looped(self):
         writes = _wave_setup()
