@@ -1006,9 +1006,17 @@ def apply_loop(song) -> str | None:
     )
     picked = max(fix.start_row if fix is not None else loop_row, loop_row)
     start_row = max(_copy_aligned(notes, picked, end_row, None, forward), loop_row)
-    if fix is None or start_row != fix.start_row:
+    if fix is None:
+        # A loop marker with no declared length and no repeating body: the
+        # whole remaining track is one iteration. Never invent a one-row
+        # loop, which would collapse the module to a single order.
+        return _write_loop(
+            song, start_row, end_row,
+            "loop kept; no repeat found, using the whole track",
+        )
+    if start_row != fix.start_row:
         fix = LoopFix(
-            start_row=start_row, end_row=start_row, period=0, shift_pulses=0,
-            step_rows=1,
+            start_row=start_row, end_row=fix.end_row, period=0,
+            shift_pulses=0, step_rows=1,
         )
     return _write_loop(song, start_row, fix.end_row, describe_fix(fix, loop_row))

@@ -270,6 +270,28 @@ class TestApplyAndWrite(unittest.TestCase):
         self.assertEqual(song.loop_start_row, 16)
         self.assertEqual(song.loop_end_row, 16 + length - 1)
 
+    def test_unknown_loop_length_without_a_repeat_keeps_the_whole_track(self):
+        # A VGM can carry a loop marker without a declared length. If the
+        # finder sees no repeating body, the fallback is the whole remaining
+        # track, never a one-row loop that collapses the module to one order.
+        notes = [(0, 0, 60), (16, 0, 64), (40, 0, 67), (80, 0, 60)]
+        song = Song(
+            vgm=_vgm(loop_samples=0, loop_sample=0),
+            t0=0, loop_sample=0, speed=1, hz=60.0,
+            fm_patches=[], pcm_samples=[],
+            events=[_event(row * 735, ch, pitch) for row, ch, pitch in notes],
+        )
+        apply_loop(song)
+        self.assertEqual(song.loop_start_row, 0)
+        self.assertEqual(song.loop_end_row, 80)
+        mod = parse_fur(write_fur(song, include_pcm=False, include_fm=True))
+        self.assertGreater(len(mod.orders[0]), 1)
+        self.assertGreater(
+            sum(1 for row in mod.patterns[(0, mod.orders[0][0])]
+                if row.note >= 0),
+            0,
+        )
+
     def test_apply_loop_calibrates_the_row_to_the_loop(self):
         # 100000 samples do not divide into the measured 735-sample row. The
         # written row is re-derived to make one iteration sample exact.
