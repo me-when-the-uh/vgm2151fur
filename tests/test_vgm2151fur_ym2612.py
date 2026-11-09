@@ -1067,6 +1067,14 @@ class TestYm2612Analyze(unittest.TestCase):
         # attack. EA01 lets the new instrument's macros take over without
         # resetting the voice; the next real key-on writes EA00.
         self.assertTrue(on[1].legato)
+        mod = parse_fur(write_fur(song, include_pcm=False, include_fm=True))
+        self.assertTrue(any(
+            row.note == on[1].note
+            and row.ins == on[1].ins
+            and any(cmd == 0xEA and val == 1 for cmd, val in row.fx)
+            for (ch, _pat), rows in mod.patterns.items() if ch == 4
+            for row in rows
+        ), "legato split lost the instrument change")
 
     def test_patch_load_before_key_on_does_not_split(self):
         # The patch bytes just before a key transition belong to the next

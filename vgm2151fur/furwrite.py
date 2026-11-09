@@ -3698,7 +3698,11 @@ def _build_patterns(song: Song, n_ch: int, pat_len_max: int, fx_cols: int,
         elif legato_on.pop(ev_ch, False):
             # Clear the channel's legato mode on the next normal note.
             _add_fx(cell, 0xEA, 0, fx_cols, stats)
-        if ev.ins >= 0 and not getattr(ev, "legato", False):
+        if ev.ins >= 0:
+            # A legato cell still has to name the new instrument. Furnace's
+            # DIV_CMD_LEGATO commits the patch when the instrument changed,
+            # but it never receives one if the writer leaves the column empty;
+            # a held patch swap then stays on the first timbre.
             cell.ins = ev.ins
         if ev.vol >= 0:
             if ev.vol_slide:
