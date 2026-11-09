@@ -172,6 +172,7 @@ uv run --with pytest -q python -m pytest tests/test_vgm2151fur_combo.py -q
   census, so `report --verify` on a combined module follows the arcade family
   whatever channel it is asked about. Per-family verification today happens in
   `TestMergedRips` by reading each chip's own registers.
-- An OPL4 (YMF278B) side, as in `merged_opl4_fmpcm_*.vgm`, is not emulated by
-  this tool at all; those logs keep only whatever else writes.
+- An OPL4 (YMF278B) side, as in `merged_opl4_fmpcm_*.vgm`, converts through
+  the OPL4 path; ROM wave IDs still need the `VGM2151FUR_YRW801` image and
+  RAM-only IDs need the VGM RAM dump.
 - A YM2610 or YM2608 merged with an OPL family still converts one side only.

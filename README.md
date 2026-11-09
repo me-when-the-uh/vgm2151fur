@@ -64,7 +64,7 @@ python -m vgm2151fur compare "01 Track.vgz" out/01.Track.fur --channel 4
 python -m vgm2151fur render out/01.Track.fur --loops 2
 ```
 
-`convert` writes one zlib-compressed `.fur` per input. `-o` sets the output folder (the default is a `fur/` folder beside the input). `--speed N` pins ticks per row when the automatic grid estimate is wrong, `--workers N` sets how many tracks run at once, and `--melody-only` / `--pcm-only` restrict the chips. `--no-normalize` skips the Furnace level fit and keeps the source's unity mix. `--no-lfo-loop` skips the LFO/tail loop search for long pitch macros, which is faster but leaves those macros longer; exact first-cycle loops are still detected. `--lossy-sample-clustering` opts into the experimental lossy map reduction for YM2612 DAC, SSG PCM, NES raw PCM, uPD7759 and PWM Generic PCM bodies (about 32 samples, short fragments mapped to similar long/hot ones). A folder of packs writes each pack to its own `fur/` folder, or to `-o/<pack>`. Every track prints its size, grid speed, instrument and sample counts, and any warnings.
+`convert` writes one zlib-compressed `.fur` per input. `-o` sets the output folder (the default is a `fur/` folder beside the input). `--speed N` pins ticks per row when the automatic grid estimate is wrong, `--workers N` sets how many tracks run at once, and `--melody-only` / `--pcm-only` restrict the chips. `--no-normalize` skips the Furnace level fit and keeps the source mix without the fit. `--no-lfo-loop` skips the LFO/tail loop search for long pitch macros, which is faster but leaves those macros longer; exact first-cycle loops are still detected. `--lossy-sample-clustering` opts into the experimental lossy map reduction for YM2612 DAC, SSG PCM, NES raw PCM, uPD7759, 32X PWM, MSM5205 and Mikey bodies (about 32 samples, short fragments mapped to similar long/hot ones). A folder of packs writes each pack to its own `fur/` folder, or to `-o/<pack>`. Every track prints its size, grid speed, instrument and sample counts, and any warnings.
 
 `report` prints the analysis without writing anything. Use it to see which chips a VGM uses, how the grid was estimated, and what was skipped.
 
@@ -94,7 +94,7 @@ tests/          unittest suite
 docs/           operating guide, format notes, chip notes
 ```
 
-Project state and workflow are in `docs/portable-context.md` and `docs/implementation-notes.md`. Chip details are in `docs/opm-notes.md`, `docs/ym2203.md`, `docs/ym2612.md`, `docs/ym2610.md`, `docs/opna-opll.md`, `docs/opl.md`, `docs/k053260.md`, `docs/scc-ay8910.md`, `docs/segapcm-c140.md`, `docs/c219.md`, `docs/k054539.md`, `docs/ga20.md`, `docs/msm5205.md`, `docs/msm5232.md`, `docs/ssg-pcm.md`, `docs/nes-vrc7.md`, `docs/fds.md`, `docs/gb.md`, `docs/huc6280.md`, `docs/c352.md`, `docs/ymz280b.md`, `docs/multipcm.md`, `docs/upd7759.md`, `docs/pwm32x.md`, `docs/pokey.md`, `docs/mikey.md`, `docs/x1-010.md`, `docs/wonderswan.md`, `docs/qsound.md` and `docs/vsu.md`. `docs/merged-logs.md` covers multi-family modules, and `docs/psg-open-items.md` tracks the remaining AY accuracy gaps.
+Project state and workflow are in `docs/portable-context.md` and `docs/implementation-notes.md`. Chip details are in `docs/opm-notes.md`, `docs/ym2203.md`, `docs/ym2612.md`, `docs/ym2610.md`, `docs/opna-opll.md`, `docs/opl.md`, `docs/k053260.md`, `docs/scc-ay8910.md`, `docs/segapcm-c140.md`, `docs/c219.md`, `docs/k054539.md`, `docs/ga20.md`, `docs/msm5205.md`, `docs/msm5232.md`, `docs/es5503.md`, `docs/ssg-pcm.md`, `docs/nes-vrc7.md`, `docs/fds.md`, `docs/gb.md`, `docs/huc6280.md`, `docs/c352.md`, `docs/ymz280b.md`, `docs/multipcm.md`, `docs/upd7759.md`, `docs/pwm32x.md`, `docs/pokey.md`, `docs/mikey.md`, `docs/x1-010.md`, `docs/wonderswan.md`, `docs/qsound.md`, `docs/vsu.md`, `docs/saa1099.md` and `docs/t6w28.md`. `docs/merged-logs.md` covers multi-family modules, and `docs/psg-open-items.md` tracks the remaining AY accuracy gaps.
 
 Open follow-ups are tracked in [TODO.md](./TODO.md).
 
@@ -143,7 +143,8 @@ Open follow-ups are tracked in [TODO.md](./TODO.md).
 - Ensoniq ES5503 converts up to 32 oscillators, each on its own Generic PCM DAC system.
   - Wave RAM (data block `0xE1`) is reconstructed and each 8-bit body stops at the chip's `0x00` terminator.
   - Playback rate follows `output_rate * freq / 2^(9 + resolution - size_class)`; the most common rate per body is the C-4 reference, then note/E5 carries each hit's exact pitch.
-  - Volume stays the source's linear 0-255 value, and the control-register output mask becomes `08xy` panning. Sync/AM and swap modes are approximated as one-shot with a warning.
+  - Volume stays the source's linear 0-255 value and the control-register output mask becomes `08xy` panning; each DAC system stays at 1.0 and the module master carries the VGM main-volume gain.
+  - Sync/AM and swap modes are approximated as one-shot with a warning.
 - RF5C68 and RF5C164 share one Furnace system selected by `chipType`, and a looping SSG PCM DAC stream plays once because the AY sample instrument is one-shot.
 - SN76489 converts as four channels, and extreme periods or two notes on the same channel/row are approximated.
   - The default system volume is 0.500, and an absolute VGM extra-header volume entry still overrides it.
