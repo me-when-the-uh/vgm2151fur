@@ -2497,12 +2497,17 @@ def _bind_tone_instruments(
                 e.sweep_div = 2.0
                 e.e5_lo = 0x00
                 e.e5_hi = 0xFF
-        elif e.tone_chip in (3, 6) and e.tone_pitch_pts and not e.tone_noise:
-            # SN76489 and Game Boy drivers play legato melodies and arpeggios
-            # by rewriting the period without a gate/trigger. A 254-entry
-            # pitch macro turns that into a coarse staircase; when the writes
-            # fit the row grid, keep them as E8/E9/E5 pitch steps instead.
-            # Dense sub-row vibrato still falls through to the macro path.
+        elif (
+            e.tone_chip in (3, 6, 11)
+            and e.tone_pitch_pts and not e.tone_noise
+        ):
+            # SN76489, Game Boy and X1-010 drivers play legato melodies,
+            # arpeggios and slides by rewriting the period/frequency without
+            # a gate/trigger. A 254-entry pitch macro turns that into a
+            # coarse staircase and spends one instrument per trajectory;
+            # when the writes fit the row grid, keep them as E8/E9/E5 pitch
+            # steps instead. Dense sub-row vibrato still falls through to
+            # the macro path.
             row_len = tick_samples * max(1, use_speed)
             rows = {
                 int((t - e.sample) // row_len)

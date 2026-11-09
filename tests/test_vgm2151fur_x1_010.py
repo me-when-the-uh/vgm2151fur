@@ -255,22 +255,70 @@ class TestX1Module(unittest.TestCase):
         self.assertEqual(len(song.x1_waves), 1)
         self.assertEqual(len(song.x1_envs), 1)
 
-    def test_pitch_points_stay_in_register_units(self):
+    def test_pitch_point_becomes_a_row_step(self):
         writes = _wave_setup()
-        # A mid-note retune.  The collector and NoteEvent keep the raw 16-bit
-        # register; only the instrument builder converts it to pitch offsets.
+        # A mid-note retune. The collector and NoteEvent keep the raw 16-bit
+        # register; when the write has its own row the builder emits an
+        # E8/E9/E5 step instead of spending an instrument on the macro.
         writes[-1:] = [
             _write(3000, 2, 1900 & 0xFF),
             _write(3000, 3, (1900 >> 8) & 0xFF),
         ] + writes[-1:]
         song = analyze(_vgm(writes))
         ev = [e for e in song.events if e.on and e.tone_chip == 11][0]
-        self.assertEqual(ev.tone_pitch_pts, ((3000, 1900),))
-        self.assertLess(
-            max((abs(v) for ins in song.x1_010_ins for v in ins.pitch),
-                default=0),
-            2000,
+        self.assertEqual(ev.tone_pitch_pts, ())
+        self.assertEqual(ev.pitch_steps, ((3000, 32),))
+        self.assertEqual(ev.sweep_div, 2.0)
+        self.assertFalse(any(ins.pitch for ins in song.x1_010_ins))
+
+    def test_row_slides_do_not_spend_the_instrument_budget(self):
+        # Each note writes a unique pitch trajectory. Keeping those as
+        # instrument macros fills the 250-slot budget and a later note on a
+        # different waveform falls back to the first instrument (the wrong
+        # wave). Row steps leave one instrument per waveform.
+        writes: list[ChipWrite] = []
+        for i in range(128):
+            writes.append(_write(0, 0x80 + i, 0xFF))
+        wave0 = bytes(
+            int(96 * math.sin(2 * math.pi * i / 128)) & 0xFF
+            for i in range(128)
         )
+        wave1 = bytes((i * 2 - 128) & 0xFF for i in range(128))
+        for wave, body in ((0, wave0), (1, wave1)):
+            for i, value in enumerate(body):
+                writes.append(_write(0, 0x1000 + wave * 128 + i, value))
+        count = 260
+        for i in range(count):
+            start = 4000 + i * 4000
+            wave = 1 if i == count - 1 else 0
+            base = 1800
+            a = (i % 7) + 1
+            b = ((i // 7) % 7) + 1
+            c = ((i // 49) % 7) + 1
+            writes += [
+                _write(start, 1, wave),
+                _write(start, 2, base & 0xFF),
+                _write(start, 3, (base >> 8) & 0xFF),
+                _write(start, 4, 10),
+                _write(start, 5, 1),
+                _write(start, 0, 3),
+            ]
+            for j, offset in enumerate((a, a + b, a + b + c)):
+                freq = base + offset * 5
+                writes += [
+                    _write(start + 800 * (j + 1), 2, freq & 0xFF),
+                    _write(start + 800 * (j + 1), 3, (freq >> 8) & 0xFF),
+                ]
+            writes.append(_write(start + 3600, 0, 0))
+        song = analyze(_vgm(writes, total=4000 + count * 4000 + 1000))
+        notes = [e for e in song.events if e.on and e.tone_chip == 11]
+        self.assertEqual(len(notes), count)
+        self.assertLessEqual(len(song.x1_010_ins), 2)
+        self.assertFalse(any(ins.pitch for ins in song.x1_010_ins))
+        self.assertTrue(all(e.pitch_steps for e in notes))
+        for e in notes:
+            self.assertEqual(song.x1_010_ins[e.ins].wave, e.tone_wave)
+        self.assertEqual(notes[-1].tone_wave, 1)
 
     def test_period_zero_envelope_rewrites_become_volume_steps(self):
         # Replace the constant envelope with a low starting level, then
