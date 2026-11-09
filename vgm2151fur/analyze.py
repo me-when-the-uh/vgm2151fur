@@ -3484,6 +3484,20 @@ MACRO_MAX = 255
 # passes that append copies; INS_HARD_LIMIT is the absolute ceiling.
 INS_TARGET = 250
 INS_HARD_LIMIT = 0xFF
+# A pattern stores the instrument as one byte, and 0xFF is the empty marker.
+# Keep the base OPN timbres below that with room for the sample/tone groups
+# the writer appends after the FM block.
+OPN_BASE_INS_CAP = 220
+
+
+def _opn_reuse_key(snap, patches, patch_order):
+    """A space-safe existing OPN patch for a note past the base timbre cap."""
+    alg = snap.alg & 7
+    for key in patch_order:
+        patch = patches.get(key)
+        if patch is not None and (patch.alg & 7) == alg:
+            return key
+    return patch_order[0]
 
 
 def _tick_values(
@@ -5724,6 +5738,34 @@ def _trim_fm_macro_copies(
             seen.add(base)
             base = removed[base]
         removed[idx] = base
+    for e in events:
+        if e.ins in removed:
+            e.ins = removed[e.ins]
+    return len(removed)
+
+
+def _trim_fm_base_patches(
+    events: list[NoteEvent], fm_patches: list[FMPatch], limit: int,
+) -> int:
+    """Fold excess base FM timbres onto an earlier patch.
+
+    A one-byte pattern instrument cannot address more than the hard limit.
+    Unlike `_trim_fm_macro_copies`, this can drop base timbres, so it only
+    runs as the final ceiling after the family caps and macro-copy folding.
+    """
+    removed: dict[int, int] = {}
+    while len(fm_patches) > max(1, limit):
+        idx = len(fm_patches) - 1
+        alg = fm_patches[idx].alg & 7
+        base = 0
+        for j in range(idx):
+            if (fm_patches[j].alg & 7) == alg:
+                base = j
+                break
+        removed[idx] = base
+        fm_patches.pop()
+    if not removed:
+        return 0
     for e in events:
         if e.ins in removed:
             e.ins = removed[e.ins]
@@ -8575,9 +8617,12 @@ def analyze(
             snap = states[cid].snapshot(ch, mask)
             key = snap.identity() + (mask,)
             if key not in patches:
-                snap.name = f"OPN {len(patch_order):02d}"
-                patches[key] = snap
-                patch_order.append(key)
+                if len(patch_order) >= OPN_BASE_INS_CAP:
+                    key = _opn_reuse_key(snap, patches, patch_order)
+                else:
+                    snap.name = f"OPN {len(patch_order):02d}"
+                    patches[key] = snap
+                    patch_order.append(key)
             p = patches[key]
             p.uses += 1
             return patch_order.index(key)
@@ -8989,9 +9034,12 @@ def analyze(
             snap, vol = normalized_patch(states[cid].snapshot(ch, mask))
             key = snap.identity() + (mask,)
             if key not in patches:
-                snap.name = f"OPN {len(patch_order):02d}"
-                patches[key] = snap
-                patch_order.append(key)
+                if len(patch_order) >= OPN_BASE_INS_CAP:
+                    key = _opn_reuse_key(snap, patches, patch_order)
+                else:
+                    snap.name = f"OPN {len(patch_order):02d}"
+                    patches[key] = snap
+                    patch_order.append(key)
             p = patches[key]
             p.uses += 1
             return patch_order.index(key), vol
@@ -9683,9 +9731,12 @@ def analyze(
             snap, vol = normalized_patch(states[cid].snapshot(ch, mask))
             key = snap.identity() + (mask,)
             if key not in patches:
-                snap.name = f"OPN {len(patch_order):02d}"
-                patches[key] = snap
-                patch_order.append(key)
+                if len(patch_order) >= OPN_BASE_INS_CAP:
+                    key = _opn_reuse_key(snap, patches, patch_order)
+                else:
+                    snap.name = f"OPN {len(patch_order):02d}"
+                    patches[key] = snap
+                    patch_order.append(key)
             p = patches[key]
             p.uses += 1
             return patch_order.index(key), vol
@@ -14094,6 +14145,17 @@ def analyze(
             f"instrument limit: folded {dropped_copies} FM macro copy/copies "
             f"back onto their base voices to stay within {INS_HARD_LIMIT} slots"
         )
+    if len(fm_list) + non_fm_ins > INS_HARD_LIMIT:
+        old_fm_count = len(fm_list)
+        dropped_base = _trim_fm_base_patches(
+            events, fm_list, max(1, INS_HARD_LIMIT - non_fm_ins),
+        )
+        if dropped_base:
+            _rebase_non_fm_ins(events, old_fm_count, len(fm_list))
+            warnings.append(
+                f"instrument limit: folded {dropped_base} base FM timbre(s) "
+                f"onto earlier patches to stay within {INS_HARD_LIMIT} slots"
+            )
     n_total_ins = len(fm_list) + non_fm_ins
     if n_total_ins > INS_HARD_LIMIT:
         warnings.append(
