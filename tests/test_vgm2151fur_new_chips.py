@@ -190,6 +190,22 @@ class TestWonderSwan(unittest.TestCase):
         ]
         return _vgm(writes, total=300, wonderswan_clock=3_072_000)
 
+    def test_semitone_pitch_jump_splits_note(self):
+        writes = [
+            _write(0, "wonderswan", 0x90, 0x01),
+            _write(0, "wonderswan", 0x88, 0x88),
+            _write(1, "wonderswan", 0x80, 0xE0),  # period 32
+            _write(2, "wonderswan", 0x81, 0x07),
+            _write(500, "wonderswan", 0x80, 0xDE),  # period 34 (~1 semitone up)
+            _write(501, "wonderswan", 0x81, 0x07),
+        ]
+        hits, _pcm, _ = collect_wonderswan(
+            _vgm(writes, total=900, wonderswan_clock=3_072_000)
+        )
+        self.assertEqual(len(hits), 2)
+        self.assertEqual(hits[0].period, 32)
+        self.assertEqual(hits[1].period, 34)
+
     def test_wave_note_and_cut(self):
         hits, pcm, _ = collect_wonderswan(self._wave_song())
         self.assertEqual(len(hits), 1)

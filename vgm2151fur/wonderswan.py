@@ -8,6 +8,7 @@ many rips use a mirrored ``0x8000+`` address.
 
 from __future__ import annotations
 
+import math
 from collections import Counter
 from dataclasses import dataclass, field
 
@@ -18,8 +19,10 @@ WS_PITCH_DIVIDER = 32
 WS_MAX_PERIOD = 0x800
 WS_WAVE_LEN = 32
 WS_VOICES = 4
-# A period jump this large (1/64 semitone) is a new note, not a bend.
-WS_NOTE_JUMP = 48
+# A musical pitch jump this large is a new note, not a bend.  Comparing
+# period registers directly is wrong: one unit near period 32 is a semitone,
+# while near period 2000 it is a few cents.
+WS_NOTE_JUMP_ST = 0.9
 WS_MIN_NOTE = 48
 # A level jump this large while the gate stays open is a retriggered drum or
 # a new note.  Hard-left/hard-right flips are also separate hits even when the
@@ -160,6 +163,8 @@ def collect_wonderswan(
                     "vol_r": 0,
                     "active": None,
                     "last_note_t": -1,
+                    "last_period_t": -100000,
+                    "last_vol_t": -100000,
                 }
                 for _ in range(WS_VOICES)
             ],
@@ -272,7 +277,11 @@ def collect_wonderswan(
             last_per = (
                 hit.period_pts[-1][1] if hit.period_pts else hit.period
             )
-            if abs(per - last_per) >= WS_NOTE_JUMP:
+            if when - hit.sample_time <= WS_SETTLE and not hit.period_pts:
+                hit.period = per
+            elif abs(12.0 * math.log2(max(1, per) / max(1, last_per))) >= (
+                WS_NOTE_JUMP_ST
+            ):
                 close(cid, voice, when, off=True)
                 open_hit(cid, voice, when)
             elif per != last_per:
@@ -437,20 +446,18 @@ def collect_wonderswan(
             # 0x80/0x81 voice 0, 0x82/0x83 voice 1, 0x84/0x85 voice 2,
             # 0x86/0x87 voice 3.  Even is the low byte, odd the high byte.
             voice = (reg - 0x80) // 2
+            ch = st["ch"][voice]
             if (reg - 0x80) % 2 == 0:
-                st["ch"][voice]["period_raw"] = (
-                    (st["ch"][voice]["period_raw"] & 0xFF00) | val
-                )
+                ch["period_raw"] = (ch["period_raw"] & 0xFF00) | val
             else:
-                st["ch"][voice]["period_raw"] = (
-                    (st["ch"][voice]["period_raw"] & 0x00FF) | (val << 8)
-                )
+                ch["period_raw"] = (ch["period_raw"] & 0x00FF) | (val << 8)
             refresh(cid, voice, t)
             continue
         if 0x88 <= reg <= 0x8B:
             voice = reg - 0x88
-            st["ch"][voice]["vol_l"] = (val >> 4) & 0x0F
-            st["ch"][voice]["vol_r"] = val & 0x0F
+            ch = st["ch"][voice]
+            ch["vol_l"] = (val >> 4) & 0x0F
+            ch["vol_r"] = val & 0x0F
             refresh(cid, voice, t)
             continue
         if reg == 0x8C:
