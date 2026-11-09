@@ -9190,6 +9190,11 @@ def analyze(
                 sweep_div=2.0,
                 e5_lo=0x00,
                 e5_hi=0xFF,
+                # The driver changed the patch under a held key, not a new
+                # attack. EA01 lets the new instrument's macros take over
+                # without resetting the voice; the next real key-on writes
+                # EA00 and restores normal note handling.
+                legato=True,
             ))
             held_idx[key] = len(events) - 1
             pitch_base[key] = (block, fnum)

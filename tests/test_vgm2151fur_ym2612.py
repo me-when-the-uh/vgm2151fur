@@ -1063,6 +1063,10 @@ class TestYm2612Analyze(unittest.TestCase):
         self.assertEqual(on[0].end, t)
         self.assertNotEqual(on[0].ins, on[1].ins)
         self.assertEqual(song.fm_patches[on[1].ins].alg, 2)
+        # The key stayed down: the patch swap is a legato split, not a new
+        # attack. EA01 lets the new instrument's macros take over without
+        # resetting the voice; the next real key-on writes EA00.
+        self.assertTrue(on[1].legato)
 
     def test_patch_load_before_key_on_does_not_split(self):
         # The patch bytes just before a key transition belong to the next
