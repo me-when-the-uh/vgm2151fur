@@ -27,6 +27,7 @@ from vgm2151fur.opl import (
 from vgm2151fur.pcm import pcm7_to_s8, scale_pcm7
 from vgm2151fur.mikey import MIKEY_VOICES
 from vgm2151fur.x1_010 import X1_CHANNELS
+from vgm2151fur.qsound import QSOUND_ADPCM_NIBBLE_RATE
 from vgm2151fur.pitch import FURNACE_CLOCK_DEFAULT, module_clock
 from vgm2151fur.pokey import POKEY_VOICES
 from vgm2151fur.saa1099 import (
@@ -127,6 +128,15 @@ INS_MIKEY = 23
 # DIV_SYSTEM_X1_010: Seta/Allumer X1-010, sixteen wavetable/PCM voices.
 CHIP_X1_010 = 0xB0
 INS_X1_010 = 25
+# DIV_SYSTEM_FDS: one 64-step wavetable voice.
+CHIP_FDS = 0x8A
+INS_FDS = 15
+# DIV_SYSTEM_SWAN: four wavetable/PCM voices.
+CHIP_SWAN = 0x96
+INS_SWAN = 22
+# DIV_SYSTEM_QSOUND: sixteen PCM and three ADPCM voices.
+CHIP_QSOUND = 0xE0
+INS_QSOUND = 40
 # DIV_SYSTEM_SAA1099: six square/noise voices, no software timers.  A pair of
 # these is the Creative Music System / Game Blaster.
 CHIP_SAA1099 = 0x97
@@ -303,6 +313,7 @@ SMP_DEPTH_ADPCM_K = 7
 SMP_DEPTH_ADPCM_A = 5
 SMP_DEPTH_ADPCM_B = 6
 SMP_DEPTH_YMZ_ADPCM = 3
+SMP_DEPTH_QSOUND_ADPCM = 4
 SMP_DEPTH_8BIT = 8
 SMP_DEPTH_12BIT = 12
 SMP_DEPTH_16BIT = 16
@@ -316,6 +327,10 @@ _DEFAULT_RENDER_MASKS = (
 # engine's C-4 reference is a hair sharp, so a 22050 Hz sample exports as
 # 22073.  Compensate at write time so the DAC clock matches the source.
 DAC_RATE_COMPENSATION = 22050.0 / 22073.0
+# WonderSwan native sample channel: at note 108 the period table yields 183
+# and the platform computes dacRate = (clock/2)/(off*183).  Store the rate
+# that makes that expression equal the reconstructed source rate.
+WS_PCM_RATE_COMPENSATION = 2.0 * 183.0 * 8363.0 / 3072000.0
 # Furnace keeps oldCenterRate=true (8363 Hz), while the linear-pitch C-4
 # reference is 440 * 2^(4.25) = 8372.  ADPCM-B's rate is derived through
 # calcFreq, so its stored centerRate needs the 8372/8363 correction.
@@ -337,8 +352,11 @@ _DEV_DEFAULT_VOLUME = {
     0x00: 0x80,
     0x03: 0x100, 0x04: 0x180, 0x08: 0x100, 0x12: 0x100, 0x16: 0x11E,
     0x18: 0x100, 0x19: 0xA0, 0x1C: 0x100, 0x1D: 0x100, 0x27: 0x40,
+    0x14: 0xC0,  # NES APU family; the FDS shares its output stage
     0x0F: 0x100, 0x22: 0x100, 0x1E: 0x100,  # VSU, POKEY
     0x26: 0x100,  # Seta X1-010
+    0x1F: 0x100,  # Capcom QSound
+    0x21: 0x100,  # Bandai WonderSwan
     0x11: 0xE0,  # Sega 32X PWM
     0x15: 0x40,  # YMW258-F / MultiPCM
 }
@@ -365,12 +383,16 @@ _FURNACE_VOLUME_SCALE = {
     # VBOY's core has a 6x post-amp.  Measured against VGMPlay on Galactic
     # Pinball and Jack Bros: the module is about 2.2x quieter at unity.
     0x22: 2.2,
+    # QSound and WonderSwan are about 3.3x and 6x quieter than the player's
+    # default mix in Furnace; FDS is 1.74x quieter.
+    0x1F: 3.3, 0x21: 6.0, 0x14: 1.74,
 }
 # MSM6258's player default is 0x11E; its Furnace core is 1.64x louder, so
 # 0.61 lands the sample at the source level. The MSM6295 (0x18) is unity.
 _CHIP_DEV = {CHIP_YM2151: 0x03, CHIP_SEGAPCM: 0x04, CHIP_MSM6295: 0x18,
              CHIP_MSM6258: 0x16, CHIP_C140: 0x1C, CHIP_C352: 0x27,
              CHIP_K053260: 0x1D, CHIP_YMZ280B: 0x0F, CHIP_VBOY: 0x22,
+             CHIP_QSOUND: 0x1F, CHIP_SWAN: 0x21, CHIP_FDS: 0x14,
              CHIP_SMS: 0x00, CHIP_T6W28: 0x00,
              CHIP_K051649: 0x19, CHIP_K052539: 0x19,
              CHIP_AY8910: 0x12,
@@ -1411,6 +1433,167 @@ def _write_ins_nes(b: Buf, name: str, ins=None) -> None:
     b.b[na_size:na_size + 2] = int(len(b.b) - na_start).to_bytes(2, "little")
     _write_tone_macros(b, ins or ToneIns(), wave=False)
     b.raw(b"EN")
+    b.end_block(size_off, start)
+
+
+def _write_ins_fds(
+    b: Buf, name: str, ins, mod_table: bytes, wave_index: int = 0,
+) -> None:
+    """DIV_INS_FDS: 64x6-bit wave plus the FD modulation table."""
+    size_off, start = b.begin_block(b"INS2")
+    b.u16(FUR_VERSION)
+    b.u16(INS_FDS)
+    b.raw(b"NA")
+    na_size = len(b.b)
+    b.u16(0)
+    na_start = len(b.b)
+    b.strz(name)
+    b.b[na_size:na_size + 2] = int(len(b.b) - na_start).to_bytes(2, "little")
+    b.raw(b"FD")
+    fd_size = len(b.b)
+    b.u16(0)
+    fd_start = len(b.b)
+    b.u32(max(0, int(getattr(ins, "fds_mod_speed", 0))) & 0xFFFFFFFF)
+    b.u32(max(0, int(getattr(ins, "fds_mod_depth", 0))) & 0xFFFFFFFF)
+    b.u8(0)
+    b.raw(bytes((mod_table + bytes(32))[:32]))
+    b.b[fd_size:fd_size + 2] = int(len(b.b) - fd_start).to_bytes(2, "little")
+    if wave_index >= 0:
+        b.raw(b"WS")
+        ws_size = len(b.b)
+        b.u16(0)
+        ws_start = len(b.b)
+        b.u32(wave_index)
+        b.u32(wave_index)
+        b.u8(1)   # rateDivider
+        b.u8(0)   # effect: none
+        b.u8(1)   # enabled
+        b.u8(0)   # global
+        b.u8(0)   # speed
+        b.u8(0)   # param1
+        b.u8(0)   # param2
+        b.u8(0)   # param3
+        b.u8(0)   # param4
+        b.b[ws_size:ws_size + 2] = int(len(b.b) - ws_start).to_bytes(2, "little")
+    macro_ins = ins
+    if getattr(ins, "waves", ()):
+        offset = wave_index - max(0, int(getattr(ins, "wave", 0)))
+        macro_ins = replace(
+            ins, waves=tuple(offset + int(v) for v in ins.waves),
+        )
+    _write_tone_macros(b, macro_ins, wave=True)
+    b.raw(b"EN")
+    b.end_block(size_off, start)
+
+
+def _write_ins_swan(
+    b: Buf, name: str, ins, wave_index: int = 0,
+) -> None:
+    """DIV_INS_SWAN: 32x4-bit wavetable with volume/pitch/pan macros."""
+    size_off, start = b.begin_block(b"INS2")
+    b.u16(FUR_VERSION)
+    b.u16(INS_SWAN)
+    b.raw(b"NA")
+    na_size = len(b.b)
+    b.u16(0)
+    na_start = len(b.b)
+    b.strz(name)
+    b.b[na_size:na_size + 2] = int(len(b.b) - na_start).to_bytes(2, "little")
+    b.raw(b"WS")
+    ws_size = len(b.b)
+    b.u16(0)
+    ws_start = len(b.b)
+    b.u32(wave_index)
+    b.u32(wave_index)
+    b.u8(1)   # rateDivider
+    b.u8(0)   # effect: none
+    b.u8(1)   # enabled
+    b.u8(0)   # global
+    b.u8(0)   # speed
+    b.u8(0)   # param1
+    b.u8(0)   # param2
+    b.u8(0)   # param3
+    b.u8(0)   # param4
+    b.b[ws_size:ws_size + 2] = int(len(b.b) - ws_start).to_bytes(2, "little")
+    macro_ins = ins
+    if getattr(ins, "waves", ()):
+        offset = wave_index - max(0, int(getattr(ins, "wave", 0)))
+        macro_ins = replace(
+            ins, waves=tuple(offset + int(v) for v in ins.waves),
+        )
+    _write_tone_macros(b, macro_ins, wave=True)
+    b.raw(b"EN")
+    b.end_block(size_off, start)
+
+
+def _write_ins_qsound(b: Buf, name: str, ins) -> None:
+    """DIV_INS_QSOUND: one sample body with volume/pitch macros."""
+    size_off, start = b.begin_block(b"INS2")
+    b.u16(FUR_VERSION)
+    b.u16(INS_QSOUND)
+    b.raw(b"NA")
+    na_size = len(b.b)
+    b.u16(0)
+    na_start = len(b.b)
+    b.strz(name)
+    b.b[na_size:na_size + 2] = int(len(b.b) - na_start).to_bytes(2, "little")
+    b.raw(b"SM")
+    sm_size = len(b.b)
+    b.u16(0)
+    sm_start = len(b.b)
+    b.u16(max(0, int(getattr(ins, "sample", 0))))
+    b.u8(0x00)  # QSound reads initSample; useSample is not required
+    b.u8(0)
+    b.b[sm_size:sm_size + 2] = int(len(b.b) - sm_start).to_bytes(2, "little")
+    # MA: volume and pitch; the platform's pan/echo effects ride the pattern.
+    moving = bool(getattr(ins, "vol", ()) or getattr(ins, "pitch", ()))
+    if moving:
+        b.raw(b"MA")
+        ma_size = len(b.b)
+        b.u16(0)
+        ma_start = len(b.b)
+        b.u16(8)
+        if getattr(ins, "vol", ()):
+            width = 2
+            _write_macro(
+                b, 0, ins.vol, speed=ins.vol_speed, loop=ins.vol_loop,
+                delay=getattr(ins, "vol_delay", 0), width=width,
+            )
+        if getattr(ins, "pitch", ()):
+            _write_macro(
+                b, 4, ins.pitch, speed=ins.pitch_speed, loop=ins.pitch_loop,
+                delay=getattr(ins, "pitch_delay", 0), width=2,
+            )
+        b.u8(255)
+        b.b[ma_size:ma_size + 2] = int(len(b.b) - ma_start).to_bytes(2, "little")
+    else:
+        _write_ma(b)
+    b.raw(b"EN")
+    b.end_block(size_off, start)
+
+
+def _write_sample_qsound_adpcm(
+    b: Buf, name: str, data: bytes, rate: int,
+) -> None:
+    """QSound 4-bit ADPCM body. ``samples`` is a nibble count."""
+    count = len(data) * 2
+    size_off, start = b.begin_block(b"SMP2")
+    b.strz(name)
+    b.u32(count)
+    b.u32(rate)
+    b.u32(rate)
+    b.u8(SMP_DEPTH_QSOUND_ADPCM)
+    b.u8(0)
+    b.u8(0)
+    b.u8(0)
+    b.s32(-1)
+    b.s32(-1)
+    # Bank 1 is the QSound ADPCM sample bank (`renderOn[1]`).
+    b.u32(0)
+    b.u32(0xFFFFFFFF)
+    b.u32(0)
+    b.u32(0)
+    b.raw(data)
     b.end_block(size_off, start)
 
 
@@ -4442,6 +4625,9 @@ def write_fur(
         or getattr(song, "pokey_ids", ())
         or getattr(song, "mikey_ids", ())
         or getattr(song, "x1_010_ids", ())
+        or getattr(song, "fds_ids", ())
+        or getattr(song, "wonderswan_ids", ())
+        or getattr(song, "qsound_ids", ())
         # YMZ280B is a sample engine with real module columns; a YMZ-only log
         # must not gain an empty YM2151 placeholder above it.
         or getattr(song, "ymz280b_samples", ())
@@ -4624,6 +4810,19 @@ def write_fur(
     pokey_specs = list(getattr(song, "pokey_ins", ()) or ())
     mikey_specs = list(getattr(song, "mikey_ins", ()) or ())
     x1_specs = list(getattr(song, "x1_010_ins", ()) or ())
+    fds_ids = list(getattr(song, "fds_ids", ()) or ())
+    fds_specs = list(getattr(song, "fds_ins", ()) or ())
+    fds_waves = list(getattr(song, "fds_waves", ()) or ())
+    fds_mod_waves = list(getattr(song, "fds_mod_waves", ()) or ())
+    wonderswan_ids = list(getattr(song, "wonderswan_ids", ()) or ())
+    wonderswan_specs = list(getattr(song, "wonderswan_ins", ()) or ())
+    wonderswan_waves = list(getattr(song, "wonderswan_waves", ()) or ())
+    wonderswan_pcm_smps = list(
+        getattr(song, "wonderswan_pcm_samples", ()) or ()
+    )
+    qsound_ids = list(getattr(song, "qsound_ids", ()) or ())
+    qsound_specs = list(getattr(song, "qsound_ins", ()) or ())
+    qsound_smps = list(getattr(song, "qsound_samples", ()) or ())
     scc_chip = CHIP_K052539 if song.vgm.k051649_plus else CHIP_K051649
     n_scc = 5 * len(scc_ids)
     n_ay = 3 * len(ay_ids)
@@ -4636,6 +4835,9 @@ def write_fur(
     n_pokey = 4 * len(pokey_ids)
     n_mikey = 4 * len(mikey_ids)
     n_x1 = X1_CHANNELS * len(x1_ids)
+    n_fds = len(fds_ids)
+    n_wonderswan = 4 * len(wonderswan_ids)
+    n_qsound = 19 * len(qsound_ids)
     n_nes_dpcm_ins = len(nes_dpcm_smps)
     n_nes_pcm_ins = (len(nes_pcm_smps) + 119) // 120
     n_huc6280_pcm_ins = len(huc6280_pcm_smps)
@@ -4683,7 +4885,7 @@ def write_fur(
         + 28 * len(multipcm_ids) + len(upd7759_ids)
         + 2 * len(pwm_ids)
         + n_scc + n_ay + n_nes + n_huc6280 + n_gb + n_vsu + n_saa
-        + n_pokey + n_mikey + n_x1
+        + n_pokey + n_mikey + n_x1 + n_fds + n_wonderswan + n_qsound
     )
     if n_ch == 0:
         raise ValueError("write_fur: need include_fm and/or include_pcm")
@@ -4720,16 +4922,20 @@ def write_fur(
         + len(nes_dpcm_smps) + len(nes_pcm_smps) + len(huc6280_pcm_smps)
         + len(ymz_smps) + len(multipcm_smps) + len(upd7759_smps)
         + len(pwm_smps) + len(mikey_smps) + len(x1_smps)
+        + len(qsound_smps) + len(wonderswan_pcm_smps)
     )
     n_wav = (
         len(scc_waves) + len(huc6280_waves) + len(gb_waves) + len(vsu_waves)
         + len(x1_waves) + len(x1_envs)
+        + len(fds_waves) + len(wonderswan_waves)
     )
     # The VSU's 10xx effects name a wavetable in the module-wide list.  Keep
     # the block order in step with the index the patterns use.
     vsu_wave_base = len(scc_waves) + len(huc6280_waves) + len(gb_waves)
     x1_wave_base = vsu_wave_base + len(vsu_waves)
     x1_env_base = x1_wave_base + len(x1_waves)
+    fds_wave_base = x1_env_base + len(x1_envs)
+    wonderswan_wave_base = fds_wave_base + len(fds_waves)
 
     # Analysis numbers sample-chip channels after the FM block. With no FM
     # they shift down to stay inside n_ch.
@@ -4806,7 +5012,9 @@ def write_fur(
     upd7759_smp_base = multipcm_smp_base + len(multipcm_smps)
     pwm_smp_base = upd7759_smp_base + len(upd7759_smps)
     mikey_smp_base = pwm_smp_base + len(pwm_smps)
-    x1_smp_base = mikey_smp_base + len(mikey_smps)
+    wonderswan_pcm_smp_base = mikey_smp_base + len(mikey_smps)
+    qsound_smp_base = wonderswan_pcm_smp_base + len(wonderswan_pcm_smps)
+    x1_smp_base = qsound_smp_base + len(qsound_smps)
     n_ins = (
         len(fm_ins) + n_dac_ins + len(pcm_smps) + len(oki_smps) + n_adpcm_ins
         + len(spcm_smps) + len(rf5c68_smps) + len(rf5c164_smps)
@@ -4816,11 +5024,12 @@ def write_fur(
         + n_y8950_b_ins + n_opl4_wave_ins + n_ssg_pcm_ins
         + n_nes_dpcm_ins + n_nes_pcm_ins + n_huc6280_pcm_ins
         + len(ymz_smps) + len(multipcm_smps) + n_upd_ins + n_pwm_ins
-        + n_mikey_ins + n_x1_ins
+        + n_mikey_ins + len(wonderswan_pcm_smps) + n_x1_ins
         + len(scc_specs) + len(ay_specs) + len(psg_specs) + len(nes_specs)
         + len(huc6280_specs) + len(gb_specs) + len(vsu_specs)
         + len(saa_specs) + len(pokey_specs) + len(mikey_specs)
-        + len(x1_specs)
+        + len(x1_specs) + len(fds_specs) + len(wonderswan_specs)
+        + len(qsound_specs)
     )
     n_smp = (
         len(pcm_smps) + len(oki_smps) + len(adpcm_smps)
@@ -4832,6 +5041,7 @@ def write_fur(
         + len(nes_dpcm_smps) + len(nes_pcm_smps) + len(huc6280_pcm_smps)
         + len(ymz_smps) + len(multipcm_smps) + len(upd7759_smps)
         + len(pwm_smps) + len(mikey_smps) + len(x1_smps)
+        + len(qsound_smps) + len(wonderswan_pcm_smps)
     )
 
     n_ord = len(orders[0]) if orders else 1
@@ -4971,6 +5181,20 @@ def write_fur(
         for voice in range(X1_CHANNELS):
             names_long.append(f"X1-010 {cid + 1}-{voice + 1}")
             names_short.append(f"X1{cid + 1}-{voice + 1}")
+    for cid in fds_ids:
+        names_long.append(f"FDS ({cid + 1})")
+        names_short.append(f"FDS{cid + 1}")
+    for cid in wonderswan_ids:
+        for voice in range(4):
+            names_long.append(f"WonderSwan {voice + 1} ({cid + 1})")
+            names_short.append(f"WS{cid + 1}-{voice + 1}")
+    for cid in qsound_ids:
+        for voice in range(16):
+            names_long.append(f"QSound PCM {voice + 1} ({cid + 1})")
+            names_short.append(f"QS{cid + 1}-{voice + 1}")
+        for voice in range(3):
+            names_long.append(f"QSound ADPCM {voice + 1} ({cid + 1})")
+            names_short.append(f"QA{cid + 1}-{voice + 1}")
 
     label_parts: list[str] = []
     if fm_present:
@@ -5069,6 +5293,12 @@ def write_fur(
         label_parts.append(
             "Seta X1-010 x2" if len(x1_ids) > 1 else "Seta X1-010"
         )
+    if fds_ids:
+        label_parts.append("Famicom Disk System")
+    if wonderswan_ids:
+        label_parts.append("WonderSwan")
+    if qsound_ids:
+        label_parts.append("Capcom QSound")
     chip_label = " + ".join(label_parts) or "empty"
 
     comment = (
@@ -5444,6 +5674,39 @@ def write_fur(
         else:
             flags = f"customClock={clock}"
         flag_texts.append(flags)
+    for _cid in fds_ids:
+        chips.append(CHIP_FDS)
+        clock = song.vgm.nes_clock or 1_789_773
+        if abs(clock - 1_789_773) <= 2:
+            flags = ""
+        elif abs(clock - 1_662_607) <= 2:
+            flags = "clockSel=1"
+        elif abs(clock - 1_773_447) <= 2:
+            flags = "clockSel=2"
+        else:
+            flags = f"customClock={clock}"
+        flag_texts.append(flags)
+    for _cid in wonderswan_ids:
+        chips.append(CHIP_SWAN)
+        clock = song.vgm.wonderswan_clock or 3_072_000
+        flags = "stereo=true"
+        if abs(clock - 3_072_000) > 2:
+            flags += f"\ncustomClock={clock}"
+        flag_texts.append(flags)
+    for _cid in qsound_ids:
+        chips.append(CHIP_QSOUND)
+        feedback = 0
+        delay = 0
+        for w in song.vgm.writes:
+            if w.chip != "qsound":
+                continue
+            if w.reg == 0x93:
+                feedback = max(0, min(255, int(round(w.val / 64.0))))
+            elif w.reg == 0xD9:
+                delay = max(0, min(2725, 4095 - int(w.val)))
+        flag_texts.append(
+            f"echoDelay={delay}\nechoFeedback={feedback}"
+        )
     n_chips = len(chips)
     # MultiPCM owns a 2 MB / 512-sample memory.  Do not let every other
     # sample body in a combined module fill it; only the bodies written with
@@ -5815,6 +6078,11 @@ def write_fur(
         _write_ins_sample_map(
             b, f"MIKEY PCM {group + 1}", 0, maps, INS_AMIGA, flags=0x03,
         )
+    for i, smp in enumerate(wonderswan_pcm_smps):
+        ins_ptrs.append(len(b))
+        _write_ins_pcm(
+            b, f"WS PCM {i:02d}", wonderswan_pcm_smp_base + i, INS_SWAN,
+        )
     for group in range(n_x1_ins):
         ins_ptrs.append(len(b))
         first = group * 120
@@ -5939,6 +6207,46 @@ def write_fur(
         _write_ins_x1(
             b, name, spec, wave_base=x1_wave_base, env_base=x1_env_base,
         )
+    for i, spec in enumerate(fds_specs):
+        ins_ptrs.append(len(b))
+        mod = (
+            fds_mod_waves[spec.fds_mod]
+            if 0 <= spec.fds_mod < len(fds_mod_waves) else bytes(32)
+        )
+        name = f"FDS {i:02d}"
+        if spec.waves:
+            name += "+wave"
+        if spec.pitch:
+            name += "+pitch"
+        _write_ins_fds(
+            b, name, spec, mod,
+            fds_wave_base + max(0, int(getattr(spec, "wave", 0))),
+        )
+    for i, spec in enumerate(wonderswan_specs):
+        ins_ptrs.append(len(b))
+        name = f"WS {i:02d}"
+        if spec.waves:
+            name += "+wave"
+        if spec.pitch:
+            name += "+pitch"
+        if spec.panl or spec.panr:
+            name += "+pan"
+        _write_ins_swan(
+            b, name, spec,
+            wonderswan_wave_base + max(0, int(getattr(spec, "wave", 0))),
+        )
+    for i, spec in enumerate(qsound_specs):
+        ins_ptrs.append(len(b))
+        name = (
+            "QS ADPCM " if spec.sample_kind == "adpcm" else "QS PCM "
+        ) + f"{i:02d}"
+        if spec.pitch:
+            name += "+pitch"
+        if spec.vol:
+            name += "+vol"
+        _write_ins_qsound(b, name, replace(
+            spec, sample=qsound_smp_base + max(0, spec.sample),
+        ))
 
     smp_ptrs: list[int] = []
     for i, smp in enumerate(pcm_smps):
@@ -6175,6 +6483,34 @@ def write_fur(
             b, smp.name, smp.data, smp.rate,
             depth=SMP_DEPTH_8BIT, render_masks=(0, 0, 0, 0),
         )
+    for i, smp in enumerate(wonderswan_pcm_smps):
+        smp_ptrs.append(len(b))
+        # The sample plays on WS channel 2 at note 60.  Furnace's C-4 reference
+        # is a hair sharp, so trim the stored rate by the same small factor the
+        # other DAC bodies use.
+        rate = max(1, int(round(smp.rate * WS_PCM_RATE_COMPENSATION)))
+        _write_sample_s8(
+            b, f"ws_pcm_{i:02d}", smp.data, rate,
+            depth=SMP_DEPTH_8BIT, render_masks=(0, 0, 0, 0),
+        )
+    for i, smp in enumerate(qsound_smps):
+        smp_ptrs.append(len(b))
+        if smp.kind == "adpcm":
+            _write_sample_qsound_adpcm(
+                b, f"qs_adpcm_{i:02d}", smp.data,
+                int(round(QSOUND_ADPCM_NIBBLE_RATE)),
+            )
+        else:
+            loop = (
+                (smp.loop_start, smp.loop_end)
+                if smp.loop_start is not None and smp.loop_end is not None
+                else (None, None)
+            )
+            _write_sample_s8(
+                b, f"qs_pcm_{i:03d}", smp.data, 8363,
+                loop=loop, depth=SMP_DEPTH_8BIT,
+                render_masks=(0xFFFFFFFF, 0, 0, 0),
+            )
     for smp in x1_smps:
         smp_ptrs.append(len(b))
         _write_sample_s8(
@@ -6227,6 +6563,16 @@ def write_fur(
         )
         wave_ptrs.append(_write_wave(
             b, f"x1_env_{_wave_label(env)}", data, maximum=15,
+        ))
+    for wave in fds_waves:
+        # FDS wave RAM is 64 6-bit samples.
+        wave_ptrs.append(_write_wave(
+            b, f"fds_wave_{_wave_label(wave)}", bytes(wave), maximum=63,
+        ))
+    for wave in wonderswan_waves:
+        # WonderSwan wave RAM is 32 4-bit samples per channel.
+        wave_ptrs.append(_write_wave(
+            b, f"ws_wave_{_wave_label(wave)}", bytes(wave), maximum=15,
         ))
 
     for i, p in enumerate(ins_ptrs):

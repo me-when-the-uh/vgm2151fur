@@ -138,6 +138,7 @@ STREAM_PWM = 0x11
 # bank is the type-0x00 PCM database and its register is $2A.
 DAC_STREAM_YM2612 = 0x02
 K007232_ROM_TYPE = 0x94  # 0x80 + 0x14
+QSOUND_ROM_TYPE = 0x8F  # Capcom QSound sample ROM
 OKI_ROM_TYPE = 0x8B  # OKIM6295 ROM
 SEGAPCM_ROM_TYPE = 0x80  # SegaPCM ROM
 # NES APU DPCM sample RAM (data-block type 0xC2): 16-bit start then bytes.
@@ -188,6 +189,8 @@ EXTRA_UPD7759 = 0x16  # NEC uPD7759
 EXTRA_POKEY = 0x1E  # Atari POKEY (same id as libvgm's DEVID_POKEY)
 EXTRA_MIKEY = 0x29  # Atari Lynx Mikey (libvgm DEVID_MIKEY)
 EXTRA_X1_010 = 0x26  # Seta X1-010 (libvgm DEVID_X1_010)
+EXTRA_QSOUND = 0x1F  # Capcom QSound (libvgm DEVID_QSOUND)
+EXTRA_WSWAN = 0x21  # Bandai WonderSwan (libvgm DEVID_WSWAN)
 # Main-header clocks (VGMFile.h layout, spec v1.71). 0x98 is MSM6295, 0x90
 # MSM6258, 0x94 its flags. K007232 has no spec field; VGMPlay tools put it at
 # 0xE8 (1.71+). C140 is 0xA8 and its type byte 0x96. AY-8910 is 0x74 with its
@@ -351,6 +354,19 @@ X1_010_DEFAULT_CLOCK = 16_000_000
 X1_010_DUAL_BIT = 0x40000000
 X1_010_ROM_TYPE = 0x91
 CMD_X1_010 = 0xC8
+# Capcom QSound header 0xB4 (VGM 1.51+).  The 4 MHz field used by old rips
+# represents the same chip that libvgm runs at 60 MHz (multiply by 15).
+QSOUND_CLOCK_OFF = 0xB4
+QSOUND_DEFAULT_CLOCK = 60_000_000
+QSOUND_LEGACY_CLOCK = 4_000_000
+CMD_QSOUND = 0xC4
+# Bandai WonderSwan header 0xC0 (VGM 1.71+).  Register writes are 0xBC and
+# internal-RAM writes 0xC6.  Bit 30 of the clock field marks a second chip.
+WSWAN_CLOCK_OFF = 0xC0
+WSWAN_DEFAULT_CLOCK = 3_072_000
+WSWAN_DUAL_BIT = 0x40000000
+CMD_WSWAN = 0xBC
+CMD_WSWAN_MEM = 0xC6
 C352_CLOCK_OFF = 0xDC  # VGM 1.71 crystal; bit 31 mutes the rear pair
 C352_DIV_OFF = 0xD6  # hardware divider / 4; 72 means a divider of 288
 SEGAPCM_CLOCK_X = 4000000  # X board / Hang-On
@@ -774,6 +790,13 @@ class VgmFile:
     # Seta X1-010 header 0xD8 (VGM 1.71+).  Sixteen wavetable/PCM voices.
     x1_010_clock: int = 0
     x1_010_dual: bool = False
+    # Capcom QSound header 0xB4.  Old rips store 4 MHz; libvgm and Furnace run
+    # the chip at 60 MHz, so the collector normalises the legacy value.
+    qsound_clock: int = 0
+    # Bandai WonderSwan header 0xC0 (VGM 1.71+).  Four voices; 0xBC carries an
+    # instance bit, 0xC6 writes the 16 KB internal RAM.
+    wonderswan_clock: int = 0
+    wonderswan_dual: bool = False
     # Extra-header clocks, raw (bit 31 kept). Keyed by libvgm chip id.
     extra_clocks: dict[int, int] = field(default_factory=dict)
     # Extra-header volume mix: chip id -> (flags, raw value, 0x100 = 1.0).
@@ -1038,8 +1061,20 @@ def chips_in_head(buf: bytes) -> set[str]:
     # prefix, so a file that carries it only there still converts; the census
     # just will not list it.
     if version >= 0x151 and _field_in_header(buf, NES_CLOCK_OFF, 4):
-        if 100_000 <= _header_clock(buf, NES_CLOCK_OFF) <= 40_000_000:
+        nes_raw = _header_raw(buf, NES_CLOCK_OFF)
+        if 100_000 <= (nes_raw & 0x3FFFFFFF) <= 40_000_000:
             kinds.add("nes")
+            if nes_raw & NES_FDS_BIT:
+                kinds.add("fds")
+    if _field_in_header(buf, QSOUND_CLOCK_OFF, 4):
+        if 100_000 <= _header_clock(buf, QSOUND_CLOCK_OFF) <= 100_000_000:
+            kinds.add("qsound")
+    if version >= 0x171 and _field_in_header(buf, WSWAN_CLOCK_OFF, 4):
+        ws_raw = _header_raw(buf, WSWAN_CLOCK_OFF)
+        if 100_000 <= (ws_raw & 0x3FFFFFFF) <= 40_000_000:
+            kinds.add("wonderswan")
+            if ws_raw & WSWAN_DUAL_BIT:
+                kinds.add("wonderswan_dual")
     if version >= 0x151 and _field_in_header(buf, SEGAPCM_CLOCK_OFF, 4):
         raw = _header_raw(buf, SEGAPCM_CLOCK_OFF)
         if 100_000 <= (raw & 0x3FFFFFFF) <= 40_000_000:
@@ -1553,6 +1588,24 @@ def load_vgm(path: Path | str) -> VgmFile:
     x1_010_clock = _sane_clock(x1_raw)
     if not x1_010_clock:
         x1_010_clock = _sane_clock(clocks.get(EXTRA_X1_010, 0))
+    # Capcom QSound clock 0xB4.  The field has no dual bit; the extra header can
+    # still provide the clock when the main field is absent.  QSound legitimately
+    # runs at 60 MHz, above the generic _sane_clock ceiling.
+    qsound_raw = _header_raw(buf, QSOUND_CLOCK_OFF) & 0x3FFFFFFF
+    qsound_clock = (
+        qsound_raw if CLOCK_MIN <= qsound_raw <= 100_000_000 else 0
+    )
+    if not qsound_clock:
+        qsound_raw = clocks.get(EXTRA_QSOUND, 0) & 0x3FFFFFFF
+        if CLOCK_MIN <= qsound_raw <= 100_000_000:
+            qsound_clock = qsound_raw
+    # Bandai WonderSwan clock 0xC0 (VGM 1.71+).  Bit 30 marks a second chip;
+    # command 0xBC carries the instance in bit 7 of the register byte.
+    ws_raw = _header_raw(buf, WSWAN_CLOCK_OFF) if ver >= 0x171 else 0
+    wonderswan_dual = bool(ws_raw & WSWAN_DUAL_BIT)
+    wonderswan_clock = _sane_clock(ws_raw)
+    if not wonderswan_clock:
+        wonderswan_clock = _sane_clock(clocks.get(EXTRA_WSWAN, 0))
 
     main_volume = 0.0
     # Bytes past the declared command offset are not header fields. Synthetic
@@ -1593,6 +1646,9 @@ def load_vgm(path: Path | str) -> VgmFile:
         nes_clock=nes_clock,
         nes_dual=nes_dual,
         nes_fds=nes_fds,
+        qsound_clock=qsound_clock,
+        wonderswan_clock=wonderswan_clock,
+        wonderswan_dual=wonderswan_dual,
         gb_dmg_clock=gb_dmg_clock,
         gb_dmg_dual=gb_dmg_dual,
         huc6280_clock=huc6280_clock,
@@ -1807,6 +1863,7 @@ def load_vgm(path: Path | str) -> VgmFile:
                     YMF278B_RAM_TYPE: "ymf278b_ram",
                     YMZ280B_ROM_TYPE: "ymz280b",
                     X1_010_ROM_TYPE: "x1_010",
+                    QSOUND_ROM_TYPE: "qsound",
                 }.get(typ) if len(payload) >= 8 else None
                 if kind:
                     rom_size = int.from_bytes(payload[0:4], "little")
@@ -2137,6 +2194,40 @@ def load_vgm(path: Path | str) -> VgmFile:
             ))
             pos += 4
             continue
+        if cmd == CMD_QSOUND and pos + 4 <= n:
+            # 0xC4 data_hi data_lo register.  The 16-bit payload is big-endian;
+            # the register is the *last* byte, unlike most VGM chip commands.
+            vgm.writes.append(ChipWrite(
+                sample, "qsound", 0, buf[pos + 3],
+                int.from_bytes(buf[pos + 1:pos + 3], "big"),
+            ))
+            pos += 4
+            continue
+        if cmd == CMD_WSWAN and pos + 3 <= n:
+            # 0xBC 0x80+register data.  Bit 7 of the register byte selects the
+            # second WonderSwan instance.
+            rr = buf[pos + 1]
+            cid = (rr >> 7) & 1
+            reg = 0x80 + (rr & 0x7F)
+            if reg > 0x94:
+                vgm.warnings.append(
+                    f"WonderSwan register {reg:#04x} is outside the sound port map"
+                )
+            vgm.writes.append(ChipWrite(
+                sample, "wonderswan", cid, reg, buf[pos + 2],
+            ))
+            pos += 3
+            continue
+        if cmd == CMD_WSWAN_MEM and pos + 4 <= n:
+            # 0xC6 address16 data.  The sound chip sees a 16 KB mirror; keep
+            # the address flat (0x10000+) so it cannot collide with a port
+            # number.  The collector applies the 0x3FFF mask.
+            addr = int.from_bytes(buf[pos + 1:pos + 3], "little")
+            vgm.writes.append(ChipWrite(
+                sample, "wonderswan", 0, 0x10000 + addr, buf[pos + 3],
+            ))
+            pos += 4
+            continue
         if cmd == CMD_MIKEY and pos + 3 <= n:
             # Atari Lynx Mikey register write: 40 aa vv.  Timer/IRQ
             # registers below 0x20 are kept too; the collector ignores them.
@@ -2383,18 +2474,36 @@ def load_vgm(path: Path | str) -> VgmFile:
             pos += 3
             continue
         if cmd == CMD_NES and pos + 3 <= n:
-            # 0xB4: register, data. Bit 7 of the register selects the second
-            # APU instance (0x00-0x17 = $4000-$4017).
+            # 0xB4: register, data.  Bit 7 of the register selects the second
+            # APU instance (0x00-0x17 = $4000-$4017).  libvgm remaps offsets
+            # 0x20-0x3F to the FDS register file and 0x40-0x7F to its wave RAM,
+            # so those writes belong to a separate chip stream.
             rr = buf[pos + 1]
             nes_cid = (rr >> 7) & 1
-            if nes_cid and not nes_dual:
-                vgm.warnings.append(
-                    "0xB4 NES writes with register bit 7 set but no "
-                    "dual-instance header bit; they were treated as the second APU"
-                )
-            vgm.writes.append(ChipWrite(
-                sample, "nes", nes_cid, rr & 0x7F, buf[pos + 2],
-            ))
+            ofs = rr & 0x7F
+            if ofs == 0x3F:
+                vgm.writes.append(ChipWrite(
+                    sample, "fds", nes_cid, 0x23, buf[pos + 2],
+                ))
+            elif 0x20 <= ofs <= 0x3F:
+                vgm.writes.append(ChipWrite(
+                    sample, "fds", nes_cid, 0x80 | (ofs & 0x1F),
+                    buf[pos + 2],
+                ))
+            elif 0x40 <= ofs <= 0x7F:
+                vgm.writes.append(ChipWrite(
+                    sample, "fds", nes_cid, ofs, buf[pos + 2],
+                ))
+            else:
+                if nes_cid and not nes_dual:
+                    vgm.warnings.append(
+                        "0xB4 NES writes with register bit 7 set but no "
+                        "dual-instance header bit; they were treated as the "
+                        "second APU"
+                    )
+                vgm.writes.append(ChipWrite(
+                    sample, "nes", nes_cid, ofs, buf[pos + 2],
+                ))
             pos += 3
             continue
         if cmd == CMD_HUC6280 and pos + 3 <= n:

@@ -7,11 +7,13 @@ Supported chips:
 - Konami: VRC7, K007232, K053260 and SCC/SCC+.
 - Atari: POKEY and Lynx/Mikey.
 - Seta: X1-010.
+- Capcom: QSound.
+- Bandai: WonderSwan.
 - Philips: SAA1099.
 - Texas Instruments: SN76489 and T6W28.
 - NEC: uPD7759 (stand-alone phrase ROMs and slave streams).
 - Sega: SegaPCM and 32X PWM.
-- Nintendo: NES APU (2A03), Game Boy DMG, Virtual Boy VSU and Hudson HuC6280 (PC Engine).
+- Nintendo: NES APU (2A03), Famicom Disk System, Game Boy DMG, Virtual Boy VSU and Hudson HuC6280 (PC Engine).
 - OKI: MSM6295 and MSM6258.
 - Namco: C140 and C352.
 - Ricoh: RF5C68 and RF5C164.

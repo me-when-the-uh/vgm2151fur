@@ -61,6 +61,11 @@ and PWM use Generic PCM DAC systems because Furnace has no native platform
 (`docs/upd7759.md`, `docs/pwm32x.md`).  A log with only these chips likewise
 suppresses the legacy YM2151 placeholder.
 
+Famicom Disk System (`0x8A`, one wave column), WonderSwan (`0x96`, four
+wave/PCM columns) and Capcom QSound (`0xE0`, sixteen PCM plus three ADPCM
+columns) follow X1-010 in that order. FDS and WonderSwan bind through the tone
+instrument pass; QSound uses sample instruments.
+
 Virtual Boy VSU is a pitched chip and comes after Game Boy: six columns per
 chip (`0x9C`). A VSU-only log likewise suppresses the placeholder, so the
 Jack Bros and Galactic Pinball references are six real columns

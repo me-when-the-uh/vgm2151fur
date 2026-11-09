@@ -126,6 +126,8 @@ def _sample_counts(info: dict) -> str:
         ("pwm_samples", "PWM"),
         ("mikey_samples", "Mikey DAC"),
         ("x1_010_samples", "X1-010 PCM"),
+        ("qsound_samples", "QSound"),
+        ("wonderswan_pcm_samples", "WS PCM"),
         ("oki_samples", "OKI"),
         ("msm6258_samples", "ADPCM"),
         ("ym2610_a_samples", "ADPCM-A"),
@@ -549,7 +551,8 @@ def build_parser() -> argparse.ArgumentParser:
             "K053260, YMZ280B, YMW258-F MultiPCM, uPD7759, 32X PWM) + "
             "Nintendo Virtual Boy (VSU) + Philips "
             "SAA1099 (Creative Music System / Game Blaster) + Atari POKEY "
-            "and Lynx/Mikey + Seta X1-010 "
+            "and Lynx/Mikey + Seta X1-010 + Nintendo FDS + Bandai WonderSwan "
+            "+ Capcom QSound "
             "VGMs into Furnace .fur files, and edit the result."
         ),
         epilog=EPILOG,

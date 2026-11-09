@@ -43,6 +43,9 @@ CHIP_NAMES = {
     CHIP_K053260: "K053260",
     CHIP_K051649: "SCC",
     CHIP_K052539: "SCC+",
+    0x8A: "FDS",
+    0x96: "WonderSwan",
+    0xE0: "QSound",
     CHIP_AY8910: "AY8910",
     # OPL family, named as Furnace names the system. A rhythm module is not the
     # same instrument set: bank A's last channels are the kit.

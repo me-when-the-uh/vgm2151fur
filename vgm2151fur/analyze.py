@@ -127,6 +127,40 @@ from vgm2151fur.x1_010 import (
     collect_x1_010,
 )
 from vgm2151fur.vgm import X1_010_DEFAULT_CLOCK
+from vgm2151fur.fds import (
+    FDS_DEFAULT_CLOCK,
+    FDS_FREQ_DIV,
+    FDS_MAX_FREQ,
+    FDS_WAVE_LEN,
+    FdsHit,
+    collect_fds,
+)
+from vgm2151fur.wonderswan import (
+    WSWAN_DEFAULT_CLOCK,
+    WS_MAX_PERIOD,
+    WS_PITCH_DIVIDER,
+    WS_VOICES,
+    WsHit,
+    WsPcmHit,
+    WsPcmSample,
+    collect_wonderswan,
+)
+from vgm2151fur.qsound import (
+    QSOUND_CHANNELS,
+    QSOUND_FREQ_DIV,
+    QSOUND_MAX_FREQ,
+    QSOUND_NO_LOOP,
+    QSOUND_OUT_RATE,
+    QSoundAdpcmHit,
+    QSoundPcmHit,
+    QSoundSample,
+    collect_qsound,
+    qsound_delay_fx,
+    qsound_echo_fx,
+    qsound_feedback_fx,
+    qsound_pan,
+    qsound_pan_split,
+)
 from vgm2151fur.pitch import (
     E5_CENTER,
     NOTE_MAX,
@@ -579,6 +613,20 @@ class NoteEvent:
     tone_wave_pts: tuple[tuple[int, bytes], ...] = ()
     # SCC only: the wavetable index the note itself starts on (-1 = no wave).
     tone_wave: int = -1
+    # QSound only: index into the deduplicated QSound sample list and whether
+    # it is a PCM or ADPCM body.
+    tone_sample: int = -1
+    tone_sample_kind: str = ""
+    # FDS only: the modulation-table image index and its initial hardware
+    # depth/speed/position.
+    tone_fds_mod: int = 0
+    tone_fds_depth: int = 0
+    tone_fds_speed: int = 0
+    tone_fds_pos: int = 0
+    # WonderSwan only: the starting left/right volume nibbles.  The note's
+    # panning macros carry the raw pair so `08xx` is not needed.
+    tone_pan_l: int = 15
+    tone_pan_r: int = 15
     tone_period_offset: int = 0
     # PCE only: the raw 12-bit period the note starts on. Splitting a long
     # gate at volume peaks needs the pitch at each new note start, which the
@@ -751,6 +799,14 @@ class ToneIns:
     # VSU only: which modulation-table image the instrument's FD feature
     # carries (channel 4).
     vsu_mod: int = 0
+    # QSound only: the sample body this instrument plays.
+    sample: int = -1
+    sample_kind: str = ""
+    # FDS only: FD feature state.
+    fds_mod: int = 0
+    fds_mod_depth: int = 0
+    fds_mod_speed: int = 0
+    fds_mod_pos: int = 0
 
 
 @dataclass(frozen=True)
@@ -884,6 +940,26 @@ class Song:
     x1_010_count: int = 0
     x1_waves: list[bytes] = field(default_factory=list)
     x1_envs: list[bytes] = field(default_factory=list)
+    # Famicom Disk System: one wavetable voice per chip.  `fds_waves` are the
+    # 64x6-bit images; `fds_mod_waves` the 32-byte modulation tables.
+    fds_ids: list[int] = field(default_factory=list)
+    fds_ins: list[ToneIns] = field(default_factory=list)
+    fds_waves: list[bytes] = field(default_factory=list)
+    fds_mod_waves: list[bytes] = field(default_factory=list)
+    fds_count: int = 0
+    # WonderSwan: four wavetable/PCM voices per chip.
+    wonderswan_ids: list[int] = field(default_factory=list)
+    wonderswan_ins: list[ToneIns] = field(default_factory=list)
+    wonderswan_waves: list[bytes] = field(default_factory=list)
+    wonderswan_pcm_samples: list = field(default_factory=list)
+    wonderswan_count: int = 0
+    wonderswan_pcm_count: int = 0
+    # Capcom QSound: sixteen PCM and three ADPCM voices per chip.
+    qsound_ids: list[int] = field(default_factory=list)
+    qsound_ins: list[ToneIns] = field(default_factory=list)
+    qsound_samples: list = field(default_factory=list)
+    qsound_count: int = 0
+    qsound_adpcm_count: int = 0
     # (sample, channel, effect, value) placed before notes. MSM6258 divider.
     channel_fx: list[tuple[int, int, int, int]] = field(default_factory=list)
     # Chip-wide YM2151 LFO effects: (sample, effect, value[, tick offset]).
@@ -1623,6 +1699,29 @@ def _plain_tone(spec: ToneIns, tone_chip: int) -> ToneIns:
             lfsr=spec.lfsr, lfsr_speed=spec.lfsr_speed,
             lfsr_loop=spec.lfsr_loop,
         )
+    if tone_chip == 12:
+        # FDS: keep the waveform and the starting modulation table.
+        return ToneIns(
+            wave=spec.wave,
+            fds_mod=spec.fds_mod,
+            fds_mod_depth=spec.fds_mod_depth,
+            fds_mod_speed=spec.fds_mod_speed,
+            fds_mod_pos=spec.fds_mod_pos,
+        )
+    if tone_chip == 13:
+        # WonderSwan: the waveform and pan pair are the timbre.
+        return ToneIns(
+            wave=spec.wave,
+            panl=spec.panl, panr=spec.panr,
+            panl_speed=spec.panl_speed, panl_loop=spec.panl_loop,
+            panr_speed=spec.panr_speed, panr_loop=spec.panr_loop,
+        )
+    if tone_chip in (14, 15):
+        # QSound: the sample body is the instrument.
+        return ToneIns(
+            sample=spec.sample,
+            sample_kind=spec.sample_kind,
+        )
     if tone_chip == 11:
         # X1-010: the wave and envelope shape are the timbre; without them a
         # budget fallback would play the wrong waveform or no envelope.
@@ -2065,6 +2164,9 @@ def _bind_tone_instruments(
     pokey_ins: list[ToneIns],
     mikey_ins: list[ToneIns],
     x1_ins: list[ToneIns],
+    fds_ins: list[ToneIns],
+    wonderswan_ins: list[ToneIns],
+    qsound_ins: list[ToneIns],
     tone_ins_base: int,
     scc_clock: int,
     ay_clock: int,
@@ -2077,6 +2179,8 @@ def _bind_tone_instruments(
     pokey_clock: int,
     mikey_clock: int,
     x1_clock: int,
+    fds_clock: int,
+    wonderswan_clock: int,
     hz: float,
     total_samples: int,
     use_speed: int = 1,
@@ -2106,13 +2210,17 @@ def _bind_tone_instruments(
     pokey_map: dict[ToneIns, int] = {}
     mikey_map: dict[ToneIns, int] = {}
     x1_map: dict[ToneIns, int] = {}
+    fds_map: dict[ToneIns, int] = {}
+    wonderswan_map: dict[ToneIns, int] = {}
+    qsound_map: dict[ToneIns, int] = {}
     ins_cap = max(1, INS_TARGET - tone_ins_base)
     # GB, VSU and POKEY bind last. Reserve a share so a large SCC/AY/PCE list
     # cannot spend every slot before them; the surplus collapses to plain
     # per-wave/per-env instruments, the documented "fall back to columns"
     # behavior.
     has_late = any(
-        e.tone_chip in (6, 7, 8, 9, 10, 11) and e.on for e in events
+        e.tone_chip in (6, 7, 8, 9, 10, 11, 12, 13, 14, 15)
+        and e.on for e in events
     )
     early_cap = ins_cap
     if has_late:
@@ -2141,6 +2249,10 @@ def _bind_tone_instruments(
     tone_order += [e for e in events if e.on and e.tone_chip == 9]
     tone_order += [e for e in events if e.on and e.tone_chip == 10]
     tone_order += [e for e in events if e.on and e.tone_chip == 11]
+    tone_order += [e for e in events if e.on and e.tone_chip == 12]
+    tone_order += [e for e in events if e.on and e.tone_chip == 13]
+    tone_order += [e for e in events if e.on and e.tone_chip == 14]
+    tone_order += [e for e in events if e.on and e.tone_chip == 15]
     for e in tone_order:
         end = e.end or track_end
         # 255 macro values times the largest speed byte. Long SSG pads can
@@ -2213,6 +2325,22 @@ def _bind_tone_instruments(
             clock = e.tone_clock or x1_clock or X1_010_DEFAULT_CLOCK
             divider = X1_FREQ_DIV
             maximum = X1_MAX_FREQ
+        elif e.tone_chip == 12:
+            # FDS: frequency mode with the NES/FDS CPU clock.
+            clock = e.tone_clock or fds_clock or FDS_DEFAULT_CLOCK
+            divider = FDS_FREQ_DIV
+            maximum = FDS_MAX_FREQ
+        elif e.tone_chip == 13:
+            # WonderSwan: period mode. The collector stores 2048-register.
+            clock = e.tone_clock or wonderswan_clock or WSWAN_DEFAULT_CLOCK
+            divider = WS_PITCH_DIVIDER
+            maximum = WS_MAX_PERIOD
+        elif e.tone_chip in (14, 15):
+            # QSound PCM: frequency mode at the fixed 60 MHz output rate.
+            # ADPCM has no pitch, but the branch still needs a table.
+            clock = QSOUND_OUT_RATE
+            divider = QSOUND_FREQ_DIV
+            maximum = QSOUND_MAX_FREQ
         else:
             # AY and the YM2203's SSG share the instrument path but not the
             # clock or Furnace's divider (8 vs 16).
@@ -2225,12 +2353,12 @@ def _bind_tone_instruments(
             tbl = pitch_table(module_clock(clock), divider, maximum=maximum)
         elif e.tone_chip == 10:
             tbl = pitch_table(float(clock), divider, maximum=maximum)
-        elif e.tone_chip == 11:
+        elif e.tone_chip in (11, 12, 14, 15):
             tbl = frequency_pitch_table(float(clock), divider, maximum=maximum)
         else:
             tbl = (
                 pitch_table(float(clock), divider, maximum=maximum)
-                if e.tone_chip in (3, 4, 5, 6, 7)
+                if e.tone_chip in (3, 4, 5, 6, 7, 13)
                 else pitch_table(module_clock(clock), divider)
             )
         base_off = (e.note << 7) + (e.e5 - E5_CENTER)
@@ -2509,6 +2637,29 @@ def _bind_tone_instruments(
                     e.sample, ticks, tick_samples,
                 ),
             )
+        elif e.tone_chip == 13:
+            # WonderSwan: the volume register contains the left/right nibbles.
+            # A column of 15 and the two panning macros reproduce it exactly.
+            pl = [(e.sample, e.tone_pan_l)]
+            pr = [(e.sample, e.tone_pan_r)]
+            pl += [(t, left) for t, left, _right in e.tone_amp_pts]
+            pr += [(t, right) for t, _left, right in e.tone_amp_pts]
+            pl_series = _tick_values(pl, e.sample, ticks, tick_samples)
+            pr_series = _tick_values(pr, e.sample, ticks, tick_samples)
+            panl, panl_speed, panl_loop, panl_delay = _macro_series_delay(
+                pl_series,
+            )
+            panr, panr_speed, panr_loop, panr_delay = _macro_series_delay(
+                pr_series,
+            )
+            if not panl:
+                panl, panl_speed, panl_loop, panl_delay = (
+                    (e.tone_pan_l,), 1, 255, 0,
+                )
+            if not panr:
+                panr, panr_speed, panr_loop, panr_delay = (
+                    (e.tone_pan_r,), 1, 255, 0,
+                )
         elif e.tone_chip == 9:
             # POKEY: AUDCTL is the instrument's duty macro.  A constant value
             # still gets a one-value macro, so the note re-asserts its clock
@@ -2616,8 +2767,21 @@ def _bind_tone_instruments(
             noise, noise_speed, noise_loop = (
                 1 if e.tone_noise else 0,
             ), 1, 255
+        if e.tone_chip in (14, 15) and vol_vals:
+            # QSound's volume macro is the raw 14-bit register level; the
+            # note column is pinned at 255 when a macro is present.
+            vol_vals = tuple(
+                min(16383, int(round(v * 16383.0 / 255.0)))
+                for v in vol_vals
+            )
         spec = ToneIns(
             wave=max(0, e.tone_wave),
+            sample=int(getattr(e, "tone_sample", -1)),
+            sample_kind=str(getattr(e, "tone_sample_kind", "")),
+            fds_mod=int(getattr(e, "tone_fds_mod", 0)),
+            fds_mod_depth=int(getattr(e, "tone_fds_depth", 0)),
+            fds_mod_speed=int(getattr(e, "tone_fds_speed", 0)),
+            fds_mod_pos=int(getattr(e, "tone_fds_pos", 0)),
             pitch=pitch, pitch_speed=pitch_speed, pitch_loop=pitch_loop,
             pitch_delay=pitch_delay,
             waves=wave_vals, wave_speed=wave_speed, wave_loop=wave_loop,
@@ -2711,6 +2875,33 @@ def _bind_tone_instruments(
                 + len(saa_ins) + len(pokey_ins) + len(mikey_ins),
                 ins_cap, 11,
             )
+        elif e.tone_chip == 12:
+            idx, kept = take(
+                spec, fds_map, fds_ins,
+                len(scc_ins) + len(ay_ins) + len(psg_ins) + len(nes_ins)
+                + len(huc6280_ins) + len(gb_ins) + len(vsu_ins)
+                + len(saa_ins) + len(pokey_ins) + len(mikey_ins)
+                + len(x1_ins),
+                ins_cap, 12,
+            )
+        elif e.tone_chip == 13:
+            idx, kept = take(
+                spec, wonderswan_map, wonderswan_ins,
+                len(scc_ins) + len(ay_ins) + len(psg_ins) + len(nes_ins)
+                + len(huc6280_ins) + len(gb_ins) + len(vsu_ins)
+                + len(saa_ins) + len(pokey_ins) + len(mikey_ins)
+                + len(x1_ins) + len(fds_ins),
+                ins_cap, 13,
+            )
+        elif e.tone_chip in (14, 15):
+            idx, kept = take(
+                spec, qsound_map, qsound_ins,
+                len(scc_ins) + len(ay_ins) + len(psg_ins) + len(nes_ins)
+                + len(huc6280_ins) + len(gb_ins) + len(vsu_ins)
+                + len(saa_ins) + len(pokey_ins) + len(mikey_ins)
+                + len(x1_ins) + len(fds_ins) + len(wonderswan_ins),
+                ins_cap, 14 if e.tone_chip == 14 else 15,
+            )
         else:
             # AY runs first, so the SCC list is still empty and `others` is 0.
             idx, kept = take(spec, ay_map, ay_ins, 0, early_cap, 2)
@@ -2787,6 +2978,26 @@ def _bind_tone_instruments(
             else:
                 e.vol = column_vol
                 e.vol_slide = 0
+        elif e.tone_chip == 12:
+            # FDS volume column tops out at 32 and the macro is the register.
+            if kept.vol:
+                e.vol = 32
+                e.vol_pts = ()
+                e.vol_slide = 0
+            else:
+                e.vol = column_vol
+        elif e.tone_chip == 13:
+            # WonderSwan carries volume and pan together in the pan macros.
+            e.vol = 15
+            e.vol_pts = ()
+            e.vol_slide = 0
+        elif e.tone_chip in (14, 15):
+            if kept.vol:
+                e.vol = 255
+                e.vol_pts = ()
+                e.vol_slide = 0
+            else:
+                e.vol = column_vol
         elif kept.vol:
             # The column that makes the macro the register: SCC vol*macro/15,
             # AY macro + column - 15, PCE vol*macro/31.
@@ -2814,7 +3025,7 @@ def _bind_tone_instruments(
     # stops the grouping pass from choosing the longer, uncompressed copy.
     for bucket in (
         scc_ins, ay_ins, psg_ins, nes_ins, huc6280_ins, gb_ins,
-        vsu_ins, saa_ins, x1_ins,
+        vsu_ins, saa_ins, x1_ins, fds_ins, wonderswan_ins, qsound_ins,
     ):
         _compress_tone_delays(bucket)
 
@@ -2853,6 +3064,10 @@ def _bind_tone_instruments(
             vsu_ins, family_notes.get(7), tick_samples, use_speed),
         8: _merge_tone_prefixes(
             saa_ins, family_notes.get(8), tick_samples, use_speed),
+        12: _merge_tone_prefixes(
+            fds_ins, family_notes.get(12), tick_samples, use_speed),
+        13: _merge_tone_prefixes(
+            wonderswan_ins, family_notes.get(13), tick_samples, use_speed),
     }
     for i, (event, idx) in enumerate(bound):
         mapping = tone_maps.get(event.tone_chip)
@@ -2869,6 +3084,9 @@ def _bind_tone_instruments(
     n_saa = len(saa_ins)
     n_pokey = len(pokey_ins)
     n_mikey = len(mikey_ins)
+    n_x1 = len(x1_ins)
+    n_fds = len(fds_ins)
+    n_ws = len(wonderswan_ins)
     for event, idx in bound:
         if event.tone_chip == 1:
             event.ins = tone_ins_base + idx
@@ -2906,6 +3124,23 @@ def _bind_tone_instruments(
             event.ins = (
                 tone_ins_base + n_scc + n_ay + n_psg + n_nes + n_huc
                 + n_gb + n_vsu + n_saa + n_pokey + n_mikey + idx
+            )
+        elif event.tone_chip == 12:
+            event.ins = (
+                tone_ins_base + n_scc + n_ay + n_psg + n_nes + n_huc
+                + n_gb + n_vsu + n_saa + n_pokey + n_mikey + n_x1 + idx
+            )
+        elif event.tone_chip == 13:
+            event.ins = (
+                tone_ins_base + n_scc + n_ay + n_psg + n_nes + n_huc
+                + n_gb + n_vsu + n_saa + n_pokey + n_mikey + n_x1
+                + n_fds + idx
+            )
+        elif event.tone_chip in (14, 15):
+            event.ins = (
+                tone_ins_base + n_scc + n_ay + n_psg + n_nes + n_huc
+                + n_gb + n_vsu + n_saa + n_pokey + n_mikey + n_x1
+                + n_fds + n_ws + idx
             )
         else:
             # AY-8910 (tone_chip 2) binds first, so its list starts at SCC end.
@@ -3025,6 +3260,8 @@ def _tone_instrument_demand(
     pokey_clock: int,
     mikey_clock: int,
     x1_clock: int,
+    fds_clock: int,
+    wonderswan_clock: int,
     hz: float,
     total_samples: int,
     use_speed: int = 1,
@@ -3044,13 +3281,18 @@ def _tone_instrument_demand(
     pokey = []
     mikey = []
     x1 = []
+    fds = []
+    wonderswan = []
+    qsound = []
     _bind_tone_instruments(
         tone, scc, ay, psg, nes, huc, gb, vsu, saa, pokey, mikey, x1,
+        fds, wonderswan, qsound,
         # A negative base leaves the instrument cap effectively unlimited, so
         # every distinct macro shape is counted.
         -1000,
         scc_clock, ay_clock, psg_clock, nes_clock, huc6280_clock,
         gb_clock, vsu_clock, saa_clock, pokey_clock, mikey_clock, x1_clock,
+        fds_clock, wonderswan_clock,
         hz, total_samples,
         use_speed,
         lfo_loop=lfo_loop,
@@ -3059,6 +3301,7 @@ def _tone_instrument_demand(
         len(bucket)
         for bucket in (
             scc, ay, psg, nes, huc, gb, vsu, saa, pokey, mikey, x1,
+            fds, wonderswan, qsound,
         )
     )
 
@@ -12043,6 +12286,369 @@ def analyze(
                     pcm=True,
                 ))
 
+    # Famicom Disk System: one wavetable voice after the X1 block.
+    fds_ids: list[int] = []
+    fds_ins: list[ToneIns] = []
+    fds_waves: list[bytes] = []
+    fds_mod_waves: list[bytes] = []
+    fds_count = 0
+    fds_clock = vgm.nes_clock or FDS_DEFAULT_CLOCK
+    fds_hits, fds_warn = collect_fds(vgm)
+    warnings.extend(fds_warn)
+    if fds_hits:
+        fds_ids = _dual_ids(
+            sorted({h.chip_id for h in fds_hits}),
+            bool(getattr(vgm, "nes_dual", False)),
+        )
+        fds_base = (
+            tone_base + SCC_VOICES * len(scc_ids) + AY_VOICES * len(ay_ids)
+            + NES_CHANNELS * len(nes_ids)
+            + (HUC6280_CHANNELS if huc6280_ids else 0)
+            + (4 * len(gb_ids))
+            + VSU_CHANNELS * len(vsu_ids)
+            + SAA_VOICES * len(saa_ids)
+            + POKEY_VOICES * len(pokey_ids)
+            + MIKEY_VOICES * len(mikey_ids)
+            + X1_CHANNELS * len(x1_ids)
+        )
+        fds_at = {
+            cid: fds_base + i for i, cid in enumerate(fds_ids)
+        }
+        fds_wave_index: dict[bytes, int] = {}
+        fds_mod_index: dict[bytes, int] = {}
+        for h in fds_hits:
+            wi = fds_wave_index.get(h.wave)
+            if wi is None:
+                wi = len(fds_waves)
+                fds_wave_index[h.wave] = wi
+                fds_waves.append(h.wave)
+            mi = fds_mod_index.get(h.mod_table)
+            if mi is None:
+                mi = len(fds_mod_waves)
+                fds_mod_index[h.mod_table] = mi
+                fds_mod_waves.append(h.mod_table)
+            ch = fds_at.get(h.chip_id, fds_base)
+            note, e5 = furnace_frequency_note(
+                fds_clock, FDS_FREQ_DIV, max(1, h.freq),
+                maximum=FDS_MAX_FREQ,
+            )
+            wave_pts_list = []
+            for t, body in h.wave_pts:
+                idx = fds_wave_index.get(body)
+                if idx is None:
+                    idx = len(fds_waves)
+                    fds_wave_index[body] = idx
+                    fds_waves.append(body)
+                wave_pts_list.append((t, idx))
+            wave_pts = tuple(wave_pts_list)
+            events.append(NoteEvent(
+                sample=h.sample_time,
+                ch=ch,
+                on=True,
+                note=note,
+                ins=-1,
+                vol=max(0, min(32, h.volume)),
+                e5=e5,
+                pan=0,
+                end=h.off_sample,
+                vol_pts=tuple(
+                    (t, max(0, min(32, v)), None) for t, v in h.vol_pts
+                ),
+                tone_pitch_pts=tuple(h.freq_pts),
+                tone_chip=12,
+                tone_clock=fds_clock,
+                tone_div=FDS_FREQ_DIV,
+                tone_period=h.freq,
+                tone_wave=wi,
+                tone_wave_pts=wave_pts,
+                tone_fds_mod=mi,
+                tone_fds_depth=h.mod_depth,
+                tone_fds_speed=h.mod_speed,
+                tone_fds_pos=h.mod_pos,
+            ))
+            for t, cmd, val in h.mod_pts:
+                if cmd == 0x11:
+                    channel_fx.append((t, ch, 0x11, val & 0x3F))
+                elif cmd == 0x12:
+                    channel_fx.append((
+                        t, ch, 0x12,
+                        ((0x10 if h.mod_depth else 0) | (val & 0x0F)),
+                    ))
+                elif cmd == 0x13:
+                    channel_fx.append((t, ch, 0x13, val & 0xFF))
+                elif cmd == 0x14:
+                    channel_fx.append((t, ch, 0x14, val & 0x7F))
+            fds_count += 1
+            if h.off_sample and (not vgm.total_samples or h.off_sample < vgm.total_samples):
+                events.append(NoteEvent(
+                    sample=h.off_sample, ch=ch, on=False, note=180,
+                    ins=-1, vol=-1, e5=0x80, pan=0,
+                ))
+
+    # WonderSwan: four columns after FDS.
+    wonderswan_ids: list[int] = []
+    wonderswan_ins: list[ToneIns] = []
+    wonderswan_waves: list[bytes] = []
+    wonderswan_pcm_samples: list[WsPcmSample] = []
+    wonderswan_pcm_events: list[tuple[NoteEvent, int]] = []
+    wonderswan_count = 0
+    wonderswan_pcm_count = 0
+    wonderswan_clock = vgm.wonderswan_clock or WSWAN_DEFAULT_CLOCK
+    ws_hits, ws_pcm, ws_warn = collect_wonderswan(vgm)
+    warnings.extend(ws_warn)
+    if ws_hits or ws_pcm:
+        wonderswan_ids = _dual_ids(
+            sorted({h.chip_id for h in ws_hits} | {s.chip_id for s in ws_pcm}),
+            bool(getattr(vgm, "wonderswan_dual", False)),
+        )
+        ws_base = (
+            tone_base + SCC_VOICES * len(scc_ids) + AY_VOICES * len(ay_ids)
+            + NES_CHANNELS * len(nes_ids)
+            + (HUC6280_CHANNELS if huc6280_ids else 0)
+            + (4 * len(gb_ids))
+            + VSU_CHANNELS * len(vsu_ids)
+            + SAA_VOICES * len(saa_ids)
+            + POKEY_VOICES * len(pokey_ids)
+            + MIKEY_VOICES * len(mikey_ids)
+            + X1_CHANNELS * len(x1_ids)
+            + len(fds_ids)
+        )
+        ws_at = {
+            cid: ws_base + WS_VOICES * i
+            for i, cid in enumerate(wonderswan_ids)
+        }
+        ws_wave_index: dict[bytes, int] = {}
+        for h in ws_hits:
+            wi = ws_wave_index.get(h.wave)
+            if wi is None:
+                wi = len(wonderswan_waves)
+                ws_wave_index[h.wave] = wi
+                wonderswan_waves.append(h.wave)
+            ch = ws_at.get(h.chip_id, ws_base) + h.voice
+            note, e5 = furnace_period_note(
+                wonderswan_clock, WS_PITCH_DIVIDER, h.period,
+                maximum=WS_MAX_PERIOD,
+            )
+            wave_pts_list = []
+            for t, body in h.wave_pts:
+                idx = ws_wave_index.get(body)
+                if idx is None:
+                    idx = len(wonderswan_waves)
+                    ws_wave_index[body] = idx
+                    wonderswan_waves.append(body)
+                wave_pts_list.append((t, idx))
+            wave_pts = tuple(wave_pts_list)
+            events.append(NoteEvent(
+                sample=h.sample_time,
+                ch=ch,
+                on=True,
+                note=note,
+                ins=-1,
+                vol=15,
+                e5=e5,
+                pan=0,
+                end=h.off_sample,
+                tone_pitch_pts=tuple(h.period_pts),
+                tone_chip=13,
+                tone_clock=wonderswan_clock,
+                tone_div=WS_PITCH_DIVIDER,
+                tone_period=h.period,
+                tone_wave=wi,
+                tone_wave_pts=wave_pts,
+                tone_pan_l=h.vol_l,
+                tone_pan_r=h.vol_r,
+                tone_amp_pts=tuple(h.vol_pts),
+            ))
+            wonderswan_count += 1
+            if h.noise:
+                channel_fx.append((h.sample_time, ch, 0x11, h.noise))
+            for t, noise in h.noise_pts:
+                channel_fx.append((t, ch, 0x11, noise))
+            if h.sweep_time or h.sweep_amount:
+                channel_fx.append((
+                    h.sample_time, ch, 0x12,
+                    0 if not h.sweep_time else min(255, h.sweep_time + 1),
+                ))
+                channel_fx.append((
+                    h.sample_time, ch, 0x13, h.sweep_amount & 0xFF,
+                ))
+            for t, stime, amount in h.sweep_pts:
+                channel_fx.append((
+                    t, ch, 0x12,
+                    0 if not stime else min(255, stime + 1),
+                ))
+                channel_fx.append((t, ch, 0x13, amount & 0xFF))
+            if h.off_sample and (not vgm.total_samples or h.off_sample < vgm.total_samples):
+                events.append(NoteEvent(
+                    sample=h.off_sample, ch=ch, on=False, note=180,
+                    ins=-1, vol=-1, e5=0x80, pan=0,
+                ))
+        # Streamed PCM bodies use one native sample instrument per body.
+        wonderswan_pcm_samples = list(ws_pcm)
+        ws_pcm_index = {id(s): i for i, s in enumerate(wonderswan_pcm_samples)}
+        for smp in wonderswan_pcm_samples:
+            base_ch = ws_at.get(smp.chip_id, ws_base) + 1
+            for hit in smp.hits:
+                ev = NoteEvent(
+                    sample=hit.sample_time,
+                    ch=base_ch,
+                    on=True,
+                    # Note 108 is C-4 in the period-table convention; at this
+                    # note the WS DAC rate is 183/8363 of the chip clock.
+                    note=108,
+                    ins=-1,
+                    vol=hit.volume,
+                    e5=0x80,
+                    pan=(hit.pan_l << 4) | hit.pan_r,
+                    pcm=True,
+                    end=hit.off_sample,
+                    vol_pts=tuple(
+                        (t, v, fx) for t, v, fx in hit.vol_pts
+                    ),
+                )
+                events.append(ev)
+                wonderswan_pcm_events.append((ev, ws_pcm_index[id(smp)]))
+                wonderswan_pcm_count += 1
+                if hit.off_sample and (
+                    not vgm.total_samples or hit.off_sample < vgm.total_samples
+                ):
+                    events.append(NoteEvent(
+                        sample=hit.off_sample, ch=base_ch, on=False,
+                        note=180, ins=-1, vol=-1, e5=0x80, pan=0,
+                        pcm=True,
+                    ))
+
+    # Capcom QSound: sixteen PCM and three ADPCM columns.
+    qsound_ids: list[int] = []
+    qsound_ins: list[ToneIns] = []
+    qsound_samples: list[QSoundSample] = []
+    qsound_count = 0
+    qsound_adpcm_count = 0
+    qs_pcm, qs_adpcm, qs_samples, qs_warn = collect_qsound(vgm)
+    warnings.extend(qs_warn)
+    if qs_pcm or qs_adpcm:
+        qsound_ids = sorted({h.chip_id for h in qs_pcm + qs_adpcm})
+        qsound_samples = list(qs_samples)
+        qs_base = (
+            tone_base + SCC_VOICES * len(scc_ids) + AY_VOICES * len(ay_ids)
+            + NES_CHANNELS * len(nes_ids)
+            + (HUC6280_CHANNELS if huc6280_ids else 0)
+            + (4 * len(gb_ids))
+            + VSU_CHANNELS * len(vsu_ids)
+            + SAA_VOICES * len(saa_ids)
+            + POKEY_VOICES * len(pokey_ids)
+            + MIKEY_VOICES * len(mikey_ids)
+            + X1_CHANNELS * len(x1_ids)
+            + len(fds_ids) + WS_VOICES * len(wonderswan_ids)
+        )
+        qs_at = {
+            cid: qs_base + QSOUND_CHANNELS * i
+            for i, cid in enumerate(qsound_ids)
+        }
+        qs_sample_index = {
+            id(s): i for i, s in enumerate(qsound_samples)
+        }
+
+        def _qs_pan_fx(raw: int) -> tuple[int, int]:
+            linear, surround = qsound_pan(raw)
+            left, right = qsound_pan_split(linear)
+            return (left << 4) | right, surround
+
+        for h in qs_pcm:
+            ch = qs_at.get(h.chip_id, qs_base) + h.voice
+            note, e5 = furnace_frequency_note(
+                QSOUND_OUT_RATE, QSOUND_FREQ_DIV, max(1, h.freq),
+                maximum=QSOUND_MAX_FREQ,
+            )
+            pan_fx, surround = _qs_pan_fx(h.pan)
+            events.append(NoteEvent(
+                sample=h.sample_time,
+                ch=ch,
+                on=True,
+                note=note,
+                ins=-1,
+                vol=h.volume,
+                e5=e5,
+                pan=pan_fx,
+                pcm=True,
+                end=h.off_sample,
+                vol_pts=tuple((t, v, None) for t, v in h.vol_pts),
+                tone_pitch_pts=tuple(h.freq_pts),
+                tone_chip=14,
+                tone_clock=QSOUND_OUT_RATE,
+                tone_div=QSOUND_FREQ_DIV,
+                tone_period=h.freq,
+                tone_sample=qs_sample_index.get(id(h.sample), -1),
+                tone_sample_kind="pcm",
+            ))
+            channel_fx.append((h.sample_time, ch, 0x08, pan_fx))
+            channel_fx.append((h.sample_time, ch, 0x12, surround))
+            channel_fx.append((
+                h.sample_time, ch, 0x11, qsound_echo_fx(h.echo),
+            ))
+            for t, raw in h.pan_pts:
+                pfx, sur = _qs_pan_fx(raw)
+                channel_fx.append((t, ch, 0x08, pfx))
+                channel_fx.append((t, ch, 0x12, sur))
+            for t, raw in h.echo_pts:
+                channel_fx.append((t, ch, 0x11, qsound_echo_fx(raw)))
+            qsound_count += 1
+            if h.off_sample and (not vgm.total_samples or h.off_sample < vgm.total_samples):
+                events.append(NoteEvent(
+                    sample=h.off_sample, ch=ch, on=False, note=180,
+                    ins=-1, vol=-1, e5=0x80, pan=0, pcm=True,
+                ))
+
+        for h in qs_adpcm:
+            ch = qs_at.get(h.chip_id, qs_base) + 16 + h.voice
+            pan_fx, surround = _qs_pan_fx(h.pan)
+            events.append(NoteEvent(
+                sample=h.sample_time,
+                ch=ch,
+                on=True,
+                note=60,
+                ins=-1,
+                vol=h.volume,
+                e5=0x80,
+                pan=pan_fx,
+                pcm=True,
+                end=h.off_sample,
+                vol_pts=tuple((t, v, None) for t, v in h.vol_pts),
+                tone_chip=15,
+                tone_sample=qs_sample_index.get(id(h.sample), -1),
+                tone_sample_kind="adpcm",
+            ))
+            channel_fx.append((h.sample_time, ch, 0x08, pan_fx))
+            channel_fx.append((h.sample_time, ch, 0x12, surround))
+            for t, raw in h.pan_pts:
+                pfx, sur = _qs_pan_fx(raw)
+                channel_fx.append((t, ch, 0x08, pfx))
+                channel_fx.append((t, ch, 0x12, sur))
+            qsound_adpcm_count += 1
+            if h.off_sample and (not vgm.total_samples or h.off_sample < vgm.total_samples):
+                events.append(NoteEvent(
+                    sample=h.off_sample, ch=ch, on=False, note=180,
+                    ins=-1, vol=-1, e5=0x80, pan=0, pcm=True,
+                ))
+
+        # Echo feedback and delay are chip-wide registers.  Put them on the
+        # first QSound column as 10xx / 3xxx effects.
+        qs_fx_ch = qs_at.get(qsound_ids[0], qs_base)
+        for w in vgm.writes:
+            if w.chip != "qsound" or w.chip_id != qsound_ids[0]:
+                continue
+            if w.reg == 0x93:
+                channel_fx.append((
+                    w.sample, qs_fx_ch, 0x10,
+                    qsound_feedback_fx(w.val),
+                ))
+            elif w.reg == 0xD9:
+                delay = qsound_delay_fx(w.val)
+                channel_fx.append((
+                    w.sample, qs_fx_ch, 0x30 | ((delay >> 8) & 0x0F),
+                    delay & 0xFF,
+                ))
+
     # The YM2203 SSG rides in the same six-channel system: 0-2 FM, 3-5 PSG. Its
     # notes share the AY instrument list.
     ssg_pcm, ssg_pcm_hits = _ssg_pcm("ym2203_ssg")
@@ -12148,6 +12754,8 @@ def analyze(
     tone_ins_base += n_pwm_ins
     mikey_ins_base = tone_ins_base
     tone_ins_base += n_mikey_ins
+    wonderswan_pcm_ins_base = tone_ins_base
+    tone_ins_base += len(wonderswan_pcm_samples)
     x1_ins_base = tone_ins_base
     tone_ins_base += n_x1_ins
 
@@ -12428,11 +13036,13 @@ def analyze(
     if (
         scc_ids or ay_ids or psg_ids or nes_ids or huc6280_ids
         or gb_ids or vsu_ids or saa_ids or pokey_ids or mikey_ids or x1_ids
+        or fds_ids or wonderswan_ids or qsound_ids
     ):
         tone_demand = _tone_instrument_demand(
             events, vgm.k051649_clock or SCC_DEFAULT_CLOCK, ay_note_clock,
             psg_clock, nes_clock, huc6280_clock, gb_clock, vsu_clock,
-            saa_clock, pokey_clock, mikey_clock, x1_clock, hz,
+            saa_clock, pokey_clock, mikey_clock, x1_clock,
+            fds_clock, wonderswan_clock, hz,
             vgm.total_samples,
             use_speed,
             lfo_loop=lfo_loop,
@@ -12518,6 +13128,8 @@ def analyze(
         tone_ins_base += n_pwm_ins
         mikey_ins_base = tone_ins_base
         tone_ins_base += n_mikey_ins
+        wonderswan_pcm_ins_base = tone_ins_base
+        tone_ins_base += len(wonderswan_pcm_samples)
         x1_ins_base = tone_ins_base
         tone_ins_base += n_x1_ins
     if pms_lost:
@@ -12561,6 +13173,7 @@ def analyze(
     tone_merged = _bind_tone_instruments(
         events, scc_ins, ay_ins, psg_ins, nes_ins, huc6280_ins, gb_ins,
         vsu_ins, saa_ins, pokey_ins, mikey_ins, x1_ins,
+        fds_ins, wonderswan_ins, qsound_ins,
         tone_ins_base,
         vgm.k051649_clock or SCC_DEFAULT_CLOCK,
         ay_note_clock,
@@ -12573,6 +13186,8 @@ def analyze(
         pokey_clock,
         mikey_clock,
         x1_clock,
+        fds_clock,
+        wonderswan_clock,
         hz, vgm.total_samples, use_speed,
         merge_tol=tone_merge_tol, lfo_loop=lfo_loop,
     )
@@ -12617,6 +13232,8 @@ def analyze(
         ev.ins = pwm_ins_base + idx
     for ev, idx in mikey_sample_events:
         ev.ins = mikey_ins_base + idx
+    for ev, idx in wonderswan_pcm_events:
+        ev.ins = wonderswan_pcm_ins_base + idx
     for ev, idx in x1_sample_events:
         ev.ins = x1_ins_base + idx
 
@@ -12798,6 +13415,22 @@ def analyze(
         x1_010_count=x1_count,
         x1_waves=x1_waves,
         x1_envs=x1_envs,
+        fds_ids=fds_ids,
+        fds_ins=fds_ins,
+        fds_waves=fds_waves,
+        fds_mod_waves=fds_mod_waves,
+        fds_count=fds_count,
+        wonderswan_ids=wonderswan_ids,
+        wonderswan_ins=wonderswan_ins,
+        wonderswan_waves=wonderswan_waves,
+        wonderswan_pcm_samples=wonderswan_pcm_samples,
+        wonderswan_count=wonderswan_count,
+        wonderswan_pcm_count=wonderswan_pcm_count,
+        qsound_ids=qsound_ids,
+        qsound_ins=qsound_ins,
+        qsound_samples=qsound_samples,
+        qsound_count=qsound_count,
+        qsound_adpcm_count=qsound_adpcm_count,
         channel_fx=channel_fx,
         k007232_volume=k007232_volume,
         c352_quad=c352_quad_events,

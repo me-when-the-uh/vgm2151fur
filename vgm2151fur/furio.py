@@ -83,6 +83,9 @@ CHIP_CHANNELS = {
     CHIP_SAA1099: 6,  # Philips SAA1099
     CHIP_POKEY: 4,  # Atari POKEY
     0xA8: 4,  # Atari Lynx Mikey: four LFSR/DAC voices
+    0x8A: 1,  # Famicom Disk System: one wavetable voice
+    0x96: 4,  # Bandai WonderSwan: four wavetable/PCM voices
+    0xE0: 19,  # Capcom QSound: sixteen PCM + three ADPCM voices
     0xB0: 16,  # Seta/Allumer X1-010: sixteen wavetable/PCM voices
     0x03: 4,  # TI SN76489 (three tone + noise)
     0xBF: 4,  # Toshiba T6W28 (stereo SN76489 derivative)

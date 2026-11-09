@@ -50,6 +50,9 @@ CHIP_LABELS = (
     ("ay8910", "AY-8910"),
     ("saa1099", "SAA1099"),
     ("pokey", "POKEY"),
+    ("fds", "FDS"),
+    ("wonderswan", "WonderSwan"),
+    ("qsound", "QSound"),
 )
 
 

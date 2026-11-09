@@ -354,6 +354,15 @@ def convert_vgm(
         "mikey_notes": song.mikey_count,
         "x1_010_samples": len(song.x1_010_samples) if pcm else 0,
         "x1_010_notes": song.x1_010_count,
+        "qsound_samples": len(getattr(song, "qsound_samples", ())) if pcm else 0,
+        "qsound_notes": (
+            getattr(song, "qsound_count", 0)
+            + getattr(song, "qsound_adpcm_count", 0)
+        ),
+        "wonderswan_pcm_samples": (
+            len(getattr(song, "wonderswan_pcm_samples", ())) if pcm else 0
+        ),
+        "wonderswan_notes": getattr(song, "wonderswan_count", 0),
         "ym2610_a_samples": len(song.ym2610_a_samples) if pcm else 0,
         "ym2610_b_samples": len(song.ym2610_b_samples) if pcm else 0,
         "ym2610_a_notes": song.ym2610_a_count,
