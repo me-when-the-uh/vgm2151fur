@@ -18,6 +18,30 @@ from dataclasses import dataclass, field
 MSM5232_VOICES = 8
 MSM5232_NOTE_BASE = 72
 
+# Furnace's MSM5232 platform maps the attack/decay effect value through these
+# tables before writing the chip (platform/msm5232.cpp).  The tables are not
+# the identity: effect 5 is hardware decay 9, for example.  The collector has
+# to invert them so the chip receives the source register value.
+FURNACE_MSM5232_ATTACK_MAP = (0, 1, 2, 3, 4, 5, 5, 5)
+FURNACE_MSM5232_DECAY_MAP = (
+    0, 1, 2, 3, 8, 9, 4, 10, 5, 11, 12, 13, 13, 13, 13, 13,
+)
+# Inverse of the decay table, keyed by the hardware register value.  Values
+# the platform cannot reach (6, 7, 14 and 15) use the nearest hardware rate.
+FURNACE_MSM5232_DECAY_FX = (
+    0, 1, 2, 3, 6, 8, 9, 10, 4, 5, 7, 9, 10, 11, 11, 11,
+)
+
+
+def msm5232_attack_fx(register: int) -> int:
+    """Effect value that makes Furnace write hardware attack ``register``."""
+    return min(register & 0x07, 5)
+
+
+def msm5232_decay_fx(register: int) -> int:
+    """Effect value that makes Furnace write hardware decay ``register``."""
+    return FURNACE_MSM5232_DECAY_FX[register & 0x0F]
+
 
 def msm5232_volume_fx(value: int) -> int:
     """TA7630 group volume (0-15) as a Furnace 0-127 channel level."""
@@ -43,6 +67,7 @@ class Msm5232Hit:
     pitch: int
     noise: bool
     volume: int = 15
+    control: int = 0x0F
     off_sample: int = 0
 
 
@@ -72,6 +97,25 @@ class Msm5232Fx:
     value: int
 
 
+def _env_fx(
+    fx: list[Msm5232Fx],
+    last_env: dict[tuple[int, int, int], int],
+    write,
+    group: int,
+    code: int,
+    register: int,
+    mapper,
+) -> None:
+    """Record a group attack/decay change once, mapped for Furnace."""
+    key = (write.chip_id, group, code)
+    if last_env.get(key) == register:
+        return
+    last_env[key] = register
+    fx.append(
+        Msm5232Fx(write.sample, write.chip_id, group, code, mapper(register))
+    )
+
+
 def collect_msm5232(
     vgm,
 ) -> tuple[
@@ -86,14 +130,21 @@ def collect_msm5232(
     warnings: list[str] = []
     keyed = [False] * MSM5232_VOICES
     active: list[Msm5232Hit | None] = [None] * MSM5232_VOICES
-    # libvgm starts both TA7630 group volumes at maximum.
+    # libvgm starts both TA7630 group volumes at maximum; the group control
+    # output-enable mask resets to all four parts on.
     ext_vol: dict[int, list[int]] = {}
+    group_ctrl: dict[int, list[int]] = {}
+    # Repeated group writes with the same value do nothing on the chip.  Keep
+    # the last source register per group so 60 Hz refresh writes don't flood
+    # the pattern with identical 12xx/13xx effects.
+    last_env: dict[tuple[int, int, int], int] = {}
     for w in vgm.writes:
         if w.chip != "msm5232":
             continue
         reg = w.reg & 0x7F
         val = w.val & 0xFF
         group_vol = ext_vol.setdefault(w.chip_id, [15, 15])
+        ctrl = group_ctrl.setdefault(w.chip_id, [0x0F, 0x0F])
         if reg < 0x08:
             voice = reg
             if val & 0x80:
@@ -107,6 +158,7 @@ def collect_msm5232(
                     pitch=pitch,
                     noise=pitch >= 0x58,
                     volume=group_vol[voice >> 2],
+                    control=ctrl[voice >> 2] & 0x1F,
                 )
                 hits.append(hit)
                 active[voice] = hit
@@ -120,17 +172,21 @@ def collect_msm5232(
                 keyed[voice] = False
             continue
         if reg == 0x08:
-            fx.append(Msm5232Fx(w.sample, w.chip_id, 0, 0x12, val & 0x07))
+            _env_fx(fx, last_env, w, 0, 0x12, val & 0x07,
+                    msm5232_attack_fx)
         elif reg == 0x09:
-            fx.append(Msm5232Fx(w.sample, w.chip_id, 1, 0x12, val & 0x07))
+            _env_fx(fx, last_env, w, 1, 0x12, val & 0x07,
+                    msm5232_attack_fx)
         elif reg == 0x0A:
-            fx.append(Msm5232Fx(w.sample, w.chip_id, 0, 0x13, val & 0x0F))
+            _env_fx(fx, last_env, w, 0, 0x13, val & 0x0F,
+                    msm5232_decay_fx)
         elif reg == 0x0B:
-            fx.append(Msm5232Fx(w.sample, w.chip_id, 1, 0x13, val & 0x0F))
+            _env_fx(fx, last_env, w, 1, 0x13, val & 0x0F,
+                    msm5232_decay_fx)
         elif reg == 0x0C:
-            fx.append(Msm5232Fx(w.sample, w.chip_id, 0, 0x10, val & 0x1F))
+            ctrl[0] = val & 0x1F
         elif reg == 0x0D:
-            fx.append(Msm5232Fx(w.sample, w.chip_id, 1, 0x10, val & 0x1F))
+            ctrl[1] = val & 0x1F
         elif reg == 0x1E:
             value = val & 0x0F
             if group_vol[0] != value:

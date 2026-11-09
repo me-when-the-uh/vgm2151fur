@@ -29,7 +29,13 @@ from vgm2151fur.furwrite import (
 )
 from vgm2151fur.ga20 import collect_ga20
 from vgm2151fur.msm5205 import collect_msm5205
-from vgm2151fur.msm5232 import collect_msm5232
+from vgm2151fur.msm5232 import (
+    FURNACE_MSM5232_ATTACK_MAP,
+    FURNACE_MSM5232_DECAY_MAP,
+    collect_msm5232,
+    msm5232_attack_fx,
+    msm5232_decay_fx,
+)
 from vgm2151fur.k054539 import (
     FORMAT_8BIT,
     FORMAT_16BIT,
@@ -425,7 +431,8 @@ class TestGa20Msm5205Msm5232(unittest.TestCase):
         self.assertFalse(hits[0].noise)
         self.assertEqual(len(offs), 1)
         self.assertTrue(any(e.code == 0x12 and e.value == 3 for e in fx))
-        self.assertTrue(any(e.code == 0x13 and e.value == 5 for e in fx))
+        # Furnace maps effect 8 back to hardware decay register 5.
+        self.assertTrue(any(e.code == 0x13 and e.value == 8 for e in fx))
 
         analysed = analyze(song)
         self.assertEqual(analysed.msm5232_count, 1)
@@ -438,6 +445,39 @@ class TestGa20Msm5205Msm5232(unittest.TestCase):
         ]
         self.assertEqual(len(notes), 1)
         self.assertEqual(notes[0].note, 72 + 0x21)
+
+    def test_msm5232_envelope_maps_reach_the_source_registers(self):
+        # Furnace runs 12xx/13xx through its own attack/decay tables before
+        # writing the chip, so the effect values must be the inverses.
+        writes = [
+            _write(0, "msm5232", 0x08, 0x08),  # attack 8 -> hardware 0
+            _write(0, "msm5232", 0x09, 0x0F),  # attack 7 -> 5 (fastest)
+            _write(0, "msm5232", 0x0A, 0x0A),  # decay 10
+            _write(0, "msm5232", 0x0B, 0x05),  # decay 5
+            _write(10, "msm5232", 0x00, 0xA1),
+            _write(20, "msm5232", 0x0B, 0x05),  # same value: no new effect
+        ]
+        song = _vgm(writes, total=1000, msm5232_clock=2_000_000)
+        _hits, _offs, fx, _vols, _warn = collect_msm5232(song)
+        attacks = [(e.group, e.value) for e in fx if e.code == 0x12]
+        decays = [(e.group, e.value) for e in fx if e.code == 0x13]
+        self.assertIn((0, 0), attacks)
+        self.assertIn((1, 5), attacks)
+        self.assertIn((0, 7), decays)   # decayMap[7] == 10
+        self.assertIn((1, 8), decays)   # decayMap[8] == 5
+        self.assertEqual(decays.count((1, 8)), 1)
+
+        for register in range(16):
+            effect = msm5232_decay_fx(register)
+            if register in FURNACE_MSM5232_DECAY_MAP:
+                self.assertEqual(
+                    FURNACE_MSM5232_DECAY_MAP[effect], register
+                )
+        for register in range(16):
+            effect = msm5232_attack_fx(register)
+            self.assertEqual(
+                FURNACE_MSM5232_ATTACK_MAP[effect], min(register & 7, 5)
+            )
 
     def test_msm5205_streams_to_pcm_dac(self):
         writes = [

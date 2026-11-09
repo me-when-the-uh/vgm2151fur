@@ -987,6 +987,7 @@ class Song:
     ga20_count: int = 0
     # OKI MSM5232: eight native tone/noise voices per chip.
     msm5232_ids: list[int] = field(default_factory=list)
+    msm5232_controls: list[int] = field(default_factory=list)
     msm5232_count: int = 0
     # Standalone channel volume changes (MSM5232 group volume).
     channel_vol_events: list[tuple[int, int, int]] = field(
@@ -10296,6 +10297,7 @@ def analyze(
     ga20_events: list[tuple[NoteEvent, int]] = []
     ga20_count = 0
     msm5232_ids: list[int] = []
+    msm5232_controls: list[int] = []
     msm5232_events: list[tuple[NoteEvent, int]] = []
     msm5232_vols: list = []
     channel_vol_events: list[tuple[int, int, int]] = []
@@ -11453,7 +11455,10 @@ def analyze(
         or ([0] if vgm.msm5232_clock else []),
         bool(getattr(vgm, "msm5232_dual", False)),
     )
-    n_msm5232_ins = len(msm5232_ids)
+    msm5232_controls = (
+        sorted({h.control for h in msm5232_hits}) if msm5232_ids else []
+    ) or ([0x0F] if msm5232_ids else [])
+    n_msm5232_ins = len(msm5232_controls)
 
     # Atari Lynx Mikey: LFSR tones always convert; streamed output bytes are
     # native 8-bit samples and follow --melody-only/--pcm-only like the other
@@ -11648,7 +11653,10 @@ def analyze(
             end=h.off_sample,
         )
         events.append(ev)
-        msm5232_events.append((ev, msm5232_index.get(h.chip_id, 0)))
+        msm5232_events.append((
+            ev, msm5232_controls.index(h.control & 0x1F)
+            if (h.control & 0x1F) in msm5232_controls else 0,
+        ))
         channel_fx.append((
             h.sample_time, ch, 0x11, 1 if h.noise else 0,
         ))
@@ -13933,6 +13941,7 @@ def analyze(
         ga20_ids=ga20_ids,
         ga20_count=ga20_count,
         msm5232_ids=msm5232_ids,
+        msm5232_controls=msm5232_controls,
         msm5232_count=msm5232_count,
         channel_vol_events=channel_vol_events,
         mikey_samples=mikey_samples,

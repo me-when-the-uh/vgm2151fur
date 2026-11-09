@@ -137,7 +137,7 @@ Open follow-ups are tracked in [TODO.md](./TODO.md).
   - The decoder mirrors libvgm's reset/FIFO/prescaler state, then reuses the YM2612-DAC/PWM chunking path.
   - `--lossy-sample-clustering` can reduce the bank further; it is off by default.
 - OKI MSM5232 converts eight tone/noise voices per chip on Furnace's native `0xBC` system.
-  - Pitch bytes map directly to note `72+pitch`; group control, attack, decay and noise become `10xy`, `12xx`, `13xx` and `11xx` effects.
+  - Pitch bytes map directly to note `72+pitch`; group control rides a one-value instrument duty macro, attack/decay become `12xx`/`13xx` (inverted through Furnace's tables), and noise becomes `11xx`.
   - TA7630 group volume (`0x1E/0x1F`) drives the channel volume columns, including mid-note changes.
 - RF5C68 and RF5C164 share one Furnace system selected by `chipType`, and a looping SSG PCM DAC stream plays once because the AY sample instrument is one-shot.
 - SN76489 converts as four channels, and extreme periods or two notes on the same channel/row are approximated.

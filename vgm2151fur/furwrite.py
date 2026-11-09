@@ -1013,7 +1013,7 @@ def _write_tone_macros(
     moving = (
         ins.vol or ins.pitch or (wave and ins.waves) or ins.noise or ins.mode
         or ins.env_shape or ins.env_period or ins.panl or ins.panr or ins.env
-        or reset
+        or getattr(ins, "duty", ()) or reset
     )
     if not moving:
         _write_ma(b)
@@ -1033,6 +1033,10 @@ def _write_tone_macros(
         # in that effect encoding (the same numbers 21xx uses).
         _write_macro(
             b, 2, ins.noise, speed=ins.noise_speed, loop=ins.noise_loop,
+        )
+    if getattr(ins, "duty", ()):
+        _write_macro(
+            b, 2, ins.duty, speed=ins.duty_speed, loop=ins.duty_loop,
         )
     if wave and ins.waves:
         _write_macro(
@@ -4799,11 +4803,16 @@ def write_fur(
         list(getattr(song, "ga20_ids", ()) or ()) if include_pcm else []
     ) or sorted({s.chip_id for s in ga20_smps})
     msm5232_ids = list(getattr(song, "msm5232_ids", ()) or ())
+    msm5232_controls = list(
+        getattr(song, "msm5232_controls", ()) or ()
+    )
+    if msm5232_ids and not msm5232_controls:
+        msm5232_controls = [0x0F]
     n_upd_ins = (len(upd7759_smps) + 119) // 120
     n_pwm_ins = (len(pwm_smps) + 119) // 120
     n_msm5205_ins = (len(msm5205_smps) + 119) // 120
     n_ga20_ins = len(ga20_smps)
-    n_msm5232_ins = len(msm5232_ids)
+    n_msm5232_ins = len(msm5232_controls) if msm5232_ids else 0
     mikey_smps = (
         list(getattr(song, "mikey_samples", ()) or ())
         if include_pcm else []
@@ -6287,10 +6296,14 @@ def write_fur(
             b, f"K054539 {smp.start:06x}", k054539_smp_base + i,
             INS_AMIGA,
         )
-    for i, cid in enumerate(msm5232_ids):
+    for i, control in enumerate(msm5232_controls):
         ins_ptrs.append(len(b))
+        # A duty macro keeps the group control write on the note and lets the
+        # platform add its internal-envelope bit (0x20). A pattern 10xx write
+        # would mask that bit and switch the group to external volume.
         _write_ins_psg(
-            b, f"MSM5232 {cid + 1}", ToneIns(), INS_MSM5232,
+            b, f"MSM5232 {i + 1}",
+            ToneIns(duty=(control & 0x1F,)), INS_MSM5232,
         )
     for group in range(n_mikey_ins):
         ins_ptrs.append(len(b))
