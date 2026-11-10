@@ -20,7 +20,7 @@ from pathlib import Path
 from vgm2151fur.analyze import analyze, format_report
 from vgm2151fur.furwrite import (
     CHIP_YM2608, CHIP_YM2608_EXT, INS_ADPCMA, INS_ADPCMB, INS_FM,
-    parse_fur_skeleton, write_fur,
+    _linked_ssg_volume, parse_fur_skeleton, write_fur,
 )
 from vgm2151fur.furnace import export_vgm, find_furnace
 from vgm2151fur.furio import (
@@ -526,6 +526,28 @@ class TestYm2608Analyze(unittest.TestCase):
         self.assertGreaterEqual(play.ins, len(song.fm_patches))
         ins = song.ym2608_b_samples
         self.assertEqual(len(ins), 1)
+
+    def test_linked_ssg_volume_sets_the_platform_flag(self):
+        # The extra-header 0x87 entry is the OPNA SSG mix. Its default is
+        # 0x80 (0.5), matching Furnace's ssgVol=128; a relative entry scales
+        # that base. Yuno's pack writes 0x80A0, i.e. 0x50.
+        writes = _fm_note(0)
+        vgm = _vgm(writes)
+        vgm.extra_volumes = {0x87: (0, 0x80A0)}
+        self.assertEqual(_linked_ssg_volume(vgm, 0x07), 0x50)
+        data = write_fur(analyze(vgm))
+        flags = [
+            blk.decode("utf-8", "replace")
+            for _o, mag, _s, blk in iter_blocks(data) if mag == b"FLAG"
+        ]
+        self.assertIn("ssgVol=80", "\n".join(flags))
+
+    def test_linked_ssg_volume_follows_the_ym2203_half_rule(self):
+        vgm = _vgm([])
+        vgm.extra_volumes = {0x86: (0, 0x8100)}   # relative 1.0
+        self.assertEqual(_linked_ssg_volume(vgm, 0x06), 0x80)
+        vgm.extra_volumes = {0x86: (0, 0x60)}     # absolute
+        self.assertEqual(_linked_ssg_volume(vgm, 0x06), 0x60)
 
     def test_same_sample_global_levels_collapse_to_the_key_value(self):
         # The driver ramps $11 several times at the key-on sample; the chip

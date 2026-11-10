@@ -1025,8 +1025,9 @@ def _parse_volume_list(buf: bytes, pos: int) -> dict[int, tuple[int, int]]:
             return {}
         chip, flags = buf[pos], buf[pos + 1]
         value = int.from_bytes(buf[pos + 2:pos + 4], "little")
-        if chip > 0x7F or value > 0x400:
-            return {}
+        # Bit 7 of the chip byte marks a linked device (the SSG half of a
+        # YM2203/YM2608/YM2610), and bit 15 of the value marks a relative
+        # multiplier. Rejecting either dropped every linked-SSG entry.
         out[chip] = (flags, value)
         pos += 4
     return out
@@ -1035,11 +1036,12 @@ def _parse_volume_list(buf: bytes, pos: int) -> dict[int, tuple[int, int]]:
 def _extra_chip_lists(buf: bytes) -> tuple[dict[int, int], dict[int, tuple[int, int]]]:
     """VGM extra header (1.70+): the clock and volume lists.
 
-    Both lists are located by an offset field next to the 4-byte size; which
-    field holds which list varies between writers. Each candidate is parsed
-    with validation and an unreadable list is reported as empty rather than as
-    garbage. Values below 100 kHz are never accepted as clocks (the volume
-    list is easy to mistake for one).
+    The spec puts the chip-clock list offset at extra+4 and the chip-volume
+    list offset at extra+8; each offset is relative to its own field. Earlier
+    code also tried the cross pair (extra+4, volume offset), which turned a
+    valid clock list into a page of bogus volume entries. Parse the spec
+    locations only; an unreadable list is reported empty. Values below
+    100 kHz are never accepted as clocks.
     """
     clocks: dict[int, int] = {}
     volumes: dict[int, tuple[int, int]] = {}
@@ -1055,14 +1057,12 @@ def _extra_chip_lists(buf: bytes) -> tuple[dict[int, int], dict[int, tuple[int, 
     if size < 8:
         return clocks, volumes
     off1 = int.from_bytes(buf[extra + 4:extra + 8], "little")
-    off2 = int.from_bytes(buf[extra + 8:extra + 12], "little") if size >= 12 else 0
-    for base, rel_off in ((extra + 8, off2), (extra + 4, off1), (extra + 4, off2), (extra + 8, off1)):
-        if not rel_off:
-            continue
-        if not volumes:
-            volumes = _parse_volume_list(buf, base + rel_off)
-        if not clocks:
-            clocks = _parse_clock_list(buf, base + rel_off)
+    if off1:
+        clocks = _parse_clock_list(buf, extra + 4 + off1)
+    if size >= 12 and extra + 12 <= len(buf):
+        off2 = int.from_bytes(buf[extra + 8:extra + 12], "little")
+        if off2:
+            volumes = _parse_volume_list(buf, extra + 8 + off2)
     return clocks, volumes
 
 

@@ -32,7 +32,25 @@ from vgm2151fur.furio import fx_pan_amps, list_fur_samples, parse_fur
 from vgm2151fur.oki import (
     msm6258_best_divider, msm6258_div_fx, oki_flag_text, oki_furnace_vol, oki_rate,
 )
-from vgm2151fur.vgm import ChipWrite, Msm6258Play, RomSlice, VgmFile, load_vgm
+from vgm2151fur.vgm import (
+    ChipWrite, Msm6258Play, RomSlice, VgmFile, _parse_volume_list, load_vgm,
+)
+
+
+class TestVgmExtraVolumeList(unittest.TestCase):
+    def test_linked_devices_and_relative_values_are_kept(self):
+        # Bit 7 of the chip byte marks the linked SSG half; bit 15 of the
+        # value is the relative-volume flag. Rejecting either silently
+        # dropped the SSG mix from every OPNA rip.
+        buf = bytes([
+            2,
+            0x87, 0x00, 0xA0, 0x80,   # OPNA SSG, relative 0xA0
+            0x03, 0x00, 0x00, 0x01,   # YM2151, absolute 0x0100
+        ])
+        self.assertEqual(_parse_volume_list(buf, 0), {
+            0x87: (0, 0x80A0),
+            0x03: (0, 0x0100),
+        })
 
 
 class TestKC(unittest.TestCase):

@@ -440,6 +440,39 @@ def _player_chip_volume(vgm, dev: int, instances: int) -> float:
     return vol / 256.0
 
 
+# VGM extra-header linked-device volumes (0x86/0x87/0x88) are the SSG half
+# of the YM2203/YM2608/YM2610. Its default follows the player's 8.8 volume:
+# 0x80 (0.5) for each, after the YM2203's linked half-of-FM rule.
+_LINKED_SSG_DEFAULT = {0x06: 0x80, 0x07: 0x80, 0x08: 0x80}
+
+
+def _linked_ssg_volume(
+    vgm, chip_type: int, chip_id: int = 0, instances: int = 1,
+) -> int | None:
+    """The player's SSG mix level for a linked YM2203/YM2608/YM2610.
+
+    Returns None when the header has no entry, so the module keeps Furnace's
+    default (128, the same 0.5). Otherwise the value is already an 8.8 level
+    and maps straight onto the platform's ``ssgVol`` flag (128 = 0.5).
+    """
+    if chip_type not in _LINKED_SSG_DEFAULT:
+        return None
+    entry = vgm.extra_volumes.get(0x80 | chip_type)
+    if entry is None:
+        return None
+    flags, value = entry
+    if (flags & 1) != chip_id:
+        return None
+    vol = _LINKED_SSG_DEFAULT[chip_type]
+    if instances > 1:
+        vol //= instances
+    if value & 0x8000:
+        vol = vol * (value & 0x7FFF) // 0x100
+    else:
+        vol = value
+    return max(0, min(0x7FFF, vol))
+
+
 def _sample_chip_volume(song: "Song", chip: int, instances: int) -> float:
     """Output volume for a .fur chip, calibrated to the reference player."""
     dev = _CHIP_DEV.get(chip)
@@ -5756,7 +5789,14 @@ def write_fur(
                 # real rip reports. Ask for that instead of a custom clock so
                 # the module reads as a stock configuration.
                 if fm_clock == 38400 * 13 * 16:
-                    flag_texts.append("clockSel=1")
+                    flags = ["clockSel=1"]
+                    ssg_vol = _linked_ssg_volume(
+                        song.vgm, 0x07, cid,
+                        sum(1 for s in systems if s.kind == "ym2608"),
+                    )
+                    if ssg_vol is not None and ssg_vol != 128:
+                        flags.append(f"ssgVol={ssg_vol}")
+                    flag_texts.append("\n".join(flags))
                     continue
                 fm_default = 8000000
             else:
@@ -5765,10 +5805,21 @@ def write_fur(
                 fm_default = 3579545
             # The cores default to their console clocks.  At any other clock
             # the notes play at the wrong pitch unless the flag carries it.
-            flag_texts.append(
-                f"customClock={fm_clock}"
-                if fm_clock and fm_clock != fm_default else ""
-            )
+            flags: list[str] = []
+            if fm_clock and fm_clock != fm_default:
+                flags.append(f"customClock={fm_clock}")
+            # The linked SSG half has its own volume in the VGM extra header.
+            # Furnace's default (128 = 0.5) matches the player's default, so
+            # only a present entry needs to travel.
+            ssg_dev = {"ym2203": 0x06, "ym2608": 0x07, "ym2610": 0x08}.get(kind)
+            if ssg_dev is not None:
+                ssg_vol = _linked_ssg_volume(
+                    song.vgm, ssg_dev, cid,
+                    sum(1 for s in systems if s.kind == kind),
+                )
+                if ssg_vol is not None and ssg_vol != 128:
+                    flags.append(f"ssgVol={ssg_vol}")
+            flag_texts.append("\n".join(flags))
     # The dual-YM3812 balance marks the two OPL chips of that system. In a
     # combined module they are not the first entries, so remember where they
     # start.
