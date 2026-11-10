@@ -557,16 +557,46 @@ class TestFurEmission(unittest.TestCase):
             struct.unpack_from("<H", block, 2)[0]
             for _off, mag, _size, block in iter_blocks(data) if mag == b"INS2"
         ]
-        self.assertEqual(ins_types, [INS_AY])
-        # the phase-reset macro must be in the instrument (file code 14)
-        ins = [block for _off, mag, _size, block in iter_blocks(data) if mag == b"INS2"][0]
-        self.assertIn(bytes([14, 2, 255, 255, 0, 1, 0, 1, 1, 0]), ins)
+        # One instrument for the envelope note and one plain tone instrument.
+        self.assertEqual(ins_types, [INS_AY, INS_AY])
+        # Only the envelope instrument carries the phase-reset macro (file
+        # code 14); a plain note must not rewrite the shared $0D register.
+        reset = bytes([14, 2, 255, 255, 0, 1, 0, 1, 1, 0])
+        ins = [
+            block for _off, mag, _size, block in iter_blocks(data)
+            if mag == b"INS2"
+        ]
+        self.assertEqual(sum(reset in block for block in ins), 1)
         # the envelope effects reach the pattern
         fx = [fx for rows in mod.patterns.values() for row in rows for fx in row.fx]
         cmds = {cmd for cmd, _val in fx}
         self.assertIn(0x22, cmds)
         self.assertIn(0x23, cmds)
         self.assertIn(0x24, cmds)
+
+    def test_mid_note_envelope_write_is_a_new_hit(self):
+        # The chip re-arms the envelope on every $0D write, even one that
+        # repeats the current shape. A tracker can only restart it with a
+        # note, so a mid-gate $0D write splits the held hit at the source's
+        # own rate instead of folding into an unchanged shape macro.
+        writes = [
+            ChipWrite(0, "ay8910", 0, 7, 0xFE),   # tone A on
+            ChipWrite(0, "ay8910", 0, 0, 254),
+            ChipWrite(0, "ay8910", 0, 1, 0),
+            ChipWrite(0, "ay8910", 0, 11, 66),
+            ChipWrite(0, "ay8910", 0, 12, 0),
+            ChipWrite(0, "ay8910", 0, 13, 0x0A),
+            ChipWrite(100, "ay8910", 0, 8, 0x10),  # envelope on
+            ChipWrite(5000, "ay8910", 0, 13, 0x0A),  # same shape: re-arm
+            ChipWrite(9000, "ay8910", 0, 13, 0x0A),
+            ChipWrite(15000, "ay8910", 0, 8, 0),
+        ]
+        song = analyze(_vgm(writes, ay8910_clock=1789773))
+        self.assertEqual(song.ay_count, 3)
+        self.assertEqual(
+            [e.sample for e in song.events if e.on and e.ch == 8],
+            [100, 5000, 9000],
+        )
 
     def test_ay_mode_macro_uses_the_pre_193_encoding(self):
         # Furnace adds one to every DIV_INS_AY wave-macro value when loading

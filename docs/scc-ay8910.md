@@ -108,10 +108,22 @@ below 9, or whose wave RAM was never written, emits no note; its key-off is
 still placed so the previous note stops.
 
 The AY gate is the volume register (0 = off) or the mixer (both tone and
-noise disabled = off). An envelope-enable volume write (bit 4) re-arms the
-generator, which is how MSX drivers retrigger drums; that becomes a new note
-even when the voice never went quiet. A write that clears the envelope bit
-also emits a mode effect, or the register would keep using the generator.
+noise disabled = off). The exception is the hardware envelope: with both
+mixer gates disabled the channel outputs the envelope level as a constant,
+and the envelope's own stepping makes that an audible low-frequency
+waveform. A note therefore stays alive for as long as the volume register
+has its envelope bit set, even under a muted mixer. An envelope-enable
+volume write (bit 4) re-arms the generator, which is how MSX drivers
+retrigger drums; that becomes a new note even when the voice never went
+quiet. A write that clears the envelope bit also emits a mode effect, or the
+register would keep using the generator.
+
+`$0D` (envelope shape) re-arms the generator on every write, including one
+that repeats the current shape. A same-value write is passed through the
+collector and, when it lands after the note's opening burst, becomes its own
+hit. That is the driver's drum/arpeggio envelope rate; folding it into an
+unchanged shape macro made a long envelope note play one continuous contour
+instead of the source's repeated attacks.
 A level jump of four or more while the gate stays open is a new hit too: a
 snare roll jumps straight from the decayed level back up without closing the
 gate, and treating it as a volume macro lost every hit after the first one.
@@ -144,12 +156,19 @@ reads signed, Furnace subtracts 128 when it loads the wave). A K051649 rip's
 shared voice-3/4 wave is handled by the chip itself (the SCC platform maps
 voice 4's wave writes to slot 3), so nothing special is needed there.
 
-The AY uses instruments of type 6 (`DIV_INS_AY`) with a phase-reset macro
-(file code 14). The chip restarts the envelope only when the shape register
-is written, and Furnace's platform skips a write whose value did not change;
+The AY uses instruments of type 6 (`DIV_INS_AY`). Only an instrument whose
+note actually uses the hardware envelope carries a phase-reset macro (file
+code 14). The chip restarts the envelope only when the shape register is
+written, and Furnace's platform skips a write whose value did not change;
 without the macro a drum hit reusing the previous shape kept the stale
 envelope state, which cost about 20 % of the AY layer's energy and the
-character of every drum attack.
+character of every drum attack. The macro also clears the platform's write
+cache for `$0D`, so every plain tone note that carried it re-armed the
+shared envelope generator. On a file that uses the envelope on one voice and
+plain tones on the others, that turned the drum decay into a machine-gun
+retrigger: a `darkfunk` rip had 1,100 shape writes where the source had 395.
+The analyzer now tags envelope instruments (`ToneIns.env_hw`) and gives the
+reset macro only to those.
 
 The instrument's channel-mode macro is written with the same bits-minus-one
 encoding as `20xy`. Files older than version 193 make Furnace add one to every

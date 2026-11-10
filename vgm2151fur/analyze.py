@@ -817,6 +817,11 @@ class ToneIns:
     env_shape: tuple[int, ...] = ()
     env_shape_speed: int = 1
     env_shape_loop: int = 255
+    # AY hardware envelope in use. Only such instruments carry the
+    # phase-reset macro; on a plain tone instrument it would rewrite the
+    # shared $0D register at every note-on and re-arm another channel's
+    # envelope (the whole module then machine-guns the drum decay).
+    env_hw: bool = False
     env_period: tuple[int, ...] = ()
     env_period_speed: int = 1
     env_period_loop: int = 255
@@ -2815,6 +2820,7 @@ def _bind_tone_instruments(
                         if len(set(vol_vals)) <= 1:
                             vol_vals = ()
         noise = mode = env_shape = env_period = ()
+        env_hw = False
         noise_speed = mode_speed = env_shape_speed = env_period_speed = 1
         noise_loop = mode_loop = env_shape_loop = env_period_loop = 255
         panl = panr = env = ()
@@ -2966,6 +2972,10 @@ def _bind_tone_instruments(
                 [(t, (val + 1) & 7) for t, cmd, val in e.tone_fx_pts if cmd == FX_MODE],
                 e.sample, ticks, tick_samples, merge_gap=_AY_MERGE_GAP,
             )
+            env_hw = any(
+                cmd == FX_MODE and ((val + 1) & 4)
+                for _t, cmd, val in e.tone_fx_pts
+            )
             env_shape, env_shape_speed, env_shape_loop = _macro_if_moving(
                 [(t, (val >> 4) & 0x0F) for t, cmd, val in e.tone_fx_pts if cmd == FX_ENV_SET],
                 e.sample, ticks, tick_samples,
@@ -3018,6 +3028,7 @@ def _bind_tone_instruments(
             mode=mode, mode_speed=mode_speed, mode_loop=mode_loop,
             env_shape=env_shape, env_shape_speed=env_shape_speed,
             env_shape_loop=env_shape_loop,
+            env_hw=env_hw,
             env_period=env_period, env_period_speed=env_period_speed,
             env_period_loop=env_period_loop,
             panl=panl, panl_speed=panl_speed, panl_loop=panl_loop,

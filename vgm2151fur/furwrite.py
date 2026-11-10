@@ -1151,11 +1151,13 @@ def _write_ins_psg(
 
 
 def _write_ins_ay(b: Buf, name: str, ins=None) -> None:
-    """DIV_INS_AY with a phase-reset macro and an optional pitch macro.
+    """DIV_INS_AY with an optional phase-reset and pitch macro.
 
-    Channel mode, noise and envelope are pattern effects, and one instrument
-    covers every voice. The phase reset clears the platform's write cache,
-    and the next 22xy restarts the envelope.
+    Channel mode, noise and envelope are pattern effects. Only an instrument
+    whose note really uses the hardware envelope gets the phase reset: it
+    clears the platform's write cache so the next 22xy re-arms $0D. A plain
+    tone instrument must not carry it, or every note-on rewrites the shared
+    envelope shape and re-arms another channel's drum decay.
     """
     size_off, start = b.begin_block(b"INS2")
     b.u16(FUR_VERSION)
@@ -1168,7 +1170,9 @@ def _write_ins_ay(b: Buf, name: str, ins=None) -> None:
     b.b[na_size:na_size + 2] = int(len(b.b) - na_start).to_bytes(2, "little")
     if ins is None:
         ins = ToneIns()
-    _write_tone_macros(b, ins, wave=False, reset=True)
+    _write_tone_macros(
+        b, ins, wave=False, reset=bool(getattr(ins, "env_hw", False)),
+    )
     b.raw(b"EN")
     b.end_block(size_off, start)
 
