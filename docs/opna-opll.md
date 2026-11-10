@@ -302,6 +302,14 @@ asked for comes back through Furnace unchanged.
 
 ### Delta-T: cut at 32, store at 256
 
+A 0x81 block can also be only a size declaration: the driver then uploads the
+ADPCM-B image through port 1 (`$100 = $60` external write mode, start/stop in
+`$102-$105`, bytes in `$108`). `replay_deltat_memory` rebuilds that image with
+libvgm's `YM_DELTAT_ADPCM_Write` rules (memory-type shift, auto-incrementing
+address, stop before the end byte) before the collector slices it. Without the
+replay the declaration is a zero-filled ROM, so every delta-T sample is silent
+or garbage even though VGMPlay plays it.
+
 `$102-$105` address blocks of **32** bytes, so `collect_ym2608_delta_t` slices
 exactly the span the log named. It must not round down to a 256-byte bank the
 way the YM2610's ADPCM-A does - that would put up to 255 bytes of whatever

@@ -343,6 +343,7 @@ from vgm2151fur.ym2608 import (
     YM2608State,
     collect_ym2608_delta_t,
     collect_ym2608_rhythm,
+    replay_deltat_memory,
 )
 from vgm2151fur.y8950 import (
     Y8950_DEFAULT_CLOCK,
@@ -10104,6 +10105,10 @@ def analyze(
         warnings.extend(rh_warn)
         rom_b = assemble_rom(vgm, "ym2608_deltat") if pcm else b""
         if pcm:
+            # A log may upload the ADPCM-B memory through the data register
+            # instead of shipping a ROM block; replay those writes so the
+            # sample slices are real data, not the zero-filled declaration.
+            rom_b = replay_deltat_memory(vgm, rom_b)
             ym2608_b_samples, dt_warn = collect_ym2608_delta_t(vgm, rom_b)
             warnings.extend(dt_warn)
 

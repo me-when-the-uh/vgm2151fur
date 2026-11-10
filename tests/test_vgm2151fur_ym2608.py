@@ -39,6 +39,7 @@ from vgm2151fur.ym2608 import (
     collect_ym2608_delta_t,
     collect_ym2608_rhythm,
     deltat_store_body,
+    replay_deltat_memory,
 )
 from vgm2151fur.ym2612 import ym2612_note_for
 
@@ -525,6 +526,41 @@ class TestYm2608Analyze(unittest.TestCase):
         self.assertGreaterEqual(play.ins, len(song.fm_patches))
         ins = song.ym2608_b_samples
         self.assertEqual(len(ins), 1)
+
+    def test_deltat_register_upload_rebuilds_the_memory(self):
+        # PMD-style logs upload the ADPCM-B image through $108 instead of
+        # shipping a 0x81 data block; the block only declares the size.
+        data = bytes((i * 11 + 5) & 0xFF for i in range(31))
+        writes = [
+            ChipWrite(0, "ym2608", 0, 0x100, 0x01),   # reset
+            ChipWrite(0, "ym2608", 0, 0x101, 0x02),   # DRAM x8, shift 5
+            ChipWrite(0, "ym2608", 0, 0x102, 0x04),   # start byte 0x80
+            ChipWrite(0, "ym2608", 0, 0x103, 0x00),
+            ChipWrite(0, "ym2608", 0, 0x104, 0x04),   # stop byte 0x9F
+            ChipWrite(0, "ym2608", 0, 0x105, 0x00),
+            ChipWrite(0, "ym2608", 0, 0x100, 0x60),   # external write mode
+        ]
+        writes += [
+            ChipWrite(0, "ym2608", 0, 0x108, b) for b in data
+        ]
+        writes += [
+            ChipWrite(100, "ym2608", 0, 0x109, 0x00),
+            ChipWrite(100, "ym2608", 0, 0x10A, 0x40),
+            ChipWrite(100, "ym2608", 0, 0x10B, 200),
+            ChipWrite(100, "ym2608", 0, 0x101, 0xC0),
+            ChipWrite(101, "ym2608", 0, 0x100, 0xA0),  # play external memory
+        ]
+        vgm = _vgm(writes)
+        vgm.roms.append(RomSlice(0, 0x200, 0, b"", "ym2608_deltat"))
+        mem = replay_deltat_memory(
+            vgm, assemble_rom(vgm, "ym2608_deltat"),
+        )
+        self.assertEqual(mem[0x80:0x80 + len(data)], data)
+        song = analyze(vgm)
+        self.assertEqual(len(song.ym2608_b_samples), 1)
+        self.assertEqual(
+            song.ym2608_b_samples[0].data[:len(data)], data,
+        )
 
     def test_mixed_log_warns_and_keeps_the_opna(self):
         writes = _fm_note(0) + [
