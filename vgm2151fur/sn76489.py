@@ -195,6 +195,10 @@ def _collect_plain(
     hits: list[PsgHit] = []
     offs: list[PsgOff] = []
     glitches = 0
+    # A driver retriggers a tone by writing the same period and a new volume
+    # on one sample. Remember the period rewrite until the volume write at
+    # the same sample turns it into a note. -1 means none pending.
+    retrigger_t = [-1, -1, -1, -1]
 
     def pan_for(voice: int) -> int:
         """The 08xy value for one voice under the current Game Gear mask."""
@@ -292,6 +296,30 @@ def _collect_plain(
         # cannot divide by it). It must close the note, not become a new one.
         on = freq_high[voice] and vol[voice] < 15 and freq[voice] > 0
         hit = active[voice]
+        if retrigger_t[voice] >= 0:
+            level = 15 - vol[voice]
+            last_level = (
+                hit.vol_pts[-1][1] if hit is not None and hit.vol_pts
+                else (hit.vol if hit is not None else level)
+            )
+            if (
+                retrigger_t[voice] == t
+                and on
+                and hit is not None
+                and level != last_level
+            ):
+                # The driver wrote this voice's period again at this sample
+                # without changing it, and is now writing a different volume.
+                # That pair is a note retrigger, not a volume step on the held
+                # note. A volume write with the same level is housekeeping.
+                retrigger_t[voice] = -1
+                old = hit
+                close(voice, t, emit_off=False)
+                open_hit(voice, t)
+                if active[voice] is not None:
+                    active[voice].split_from = old
+                return
+            retrigger_t[voice] = -1
         if on and hit is None:
             open_hit(voice, t)
             return
@@ -441,9 +469,21 @@ def _collect_plain(
             if latch_vol or latch_ch == 3:
                 continue
             data = b & 0x3F
-            freq[latch_ch] = (freq[latch_ch] & 0x00F) | (data << 4)
+            old_period = freq[latch_ch]
+            freq[latch_ch] = (old_period & 0x00F) | (data << 4)
             freq_high[latch_ch] = True
+            existing = active[latch_ch]
+            retrigger = (
+                old_period > 0
+                and freq[latch_ch] == old_period
+                and existing is not None
+                and t > existing.sample_time
+            )
             evaluate_tone(latch_ch, t)
+            if retrigger:
+                # Wait for a volume write at this sample. A bare period
+                # refresh is only housekeeping.
+                retrigger_t[latch_ch] = t
 
     for voice in range(4):
         if active[voice] is not None:

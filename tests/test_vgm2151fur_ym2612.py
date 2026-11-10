@@ -376,6 +376,29 @@ class TestGenesisPsgDac(unittest.TestCase):
         self.assertEqual([(h.sample_time, h.noise_mode) for h in noise],
                          [(0, 4), (500, 6)])
 
+    def test_same_period_rewrite_with_a_volume_write_retriggers(self):
+        # Some GG drivers retrigger a held tone by writing the same period
+        # again and then the new volume on one sample. Without the volume
+        # pair a period refresh is housekeeping; with it the driver means a
+        # new note, and the pattern must show the note-on.
+        ws = [
+            ChipWrite(0, "sn76489", 0, 0, 0x84),
+            ChipWrite(0, "sn76489", 0, 0, 0x06),  # period 100
+            ChipWrite(0, "sn76489", 0, 0, 0x90),
+            ChipWrite(300, "sn76489", 0, 0, 0x84),  # refresh only
+            ChipWrite(300, "sn76489", 0, 0, 0x06),
+            ChipWrite(600, "sn76489", 0, 0, 0x84),  # retrigger
+            ChipWrite(600, "sn76489", 0, 0, 0x06),
+            ChipWrite(600, "sn76489", 0, 0, 0x97),
+            ChipWrite(900, "sn76489", 0, 0, 0x9F),
+        ]
+        hits, _offs, _warn = collect_sn76489(
+            _vgm(ws, sn76489_clock=3579540),
+        )
+        tone = [h for h in hits if h.voice == 0]
+        self.assertEqual([(h.sample_time, h.off_sample, h.vol) for h in tone],
+                         [(0, 600, 15), (600, 900, 8)])
+
     def test_rate_change_and_mute_on_one_sample_still_emits_off(self):
         # A Game Gear driver changes the noise rate and mutes the voice on the
         # same sample. The rate split opens a zero-length note, which is
