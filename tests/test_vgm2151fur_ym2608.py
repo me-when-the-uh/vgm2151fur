@@ -24,7 +24,7 @@ from vgm2151fur.furwrite import (
 )
 from vgm2151fur.furnace import export_vgm, find_furnace
 from vgm2151fur.furio import (
-    CHIP_CHANNELS, iter_blocks, parse_smp2_payload,
+    CHIP_CHANNELS, iter_blocks, parse_fur, parse_smp2_payload,
 )
 from vgm2151fur.vgm import (
     ChipWrite, RomSlice, VgmFile, assemble_rom, chips_in_head, load_vgm,
@@ -526,6 +526,23 @@ class TestYm2608Analyze(unittest.TestCase):
         self.assertGreaterEqual(play.ins, len(song.fm_patches))
         ins = song.ym2608_b_samples
         self.assertEqual(len(ins), 1)
+
+    def test_same_sample_global_levels_collapse_to_the_key_value(self):
+        # The driver ramps $11 several times at the key-on sample; the chip
+        # only holds the last byte. Placing the earlier values on following
+        # rows attacked the drum too loud, then dropped it a row late.
+        writes = [
+            ChipWrite(400, "ym2608", 0, 0x11, 0x30),
+            ChipWrite(400, "ym2608", 0, 0x11, 0x3C),
+            ChipWrite(400, "ym2608", 0, 0x18, 0xCF),
+            ChipWrite(400, "ym2608", 0, 0x10, 0x01),
+        ]
+        song = analyze(_vgm(writes))
+        mod = parse_fur(write_fur(song))
+        global_row = song.row_of(400)
+        pat, row = divmod(global_row, mod.pat_len)
+        cell = mod.patterns[(9, pat)][row]
+        self.assertIn((0x1F, 0x3C), cell.fx or ())
 
     def test_deltat_register_upload_rebuilds_the_memory(self):
         # PMD-style logs upload the ADPCM-B image through $108 instead of

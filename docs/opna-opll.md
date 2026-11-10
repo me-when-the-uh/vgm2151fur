@@ -296,8 +296,15 @@ at 3 and the levels full. Zeroed defaults folded an unwritten voice to silence
 and then discarded its notes as muted.
 
 Combined attenuation is `(31 ^ level) + (63 ^ global)` (`ymfm_adpcm.cpp:226`),
-so the converter folds the source's `$11` into each hit's 0-31 column and
-leaves Furnace's global at its full default: verified, every level the log
+so the converter keeps the per-voice `$18` on the hit's 0-31 column and `$11`
+as a `1Fxx` chip effect. A driver that ramps `$11` several times at the same
+sample (Yuno's OPNA pack does, just before each kit key) must collapse to the
+last byte before the key: the chip sees only that value, and spreading the
+ramp over following rows attacked the drum at the first, louder level and then
+dropped it a row late. The writer therefore keeps one value per
+register/sample, not just per row.
+
+The design leaves Furnace's global at its full default: verified, every level the log
 asked for comes back through Furnace unchanged.
 
 ### Delta-T: cut at 32, store at 256

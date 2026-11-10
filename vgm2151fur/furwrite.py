@@ -3513,7 +3513,23 @@ def _build_patterns(song: Song, n_ch: int, pat_len_max: int, fx_cols: int,
                 key = (ev_ch, dest)
                 prev = note_delay.get(key)
                 note_delay[key] = dest_delay if prev is None else min(prev, dest_delay)
+    # Several writes of one register at the same VGM sample are one chip
+    # update: the last byte is what the hardware holds when the sample ends.
+    # The rhythm driver in particular ramps $11 several times at the key-on
+    # sample; spreading those onto following rows attacked the drum at the
+    # first (louder) level and only stepped to the real one a row late.
+    channel_fx: list[tuple[int, int, int, int]] = []
+    last_fx: dict[tuple[int, int, int], int] = {}
     for sample, ch, cmd, val in getattr(song, "channel_fx", ()) or ():
+        last_fx[(sample, ch, cmd)] = val
+    emitted_fx: set[tuple[int, int, int]] = set()
+    for entry in getattr(song, "channel_fx", ()) or ():
+        key_fx = (entry[0], entry[1], entry[2])
+        if key_fx in emitted_fx:
+            continue
+        emitted_fx.add(key_fx)
+        channel_fx.append((entry[0], entry[1], entry[2], last_fx[key_fx]))
+    for sample, ch, cmd, val in channel_fx:
         # VSU wave changes carry a sentinel index into the source wave list;
         # resolve it against the module-wide block order now that the other
         # families' waves are ahead of it.
