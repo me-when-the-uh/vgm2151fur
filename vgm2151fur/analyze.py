@@ -350,6 +350,7 @@ from vgm2151fur.y8950 import (
     collect_y8950_delta_t,
 )
 from vgm2151fur.ymf278b import (
+    OPL4_TAIL_MUTE,
     OPL4_WAVE_SLOTS,
     Opl4WaveSample,
     collect_opl4_wave,
@@ -9692,13 +9693,18 @@ def analyze(
                     vol_pts.append((when, target_vol, pan_fx))
                     written_vol = target_vol
                     written_pan = last_pan
-                # The driver silences a slot by writing TL=0x7F just before
-                # its key-off. The key-off row already stops the note, so the
-                # trailing zero is not heard in the source; keeping it only
-                # adds a volume-00 row (often on a row with no note) and can
-                # outlive the following key-on after row rounding. Keep a zero
-                # only when a later write raises the level again.
-                while vol_pts and vol_pts[-1][1] == 0:
+                # A TL=0/pan-8 mute immediately before a key-off is the
+                # driver's trailing silence: the note-off row already stops
+                # the voice, and keeping the zero can outlive the following
+                # key-on after row rounding. A mute farther from the off (or
+                # with no off at all, where the driver leaves the slot keyed
+                # and silences it through TL/pan) is a real cut and must stay.
+                while (
+                    vol_pts
+                    and vol_pts[-1][1] == 0
+                    and h.end_time
+                    and h.end_time - vol_pts[-1][0] <= OPL4_TAIL_MUTE
+                ):
                     vol_pts.pop()
                 # Held f-num/octave writes are pitch bends. A sample channel
                 # takes them as 1/64-semitone row steps, like ADPCM-B.
