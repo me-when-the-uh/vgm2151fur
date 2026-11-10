@@ -249,6 +249,10 @@ from vgm2151fur.sn76489 import (
     t6w28_note,
     t6w28_noise_note,
 )
+from vgm2151fur.psg_dac import (
+    PSG_DAC_RATE,
+    collect_psg_dac,
+)
 from vgm2151fur.rf5c import (
     RF5C68_DEFAULT_CLOCK,
     RF5C164_DEFAULT_CLOCK,
@@ -1261,6 +1265,14 @@ class Song:
     # T6W28: one stereo chip made of the two SN76489 halves.  The module uses
     # Furnace's T6W28 system (four channels) and independent 08xy panning.
     psg_t6w28: bool = False
+    # SN76489 channels used as 4-bit DACs.  The stream is rendered to 8-bit
+    # chunks and played on Generic PCM DAC systems (`psg_dac_voices`).
+    psg_dac_samples: list = field(default_factory=list)
+    psg_dac_plays: list = field(default_factory=list)
+    psg_dac_voices: list[tuple[int, int]] = field(default_factory=list)
+    psg_dac_rate: int = PSG_DAC_RATE
+    psg_dac_count: int = 0
+    psg_dac_stats: dict = field(default_factory=dict)
     dac_samples: list[DacSample] = field(default_factory=list)
     dac_count: int = 0
     dac_stats: dict = field(default_factory=dict)
@@ -10237,6 +10249,7 @@ def analyze(
 
     # Genesis PSG.  The SN76489 has no key-on, so the collector gates on its
     # 4-bit attenuation and keeps mid-note period/volume writes as macros.
+    psg_dac = collect_psg_dac(vgm)
     psg_count = 0
     if psg_base is not None:
         psg_hits, psg_offs, psg_warn = collect_sn76489(vgm, psg_clock)
@@ -10334,10 +10347,16 @@ def analyze(
         if not psg_count:
             # Chips that only wrote their init (all four attenuations muted)
             # need no system: an empty PSG would only add four dead columns.
-            warnings.append(
-                "SN76489 writes carry no audible note; the PSG system was "
-                "dropped"
-            )
+            if psg_dac.samples:
+                warnings.append(
+                    "SN76489 tone voices are silent; the DAC stream is "
+                    "converted as Generic PCM DAC"
+                )
+            else:
+                warnings.append(
+                    "SN76489 writes carry no audible note; the PSG system was "
+                    "dropped"
+                )
             psg_ids = []
             psg_t6w28 = False
             # Give the reserved columns back. Every sample chip's base is
@@ -10530,6 +10549,7 @@ def analyze(
     n_ga20_ins = 0
     n_msm5232_ins = 0
     n_es5503_ins = 0
+    n_psg_dac_ins = (len(psg_dac.samples) + 119) // 120
     # Set where the C352 runs and the source drives its rear pair.
     c352_quad_events = False
     if pcm:
@@ -12012,6 +12032,35 @@ def analyze(
                 pan=0,
                 pcm=True,
             ))
+
+    # SN76489 4-bit DAC streams.  One Generic PCM DAC system per hardware
+    # voice; the rendered bodies are shared by the voice's chunk notes.
+    psg_dac_base = tone_base
+    psg_dac_voices = list(psg_dac.voices)
+    psg_dac_at = {
+        key: psg_dac_base + index
+        for index, key in enumerate(psg_dac_voices)
+    }
+    tone_base += len(psg_dac_voices)
+    psg_dac_events: list[tuple[NoteEvent, int]] = []
+    for play in psg_dac.plays:
+        ch = psg_dac_at.get((play.chip_id, play.voice))
+        if ch is None:
+            continue
+        ev = NoteEvent(
+            sample=play.sample_time,
+            ch=ch,
+            on=True,
+            note=60 + (play.body % 120),
+            ins=-1,
+            vol=255,
+            e5=0x80,
+            pan=0,
+            pcm=True,
+        )
+        events.append(ev)
+        psg_dac_events.append((ev, play.body))
+    psg_dac_count = len(psg_dac_events)
 
     # Count the final DAC maps once, below; the collector's list is transient.
     n_ym2610_a_ins = (len(ym2610_a_samples) + YM2610_MAP_SLOTS - 1) // YM2610_MAP_SLOTS
@@ -13585,6 +13634,8 @@ def analyze(
     tone_ins_base += n_msm5232_ins
     es5503_ins_base = tone_ins_base
     tone_ins_base += n_es5503_ins
+    psg_dac_ins_base = tone_ins_base
+    tone_ins_base += n_psg_dac_ins
     mikey_ins_base = tone_ins_base
     tone_ins_base += n_mikey_ins
     wonderswan_pcm_ins_base = tone_ins_base
@@ -13988,6 +14039,8 @@ def analyze(
         tone_ins_base += n_msm5232_ins
         es5503_ins_base = tone_ins_base
         tone_ins_base += n_es5503_ins
+        psg_dac_ins_base = tone_ins_base
+        tone_ins_base += n_psg_dac_ins
         mikey_ins_base = tone_ins_base
         tone_ins_base += n_mikey_ins
         wonderswan_pcm_ins_base = tone_ins_base
@@ -14104,6 +14157,8 @@ def analyze(
         ev.ins = k054539_ins_base + idx
     for ev, idx in es5503_events:
         ev.ins = es5503_ins_base + idx
+    for ev, idx in psg_dac_events:
+        ev.ins = psg_dac_ins_base + idx // 120
     for ev, idx in mikey_sample_events:
         ev.ins = mikey_ins_base + idx
     for ev, idx in wonderswan_pcm_events:
@@ -14127,7 +14182,7 @@ def analyze(
         or huc_pcm_samples or ymz_audible
         or multipcm_audible or upd_audible or pwm_audible
         or c219_ins_count or k054539_samples
-        or es5503_samples
+        or es5503_samples or psg_dac.samples
         or mikey_ids or x1_ids
         or any(s.length >= 8 for s in pcm_samples)
         or scc_waves or ay_count or dac_samples or psg_count
@@ -14193,6 +14248,7 @@ def analyze(
         + n_ssg_pcm + len(ymz_audible)
         + len(multipcm_audible) + n_upd_ins + n_pwm_ins
         + c219_ins_count + len(k054539_samples)
+        + n_psg_dac_ins
     )
     # Before trimming anything for the hard limit, share an instrument whose
     # macros only differ by a longer tail with its shorter copies. A short
@@ -14238,6 +14294,7 @@ def analyze(
         + len(ymz_audible)
         + len(multipcm_audible) + len(upd_audible) + len(pwm_audible)
         + len(c219_samples) + len(k054539_samples)
+        + len(psg_dac.samples)
     )
     if n_total_smp > 65535:
         warnings.append(
@@ -14314,6 +14371,12 @@ def analyze(
         es5503_oscs=es5503_oscs,
         es5503_rate=es5503_rate,
         es5503_count=es5503_count,
+        psg_dac_samples=psg_dac.samples,
+        psg_dac_plays=psg_dac.plays,
+        psg_dac_voices=psg_dac_voices,
+        psg_dac_rate=psg_dac.rate,
+        psg_dac_count=psg_dac_count,
+        psg_dac_stats=psg_dac.stats,
         channel_vol_events=channel_vol_events,
         mikey_samples=mikey_samples,
         mikey_ids=mikey_ids,

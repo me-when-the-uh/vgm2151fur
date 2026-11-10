@@ -327,6 +327,7 @@ SMP_DEPTH_QSOUND_ADPCM = 4
 SMP_DEPTH_8BIT = 8
 SMP_DEPTH_12BIT = 12
 SMP_DEPTH_16BIT = 16
+SMP_DEPTH_4BIT = 15
 SMP_DEPTH_VOX = 10
 # C219 mu-law bodies are expanded to 8-bit linear in `c219.py`; there is no
 # separate sample depth for them here.
@@ -1789,6 +1790,35 @@ def _write_sample_s8(
     for mask in render_masks:
         b.u32(mask)
     b.raw(data[:n_frames * width])
+    b.end_block(size_off, start)
+
+
+def _write_sample_4bit(
+    b: Buf, name: str, data: bytes, frames: int, c4_rate: int,
+    render_masks: tuple[int, int, int, int] | None = None,
+) -> None:
+    """Packed linear 4-bit PCM (two high-nibble-first frames per byte).
+
+    Furnace's DIV_SAMPLE_DEPTH_4BIT decoder expands each nibble linearly to
+    signed 16-bit; the SN76489 attenuation curve is baked into the nibble
+    values by the collector.
+    """
+    if render_masks is None:
+        render_masks = _DEFAULT_RENDER_MASKS
+    size_off, start = b.begin_block(b"SMP2")
+    b.strz(name)
+    b.u32(frames)
+    b.u32(c4_rate)
+    b.u32(c4_rate)
+    b.u8(SMP_DEPTH_4BIT)
+    b.u8(0)
+    b.u8(0)
+    b.u8(0)
+    b.s32(-1)
+    b.s32(-1)
+    for mask in render_masks:
+        b.u32(mask)
+    b.raw(data[:(frames + 1) // 2])
     b.end_block(size_off, start)
 
 
@@ -4727,6 +4757,7 @@ def write_fur(
         or getattr(song, "msm5205_ids", ())
         or getattr(song, "msm5232_ids", ())
         or getattr(song, "es5503_ids", ())
+        or getattr(song, "psg_dac_voices", ())
     )
     if ym2610 or ym2608:
         fm_present = (include_fm or include_pcm) and bool(ym_ids)
@@ -4838,6 +4869,16 @@ def write_fur(
     )
     es5503_ids = sorted({smp.chip_id for smp in es5503_smps})
     n_es5503_ins = len(es5503_smps)
+    psg_dac_smps = (
+        list(getattr(song, "psg_dac_samples", ()) or ())
+        if include_pcm else []
+    )
+    psg_dac_voices = (
+        list(getattr(song, "psg_dac_voices", ()) or ())
+        if psg_dac_smps else []
+    )
+    psg_dac_rate = int(getattr(song, "psg_dac_rate", 0) or 22_050)
+    n_psg_dac_ins = (len(psg_dac_smps) + 119) // 120
     n_upd_ins = (len(upd7759_smps) + 119) // 120
     n_pwm_ins = (len(pwm_smps) + 119) // 120
     n_msm5205_ins = (len(msm5205_smps) + 119) // 120
@@ -5030,7 +5071,7 @@ def write_fur(
         + 2 * len(pwm_ids)
         + len(msm5205_ids) + 4 * len(ga20_ids) + 8 * len(msm5232_ids)
         + 16 * len(c219_ids) + 8 * len(k054539_ids)
-        + len(es5503_oscs)
+        + len(es5503_oscs) + len(psg_dac_voices)
         + n_scc + n_ay + n_nes + n_huc6280 + n_gb + n_vsu + n_saa
         + n_pokey + n_mikey + n_x1 + n_fds + n_wonderswan + n_qsound
     )
@@ -5057,7 +5098,7 @@ def write_fur(
         + n_nes_dpcm_ins + n_nes_pcm_ins + n_huc6280_pcm_ins
         + len(ymz_smps) + len(multipcm_smps) + n_upd_ins + n_pwm_ins
         + n_msm5205_ins + n_ga20_ins + n_msm5232_ins + n_es5503_ins
-        + len(c219_real) + len(k054539_smps)
+        + len(c219_real) + len(k054539_smps) + n_psg_dac_ins
         + n_mikey_ins + n_x1_ins
         + len(scc_specs) + len(ay_specs) + len(psg_specs) + len(nes_specs)
         + len(huc6280_specs) + len(gb_specs) + len(vsu_specs)
@@ -5075,6 +5116,7 @@ def write_fur(
         + len(pwm_smps) + len(mikey_smps) + len(x1_smps)
         + len(msm5205_smps) + len(ga20_smps)
         + len(c219_all) + len(k054539_smps) + len(es5503_smps)
+        + len(psg_dac_smps)
         + len(qsound_smps) + len(wonderswan_pcm_smps)
     )
     n_wav = (
@@ -5169,7 +5211,8 @@ def write_fur(
     c219_smp_base = ga20_smp_base + len(ga20_smps)
     k054539_smp_base = c219_smp_base + len(c219_all)
     es5503_smp_base = k054539_smp_base + len(k054539_smps)
-    mikey_smp_base = es5503_smp_base + len(es5503_smps)
+    psg_dac_smp_base = es5503_smp_base + len(es5503_smps)
+    mikey_smp_base = psg_dac_smp_base + len(psg_dac_smps)
     wonderswan_pcm_smp_base = mikey_smp_base + len(mikey_smps)
     qsound_smp_base = wonderswan_pcm_smp_base + len(wonderswan_pcm_smps)
     x1_smp_base = qsound_smp_base + len(qsound_smps)
@@ -5183,7 +5226,7 @@ def write_fur(
         + n_nes_dpcm_ins + n_nes_pcm_ins + n_huc6280_pcm_ins
         + len(ymz_smps) + len(multipcm_smps) + n_upd_ins + n_pwm_ins
         + n_msm5205_ins + n_ga20_ins + n_msm5232_ins + n_es5503_ins
-        + len(c219_real) + len(k054539_smps)
+        + len(c219_real) + len(k054539_smps) + n_psg_dac_ins
         + n_mikey_ins + len(wonderswan_pcm_smps) + n_x1_ins
         + len(scc_specs) + len(ay_specs) + len(psg_specs) + len(nes_specs)
         + len(huc6280_specs) + len(gb_specs) + len(vsu_specs)
@@ -5203,6 +5246,7 @@ def write_fur(
         + len(pwm_smps) + len(mikey_smps) + len(x1_smps)
         + len(msm5205_smps) + len(ga20_smps)
         + len(c219_all) + len(k054539_smps) + len(es5503_smps)
+        + len(psg_dac_smps)
         + len(qsound_smps) + len(wonderswan_pcm_smps)
     )
 
@@ -5313,6 +5357,10 @@ def write_fur(
     for cid, osc in es5503_oscs:
         names_long.append(f"ES5503 {cid + 1}-{osc + 1}")
         names_short.append(f"E{cid + 1}-{osc + 1}")
+    for index, key in enumerate(psg_dac_voices):
+        suffix = f" {key[1] + 1}" if len(psg_dac_voices) > 1 else ""
+        names_long.append(f"PSG DAC{suffix}")
+        names_short.append(f"P{index + 1}")
     for cid in scc_ids:
         for voice in range(5):
             names_long.append(f"SCC {cid + 1}-{voice + 1}")
@@ -5829,6 +5877,11 @@ def write_fur(
         es5503_sys[(cid, osc)] = len(chips)
         chips.append(CHIP_PCM_DAC)
         flag_texts.append(pcm_dac_flag_text(es5503_rate, stereo=True))
+    psg_dac_sys: dict[tuple[int, int], int] = {}
+    for key in psg_dac_voices:
+        psg_dac_sys[key] = len(chips)
+        chips.append(CHIP_PCM_DAC)
+        flag_texts.append(pcm_dac_flag_text(psg_dac_rate))
     for cid in scc_ids:
         chips.append(scc_chip)
         flag_texts.append(k051649_flag_text(song.vgm.k051649_clock))
@@ -5983,6 +6036,7 @@ def write_fur(
         for idx in systems_for_chip
     }
     es5503_set = set(es5503_sys.values())
+    psg_dac_set = set(psg_dac_sys.values())
     msm5205_set = set(msm5205_sys.values())
     for i, chip in enumerate(chips):
         # Twin16 K007232 sits under the OPM; the rip's mix says how far. Every
@@ -6003,6 +6057,13 @@ def write_fur(
             # One PCM DAC system per oscillator.  Keep every system at unity;
             # dividing by the system count would make a 28-voice module 0.02x.
             cv = 1.0
+        elif i in psg_dac_set:
+            # The body is normalized to one PSG voice's full amplitude, and
+            # the SN76489 core mixes four voices at a quarter range each.
+            # Keep the player's chip level (0.500 by default) and apply the
+            # one-voice share: 0.5 / 4 = 0.125.  Using the bare chip level
+            # made the DAC four times too loud.
+            cv = _player_chip_volume(song.vgm, 0x00, 1) / 4.0
         elif i in msm5205_set:
             # Generic PCM DAC is unity in Furnace; MSM5205's player default
             # is 0x100.  The decoded body already carries the chip level.
@@ -6369,6 +6430,16 @@ def write_fur(
         _write_ins_pcm(
             b, f"ES5503 {smp.ptr:05x}", es5503_smp_base + i,
             INS_AMIGA,
+        )
+    for group in range(n_psg_dac_ins):
+        ins_ptrs.append(len(b))
+        first = group * 120
+        maps = [
+            psg_dac_smp_base + first + slot
+            for slot in range(min(120, len(psg_dac_smps) - first))
+        ]
+        _write_ins_sample_map(
+            b, f"PSG DAC {group + 1}", 0, maps, INS_AMIGA, flags=0x03,
         )
     for group in range(n_mikey_ins):
         ins_ptrs.append(len(b))
@@ -6831,6 +6902,13 @@ def write_fur(
         _write_sample_s8(
             b, f"es5503_{i:03d}_{smp.ptr:05x}", smp.data,
             rate, loop=loop, depth=SMP_DEPTH_8BIT,
+            render_masks=(0, 0, 0, 0),
+        )
+    for i, smp in enumerate(psg_dac_smps):
+        smp_ptrs.append(len(b))
+        _write_sample_4bit(
+            b, f"psg_dac_{i:03d}", smp.data, smp.frames,
+            max(1, int(round(smp.rate * DAC_RATE_COMPENSATION))),
             render_masks=(0, 0, 0, 0),
         )
     for smp in mikey_smps:
