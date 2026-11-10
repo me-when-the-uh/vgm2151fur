@@ -1805,6 +1805,12 @@ def _write_sample_4bit(
     """
     if render_masks is None:
         render_masks = _DEFAULT_RENDER_MASKS
+    packed = bytearray((frames + 1) // 2)
+    for i in range(min(frames, len(data))):
+        if i & 1:
+            packed[i >> 1] |= data[i] & 0x0F
+        else:
+            packed[i >> 1] = (data[i] & 0x0F) << 4
     size_off, start = b.begin_block(b"SMP2")
     b.strz(name)
     b.u32(frames)
@@ -1818,7 +1824,7 @@ def _write_sample_4bit(
     b.s32(-1)
     for mask in render_masks:
         b.u32(mask)
-    b.raw(data[:(frames + 1) // 2])
+    b.raw(bytes(packed))
     b.end_block(size_off, start)
 
 

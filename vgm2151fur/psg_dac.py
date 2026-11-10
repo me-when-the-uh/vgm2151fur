@@ -23,8 +23,9 @@ from vgm2151fur.vgm import VgmFile
 # 22.05 kHz body keeps the attack edges with less than 0.1 ms error and is
 # half the size of a 44.1 kHz body.
 PSG_DAC_RATE = 22_050
-# Same chunk length the YM2612 DAC path uses.
-PSG_DAC_CHUNK_SECONDS = 0.25
+# A run this long at the exact idle attenuation starts a new attack sample.
+# At 22.05 kHz this is about 2.9 ms; shorter zero crossings are waveform.
+PSG_DAC_REST_FRAMES = 64
 PSG_DAC_MIN_WRITES = 64
 PSG_DAC_MIN_ZERO_PERIOD = 0.90
 PSG_DAC_MAX_GAP = 256
@@ -90,37 +91,94 @@ def _render(
     return out
 
 
-def _pack(values: bytes) -> bytes:
-    """Pack 4-bit values high nibble first, as Furnace's depth-4 decoder reads."""
-    data = bytearray((len(values) + 1) // 2)
-    for i, value in enumerate(values):
-        if i & 1:
-            data[i >> 1] |= value & 0x0F
-        else:
-            data[i >> 1] = (value & 0x0F) << 4
-    return bytes(data)
-
-
-def _chunks(
-    frames: bytearray, loop_frame: int, chunk_frames: int,
+def _segments(
+    frames: bytearray, loop_frame: int,
 ) -> list[tuple[int, int]]:
-    """Split [first non-idle, last non-idle) at loop and chunk boundaries."""
+    """Split at rests so every body starts on an attack transient.
+
+    A long hold at the idle level ends the previous body and the next
+    non-idle frame starts the next one.  A continuous stream stays one body;
+    there is no fixed-time cut that would start a sample in mid-wave.  The
+    loop point is the only non-attack boundary, because playback has to
+    restart there.
+    """
     first = next((i for i, v in enumerate(frames) if v != 8), len(frames))
-    last = len(frames) - next(
-        (i for i, v in enumerate(reversed(frames)) if v != 8), len(frames)
-    )
-    if first >= last:
+    if first >= len(frames):
         return []
-    bounds = {first, last}
-    pos = first
-    while pos < last:
-        pos += chunk_frames
-        if pos < last:
-            bounds.add(pos)
-    if first < loop_frame < last:
-        bounds.add(loop_frame)
-    points = sorted(bounds)
-    return [(a, b) for a, b in zip(points, points[1:]) if b > a]
+    pieces: list[tuple[int, int]] = []
+    start = first
+    quiet = 0
+    for i in range(first, len(frames)):
+        if frames[i] == 8:
+            quiet += 1
+            continue
+        if quiet >= PSG_DAC_REST_FRAMES:
+            # The previous body keeps the rest/decay tail all the way to this
+            # attack.  The next note cuts it when the source does, so a short
+            # body never loses its tail.
+            if i > start:
+                pieces.append((start, i))
+            start = i
+        quiet = 0
+    if start < len(frames):
+        pieces.append((start, len(frames)))
+    if first < loop_frame < len(frames):
+        split: list[tuple[int, int]] = []
+        for a, b in pieces:
+            if a < loop_frame < b:
+                split.append((a, loop_frame))
+                split.append((loop_frame, b))
+            else:
+                split.append((a, b))
+        pieces = split
+    return [(a, b) for a, b in pieces if b > a]
+
+
+def _share_prefix_samples(
+    samples: list[PsgDacSample], plays: list[PsgDacPlay], stats: dict,
+) -> None:
+    """Keep the largest body when a shorter attack is its prefix.
+
+    The next note cuts a long body at the source's attack, so a shorter hit
+    can safely reuse a longer variant.  This is the "largest variant wins"
+    rule the YM2612 attack splitter uses; it also makes sure a quiet decay
+    tail is present when no following note arrives.
+    """
+    by_head: dict[tuple[int, bytes], list[int]] = {}
+    for i, smp in enumerate(samples):
+        if smp.data:
+            by_head.setdefault((smp.rate, smp.data[:2]), []).append(i)
+    remap = list(range(len(samples)))
+    reused = 0
+    for indexes in by_head.values():
+        if len(indexes) < 2:
+            continue
+        indexes.sort(key=lambda i: samples[i].frames, reverse=True)
+        for pos, i in enumerate(indexes):
+            for j in indexes[:pos]:
+                if samples[j].data.startswith(samples[i].data):
+                    remap[i] = j
+                    reused += 1
+                    break
+    if not reused:
+        return
+    for i in range(len(remap)):
+        while remap[i] != remap[remap[i]]:
+            remap[i] = remap[remap[i]]
+    for play in plays:
+        play.body = remap[play.body]
+    used = {play.body for play in plays}
+    compact: list[PsgDacSample] = []
+    compact_map: dict[int, int] = {}
+    for i, smp in enumerate(samples):
+        if i not in used:
+            continue
+        compact_map[i] = len(compact)
+        compact.append(smp)
+    samples[:] = compact
+    for play in plays:
+        play.body = compact_map[play.body]
+    stats["psg_dac_prefix_reused"] = reused
 
 
 def collect_psg_dac(
@@ -138,7 +196,6 @@ def collect_psg_dac(
     total = vgm.total_samples or 0
     if not total:
         return out
-    chunk_frames = max(1, int(round(rate * PSG_DAC_CHUNK_SECONDS)))
     loop_frame = (
         int(round((vgm.loop_sample or 0) * rate / 44100.0))
         if vgm.loop_sample else 0
@@ -196,19 +253,21 @@ def collect_psg_dac(
                 held[att] += max(0, end - t)
             base = held.most_common(1)[0][0]
             frames = _render(dac, total, base, rate)
-            pieces = _chunks(frames, loop_frame, chunk_frames)
+            pieces = _segments(frames, loop_frame)
             if not pieces:
                 continue
             used_voices.append((chip_id, voice))
             for a, b in pieces:
                 values = bytes(frames[a:b])
-                body = _pack(values)
-                key = (len(values), body)
+                if not any(v != 8 for v in values):
+                    # A body must start on an audible attack.
+                    continue
+                key = (len(values), values)
                 idx = body_index.get(key)
                 if idx is None:
                     idx = len(out.samples)
                     body_index[key] = idx
-                    out.samples.append(PsgDacSample(body, len(values), rate))
+                    out.samples.append(PsgDacSample(values, len(values), rate))
                 out.plays.append(PsgDacPlay(
                     sample_time=int(round(a * 44100.0 / rate)),
                     body=idx,
@@ -216,14 +275,18 @@ def collect_psg_dac(
                     voice=voice,
                 ))
                 out.stats["psg_dac_bodies"] = len(out.samples)
-                out.stats["psg_dac_bytes"] = sum(
-                    len(s.data) for s in out.samples
-                )
                 out.stats["psg_dac_plays"] = len(out.plays)
+
+    if len(out.samples) > 1:
+        _share_prefix_samples(out.samples, out.plays, out.stats)
 
     out.voices = used_voices
     if out.voices:
         out.stats["psg_dac_voices"] = len(out.voices)
         out.stats["psg_dac_rate"] = rate
         out.stats["psg_dac_chunks"] = len(out.plays)
+        out.stats["psg_dac_bodies"] = len(out.samples)
+        out.stats["psg_dac_bytes"] = sum(
+            (s.frames + 1) // 2 for s in out.samples
+        )
     return out

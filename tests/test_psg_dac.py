@@ -45,6 +45,32 @@ class TestPsgDacCollector(unittest.TestCase):
         # The loop point gets its own chunk boundary.
         self.assertIn(2048, [p.sample_time for p in got.plays])
 
+    def test_silent_chunks_are_filtered_out(self):
+        writes = [
+            ChipWrite(0, "sn76489", 0, 0, 0x80),
+            ChipWrite(0, "sn76489", 0, 0, 0x00),
+            ChipWrite(0, "sn76489", 0, 0, 0x90),
+        ]
+        pattern = (5, 4, 6, 3, 7, 2, 8, 1)
+        for i, t in enumerate(range(16, 4096, 8)):
+            writes.append(
+                ChipWrite(t, "sn76489", 0, 0, 0x90 | pattern[i % 8])
+            )
+        # A long rest at the idle attenuation, then another burst.
+        for t in range(4096, 30000, 8):
+            writes.append(ChipWrite(t, "sn76489", 0, 0, 0x90 | 5))
+        for i, t in enumerate(range(30000, 34096, 8)):
+            writes.append(
+                ChipWrite(t, "sn76489", 0, 0, 0x90 | pattern[i % 8])
+            )
+        got = collect_psg_dac(_vgm(writes, total_samples=34096))
+        for smp in got.samples:
+            self.assertTrue(
+                any(v != 8 for v in smp.data),
+                "a silent body was kept",
+            )
+            self.assertNotEqual(smp.data[0], 8, "a body starts in silence")
+
     def test_non_dac_volume_writes_are_not_a_stream(self):
         writes = [
             ChipWrite(0, "sn76489", 0, 0, 0x80),
