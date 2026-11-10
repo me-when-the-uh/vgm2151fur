@@ -57,6 +57,14 @@ collector moves NRx4/NR44 trigger writes to the end of their sample group, the
 same way the YM2612 key-on handling does, so the note takes the setup written
 beside it. Correctly ordered logs are unchanged.
 
+The opposite idiom is equally common: trigger the voice with one period and
+immediately write the real low/high pair at the same sample. The trigger's own
+NRx4 high byte must not overwrite that correction, so when a complete pair
+follows the trigger in its group, the trigger keeps the pair's high byte. A
+same-sample pitch write also counts as the note's opening pitch (the refit
+window accepts `t - trigger <= 735`), not as a bend. Without this, the note
+plays at the trigger's throwaway period, which is often an octave or more high.
+
 Noise has no period register: `gb_noise_note` inverts Furnace's `noiseTable`.
 The note number is a table index, not a 12-TET pitch: each chromatic step moves
 the hardware rate by two to four semitones (and the last few steps by up to an
@@ -129,8 +137,9 @@ source bytes.
 A wave trigger counts even when NR32 (output level) is still 0: some drivers
 start the voice muted and raise the level a few samples later. NR32 changes
 while the voice is open become volume-column steps, including the mute gaps.
-A frequency write just after the trigger is the note's base pitch rather than
-a bend, because those same drivers set NRx3/NRx4 right after the trigger.
+A frequency write at or just after the trigger is the note's base pitch rather
+than a bend, because those same drivers set NRx3/NRx4 right after the trigger
+(including at the trigger's own sample).
 
 ## Stereo
 

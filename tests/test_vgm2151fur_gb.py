@@ -123,6 +123,38 @@ class TestGbNotes(unittest.TestCase):
         self.assertEqual(hits[0].vol, 6)
         self.assertEqual([o.sample_time for o in offs], [2000])
 
+    def test_pitch_correction_after_trigger_is_the_note_base(self):
+        # "Start the voice, then set the real frequency": the trigger carries
+        # one period and a low/high pair after it corrects the pitch at the
+        # same sample. The correction must be the note's base; applying the
+        # late trigger write over it left the note an octave or more high.
+        writes = _note(1000, 0x80, period=0x600)
+        writes += [
+            _gb(1000, 0x0A, 0x80),     # wave DAC on
+            _gb(1000, 0x0C, 0x20),     # 50%
+            _gb(1000, 0x0D, 0xE0),
+            _gb(1000, 0x0E, 0x87),     # trigger, period 0x7E0
+            _gb(1000, 0x0D, 0xB2),
+            _gb(1000, 0x0E, 0x06),     # correction, period 0x6B2
+        ]
+        hits, _o, _w, _warn = collect_gb(_vgm(writes))
+        pulse = [h for h in hits if h.voice == 0][0]
+        wave = [h for h in hits if h.voice == 2][0]
+        self.assertEqual(pulse.period, 0x600)
+        self.assertEqual(wave.period, 0x6B2)
+
+    def test_pitch_correction_without_a_complete_pair_keeps_the_trigger(self):
+        # Trigger-before-setup still applies the setup's high byte when only
+        # one half of the pair follows the trigger.
+        writes = [
+            _gb(1000, 0x04, 0x86),     # trigger, period high 6
+            _gb(1000, 0x03, 0x00),     # period low
+            _gb(1000, 0x02, 0x60),     # volume 6
+        ]
+        hits, _o, _w, _warn = collect_gb(_vgm(writes))
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0].period, 0x600)
+
     def test_frequency_write_without_a_trigger_is_a_bend(self):
         # Slow slides rewrite NRx3/NRx4 without a trigger, so the hardware
         # envelope keeps running. They stay in pitch_pts and become row pitch

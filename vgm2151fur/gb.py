@@ -296,6 +296,35 @@ def collect_gb(
             reg in (REG_P1_HI, REG_P2_HI, REG_W_HI) or reg == REG_N_CTL
         )
 
+    # The trigger's NRx4 also carries the period high bits. If the driver
+    # follows the trigger with a full low+high pitch correction at the same
+    # sample (a very common "start the voice, then set the real frequency"
+    # idiom), the correction is the note's base. Do not let the late trigger
+    # write put the trigger's high byte back over it.
+    pitch_lo = {
+        REG_P1_HI: REG_P1_LO,
+        REG_P2_HI: REG_P2_LO,
+        REG_W_HI: REG_W_LO,
+    }
+    trigger_high: dict[int, bool] = {}
+    for i, w in enumerate(writes):
+        if not is_trigger(w):
+            continue
+        reg = w.reg & 0x7F
+        lo = pitch_lo.get(reg)
+        if lo is None:
+            continue
+        low_after = high_after = False
+        for nxt in writes[i + 1:]:
+            if nxt.sample != w.sample:
+                break
+            nreg = nxt.reg & 0x7F
+            if nreg == lo:
+                low_after = True
+            elif nreg == reg and not is_trigger(nxt):
+                high_after = True
+        trigger_high[id(w)] = not (low_after and high_after)
+
     writes.sort(key=lambda w: (w.sample, 1 if is_trigger(w) else 0))
 
     duty = [0, 0]                       # pulse 1/2 duty
@@ -463,7 +492,7 @@ def collect_gb(
 
     def record_pitch(voice: int, t: int) -> None:
         hit = active[voice]
-        if hit is None or t <= hit.sample_time:
+        if hit is None or t < hit.sample_time:
             return
         if period[voice] == prev_period[voice]:
             return
@@ -594,9 +623,11 @@ def collect_gb(
             pending_pitch.add(voice)
         elif reg in (REG_P1_HI, REG_P2_HI, REG_W_HI):
             voice = {REG_P1_HI: 0, REG_P2_HI: 1, REG_W_HI: 2}[reg]
-            period[voice] = (period[voice] & 0xFF) | ((val & 7) << 8)
+            triggered = bool(val & 0x80)
+            if not triggered or trigger_high.get(id(w), True):
+                period[voice] = (period[voice] & 0xFF) | ((val & 7) << 8)
             length_en[voice] = bool(val & 0x40)
-            if val & 0x80:
+            if triggered:
                 if voice == 2:
                     wave_started = True
                 trigger(voice, t)
