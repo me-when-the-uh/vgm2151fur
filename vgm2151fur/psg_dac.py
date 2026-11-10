@@ -24,8 +24,13 @@ from vgm2151fur.vgm import VgmFile
 # half the size of a 44.1 kHz body.
 PSG_DAC_RATE = 22_050
 # A run this long at the exact idle attenuation starts a new attack sample.
-# At 22.05 kHz this is about 2.9 ms; shorter zero crossings are waveform.
-PSG_DAC_REST_FRAMES = 64
+# At 22.05 kHz this is about 11.6 ms; shorter gaps are waveform motion or
+# noisy fragments that belong in the previous sample's tail.
+PSG_DAC_REST_FRAMES = 256
+# Do not spend a body on a fragment shorter than 128 packed bytes (256
+# frames).  At 4-bit amplitude resolution these micro-fragments are noise,
+# not useful independent attack samples, so they stay in the tail above.
+PSG_DAC_MIN_BODY_FRAMES = 256
 PSG_DAC_MIN_WRITES = 64
 PSG_DAC_MIN_ZERO_PERIOD = 0.90
 PSG_DAC_MAX_GAP = 256
@@ -122,6 +127,18 @@ def _segments(
         quiet = 0
     if start < len(frames):
         pieces.append((start, len(frames)))
+    # Fold micro-attacks into the previous body's tail.  A chain of short
+    # fragments extends that body until a real body is reached.
+    merged: list[tuple[int, int]] = []
+    for a, b in pieces:
+        if b - a < PSG_DAC_MIN_BODY_FRAMES and merged:
+            merged[-1] = (merged[-1][0], b)
+        else:
+            merged.append((a, b))
+    if len(merged) > 1 and merged[0][1] - merged[0][0] < PSG_DAC_MIN_BODY_FRAMES:
+        merged[1] = (merged[0][0], merged[1][1])
+        merged.pop(0)
+    pieces = merged
     if first < loop_frame < len(frames):
         split: list[tuple[int, int]] = []
         for a, b in pieces:
