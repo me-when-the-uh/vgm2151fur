@@ -1603,6 +1603,46 @@ def _tone_pitch_tick_scale(vgm: VgmFile, hz: float, speed: int) -> int:
     return max(1, min(k, 32, 255 // max(1, speed)))
 
 
+def _snap_psg_write_lattice(
+    vgm: VgmFile, hz: float, speed: int, subdiv: float,
+) -> tuple[float, int, float, str]:
+    """Keep a whole number of rows per SN76489 driver write tick.
+
+    A PSG-only log is driven by a 50/60 Hz write loop. The note-onset grid
+    can land a few percent away from that loop, so a row slowly slides
+    across the writes and every so often two writes (a volume step and the
+    next note, say) fall on one row. A volume column cannot carry an
+    ``EDxx`` delay, so one of them was pulled back to the row start or
+    dropped. Snapping the row length to a whole divisor or multiple of the
+    write interval keeps each write on a row boundary. The 16th-note
+    highlight is scaled by the same factor, so the BPM and the tick-per-row
+    setting stay as they were.
+    """
+    tick = _saa_tick_interval(vgm, "sn76489")
+    if not tick or tick < 64:
+        return hz, speed, subdiv, ""
+    row = VGM_RATE * speed / hz
+    if row <= 0:
+        return hz, speed, subdiv, ""
+    # Keep a whole number of rows per driver write. A grid that is already
+    # four rows per write stays at write/4 instead of being stretched to the
+    # whole interval; one slightly longer than a write is pulled to the tick.
+    per_write = max(1, int(round(tick / row)))
+    target = tick / per_write
+    if not 0.5 <= row / target <= 2.0:
+        return hz, speed, subdiv, ""
+    if (vgm.total_samples or 0) / target > 60_000:
+        # An audio-rate write loop would need more rows than the order table
+        # holds. Leave the existing grid alone.
+        return hz, speed, subdiv, ""
+    new_hz = VGM_RATE * speed / target
+    new_subdiv = subdiv * row / target
+    return new_hz, speed, new_subdiv, (
+        f"row snapped to the SN76489 write tick ({target:g} samples, "
+        f"{per_write:g} per write)"
+    )
+
+
 def _musical_row(grid: Grid) -> tuple[float, int, int, str]:
     """One row per measured 16th, one tick per 60 Hz frame.
 
@@ -2531,14 +2571,19 @@ def _bind_tone_instruments(
                 for t, _per in e.tone_pitch_pts
             }
             if row_len > 0 and len(rows) * 3 >= len(e.tone_pitch_pts) * 2:
+                # Round half up rather than to even: the pitch table's short
+                # periods sit on plateaus where two adjacent source registers
+                # differ by one engine unit. int(round()) mapped both the
+                # 128.5 and 128.0 steps to 128 and the smaller step vanished,
+                # leaving the note on the previous period.
                 steps = tuple(
                     (
                         t,
-                        int(round((
+                        int(math.floor((
                             tbl.offset_for(
                                 e.note, per + e.tone_period_offset,
                             ) - base_off
-                        ) / 2.0)),
+                        ) / 2.0 + 0.5)),
                     )
                     for t, per in e.tone_pitch_pts
                 )
@@ -10270,6 +10315,7 @@ def analyze(
                 tone_clock=psg_clock,
                 tone_div=tone_div,
                 tone_period_offset=0,
+                legato=bool(getattr(h, "legato", False)),
             ))
             psg_count += 1
         for off in psg_offs:
@@ -13625,6 +13671,22 @@ def analyze(
                     f"row = 1/{grid.subdiv} of the measured 16th, "
                     f"{grid.speed} ticks/row"
                 )
+                if (
+                    psg_count
+                    and not keyon_times
+                    and not (
+                        scc_count or ay_count or vsu_count or saa_count
+                        or pokey_count
+                    )
+                    and not any(e.on and e.pcm for e in events)
+                ):
+                    hz, use_speed, row_subdiv, snap = (
+                        _snap_psg_write_lattice(
+                            vgm, hz, use_speed, row_subdiv,
+                        )
+                    )
+                    if snap:
+                        grid_note = f"{grid_note}; {snap}"
         else:
             hz = 60.0
             use_speed = suggest_speed(keyon_times, hz)

@@ -3928,7 +3928,12 @@ def _build_patterns(song: Song, n_ch: int, pat_len_max: int, fx_cols: int,
                     continue
                 row, delay = song.place(sample, stats)
                 if not ev.vol_slide:
-                    delay = 0
+                    # A volume column changes at the row's first tick; EDxx
+                    # cannot delay it. Using the floor row pulled a step that
+                    # sat near the end of a row (a 60 Hz SN76489 write on a
+                    # slightly slower grid) back to the row start, up to most
+                    # of a row early. The nearest row keeps it in place.
+                    row, delay = song.row_of(sample), 0
                 if row < 0 or row >= total_rows or row >= next_row:
                     continue
                 if ev.pcm and row <= own_row:
@@ -5718,6 +5723,11 @@ def write_fur(
         # Game Gear selects Furnace's stereo SMPSG core (chipType 3). The
         # plain SMS core is mono, so its 08xy panning would be ignored.
         flags = "chipType=3" if getattr(song, "psg_stereo", False) else ""
+        # Furnace's SMS core has an "easy noise" shortcut that maps every
+        # note above ~141 to a linear period and clamps the shortest ones to
+        # 0, so a channel-3 noise period below 16 came back silent/wrong.
+        # The converter writes real periods, so turn the shortcut off.
+        flags = (flags + "\n" if flags else "") + "noEasyNoise=true"
         if abs(psg_clock - 3579545) <= 2:
             clock_flag = "clockSel=0"
         else:

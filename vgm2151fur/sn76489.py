@@ -41,6 +41,10 @@ PSG_MAX_PERIOD = 0x3FF
 PSG_MIN_NOTE = 100          # shorter gates are driver housekeeping
 PSG_NOTE_JUMP_ST = 1.0      # a larger period jump is a new note
 PSG_ATTACK_STEP = 2         # a volume rise this large is a new attack
+# E8xx/E9xx move at most 15 semitones on one row. A larger channel-3 noise
+# period jump is split into a pitch-only legato note instead of a multi-row
+# slide, because the source changes the period register in one write.
+PSG_NOISE_LEGATO_ST = 15.0
 
 
 @dataclass
@@ -53,12 +57,25 @@ class PsgHit:
     chip: int = 0           # 0 = first SN76489, 1 = second/T6W28 right half
     noise: bool = False
     noise_mode: int = 0
+    # Register mode while the gate is still open. `noise_mode` stays the
+    # mode the note started with, so analyze emits that as the note's own
+    # 20xy and the later changes ride `mode_pts`.
+    noise_mode_now: int = -1
+    # Fixed noise rate / channel-3 select (bits 0-1 of the noise register).
+    # Furnace derives that rate from the note, not from effect 20xy, so a
+    # mid-note change needs a new note with the new `noise_mode`.
+    noise_spec: int = 0
     # Game Gear 08xy pan value (0xF0 left, 0x0F right, 0xFF both). Zero when
     # the source did not declare stereo.  On a T6W28 this is the independent
     # x=left / y=right split computed from the two attenuation nibbles.
     pan: int = 0
     opened_pan: int = 0
     t6w28: bool = False
+    # This note only changes pitch; it continues the previous noise gate.
+    # A channel-3 noise period jump larger than E8xx can carry in one row is
+    # split here and committed with EA01, so the new period lands instantly
+    # instead of sliding over several rows.
+    legato: bool = False
     # T6W28 left/right attenuation steps and their pan at the same instant.
     mix_pts: list[tuple[int, int, int]] = field(default_factory=list)
     pan_pts: list[tuple[int, int]] = field(default_factory=list)
@@ -189,6 +206,13 @@ def _collect_plain(
         if hit is None:
             return
         hit.off_sample = t
+        if t > 0:
+            # Nothing at or after the close is heard on this note. A noise
+            # mode write and the gate-off can share one source sample; the
+            # point belongs to the next note, not this one.
+            hit.mode_pts = [pt for pt in hit.mode_pts if pt[0] < t]
+            hit.pitch_pts = [pt for pt in hit.pitch_pts if pt[0] < t]
+            hit.vol_pts = [pt for pt in hit.vol_pts if pt[0] < t]
         if t <= 0:
             # End of the log while the gate is still open: a held note.
             hits.append(hit)
@@ -203,14 +227,25 @@ def _collect_plain(
     def noise_period() -> int:
         return max(0, min(PSG_MAX_PERIOD, freq[2]))
 
-    def set_noise_period(hit: PsgHit, t: int) -> None:
+    def set_noise_period(hit: PsgHit, t: int) -> bool:
+        """Follow a channel-3 period write. True when the note was split."""
         period = noise_period()
         if hit.period == period:
-            return
+            return False
         if t == hit.sample_time:
             hit.period = period
-        elif not hit.pitch_pts or hit.pitch_pts[-1][1] != period:
+            return False
+        last = hit.pitch_pts[-1][1] if hit.pitch_pts else hit.period
+        if _jump_st(last, period) > PSG_NOISE_LEGATO_ST:
+            close(3, t, emit_off=False)
+            open_hit(3, t)
+            new = active[3]
+            if new is not None:
+                new.legato = True
+            return True
+        if not hit.pitch_pts or hit.pitch_pts[-1][1] != period:
             hit.pitch_pts.append((t, period))
+        return False
 
     def open_hit(voice: int, t: int) -> None:
         pan = pan_for(voice)
@@ -232,6 +267,8 @@ def _collect_plain(
             chip=chip,
             noise=voice == 3,
             noise_mode=noise_mode if voice == 3 else 0,
+            noise_mode_now=noise_mode if voice == 3 else -1,
+            noise_spec=(noise_mode & 3) if voice == 3 else 0,
             pan=pan,
             opened_pan=pan,
         )
@@ -297,13 +334,29 @@ def _collect_plain(
                 close(3, t)
             return
         assert hit is not None
-        if hit.noise_mode != noise_mode:
+        current = hit.noise_mode_now if hit.noise_mode_now >= 0 else hit.noise_mode
+        if current != noise_mode:
+            spec = noise_mode & 3
             if t == hit.sample_time:
                 hit.noise_mode = noise_mode
+                hit.noise_mode_now = noise_mode
+                hit.noise_spec = spec
+            elif hit.noise_spec != spec:
+                # The fixed rate (or the channel-3 switch) selects the note
+                # on this platform; 20xy only carries the white/periodic and
+                # channel-3 bits. A rate change is therefore a new note, just
+                # like the source's noise-register write.
+                close(3, t, emit_off=False)
+                open_hit(3, t)
+                return
             else:
-                hit.mode_pts.append((t, noise_mode))
+                if not hit.mode_pts or hit.mode_pts[-1][1] != noise_mode:
+                    hit.mode_pts.append((t, noise_mode))
+                hit.noise_mode_now = noise_mode
+                hit.noise_spec = spec
         if (noise_mode & 3) == 3:
-            set_noise_period(hit, t)
+            if set_noise_period(hit, t):
+                return
         level = 15 - vol[3]
         last_level = hit.vol_pts[-1][1] if hit.vol_pts else hit.vol
         if last_level != level:
@@ -459,6 +512,7 @@ def _collect_t6w28(
             chip=0,
             noise=voice == 3,
             noise_mode=(4 if noise_white else 0) if voice == 3 else 0,
+            noise_mode_now=(4 if noise_white else 0) if voice == 3 else -1,
             pan=pan,
             opened_pan=pan,
             t6w28=True,
@@ -522,11 +576,17 @@ def _collect_t6w28(
             return
         assert hit is not None
         mode = 4 if noise_white else 0
-        if hit.noise_mode != mode:
+        current = hit.noise_mode_now if hit.noise_mode_now >= 0 else hit.noise_mode
+        if current != mode:
             if t == hit.sample_time:
                 hit.noise_mode = mode
-            elif not hit.mode_pts or hit.mode_pts[-1][1] != mode:
-                hit.mode_pts.append((t, mode))
+            else:
+                if not hit.mode_pts or hit.mode_pts[-1][1] != mode:
+                    hit.mode_pts.append((t, mode))
+            hit.noise_mode_now = mode
+        # The T6W28 noise select also picks the extra period (0x100/0x200/
+        # 0x400/right register). That changes the period, and the note's
+        # pitch points already carry it, so the select itself is not a note.
         period = noise_period()
         if hit.period != period:
             if t == hit.sample_time:

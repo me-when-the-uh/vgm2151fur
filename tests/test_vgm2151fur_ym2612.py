@@ -359,6 +359,79 @@ class TestGenesisPsgDac(unittest.TestCase):
         self.assertEqual((noise.period, noise.noise_mode), (14, 7))
         self.assertEqual(noise.pitch_pts, [(400, 30)])
 
+    def test_mid_note_noise_rate_change_is_a_new_note(self):
+        # Modes 4 and 6 are both white, so 20xy does not change. Furnace
+        # still takes the fixed rate from the note, so a rate write inside a
+        # gate has to become a new note or the old rate keeps playing.
+        ws = [
+            ChipWrite(0, "sn76489", 0, 0, 0xE4),
+            ChipWrite(0, "sn76489", 0, 0, 0xF0),
+            ChipWrite(500, "sn76489", 0, 0, 0xE6),
+            ChipWrite(900, "sn76489", 0, 0, 0xFF),
+        ]
+        hits, _offs, _warn = collect_sn76489(
+            _vgm(ws, sn76489_clock=3579545),
+        )
+        noise = [h for h in hits if h.noise]
+        self.assertEqual([(h.sample_time, h.noise_mode) for h in noise],
+                         [(0, 4), (500, 6)])
+
+    def test_large_channel3_noise_jump_is_a_legato_note(self):
+        # A period jump beyond what E8xx can carry on one row must land at
+        # once. The source writes the register in one go; splitting the note
+        # and marking it legato keeps the new period exact without
+        # restarting the noise generator.
+        ws = [
+            ChipWrite(0, "sn76489", 0, 0, 0xCE),  # ch2 tone period 14
+            ChipWrite(0, "sn76489", 0, 0, 0x00),
+            ChipWrite(0, "sn76489", 0, 0, 0xE7),  # mode 3 + white
+            ChipWrite(0, "sn76489", 0, 0, 0xF0),
+            ChipWrite(500, "sn76489", 0, 0, 0xC0),  # ch2 period 0x200
+            ChipWrite(500, "sn76489", 0, 0, 0x20),
+            ChipWrite(900, "sn76489", 0, 0, 0xFF),
+        ]
+        hits, _offs, _warn = collect_sn76489(
+            _vgm(ws, sn76489_clock=3579545),
+        )
+        noise = [h for h in hits if h.noise]
+        self.assertEqual(len(noise), 2)
+        self.assertEqual((noise[0].period, noise[0].legato), (14, False))
+        self.assertEqual((noise[1].period, noise[1].legato), (0x200, True))
+
+    def test_psg_system_disables_easy_noise(self):
+        # Furnace's easy-noise shortcut clamps channel-3 noise periods below
+        # 16 to 0. The converter writes real periods, so the flag must say so.
+        ws = [
+            ChipWrite(0, "sn76489", 0, 0, 0x8F),
+            ChipWrite(0, "sn76489", 0, 0, 0x01),
+            ChipWrite(0, "sn76489", 0, 0, 0x90),
+        ]
+        song = analyze(_vgm(ws, clock=0, sn76489_clock=3579545))
+        self.assertIn(b"noEasyNoise=true", write_fur(song))
+
+    def test_psg_rows_snap_to_the_write_lattice(self):
+        # A PSG-only driver writes one frame at a time. The row grid follows
+        # that interval, so a volume step and the next note never land on the
+        # same row and a column step cannot be pulled back to the row start.
+        step = 1470
+        writes = []
+        for i in range(64):
+            t = i * step
+            per = 200 + (i % 4) * 40
+            writes += [
+                ChipWrite(t, "sn76489", 0, 0, 0x80 | (per & 0x0F)),
+                ChipWrite(t, "sn76489", 0, 0, per >> 4),
+                ChipWrite(t, "sn76489", 0, 0, 0x90),
+            ]
+        writes.append(ChipWrite(64 * step, "sn76489", 0, 0, 0x9F))
+        song = analyze(_vgm(
+            writes, clock=0, total_samples=64 * step,
+            sn76489_clock=3579545,
+        ))
+        per_write = step / song.samples_per_row
+        self.assertAlmostEqual(per_write, round(per_write), delta=1e-6)
+        self.assertGreaterEqual(round(per_write), 1)
+
     def test_psg_note_is_the_same_period(self):
         tbl = psg_pitch_table()
         for period in (2, 14, 31, 100, 511, 1023):
