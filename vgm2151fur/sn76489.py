@@ -32,6 +32,10 @@ from vgm2151fur.vgm import VgmFile
 PSG_FURNACE_CLOCK = 315_000_000.0 / 88.0
 PSG_DEFAULT_CLOCK = 3579545
 PSG_DIVIDER = 64
+# The writer asks for Furnace's named COLOR_NTSC clock when the header value
+# is within this many hertz of it; the note/pitch tables must then use that
+# named clock too, or the emitted period is a fraction of a unit off.
+PSG_CLOCK_TOLERANCE = 2
 # Furnace's T6W28 platform uses its own clock (3072000 Hz) and the SN pitch
 # tables with dividers 16 (tone) and 15 (noise).
 T6W28_CLOCK = 3_072_000
@@ -55,6 +59,10 @@ class PsgHit:
     vol: int                # Furnace volume 0-15 (15 = loudest)
     off_sample: int = 0
     chip: int = 0           # 0 = first SN76489, 1 = second/T6W28 right half
+    # The instance's own clock. A dual log may run the two chips from
+    # different crystals; the note table has to invert the same clock the
+    # module ends up using, or the register period is rescaled.
+    clock: int = 0
     noise: bool = False
     noise_mode: int = 0
     # Register mode while the gate is still open. `noise_mode` stays the
@@ -117,15 +125,32 @@ def _period_note(period: int, clock: float, divider: float) -> tuple[int, int]:
     )
 
 
-def psg_note(period: int) -> tuple[int, int]:
+def psg_module_clock(clock: int | float | None) -> float:
+    """The clock the SMS system will actually run at.
+
+    The writer leaves a clock within `PSG_CLOCK_TOLERANCE` of the header
+    default on Furnace's named COLOR_NTSC selection; every other clock goes
+    out as `customClock`. The period table must use the same value.
+    """
+    value = float(clock or PSG_DEFAULT_CLOCK)
+    if abs(value - PSG_DEFAULT_CLOCK) <= PSG_CLOCK_TOLERANCE:
+        return PSG_FURNACE_CLOCK
+    return value
+
+
+def psg_note(
+    period: int, clock: int | float | None = None,
+) -> tuple[int, int]:
     """10-bit SN76489 period -> (Furnace note, E5) for the same register.
 
-    Period values below the pitch table's highest note (a very high source
-    frequency, e.g. 14) cannot be represented by a note; clamp to the
-    shortest period the table can produce instead of letting the platform
-    fall back to its slowest one (1023).
+    `clock` is the chip instance's own clock (a dual log can run two
+    crystals); the inverse table must use it so the module writes the source
+    period back unchanged. Period values below the pitch table's highest note
+    (a very high source frequency, e.g. 14) cannot be represented by a note;
+    clamp to the shortest period the table can produce instead of letting the
+    platform fall back to its slowest one (1023).
     """
-    return _period_note(period, PSG_FURNACE_CLOCK, PSG_DIVIDER)
+    return _period_note(period, psg_module_clock(clock), PSG_DIVIDER)
 
 
 def t6w28_note(period: int, clock: int) -> tuple[int, int]:
@@ -172,8 +197,13 @@ def collect_sn76489(
     stereo = bool(getattr(vgm, "sn76489_stereo", False))
     hits: list[PsgHit] = []
     offs: list[PsgOff] = []
+    second_clock = getattr(vgm, "sn76489_clock_2", 0)
     for cid in sorted(by_chip):
-        h, o, warn = _collect_plain(by_chip[cid], clock, stereo, cid)
+        # libvgm gives the second instance the first one's clock when the
+        # extra header has no entry for it; a VGM 1.70+ log may carry a
+        # different crystal and the writer passes that one through.
+        chip_clock = second_clock if (cid == 1 and second_clock) else clock
+        h, o, warn = _collect_plain(by_chip[cid], chip_clock, stereo, cid)
         hits.extend(h)
         offs.extend(o)
         warnings.extend(warn)
@@ -279,6 +309,7 @@ def _collect_plain(
             ),
             vol=level,
             chip=chip,
+            clock=clock,
             noise=voice == 3,
             noise_mode=noise_mode if voice == 3 else 0,
             noise_mode_now=noise_mode if voice == 3 else -1,
@@ -569,6 +600,7 @@ def _collect_t6w28(
             ),
             vol=level,
             chip=0,
+            clock=clock,
             noise=voice == 3,
             noise_mode=(4 if noise_white else 0) if voice == 3 else 0,
             noise_mode_now=(4 if noise_white else 0) if voice == 3 else -1,

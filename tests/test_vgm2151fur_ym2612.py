@@ -29,7 +29,9 @@ from vgm2151fur.vgm import (
     ChipWrite, VgmFile, _decompress_data_block, _parse_compression_table,
     chips_in_head, load_vgm,
 )
+from vgm2151fur.pitch import pitch_table
 from vgm2151fur.sn76489 import (
+    PSG_DIVIDER, PSG_MAX_PERIOD,
     collect_sn76489, psg_note, psg_pitch_table,
 )
 from vgm2151fur.ym2612 import (
@@ -482,6 +484,28 @@ class TestGenesisPsgDac(unittest.TestCase):
                 tbl.value(note, e5 - 0x80), period,
                 (period, note, e5),
             )
+
+    def test_psg_note_uses_the_source_clock(self):
+        # Ice1.vgz runs two SN76489s from a 2,858,084 Hz crystal. Looking the
+        # period up in the 3,579,545 Hz default table made the module rescale
+        # every register and play the whole conversion ~4 semitones sharp.
+        clock = 2_858_084
+        tbl = pitch_table(float(clock), PSG_DIVIDER, maximum=PSG_MAX_PERIOD)
+        for period in (2, 14, 31, 100, 254, 511, 1023):
+            note, e5 = psg_note(period, clock)
+            self.assertEqual(
+                tbl.value(note, e5 - 0x80), period,
+                (period, note, e5),
+            )
+
+    def test_psg_custom_clock_reaches_the_module_flag(self):
+        ws = [
+            ChipWrite(0, "sn76489", 0, 0, 0x8F),
+            ChipWrite(0, "sn76489", 0, 0, 0x01),
+            ChipWrite(0, "sn76489", 0, 0, 0x90),
+        ]
+        song = analyze(_vgm(ws, clock=0, sn76489_clock=2_858_084))
+        self.assertIn(b"customClock=2858084", write_fur(song))
 
     @unittest.skipUnless(HAVE_FURNACE, "furnace console build missing")
     def test_psg_module_round_trip(self):

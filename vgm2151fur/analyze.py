@@ -245,6 +245,7 @@ from vgm2151fur.sn76489 import (
     PSG_FURNACE_CLOCK,
     PSG_MAX_PERIOD,
     collect_sn76489,
+    psg_module_clock,
     psg_note,
     t6w28_note,
     t6w28_noise_note,
@@ -10276,6 +10277,10 @@ def analyze(
         psg_events: list[NoteEvent] = []
         for h in psg_hits:
             ch = psg_at.get(h.chip, psg_base) + h.voice
+            # Each SN76489 instance can run a different crystal. The module
+            # gets that clock through customClock, so the note table must
+            # invert the same value or the writer rescales every period.
+            hit_clock = psg_module_clock(h.clock or psg_clock)
             vol_pts: tuple[tuple[int, int, int | None], ...] = ()
             if psg_t6w28:
                 if h.noise:
@@ -10306,7 +10311,7 @@ def analyze(
                     # so its note is that channel's note and its pitch points
                     # follow that period.
                     if spec == 3:
-                        note, e5 = psg_note(h.period)
+                        note, e5 = psg_note(h.period, hit_clock)
                         pitch = tuple(h.pitch_pts)
                     else:
                         note = 62 - spec
@@ -10322,7 +10327,7 @@ def analyze(
                         )
                         channel_fx.append((t, ch, 0x20, mf))
                 else:
-                    note, e5 = psg_note(h.period)
+                    note, e5 = psg_note(h.period, hit_clock)
                     pitch = tuple(h.pitch_pts)
                 if psg_stereo:
                     for t, pan in h.pan_pts:
@@ -10344,7 +10349,7 @@ def analyze(
                 vol_pts=vol_pts,
                 tone_pitch_pts=pitch,
                 tone_chip=3,
-                tone_clock=psg_clock,
+                tone_clock=hit_clock,
                 tone_div=tone_div,
                 tone_period_offset=0,
                 legato=bool(getattr(h, "legato", False)),

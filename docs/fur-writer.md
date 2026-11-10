@@ -107,6 +107,10 @@ triples start 31 bytes plus 12 per chip before the first ADIR pointer.
   flag, while a value that is the default to within about 2 Hz does not:
   identical phase steps either way, and writing the crystal keeps a shared
   module in tune with its own log.
+- An SMS (SN76489) system uses `clockSel=0` when its clock is within 2 Hz of
+  3579545 and `customClock=` otherwise, per instance: a dual log can run the
+  two chips from different crystals. The converter inverts each instance's
+  note table with that same clock.
 - The K007232 flag carries `stereo=true` and a clock when it differs from the
   default.
 - The K053260 flag selects `clockSel=0` (COLOR_NTSC) or `clockSel=1` (4 MHz)
