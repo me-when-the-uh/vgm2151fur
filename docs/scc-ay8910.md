@@ -174,6 +174,13 @@ the previous body's instrument macro and never reaches its own row. A
 tone-to-noise handover where the tone bit drops stays one note: that is a mode
 change on the same sound, not a new attack.
 
+A pitch split inside one gate starts the next note in the mode the register
+already holds. That segment's write list only contains the changes after the
+split, so the settled mode and noise period are seeded at its start. Without
+the seed a later tone→noise handover was the macro's only point; a one-point
+macro is dropped, so the note stayed on tone and lost the whole noise part of
+the hit (Breeze's PSG3 percussion switches that way every two ticks).
+
 A pure-noise AY voice has no audible pitch, and its period writes stay off
 the pattern. A tone voice keeps every period written while the tone bit was
 set, including a glide that finishes with the tone bit off. A step held for

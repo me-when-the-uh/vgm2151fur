@@ -1099,6 +1099,32 @@ class TestToneMacros(unittest.TestCase):
         self.assertEqual([o.sample_time for o in offs], [2000])
 
 
+    def test_pitch_split_keeps_the_mode_it_starts_in(self):
+        # A quick tone-to-noise handover after a pitch split: the split's
+        # own fx list starts at the handover, so the settled tone mode has
+        # to be seeded. Without it the instrument's mode macro starts on
+        # noise and never switches (PSG3's percussion in Breeze).
+        writes = [
+            ChipWrite(0, "ay8910", 0, 7, 0x38),      # tone on, noise off
+            ChipWrite(0, "ay8910", 0, 0, 0x00),
+            ChipWrite(0, "ay8910", 0, 1, 0x04),
+            ChipWrite(0, "ay8910", 0, 8, 12),
+            ChipWrite(2000, "ay8910", 0, 0, 0x00),
+            ChipWrite(2000, "ay8910", 0, 1, 0x02),   # octave up: splits
+            ChipWrite(3500, "ay8910", 0, 7, 0x31),   # tone off, noise on
+            ChipWrite(6000, "ay8910", 0, 8, 0),
+        ]
+        song = analyze(_vgm(writes, ay8910_clock=1789772))
+        notes = [e for e in song.events if e.on and e.tone_chip == 2]
+        self.assertEqual([n.sample for n in notes], [0, 2000])
+        self.assertIn((2000, FX_MODE, 0), notes[1].tone_fx_pts)
+        self.assertIn((3500, FX_MODE, 1), notes[1].tone_fx_pts)
+        spec = song.ay_ins[notes[1].ins]
+        self.assertTrue(spec.mode)
+        self.assertEqual(spec.mode[0], 1)   # tone at the segment start
+        self.assertIn(2, spec.mode)         # switches to noise later
+
+
 def _levels_vgm(levels: list[int], *, wave: bytes = SINE, origin: int = 0) -> VgmFile:
     """One SCC+ note whose volume register follows ``levels``, one frame apart."""
     t0 = origin

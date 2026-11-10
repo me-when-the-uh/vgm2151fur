@@ -4236,7 +4236,15 @@ def _emit_ay_notes(
                 for t, v in h.vol_pts if sst < t < bound
             )
             prev_st = segs[i - 1][0] if i else -1
-            latest: dict[int, int] = {}
+            # A pitch split starts the next note in whatever tone/noise mode
+            # the register already holds. Its own fx list only has the writes
+            # after the split, so a later tone-to-noise handover became the
+            # macro's *first and only* value and the note stayed on tone.
+            # Seed the settled mode and noise period at the segment start.
+            latest: dict[int, int] = {
+                fx: val for t, fx, val in h.fx_pts
+                if t <= sst and fx in (FX_MODE, FX_NOISE)
+            }
             later: list[tuple[int, int, int]] = []
             for t, fx, val in buckets[i]:
                 # A source register burst often lands a sample or two after
