@@ -826,6 +826,28 @@ class TestYm2612DacSlices(unittest.TestCase):
         song = analyze(src, speed=6, dac_slices=True)
         self.assertEqual(song.dac_count, 2)
 
+    def test_second_block_play_cuts_the_first(self):
+        # Starting a 0x95 stream stops the previous block.  Expanding both
+        # copies to their full length leaves two PCM streams interleaved, and
+        # the later word wins at each frame (a garbled waveform).
+        body = bytes(range(0x80, 0x80 + 100))
+        src = _vgm(
+            self._marker(), dac_blocks=[body],
+            dac_block_plays=[(0, 0, 11025), (200, 0, 11025)],
+            total_samples=9000,
+        )
+        samples, plays, warn, _stats = collect_dac(src, slices=True)
+        self.assertFalse(warn)
+        # 200 VGM samples at 11025 Hz is 50 source bytes.
+        self.assertEqual(len(samples), 2)
+        self.assertEqual(samples[0].data, self._signed(body[:50]))
+        self.assertEqual(samples[1].data, self._signed(body))
+        self.assertEqual(sorted(p.onset for p in plays), [0, 200])
+
+        _s, _p, _w, stats = collect_dac(src)
+        self.assertEqual(stats.get("dac_block_plays_cut"), 1)
+        self.assertNotIn("dac_same_time_runs", stats)
+
     @unittest.skipUnless(HAVE_FURNACE, "furnace console build missing")
     def test_export_starts_and_bodies_match_the_slices(self):
         spec = [

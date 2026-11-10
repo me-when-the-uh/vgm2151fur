@@ -7,6 +7,7 @@ slice representation; `timeline=True` is the old comparison body.
 from __future__ import annotations
 
 import bisect
+import math
 import statistics
 from dataclasses import dataclass
 
@@ -380,8 +381,9 @@ def _collect_slices(
         i += 1
     flush()
 
-    # Modern block plays: each 0x95 supplies one slice.
-    for t, block, rate in vgm.dac_block_plays:
+    # Modern block plays: each 0x95 supplies one slice, cut by the next play
+    # because starting a stream stops the previous one.
+    for t, block, rate, stop in _block_play_spans(vgm):
         if not (0 <= block < len(vgm.dac_blocks)):
             continue
         if not _dac_enabled_at(enable_tl, t):
@@ -391,6 +393,11 @@ def _collect_slices(
         if not body:
             continue
         rate = _clamp_rate(rate, stats)
+        if stop is not None:
+            cut = int(math.ceil(max(0, stop - t) * rate / VGM_RATE))
+            body = body[:max(0, min(len(body), cut))]
+            if not body:
+                continue
         span = int(round(len(body) * VGM_RATE / rate))
         idx = _add_sample(samples, by_key, body, rate, t)
         plays.append(DacPlay(t, idx, _pan_at(pan_timeline, t), span, False))
@@ -448,6 +455,26 @@ def _collect_slices(
     return samples, plays, warnings, stats
 
 
+def _block_play_spans(
+    vgm: VgmFile,
+) -> list[tuple[int, int, int, int | None]]:
+    """Block plays with the next play's onset as their stop time.
+
+    A YM2612 DAC stream plays one data block at a time: the next `0x95`
+    restarts it, so the current block is cut there.  Expanding every block to
+    its full length instead leaves two copies of the same (or different) PCM
+    running at once; the later word at each frame wins, which garbles the
+    waveform.  Drivers that repeat a long block before it ends rely on this
+    cut (SA2's Leaf Forest intro does exactly that).
+    """
+    plays = sorted(vgm.dac_block_plays, key=lambda p: p[0])
+    out: list[tuple[int, int, int, int | None]] = []
+    for i, (t, block, rate) in enumerate(plays):
+        stop = plays[i + 1][0] if i + 1 < len(plays) else None
+        out.append((t, block, rate, stop))
+    return out
+
+
 def _packed_words(
     vgm: VgmFile, stats: dict, enable_tl: list[tuple[int, bool]],
 ) -> list[tuple[float, int, int]]:
@@ -455,7 +482,7 @@ def _packed_words(
     words: list[tuple[float, int, int]] = list(
         _byte_events(vgm, stats, enable_tl)
     )
-    for t, block, rate in vgm.dac_block_plays:
+    for t, block, rate, stop in _block_play_spans(vgm):
         if not (0 <= block < len(vgm.dac_blocks)):
             continue
         if not _dac_enabled_at(enable_tl, t):
@@ -464,10 +491,19 @@ def _packed_words(
         body = _signed_bank(bytes(vgm.dac_blocks[block]))
         if not body:
             continue
-        step = VGM_RATE / (rate if rate > 0 else VGM_RATE)
-        for i, byte in enumerate(body):
+        play_rate = rate if rate > 0 else VGM_RATE
+        step = VGM_RATE / play_rate
+        count = len(body)
+        if stop is not None:
+            cut = int(math.ceil(max(0, stop - t) * play_rate / VGM_RATE))
+            count = min(count, cut)
+        for i, byte in enumerate(body[:count]):
             words.append((t + i * step, byte, 0))
         stats["dac_block_plays"] = stats.get("dac_block_plays", 0) + 1
+        if count < len(body):
+            stats["dac_block_plays_cut"] = (
+                stats.get("dac_block_plays_cut", 0) + 1
+            )
     if not words:
         return []
     words.sort(key=lambda w: w[0])
