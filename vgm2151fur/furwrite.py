@@ -5995,12 +5995,10 @@ def write_fur(
             # module system carries one side.
             cv = _player_chip_volume(song.vgm, 0x11, 1)
         elif i in k054539_set:
-            # The K054539 core always applies its own /4 voice gain.  Eight
-            # one-voice PCM DAC systems each carry that share; the song master
-            # stays at 1.0.
-            cv = 0.25 * _player_chip_volume(
-                song.vgm, 0x1A, max(1, len(k054539_ids)),
-            )
+            # One Generic PCM DAC system per K054539 voice. The decoded body
+            # already carries the chip level, so every system stays at unity;
+            # scaling each one to 0.25 made the whole chip 4x too quiet.
+            cv = 1.0
         elif i in es5503_set:
             # One PCM DAC system per oscillator.  Keep every system at unity;
             # dividing by the system count would make a 28-voice module 0.02x.

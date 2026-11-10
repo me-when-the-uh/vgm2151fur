@@ -17,7 +17,7 @@ from vgm2151fur.c219 import (
     collect_c219,
     layout_c219_samples,
 )
-from vgm2151fur.furio import parse_fur
+from vgm2151fur.furio import decompress_fur, iter_blocks, parse_fur
 from vgm2151fur.furwrite import (
     CHIP_C219,
     CHIP_GA20,
@@ -370,6 +370,18 @@ class TestK054539(unittest.TestCase):
         )
         self.assertEqual(mod.n_ch, 8)  # one DAC system per hardware voice
         self.assertEqual(mod.master_vol, 1.0)
+        # Every one-voice DAC system stays at unity too. The decoded body
+        # already carries the K054539 level; 0.25 per system was 4x too quiet.
+        raw = decompress_fur(write_fur(song))
+        for _off, mag, _size, payload in iter_blocks(raw):
+            if mag in (b"INFO", b"INF2"):
+                chips = list(payload[24:56])
+                vols = list(payload[56:88])
+                self.assertTrue(
+                    all(vols[i] == 64 for i, c in enumerate(chips)
+                        if c == CHIP_PCM_DAC),
+                )
+                break
         self.assertEqual(len(mod.samples), 1)
         self.assertEqual(mod.samples[0].depth, 8)
         notes = [
