@@ -64,6 +64,11 @@ class Rf5cHit:
     env: int  # 8-bit envelope
     pan: int  # low nibble left, high nibble right
     chip_id: int = 0
+    # Step-register writes while the voice stays enabled. The chip uses the
+    # new step from that sample on, so a microsample at a fixed loop address
+    # is also how these drivers play a pitch: the key-on step is the note and
+    # these are its bends/slides. (sample, 16-bit step)
+    step_pts: list[tuple[int, int]] = field(default_factory=list)
 
 
 @dataclass
@@ -191,6 +196,10 @@ def collect_rf5c(
     # A disable is held here until the next event on the voice proves whether
     # it was a real note-off or the first half of a retrigger burst.
     pending_off: list[int | None] = [None] * RF5C_VOICES
+    # The hit currently sounding on each voice, so later step writes land on
+    # it. A disable clears it: any writes before the next enable are that
+    # note's setup, not a bend on the old one.
+    active_hit: list[Rf5cHit | None] = [None] * RF5C_VOICES
 
     def flush_off(i: int) -> None:
         if pending_off[i] is not None:
@@ -222,7 +231,7 @@ def collect_rf5c(
                     else:
                         flush_off(i)
                     voice = voices[i]
-                    hits.append(Rf5cHit(
+                    hit = Rf5cHit(
                         sample_time=write.sample,
                         voice=i,
                         start=(voice.start << 8) & 0xFFFF,
@@ -231,13 +240,32 @@ def collect_rf5c(
                         env=voice.env & 0xFF,
                         pan=voice.pan & 0xFF,
                         chip_id=chip_id,
-                    ))
+                    )
+                    hits.append(hit)
+                    active_hit[i] = hit
                 elif was[i] and not voices[i].enabled:
                     flush_off(i)
                     pending_off[i] = write.sample
+                    active_hit[i] = None
             continue
         if reg <= 0x06:
-            _apply_reg(voices[current], reg, write.val)
+            voice = voices[current]
+            _apply_reg(voice, reg, write.val)
+            if reg in (0x02, 0x03):
+                hit = active_hit[current]
+                if hit is not None and voice.enabled:
+                    step = voice.step & 0xFFFF
+                    if write.sample - hit.sample_time <= RF5C_RETRIGGER:
+                        # A pitch write right after the key is the note's
+                        # own step (drivers often set it after the enable).
+                        if not hit.step_pts:
+                            hit.step = step
+                    else:
+                        last = (
+                            hit.step_pts[-1][1] if hit.step_pts else hit.step
+                        )
+                        if step != last:
+                            hit.step_pts.append((write.sample, step))
 
     for i in range(RF5C_VOICES):
         flush_off(i)

@@ -226,6 +226,13 @@ Playback rate is `clock * step / 786432` bytes/second (Furnace's
 `CHIP_FREQBASE` for the core, 384 * 2048). The sample's usual step is C-4 and
 each hit's step becomes the note/E5 ratio.
 
+The step register is live, so a driver can hold one key on a tiny looped body
+and write the melody into `$02/$03` instead (unreeeal_superhero_3_2 does this
+for every note). Those writes are kept on the hit as a pitch trajectory and
+become `01xx`/`02xx` ramps or `E8xx`/`E9xx` jumps; the key-on step stays the
+note. A step write inside the 64-sample key burst is folded into that base
+instead, because it is the note's own step rather than a bend.
+
 **One-shot trick.** The chip has no loop-disable bit. Drivers that want a
 one-shot point the loop at the trailing silence just before the end marker,
 so a loop at `len-1` (the Xenon FM Towns rip does this for every hit) is

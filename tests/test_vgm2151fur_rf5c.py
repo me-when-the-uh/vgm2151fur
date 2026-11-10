@@ -256,6 +256,29 @@ class TestRf5cCollector(unittest.TestCase):
         self.assertAlmostEqual(rf5c_rate(8000000, 0x1000), 8000000 * 4096 / 786432)
         self.assertAlmostEqual(rf5c_rate(12500000, 0x1000), 12500000 * 4096 / 786432)
 
+    def test_live_step_writes_are_recorded_on_the_hit(self):
+        # A microsample can hold one key while the driver writes the melody
+        # into $02/$03. The key-on step is the note and the later writes are
+        # its pitch trajectory.
+        writes = _lattice() + _note(1000) + [
+            _select(5000, 0),
+            _reg(5000, 0x02, 0x00),
+            _reg(5000, 0x03, 0x20),        # step 0x2000, one octave up
+        ]
+        vgm = _vgm(
+            writes,
+            roms=[RomSlice(0, 0, 0x1000, _body() + b"\xFF", "rf5c68")],
+        )
+        _ram, samples, _offs, _warn = collect_rf5c(
+            vgm, "rf5c68", RF5C68_CLOCK,
+        )
+        hit = samples[0].hits[0]
+        self.assertEqual(hit.step, 0x1000)
+        self.assertEqual(hit.step_pts, [(5000, 0x2000)])
+        song = analyze(vgm)
+        ev = [e for e in song.events if e.on and e.pcm][0]
+        self.assertEqual(ev.sweep, ((5000, 768),))
+
     def test_banked_memory_write_lands_in_the_window(self):
         rom = RomSlice(0, 0, 0x200, b"\x80" * 8 + b"\xFF", "rf5c68")
         writes = _lattice() + [

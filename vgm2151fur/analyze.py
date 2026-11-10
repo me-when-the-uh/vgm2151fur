@@ -11086,6 +11086,23 @@ def analyze(
                 ref = rf5c_rate(clock, smp.mode_step())
                 for h in smp.hits:
                     note, e5 = rate_to_note(rf5c_rate(clock, h.step), ref)
+                    # The chip's step register is live. A driver that plays a
+                    # tiny looped body can hold the key and write the melody
+                    # into $02/$03; the key-on step is the note and each later
+                    # write is a pitch ramp around it.
+                    sweep: tuple[tuple[int, int], ...] = ()
+                    if h.step_pts and h.step:
+                        deltas = tuple(
+                            (t, int(round(
+                                64.0 * 12.0 * math.log2(
+                                    (step & 0xFFFF) / h.step
+                                )
+                            )))
+                            for t, step in h.step_pts if step
+                        )
+                        vals = [d for _t, d in deltas]
+                        if deltas and max(vals + [0]) - min(vals + [0]) >= 4:
+                            sweep = deltas
                     left = h.pan & 0x0F
                     right = (h.pan >> 4) & 0x0F
                     # The core mixes pan nibble * envelope, so the volume
@@ -11102,6 +11119,7 @@ def analyze(
                         e5=e5,
                         pan=pcm_pan_fx(left, right),
                         pcm=True,
+                        sweep=sweep,
                     ))
             for off in offs:
                 base = (
