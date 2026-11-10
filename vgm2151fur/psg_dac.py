@@ -31,6 +31,18 @@ PSG_DAC_REST_FRAMES = 256
 # frames).  At 4-bit amplitude resolution these micro-fragments are noise,
 # not useful independent attack samples, so they stay in the tail above.
 PSG_DAC_MIN_BODY_FRAMES = 256
+# Similarity clustering for reused attacks.  Compare a substantial opening
+# window (0.19 s) with a small alignment tolerance; keep the longest body.
+PSG_DAC_SIMILAR_FRAMES = 4096
+PSG_DAC_SIMILAR_SHIFT = 8
+PSG_DAC_SIMILAR_STEP = 4
+PSG_DAC_SIMILAR_MAD = 0.6
+# Attacks inside a continuous stream.  A short-window envelope that rises
+# out of a quiet lookback is a new hit even with no silent rest between.
+PSG_DAC_ATTACK_WINDOW = 64
+PSG_DAC_ATTACK_LOOKBACK = 256
+PSG_DAC_ATTACK_HIGH = 1.4
+PSG_DAC_ATTACK_LOW = 0.5
 PSG_DAC_MIN_WRITES = 64
 PSG_DAC_MIN_ZERO_PERIOD = 0.90
 PSG_DAC_MAX_GAP = 256
@@ -49,6 +61,10 @@ class PsgDacPlay:
     body: int
     chip_id: int
     voice: int
+    # Frames this event actually owns in the source.  A longer bank body
+    # reuses a shorter event as a prefix, so playback must be cut here when
+    # no following note would do it.
+    frames: int = 0
 
 
 @dataclass
@@ -98,57 +114,111 @@ def _render(
 
 def _segments(
     frames: bytearray, loop_frame: int,
-) -> list[tuple[int, int]]:
+) -> list[tuple[int, int, int]]:
     """Split at rests so every body starts on an attack transient.
 
-    A long hold at the idle level ends the previous body and the next
-    non-idle frame starts the next one.  A continuous stream stays one body;
-    there is no fixed-time cut that would start a sample in mid-wave.  The
-    loop point is the only non-attack boundary, because playback has to
-    restart there.
+    Returns ``(start, end, audible_end)``.  ``end`` carries the body's
+    decay/silent tail to the next attack; ``audible_end`` is where the
+    source event reached its rest.  A shorter event that reuses a longer
+    bank body is cut at ``audible_end``, so the longer body's unrelated tail
+    cannot play into the rest.
     """
     first = next((i for i, v in enumerate(frames) if v != 8), len(frames))
     if first >= len(frames):
         return []
-    pieces: list[tuple[int, int]] = []
+    amplitude = [abs(v - 8) for v in frames]
+    prefix = [0]
+    for value in amplitude:
+        prefix.append(prefix[-1] + value)
+
+    def envelope(at: int) -> float:
+        end = min(at + PSG_DAC_ATTACK_WINDOW, len(amplitude))
+        if end <= at:
+            return 0.0
+        return (prefix[end] - prefix[at]) / (end - at)
+
+    pieces: list[tuple[int, int, int]] = []
     start = first
+    quiet_start = 0
     quiet = 0
     for i in range(first, len(frames)):
         if frames[i] == 8:
+            if quiet == 0:
+                quiet_start = i
             quiet += 1
             continue
         if quiet >= PSG_DAC_REST_FRAMES:
             # The previous body keeps the rest/decay tail all the way to this
-            # attack.  The next note cuts it when the source does, so a short
-            # body never loses its tail.
+            # attack.  Its audible part ended where the idle run began.
             if i > start:
-                pieces.append((start, i))
+                pieces.append((start, i, quiet_start))
             start = i
+        elif (
+            i - start >= PSG_DAC_MIN_BODY_FRAMES
+            and i % 16 == 0
+            and envelope(i) >= PSG_DAC_ATTACK_HIGH
+        ):
+            quiet_before = min(
+                (
+                    envelope(j)
+                    for j in range(
+                        max(start, i - PSG_DAC_ATTACK_LOOKBACK), i, 32,
+                    )
+                ),
+                default=PSG_DAC_ATTACK_HIGH,
+            )
+            if quiet_before <= PSG_DAC_ATTACK_LOW:
+                pieces.append((start, i, i))
+                start = i
         quiet = 0
     if start < len(frames):
-        pieces.append((start, len(frames)))
+        if quiet >= PSG_DAC_REST_FRAMES:
+            pieces.append((start, len(frames), quiet_start))
+        else:
+            pieces.append((start, len(frames), len(frames)))
     # Fold micro-attacks into the previous body's tail.  A chain of short
     # fragments extends that body until a real body is reached.
-    merged: list[tuple[int, int]] = []
-    for a, b in pieces:
-        if b - a < PSG_DAC_MIN_BODY_FRAMES and merged:
-            merged[-1] = (merged[-1][0], b)
+    merged: list[tuple[int, int, int]] = []
+    for a, b, audible in pieces:
+        if audible - a < PSG_DAC_MIN_BODY_FRAMES and merged:
+            prev_a, _prev_b, _prev_audible = merged[-1]
+            # The fragment stays inside the previous body's audible tail; it
+            # is not a separate attack, but it must not be muted away either.
+            merged[-1] = (prev_a, b, audible)
         else:
-            merged.append((a, b))
-    if len(merged) > 1 and merged[0][1] - merged[0][0] < PSG_DAC_MIN_BODY_FRAMES:
-        merged[1] = (merged[0][0], merged[1][1])
+            merged.append((a, b, audible))
+    if (
+        len(merged) > 1
+        and merged[0][2] - merged[0][0] < PSG_DAC_MIN_BODY_FRAMES
+    ):
+        merged[1] = (merged[0][0], merged[1][1], merged[1][2])
         merged.pop(0)
     pieces = merged
     if first < loop_frame < len(frames):
-        split: list[tuple[int, int]] = []
-        for a, b in pieces:
+        split: list[tuple[int, int, int]] = []
+        for a, b, audible in pieces:
             if a < loop_frame < b:
-                split.append((a, loop_frame))
-                split.append((loop_frame, b))
+                split.append((a, loop_frame, min(audible, loop_frame)))
+                split.append((loop_frame, b, max(audible, loop_frame)))
             else:
-                split.append((a, b))
+                split.append((a, b, audible))
         pieces = split
-    return [(a, b) for a, b in pieces if b > a]
+    return [(a, b, audible) for a, b, audible in pieces if b > a]
+
+
+def _tail_is_quiet(data: bytes, start: int) -> bool:
+    """True when everything past `start` is the idle nibble."""
+    return all(v == 8 for v in data[start:])
+
+
+def _min_audible(plays: list[PsgDacPlay]) -> dict[int, int]:
+    """Shortest source event that uses each body."""
+    out: dict[int, int] = {}
+    for play in plays:
+        old = out.get(play.body)
+        if old is None or play.frames < old:
+            out[play.body] = play.frames
+    return out
 
 
 def _share_prefix_samples(
@@ -166,14 +236,21 @@ def _share_prefix_samples(
         if smp.data:
             by_head.setdefault((smp.rate, smp.data[:2]), []).append(i)
     remap = list(range(len(samples)))
+    audible = _min_audible(plays)
     reused = 0
     for indexes in by_head.values():
         if len(indexes) < 2:
             continue
         indexes.sort(key=lambda i: samples[i].frames, reverse=True)
         for pos, i in enumerate(indexes):
+            need = audible.get(i, samples[i].frames)
             for j in indexes[:pos]:
-                if samples[j].data.startswith(samples[i].data):
+                longer = samples[j].data
+                shorter = samples[i].data
+                if (
+                    longer.startswith(shorter)
+                    and _tail_is_quiet(longer, need)
+                ):
                     remap[i] = j
                     reused += 1
                     break
@@ -196,6 +273,86 @@ def _share_prefix_samples(
     for play in plays:
         play.body = compact_map[play.body]
     stats["psg_dac_prefix_reused"] = reused
+
+
+def _best_similarity(a: bytes, b: bytes, limit: int) -> float:
+    """Smallest mean code difference over small start-time shifts."""
+    best = 99.0
+    for shift in range(-PSG_DAC_SIMILAR_SHIFT, PSG_DAC_SIMILAR_SHIFT + 1):
+        aa = a[shift:] if shift >= 0 else a
+        bb = b if shift >= 0 else b[-shift:]
+        n = min(len(aa), len(bb), limit)
+        if n <= 0:
+            continue
+        total = 0
+        count = 0
+        for k in range(0, n, PSG_DAC_SIMILAR_STEP):
+            total += abs(aa[k] - bb[k])
+            count += 1
+        if count:
+            score = total / count
+            if score < best:
+                best = score
+                if best <= PSG_DAC_SIMILAR_MAD:
+                    break
+    return best
+
+
+def _share_similar_samples(
+    samples: list[PsgDacSample], plays: list[PsgDacPlay], stats: dict,
+) -> None:
+    """Bank similar attacks onto the longest body.
+
+    Exact prefixes already share a body.  This pass catches the same hit with
+    a one- or two-frame phase difference, which is common in the 4-bit
+    stream.  The longest variant wins because the next note cuts its tail at
+    the source's attack.
+    """
+    if len(samples) < 2:
+        return
+    order = sorted(
+        range(len(samples)), key=lambda i: samples[i].frames, reverse=True,
+    )
+    audible = _min_audible(plays)
+    anchors: list[int] = []
+    remap = list(range(len(samples)))
+    for i in order:
+        limit = min(samples[i].frames, PSG_DAC_SIMILAR_FRAMES)
+        need = audible.get(i, samples[i].frames)
+        for anchor in anchors:
+            # Only borrow a longer body when its extra tail is pure silence.
+            # An audible tail belongs to a different event; keeping this
+            # shorter body is preferable to muting a wrong tail later.
+            if not _tail_is_quiet(samples[anchor].data, need):
+                continue
+            if _best_similarity(
+                samples[i].data, samples[anchor].data, limit,
+            ) <= PSG_DAC_SIMILAR_MAD:
+                remap[i] = anchor
+                break
+        else:
+            anchors.append(i)
+    if len(anchors) == len(samples):
+        return
+    for i in range(len(remap)):
+        while remap[i] != remap[remap[i]]:
+            remap[i] = remap[remap[i]]
+    for play in plays:
+        play.body = remap[play.body]
+    used = {play.body for play in plays}
+    compact: list[PsgDacSample] = []
+    compact_map: dict[int, int] = {}
+    for i, smp in enumerate(samples):
+        if i not in used:
+            continue
+        compact_map[i] = len(compact)
+        compact.append(smp)
+    samples[:] = compact
+    for play in plays:
+        play.body = compact_map[play.body]
+    stats["psg_dac_similar_reused"] = sum(
+        1 for i, r in enumerate(remap) if i != r
+    )
 
 
 def collect_psg_dac(
@@ -274,7 +431,7 @@ def collect_psg_dac(
             if not pieces:
                 continue
             used_voices.append((chip_id, voice))
-            for a, b in pieces:
+            for a, b, audible in pieces:
                 values = bytes(frames[a:b])
                 if not any(v != 8 for v in values):
                     # A body must start on an audible attack.
@@ -290,12 +447,14 @@ def collect_psg_dac(
                     body=idx,
                     chip_id=chip_id,
                     voice=voice,
+                    frames=max(1, audible - a),
                 ))
                 out.stats["psg_dac_bodies"] = len(out.samples)
                 out.stats["psg_dac_plays"] = len(out.plays)
 
     if len(out.samples) > 1:
         _share_prefix_samples(out.samples, out.plays, out.stats)
+        _share_similar_samples(out.samples, out.plays, out.stats)
 
     out.voices = used_voices
     if out.voices:

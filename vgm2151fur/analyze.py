@@ -12060,6 +12060,25 @@ def analyze(
         )
         events.append(ev)
         psg_dac_events.append((ev, play.body))
+        body = psg_dac.samples[play.body] if play.body < len(psg_dac.samples) else None
+        if body is not None and play.frames and body.frames > play.frames:
+            # The bank body is a longer variant reused for this shorter
+            # attack.  Cut it where the source event ends; if a following
+            # note starts there, the writer swallows the redundant off.
+            end_sample = play.sample_time + int(round(
+                play.frames * 44100.0 / psg_dac.rate
+            ))
+            events.append(NoteEvent(
+                sample=end_sample,
+                ch=ch,
+                on=False,
+                note=180,
+                ins=-1,
+                vol=-1,
+                e5=0x80,
+                pan=0,
+                pcm=True,
+            ))
     psg_dac_count = len(psg_dac_events)
 
     # Count the final DAC maps once, below; the collector's list is transient.

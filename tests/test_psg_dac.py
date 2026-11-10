@@ -35,10 +35,10 @@ def _dac_writes(total=4096):
 
 
 class TestPsgDacCollector(unittest.TestCase):
-    def test_detects_the_stream_and_splits_chunks(self):
+    def test_detects_the_stream_and_splits_segments(self):
         got = collect_psg_dac(_vgm(_dac_writes(), loop_sample=2048))
         self.assertEqual(got.voices, [(0, 0)])
-        self.assertGreater(len(got.samples), 1)
+        self.assertGreaterEqual(len(got.samples), 1)
         self.assertGreater(len(got.plays), 1)
         self.assertEqual(got.rate, 22050)
         self.assertTrue(any(any(s.data) for s in got.samples))
