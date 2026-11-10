@@ -103,6 +103,13 @@ OPN, a live YM2151 over a YM2203.
 DAC audio beside an OPL that carries the tune. The OPN2 contributes a system
 with no notes on five of its six columns and PCM on the sixth.
 
+A DAC-only YM2612 beside a **YM2151** is the same shape: the OPM owns the
+music columns, the YM2612 follows as its own system with PCM on channel 6
+(or 9 in Ext mode). `opn2_dac` keeps the pair even though the normal arcade
+precedence would let the YM2151 displace the YM2612, and marks the OPN2 as
+converted so it is not reported as a lost family. `03 In the Beginning.vgz`
+is this shape (OPM music plus a YM2612 DAC stream).
+
 ## Silence is not a system
 
 A merged log opens every chip it knows about and then scores one of them. The

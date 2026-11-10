@@ -17,6 +17,7 @@ from vgm2151fur.furio import (
     CHIP_CHANNELS, decompress_fur, iter_blocks, parse_fur,
 )
 from vgm2151fur.furwrite import (
+    CHIP_YM2151,
     CHIP_YM2612,
     CHIP_YM2612_EXT,
     INS_FM,
@@ -2319,6 +2320,39 @@ class TestYm2612PitchRoundTrip(unittest.TestCase):
                 pitch_runs(src, back, ch, threshold_st=0.25, min_run_ms=60),
                 [], f"ch{ch}",
             )
+
+
+class TestOpmWithDacOnlyYm2612(unittest.TestCase):
+    def test_dac_only_chip_stays_beside_the_opm(self):
+        # A log can score the music on a YM2151 and use a second YM2612 only
+        # as a DAC stream. The YM2612 keys no FM note, but its PCM is music,
+        # so both systems belong in the module.
+        bank = bytes((0x80 + (i % 31) - 15) & 0xFF for i in range(300))
+        events = [(0, 0, 0)] + [(i * 4, 1, 4) for i in range(300)]
+        vgm = VgmFile(
+            path=Path("synthetic.vgm"), buf=b"", version=0x161,
+            total_samples=400000, loop_samples=0, loop_file_pos=None,
+            loop_sample=None, ym2151_clock=3579545, k007232_clock=0,
+            gd3={}, roms=[],
+            writes=[
+                ChipWrite(0, "ym2151", 0, 0x08, 0x78),
+                ChipWrite(0, "ym2612", 0, 0x22, 0x00),
+            ],
+            ym2612_clock=7670453,
+            dac_data=bytearray(bank), dac_events=events,
+        )
+        song = analyze(vgm)
+        self.assertEqual(
+            [s.kind for s in song.fm_systems], ["ym2151", "ym2612"],
+        )
+        self.assertEqual(song.dac_count, 1)
+        self.assertTrue(any(e.on and e.dac for e in song.events))
+        self.assertFalse(
+            any("YM2612 writes in this log" in w for w in song.warnings)
+        )
+        mod = parse_fur(write_fur(song, include_pcm=True))
+        self.assertEqual(mod.chips, [CHIP_YM2151, CHIP_YM2612])
+        self.assertEqual(len(mod.samples), 1)
 
 
 if __name__ == "__main__":

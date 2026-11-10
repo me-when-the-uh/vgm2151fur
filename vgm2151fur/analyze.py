@@ -7937,6 +7937,13 @@ def analyze(
     is_opll = bool(
         opll_live and not is_opl and (arcade_pick is None or share_fm)
     )
+    # A YM2612 that only streams DAC data is a sample player, not a competing
+    # FM family. Keep its system beside the chosen music chip (OPM/OPL/OPLL)
+    # so the stream still reaches the module.
+    opn2_dac_only = bool(
+        "ym2612" in arcade_present and dac_side
+        and not _family_keyons(vgm, {"ym2612"})
+    )
 
     # Every family that writes but gets no system is named here, after the
     # decision. A chip that only received its init block lost nothing.
@@ -7951,6 +7958,15 @@ def analyze(
         converted.add("opll")
     if keep_arcade and arcade_pick:
         converted.add(arcade_pick)
+    # The DAC-only YM2612 rides beside the OPM/OPL/OPLL music as its own
+    # sample system. It is not an FM family loss, so mark it converted.
+    opn2_dac = bool(
+        opn2_dac_only
+        and ("ym2151" in converted or is_opl or is_opll)
+    )
+    if opn2_dac:
+        is_opn2 = True
+        converted.add("ym2612")
     silent = {n for n in all_fm if not sounds[n]}
     lost = {n for n in all_fm if sounds[n] and n not in converted}
     if silent:
@@ -8142,19 +8158,34 @@ def analyze(
     }
     ym2608_ext = bool(ym2608_modes & {1, 2})
     ym2608_fm_count = 9 if ym2608_ext else 6
+    # The OPM's eight columns come first when the module keeps that chip. A
+    # YM2612 that only drives its DAC can follow it as a second live system
+    # (both the OPM music and the streamed PCM are then kept).
+    convert_opm = "ym2151" in converted
+    opm_ids = _dual_ids(
+        sorted({w.chip_id for w in vgm.writes if w.chip == "ym2151"})
+        if convert_opm else [],
+        bool(getattr(vgm, "ym2151_dual", False) and convert_opm),
+    )
+    opm_base = {cid: 8 * i for i, cid in enumerate(opm_ids)}
+    opm_end = 8 * len(opm_ids) if convert_opm else 0
     multi_ext = ym2203_ext or ym2612_ext or ym2608_ext
     ym_chunk = 9 if multi_ext else 6
     if is_opnb:
         ym_chunk = ym2610_fm_count + 3 + 6 + 1
-        ym_base = {cid: ym_chunk * i for i, cid in enumerate(ym2610_ids)}
+        ym_base = {
+            cid: opm_end + ym_chunk * i for i, cid in enumerate(ym2610_ids)
+        }
         ym_count = len(ym2610_ids)
     elif is_opna:
         ym_chunk = ym2608_fm_count + 3 + 6 + 1
-        ym_base = {cid: ym_chunk * i for i, cid in enumerate(ym2608_ids)}
+        ym_base = {
+            cid: opm_end + ym_chunk * i for i, cid in enumerate(ym2608_ids)
+        }
         ym_count = len(ym2608_ids)
     else:
         ym_base = {
-            cid: ym_chunk * i
+            cid: opm_end + ym_chunk * i
             for i, cid in enumerate(ym_ids if is_opn else ym2612_ids)
         }
         ym_count = len(ym_ids if is_opn else ym2612_ids)
@@ -8172,16 +8203,10 @@ def analyze(
     # A combined module lists its systems in channel order: the arcade family
     # (or the OPM's eight voices) first, then every OPL one. The bases below
     # are offsets into the module's channel space, not per-chip ones.
-    convert_opm = "ym2151" in converted
-    opm_ids = _dual_ids(
-        sorted({w.chip_id for w in vgm.writes if w.chip == "ym2151"})
-        if convert_opm else [],
-        bool(getattr(vgm, "ym2151_dual", False) and convert_opm),
-    )
-    opm_base = {cid: 8 * i for i, cid in enumerate(opm_ids)}
     ym_end = (
-        ym_chunk * ym_count if (is_opn or is_opn2 or is_opnb or is_opna)
-        else (8 * len(opm_ids) if convert_opm else 0)
+        opm_end + ym_chunk * ym_count
+        if (is_opn or is_opn2 or is_opnb or is_opna)
+        else opm_end
     )
     opl_base = {
         cid: ym_end + opl_chunk * i for i, cid in enumerate(opl_ids)
@@ -8225,22 +8250,24 @@ def analyze(
                 "ym2608", cid, ym2608_fm_count, ext=ym2608_ext,
                 clock=ym2608_clock,
             ))
-    elif is_opn2:
-        for cid in ym2612_ids:
-            fm_systems.append(FmSystem(
-                "ym2612", cid, 9 if ym2612_ext else 6,
-                ext=ym2612_ext, csm=ym2612_csm, clock=ym2612_clock,
-            ))
     elif is_opn:
         for cid in ym_ids:
             fm_systems.append(FmSystem(
                 "ym2203", cid, 6 if ym2203_ext else 3,
                 ext=ym2203_ext, clock=ym_clock,
             ))
-    elif "ym2151" in converted or not (is_opl or is_opll or arcade_present):
+    # OPM first when present, then a DAC-only YM2612 beside it (or the
+    # YM2612 alone). The bases above put the OPM's eight columns first.
+    if convert_opm or not (is_opl or is_opll or arcade_present):
         for cid in (opm_ids or [0]):
             fm_systems.append(FmSystem(
                 "ym2151", cid, 8, clock=vgm.ym2151_clock,
+            ))
+    if is_opn2:
+        for cid in ym2612_ids:
+            fm_systems.append(FmSystem(
+                "ym2612", cid, 9 if ym2612_ext else 6,
+                ext=ym2612_ext, csm=ym2612_csm, clock=ym2612_clock,
             ))
     if is_opl:
         for cid in opl_ids:
