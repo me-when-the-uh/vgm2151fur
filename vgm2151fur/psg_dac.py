@@ -37,12 +37,20 @@ PSG_DAC_SIMILAR_FRAMES = 4096
 PSG_DAC_SIMILAR_SHIFT = 8
 PSG_DAC_SIMILAR_STEP = 4
 PSG_DAC_SIMILAR_MAD = 0.6
+# Do not bank a loud hit onto a quiet one merely because their low-level
+# waveforms are close.  At 4-bit resolution a one-code difference is audible,
+# and the first Maximum Power attack was being mapped to a nearly silent body.
+PSG_DAC_SIMILAR_PEAK = 1
 # Attacks inside a continuous stream.  A short-window envelope that rises
 # out of a quiet lookback is a new hit even with no silent rest between.
 PSG_DAC_ATTACK_WINDOW = 64
 PSG_DAC_ATTACK_LOOKBACK = 256
 PSG_DAC_ATTACK_HIGH = 1.4
 PSG_DAC_ATTACK_LOW = 0.5
+# A leading fragment at this amplitude or below is a fade-in, not a first
+# note of its own.  Fold it into the next body so the first note reaches the
+# real attack instead of playing a nearly silent sample.
+PSG_DAC_LEAD_PEAK = 1
 PSG_DAC_MIN_WRITES = 64
 PSG_DAC_MIN_ZERO_PERIOD = 0.90
 PSG_DAC_MAX_GAP = 256
@@ -194,6 +202,13 @@ def _segments(
         merged[1] = (merged[0][0], merged[1][1], merged[1][2])
         merged.pop(0)
     pieces = merged
+    while len(pieces) > 1:
+        a, b, _audible = pieces[0]
+        peak = max((abs(frames[i] - 8) for i in range(a, b)), default=0)
+        if peak > PSG_DAC_LEAD_PEAK:
+            break
+        pieces[1] = (a, pieces[1][1], pieces[1][2])
+        pieces.pop(0)
     if first < loop_frame < len(frames):
         split: list[tuple[int, int, int]] = []
         for a, b, audible in pieces:
@@ -313,6 +328,9 @@ def _share_similar_samples(
     order = sorted(
         range(len(samples)), key=lambda i: samples[i].frames, reverse=True,
     )
+    peaks = [
+        max((abs(v - 8) for v in smp.data), default=0) for smp in samples
+    ]
     audible = _min_audible(plays)
     anchors: list[int] = []
     remap = list(range(len(samples)))
@@ -320,6 +338,8 @@ def _share_similar_samples(
         limit = min(samples[i].frames, PSG_DAC_SIMILAR_FRAMES)
         need = audible.get(i, samples[i].frames)
         for anchor in anchors:
+            if abs(peaks[anchor] - peaks[i]) > PSG_DAC_SIMILAR_PEAK:
+                continue
             # Only borrow a longer body when its extra tail is pure silence.
             # An audible tail belongs to a different event; keeping this
             # shorter body is preferable to muting a wrong tail later.
