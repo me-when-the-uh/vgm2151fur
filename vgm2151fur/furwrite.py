@@ -3257,16 +3257,18 @@ def _place_chip_fx(
     total_rows: int,
     content_cut: int | None = None,
     stats: dict | None = None,
-    max_ch: int = 8,
+    max_ch: int | None = None,
 ) -> None:
     """Place chip-wide effects.
 
     0x17 rides the key-on tick it belongs to. PMD, AMD and wave writes stay
-    on channel 0 at the row of the write.
+    on the target channel at the row of the write. A dual YM2151/OPN entry
+    carries the second chip's first column, so its LFO reaches that system
+    instead of the first one.
     """
     if not entries:
         return
-    max_ch = min(max_ch, len(grid))
+    max_ch = len(grid) if max_ch is None else min(max_ch, len(grid))
     row_len = song.samples_per_row
     has_speed = any(entry[1] == 0x17 for entry in entries)
     by_tick: dict[tuple[int, int], list[int]] = {}
@@ -3298,16 +3300,23 @@ def _place_chip_fx(
     for entry in entries:
         sample, cmd, val = entry[0], entry[1], entry[2]
         tick_off = entry[3] if len(entry) > 3 else 0
+        target_ch = entry[4] if len(entry) > 4 else 0
+        target_ch = max(0, min(int(target_ch), len(grid) - 1))
+        # The OPM has eight FM columns per chip. Keep the 0x17 search on the
+        # entry's own instance so a chip-wide write never lands on the other
+        # YM2151's columns.
+        ch_lo = target_ch
+        ch_hi = min(len(grid), target_ch + 8)
         if content_cut is not None and sample >= content_cut:
             continue
         if cmd != 0x17:
             row = song.row_of(sample)
             if row < 0 or row >= total_rows:
                 continue
-            cell = grid[0].get(row)
+            cell = grid[target_ch].get(row)
             if cell is None:
                 cell = _blank_row()
-                grid[0][row] = cell
+                grid[target_ch][row] = cell
             _add_fx(cell, cmd, val, fx_cols, stats)
             continue
         target = None
@@ -3316,6 +3325,8 @@ def _place_chip_fx(
             if not 0 <= j < len(notes):
                 continue
             cand = notes[j]
+            if not ch_lo <= cand[1] < ch_hi:
+                continue
             if abs(cand[0] - sample) > row_len:
                 continue
             if target is None or abs(cand[0] - sample) < abs(target[0] - sample):
@@ -3338,17 +3349,19 @@ def _place_chip_fx(
                 continue
         if target is not None:
             for cand_ch in by_tick.get((row, delay), ()):
+                if not ch_lo <= cand_ch < ch_hi:
+                    continue
                 if not has_cmd(grid[cand_ch].get(row), cmd):
                     chosen = (cand_ch, row)
                     break
             if chosen is None:
-                for cand_ch in range(max_ch):
+                for cand_ch in range(ch_lo, ch_hi):
                     cell = grid[cand_ch].get(row)
                     if _cell_ed(cell) == delay and not has_cmd(cell, cmd):
                         chosen = (cand_ch, row)
                         break
         if chosen is None:
-            for cand_ch in range(max_ch):
+            for cand_ch in range(ch_lo, ch_hi):
                 cell = grid[cand_ch].get(row)
                 free = cell is None or not (0 <= cell.note < 180)
                 if (free and _cell_ed(cell) in (0, delay)
@@ -3356,7 +3369,7 @@ def _place_chip_fx(
                     chosen = (cand_ch, row)
                     break
         if chosen is None:
-            chosen = (0, row)
+            chosen = (target_ch, row)
         ch, row = chosen
         cell = grid[ch].get(row)
         if cell is None:

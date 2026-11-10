@@ -1060,11 +1060,12 @@ class Song:
     qsound_adpcm_count: int = 0
     # (sample, channel, effect, value) placed before notes. MSM6258 divider.
     channel_fx: list[tuple[int, int, int, int]] = field(default_factory=list)
-    # Chip-wide YM2151 LFO effects: (sample, effect, value[, tick offset]).
-    # 17xx speed, 18xx wave, 1Exx AMD, 1Fxx PMD.
-    chip_fx: list[tuple[int, int, int] | tuple[int, int, int, int]] = field(
-        default_factory=list
-    )
+    # Chip-wide LFO effects: (sample, effect, value[, tick offset[, target
+    # channel]]). 17xx speed, 18xx wave, 1Exx AMD, 1Fxx PMD. The target
+    # channel is the first module column of the chip instance, so a dual
+    # YM2151/OPN log keeps each chip's LFO on its own system; entries with a
+    # zero target are the historical 3/4-tuples on channel 0.
+    chip_fx: list[tuple] = field(default_factory=list)
     # How hz was chosen ("" = default 60 Hz). Shown in --report.
     grid_note: str = ""
     # Held one/two-step pitch moves written as E8/E9, and one/two-step
@@ -1376,13 +1377,15 @@ class YM2151State:
         )
 
     def pan_byte(self, ch: int) -> int:
+        # $20 RL: bit 7 = left, bit 6 = right. The 2-bit field is therefore
+        # 2 for left-only and 1 for right-only (the same layout as OPN $B4).
         rl = (self.rl_fb_con[ch] >> 6) & 3
         if rl == 3:
             return 0xFF
         if rl == 2:
-            return 0x0F  # R
-        if rl == 1:
             return 0xF0  # L
+        if rl == 1:
+            return 0x0F  # R
         return 0x00
 
     def carrier_tl(self, ch: int) -> int:
@@ -8356,19 +8359,32 @@ def analyze(
         p.uses += 1
         return patch_order.index(key)
 
-    def emit_chip_fx(sample: int, cmd: int, val: int) -> None:
+    def emit_chip_fx(
+        sample: int, cmd: int, val: int,
+        target_ch: int = 0, tick_off: int = 0,
+    ) -> None:
         # A same-value 0x18 write is not redundant: the OPM reloads its LFO
         # counter on every write.
-        if chip_fx and chip_fx[-1] == (sample, cmd, val):
+        if target_ch:
+            entry = (sample, cmd, val, tick_off, target_ch)
+        elif tick_off:
+            entry = (sample, cmd, val, tick_off)
+        else:
+            entry = (sample, cmd, val)
+        if chip_fx and chip_fx[-1] == entry:
             return
-        chip_fx.append((sample, cmd, val))
+        chip_fx.append(entry)
 
     # The OPM collector runs only for the family the module keeps. A mixed log
     # that chose the OPL side must not also write YM2151 notes into the same
     # channels. (`convert_opm` was set with the channel bases above.)
     if convert_opm:
-        emit_chip_fx(0, FX_LFO_AMD, 0)
-        emit_chip_fx(0, FX_LFO_PMD, 0)
+        for cid in opm_ids:
+            # Each chip has its own LFO; Furnace's defaults are PMD/AMD 0x7F,
+            # so pin both on every instance. The first chip keeps the
+            # historical channel-0 entries.
+            emit_chip_fx(0, FX_LFO_AMD, 0, opm_base[cid])
+            emit_chip_fx(0, FX_LFO_PMD, 0, opm_base[cid])
         if len(opm_ids) > 1:
             warnings.append(
                 f"dual YM2151 log: {len(opm_ids)} chips converted as separate systems"
@@ -8440,43 +8456,39 @@ def analyze(
             if w.reg != 0x08:
                 if w.reg == 0x18:
                     last_lfrq = w.val & 0xFF
-                    if opm_cid == 0:
-                        emit_chip_fx(w.sample, FX_LFO_SPEED, last_lfrq)
+                    emit_chip_fx(w.sample, FX_LFO_SPEED, last_lfrq, base_ch)
                 elif w.reg == 0x01:
                     # TEST bit 1 gates the LFO's wave-3 term. Capcom's driver
                     # pulses it at key-on to re-seed the LFO. Emit 17 00, then
                     # restore the real LFRQ one tick later.
                     if w.val & 0x02:
                         last_test_pulse = w.sample
-                        if opm_cid == 0:
-                            emit_chip_fx(w.sample, FX_LFO_SPEED, 0)
-                            chip_fx.append(
-                                (w.sample, FX_LFO_SPEED, max(0, last_lfrq), 1)
-                            )
+                        emit_chip_fx(w.sample, FX_LFO_SPEED, 0, base_ch)
+                        emit_chip_fx(
+                            w.sample, FX_LFO_SPEED, max(0, last_lfrq),
+                            base_ch, 1,
+                        )
                     elif w.sample - last_test_pulse > 2:
-                        if opm_cid == 0:
-                            emit_chip_fx(
-                                w.sample, FX_LFO_SPEED, max(0, last_lfrq)
-                            )
+                        emit_chip_fx(
+                            w.sample, FX_LFO_SPEED, max(0, last_lfrq),
+                            base_ch,
+                        )
                 elif w.reg == 0x19:
                     if w.val & 0x80:
                         pmd = w.val & 0x7F
                         if pmd != last_pmd:
                             last_pmd = pmd
-                            if opm_cid == 0:
-                                emit_chip_fx(w.sample, FX_LFO_PMD, pmd)
+                            emit_chip_fx(w.sample, FX_LFO_PMD, pmd, base_ch)
                     else:
                         amd = w.val & 0x7F
                         if amd != last_amd:
                             last_amd = amd
-                            if opm_cid == 0:
-                                emit_chip_fx(w.sample, FX_LFO_AMD, amd)
+                            emit_chip_fx(w.sample, FX_LFO_AMD, amd, base_ch)
                 elif w.reg == 0x1B:
                     wave = w.val & 3
                     if wave != last_wave:
                         last_wave = wave
-                        if opm_cid == 0:
-                            emit_chip_fx(w.sample, FX_LFO_WAVE, wave)
+                        emit_chip_fx(w.sample, FX_LFO_WAVE, wave, base_ch)
                 elif 0x38 <= w.reg <= 0x3F:
                     ch = w.reg - 0x38
                     ym.write(w.reg, w.val)

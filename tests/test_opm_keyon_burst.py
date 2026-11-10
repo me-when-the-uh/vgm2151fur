@@ -26,10 +26,12 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from vgm2151fur.analyze import analyze  # noqa: E402
+from vgm2151fur.furio import parse_fur  # noqa: E402
+from vgm2151fur.furwrite import write_fur  # noqa: E402
 from vgm2151fur.vgm import ChipWrite  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _synth import lattice, vgm  # noqa: E402
+from _synth import PATCH, lattice, vgm  # noqa: E402
 
 CH = 2
 KEY_ON = 60000
@@ -122,6 +124,53 @@ class TestLateInstrumentLoad(unittest.TestCase):
         patch = song.fm_patches[ev.ins]
         self.assertEqual([patch.ops[i].tl & 0x7F for i in range(4)],
                          [LOADED_TL[r] for r in sorted(LOADED_TL)])
+
+
+class TestOpmPanAndDualLfo(unittest.TestCase):
+    def _note(self, rl: int, cid: int = 0, t: int = 1000):
+        writes = []
+        for reg, val in PATCH:
+            if reg == 0x20:
+                val = (rl << 6) | 0x07
+            writes.append(ChipWrite(t - 500, "ym2151", cid, reg, val))
+        writes.append(ChipWrite(t, "ym2151", cid, 0x28, 0x40))
+        writes.append(ChipWrite(t, "ym2151", cid, 0x30, 0x00))
+        writes.append(ChipWrite(t, "ym2151", cid, 0x08, 0x78))
+        writes.append(ChipWrite(t + 20000, "ym2151", cid, 0x08, 0x00))
+        writes.sort(key=lambda w: w.sample)
+        return writes
+
+    def test_rl_bits_are_not_swapped(self):
+        # $20 RL: bit 7 = left, bit 6 = right. The 2-bit field is 2 for
+        # left-only and 1 for right-only.
+        for rl, pan in ((0x1, 0x0F), (0x2, 0xF0), (0x3, 0xFF)):
+            song = analyze(vgm(self._note(rl)))
+            ev = next(e for e in song.events if e.on and e.ch == 0)
+            self.assertEqual(ev.pan, pan, f"RL={rl}")
+
+    def test_second_ym2151_keeps_its_own_lfo(self):
+        # Chip-wide LFO writes are per instance. Chip 1's speed/wave/depth
+        # must travel as effects on one of its own eight columns; sending
+        # them to column 0 leaves the second chip at Furnace's defaults.
+        writes = self._note(0x3, cid=1)
+        writes += [
+            ChipWrite(1000, "ym2151", 1, 0x18, 245),
+            ChipWrite(1001, "ym2151", 1, 0x19, 0x87),
+            ChipWrite(1002, "ym2151", 1, 0x1B, 3),
+        ]
+        song = analyze(vgm(writes, ym2151_dual=True))
+        self.assertIn((1000, 0x17, 245, 0, 8), song.chip_fx)
+        self.assertIn((1001, 0x1F, 7, 0, 8), song.chip_fx)
+        self.assertIn((1002, 0x18, 3, 0, 8), song.chip_fx)
+        mod = parse_fur(write_fur(song, include_pcm=False))
+        on_chip1 = {
+            ch for (ch, _pat), rows in mod.patterns.items()
+            if ch >= 8
+            for row in rows if row is not None
+            for cmd, val in row.fx
+            if (cmd, val) == (0x17, 245)
+        }
+        self.assertTrue(on_chip1, "chip 1's LFO speed landed on chip 0")
 
 
 if __name__ == "__main__":
