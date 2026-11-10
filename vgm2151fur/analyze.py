@@ -1377,15 +1377,16 @@ class YM2151State:
         )
 
     def pan_byte(self, ch: int) -> int:
-        # $20 RL: bit 7 = left, bit 6 = right. The 2-bit field is therefore
-        # 2 for left-only and 1 for right-only (the same layout as OPN $B4).
+        # $20 RL: bit 6 = left, bit 7 = right (libvgm ym2151.c pan[]). The
+        # 2-bit field is therefore 1 for left-only and 2 for right-only --
+        # the opposite bit order from the OPN's $B4 register.
         rl = (self.rl_fb_con[ch] >> 6) & 3
         if rl == 3:
             return 0xFF
         if rl == 2:
-            return 0xF0  # L
-        if rl == 1:
             return 0x0F  # R
+        if rl == 1:
+            return 0xF0  # L
         return 0x00
 
     def carrier_tl(self, ch: int) -> int:
@@ -6118,7 +6119,13 @@ def _bind_opm_dtmul_macros(
 
     def macro_values(
         pts: list[tuple[int, int]], start: int,
-    ) -> tuple[int, ...]:
+    ) -> tuple[tuple[int, ...], int]:
+        """Sequence and macro speed for an operator change series.
+
+        The sequence has one entry per `speed` ticks, so the caller must
+        store that speed in the macro header or the motion plays `speed`
+        times too fast.
+        """
         last_s = pts[-1][0]
         span_end = ev.end if (ev.end and ev.end > last_s) else last_s
         span_ticks = max(1.0, (span_end - ev.sample) / tick_samples)
@@ -6132,7 +6139,7 @@ def _bind_opm_dtmul_macros(
                 marks[-1] = (slot, value)
             else:
                 marks.append((slot, value))
-        return expand(marks, start) if marks else ()
+        return (expand(marks, start) if marks else ()), speed
 
     for e in events:
         ev = e
@@ -6150,6 +6157,12 @@ def _bind_opm_dtmul_macros(
         mul_entries: list[tuple[int, tuple[int, ...], int]] = []
         dt_entries: list[tuple[int, tuple[int, ...], int]] = []
         dt2_entries: list[tuple[int, tuple[int, ...], int]] = []
+        # Plan every operator series first. A row can carry at most eight
+        # effect columns; four operators changing MULT *and* DT2 on one tick
+        # need nine with the ED delay. When the row-effect form would
+        # overflow, move the whole batch to the per-operator macro features.
+        plans: list[tuple[int, str, list[tuple[int, int]], tuple, int, int]] = []
+        row_load: Counter = Counter()
         for oi in range(4):
             raw_pts = by_op.get(oi, [])
             dt2_pts = dt2_by_op.get(oi, [])
@@ -6159,40 +6172,52 @@ def _bind_opm_dtmul_macros(
             start_mul = start_raw & 0x0F
             start_dt = _YM_DT_TO_FURNACE[(start_raw >> 4) & 7]
             start_dt2 = (base.ops[oi].dt2_d2r >> 6) & 3
+            series: list[tuple[str, list[tuple[int, int]], int]] = []
             if raw_pts:
-                mul_pts = [(s, raw & 0x0F) for s, raw in raw_pts]
-                marks, ok = row_marks(mul_pts, start_mul)
-                if ok:
-                    ev.op_mul_fx += tuple(
-                        (s, oi, value) for s, value in marks
-                    )
-                else:
-                    values = macro_values(mul_pts, start_mul)
-                    if len(set(values)) > 1 or values[0] != start_mul:
-                        mul_entries.append((oi, values, 1))
-                dt_pts = [
-                    (s, _YM_DT_TO_FURNACE[(raw >> 4) & 7])
-                    for s, raw in raw_pts
-                ]
-                marks, ok = row_marks(dt_pts, start_dt)
-                if ok:
-                    ev.op_dt_fx += tuple(
-                        (s, oi, value) for s, value in marks
-                    )
-                else:
-                    values = macro_values(dt_pts, start_dt)
-                    if len(set(values)) > 1 or values[0] != start_dt:
-                        dt_entries.append((oi, values, 1))
+                series.append((
+                    "mul",
+                    [(s, raw & 0x0F) for s, raw in raw_pts],
+                    start_mul,
+                ))
+                series.append((
+                    "dt",
+                    [
+                        (s, _YM_DT_TO_FURNACE[(raw >> 4) & 7])
+                        for s, raw in raw_pts
+                    ],
+                    start_dt,
+                ))
             if dt2_pts:
-                marks, ok = row_marks(dt2_pts, start_dt2)
-                if ok:
-                    ev.op_dt2_fx += tuple(
-                        (s, oi, value) for s, value in marks
-                    )
+                series.append(("dt2", list(dt2_pts), start_dt2))
+            for kind, pts, start in series:
+                marks, ok = row_marks(pts, start)
+                values, speed = macro_values(pts, start)
+                if ok and marks:
+                    for s, _v in marks:
+                        row_load[max(0, int((s - t0) // row_samples))] += 1
+                plans.append((
+                    oi, kind, marks if ok else [], values, speed, start,
+                ))
+        force_macro = max(row_load.values(), default=0) + 2 > 8
+        for oi, kind, marks, values, speed, start in plans:
+            if marks and not force_macro:
+                points = tuple((s, oi, value) for s, value in marks)
+                if kind == "mul":
+                    ev.op_mul_fx += points
+                elif kind == "dt":
+                    ev.op_dt_fx += points
                 else:
-                    values = macro_values(dt2_pts, start_dt2)
-                    if len(set(values)) > 1 or values[0] != start_dt2:
-                        dt2_entries.append((oi, values, 1))
+                    ev.op_dt2_fx += points
+                continue
+            if not values or (len(set(values)) <= 1 and values[0] == start):
+                continue
+            entry = (oi, values, speed)
+            if kind == "mul":
+                mul_entries.append(entry)
+            elif kind == "dt":
+                dt_entries.append(entry)
+            else:
+                dt2_entries.append(entry)
         if not mul_entries and not dt_entries and not dt2_entries:
             continue
         key = (

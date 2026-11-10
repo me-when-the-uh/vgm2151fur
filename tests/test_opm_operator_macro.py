@@ -165,5 +165,38 @@ class TestShortNoteOperatorTracking(unittest.TestCase):
         self.assertEqual(patch.op_mul_macro, ())
 
 
+class TestDenseOperatorBatch(unittest.TestCase):
+    def test_four_operator_mult_and_dt2_batch_becomes_macros(self):
+        # A driver that retunes all four operators' MULT and DT2 on one tick
+        # would need eight effect columns (plus ED) for the row form. The
+        # analyzer must move the batch to the per-operator O1..O4 macros
+        # instead of letting _add_fx overwrite three operators per row.
+        writes = []
+        for sample in (61000, 63000, 65000):
+            for op in range(4):
+                # OpRegs defaults to MUL 1 / DT2 0, so use values that are
+                # real changes for every operator.
+                writes.append((sample, 0x40 | (op << 3) | CH, op + 2))
+                writes.append((
+                    sample, 0xC0 | (op << 3) | CH,
+                    ((op % 3) + 1) << 6,
+                ))
+        song = analyze(_song(*writes), pcm=False)
+        ev = next(e for e in song.events if e.on and e.ch == CH)
+        patch = song.fm_patches[ev.ins]
+        self.assertFalse(ev.op_mul_fx)
+        self.assertFalse(ev.op_dt2_fx)
+        self.assertEqual([e[0] for e in patch.op_mul_macro], [0, 1, 2, 3])
+        self.assertEqual([e[0] for e in patch.op_dt2_macro], [0, 1, 2, 3])
+        data = write_fur(song, include_pcm=False, include_fm=True)
+        m = parse_fur(data)
+        row_fx = {
+            code for (_ch, _pat), rows in m.patterns.items()
+            for row in rows for code, _val in row.fx
+        }
+        self.assertNotIn(0x16, row_fx)
+        self.assertNotIn(0x55, row_fx)
+
+
 if __name__ == "__main__":
     unittest.main()

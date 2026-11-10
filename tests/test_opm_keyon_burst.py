@@ -140,10 +140,10 @@ class TestOpmPanAndDualLfo(unittest.TestCase):
         writes.sort(key=lambda w: w.sample)
         return writes
 
-    def test_rl_bits_are_not_swapped(self):
-        # $20 RL: bit 7 = left, bit 6 = right. The 2-bit field is 2 for
-        # left-only and 1 for right-only.
-        for rl, pan in ((0x1, 0x0F), (0x2, 0xF0), (0x3, 0xFF)):
+    def test_rl_bits_match_the_hardware(self):
+        # $20 RL: bit 6 = left, bit 7 = right (libvgm ym2151.c pan[]). The
+        # 2-bit field is 1 for left-only and 2 for right-only.
+        for rl, pan in ((0x1, 0xF0), (0x2, 0x0F), (0x3, 0xFF)):
             song = analyze(vgm(self._note(rl)))
             ev = next(e for e in song.events if e.on and e.ch == 0)
             self.assertEqual(ev.pan, pan, f"RL={rl}")

@@ -20,10 +20,11 @@ second chip's own first column rather than the first chip's; per-note PMS/AMS,
 sweeps and carrier-TL moves are collected separately for each chip.  Without
 bit 30 an `0xA4` write is dropped and reported.
 
-The `$20` RL field is bit 7 = left, bit 6 = right, so the 2-bit value is 2
-for left-only and 1 for right-only. `08xy` uses the same left/right nibble
-order as the OPN's `$B4`; getting these backwards swapped the stereo image
-of every YM2151 note.
+The `$20` RL field is bit 6 = left, bit 7 = right (libvgm's
+`pan[2*ch]`/`pan[2*ch+1]`), so the 2-bit value is 1 for left-only and 2 for
+right-only — the opposite bit order from the OPN's `$B4` register. `08xy`
+then uses the usual left nibble / right nibble order. Getting these backwards
+swaps the stereo image of every YM2151 note.
 
 The clock flag alone does not fix playback pitch: Furnace keeps a note at
 its musical frequency at *any* clock (`baseFreqOff` in `arcade.cpp`
