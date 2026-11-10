@@ -76,6 +76,10 @@ class PsgHit:
     # split here and committed with EA01, so the new period lands instantly
     # instead of sliding over several rows.
     legato: bool = False
+    # The note this split continued. If the new note is muted on the same
+    # sample it has no duration and is discarded; the predecessor then still
+    # needs its key-off, or the noise channel rings until the next key-on.
+    split_from: PsgHit | None = None
     # T6W28 left/right attenuation steps and their pan at the same instant.
     mix_pts: list[tuple[int, int, int]] = field(default_factory=list)
     pan_pts: list[tuple[int, int]] = field(default_factory=list)
@@ -222,6 +226,10 @@ def _collect_plain(
                 offs.append(PsgOff(t, voice, chip))
         else:
             glitches += 1
+            if hit.split_from is not None:
+                # This split note was muted on the sample it started, so it
+                # never sounds. The note it continued still has to stop.
+                offs.append(PsgOff(t, voice, chip))
         active[voice] = None
 
     def noise_period() -> int:
@@ -237,11 +245,13 @@ def _collect_plain(
             return False
         last = hit.pitch_pts[-1][1] if hit.pitch_pts else hit.period
         if _jump_st(last, period) > PSG_NOISE_LEGATO_ST:
+            old = hit
             close(3, t, emit_off=False)
             open_hit(3, t)
             new = active[3]
             if new is not None:
                 new.legato = True
+                new.split_from = old
             return True
         if not hit.pitch_pts or hit.pitch_pts[-1][1] != period:
             hit.pitch_pts.append((t, period))
@@ -317,8 +327,11 @@ def _collect_plain(
                 # A clear attenuation jump back up is a new attack, not
                 # just a volume step. Put a note on the row so it shows in
                 # the pattern; the SN76489 has no envelope to restart.
+                old = hit
                 close(voice, t, emit_off=False)
                 open_hit(voice, t)
+                if active[voice] is not None:
+                    active[voice].split_from = old
                 return
             elif not hit.vol_pts or hit.vol_pts[-1][1] != level:
                 hit.vol_pts.append((t, level))
@@ -346,8 +359,11 @@ def _collect_plain(
                 # on this platform; 20xy only carries the white/periodic and
                 # channel-3 bits. A rate change is therefore a new note, just
                 # like the source's noise-register write.
+                old = hit
                 close(3, t, emit_off=False)
                 open_hit(3, t)
+                if active[3] is not None:
+                    active[3].split_from = old
                 return
             else:
                 if not hit.mode_pts or hit.mode_pts[-1][1] != noise_mode:
@@ -365,8 +381,11 @@ def _collect_plain(
             elif level >= last_level + PSG_ATTACK_STEP:
                 # Same attack rule as the tone voices: a clear jump back
                 # up is a new note, not a volume step inside one note.
+                old = hit
                 close(3, t, emit_off=False)
                 open_hit(3, t)
+                if active[3] is not None:
+                    active[3].split_from = old
                 return
             elif not hit.vol_pts or hit.vol_pts[-1][1] != level:
                 hit.vol_pts.append((t, level))

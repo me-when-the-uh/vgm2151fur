@@ -376,6 +376,25 @@ class TestGenesisPsgDac(unittest.TestCase):
         self.assertEqual([(h.sample_time, h.noise_mode) for h in noise],
                          [(0, 4), (500, 6)])
 
+    def test_rate_change_and_mute_on_one_sample_still_emits_off(self):
+        # A Game Gear driver changes the noise rate and mutes the voice on the
+        # same sample. The rate split opens a zero-length note, which is
+        # discarded, but the note it replaced must still get its key-off or
+        # the periodic noise rings until the next key-on.
+        ws = [
+            ChipWrite(0, "sn76489", 0, 0, 0xE0),
+            ChipWrite(0, "sn76489", 0, 0, 0xF0),
+            ChipWrite(500, "sn76489", 0, 0, 0xE1),
+            ChipWrite(500, "sn76489", 0, 0, 0xFF),
+        ]
+        hits, offs, _warn = collect_sn76489(
+            _vgm(ws, sn76489_clock=3579540),
+        )
+        noise = [h for h in hits if h.noise]
+        self.assertEqual([(h.sample_time, h.off_sample) for h in noise],
+                         [(0, 500)])
+        self.assertIn((500, 3), [(o.sample_time, o.voice) for o in offs])
+
     def test_large_channel3_noise_jump_is_a_legato_note(self):
         # A period jump beyond what E8xx can carry on one row must land at
         # once. The source writes the register in one go; splitting the note
