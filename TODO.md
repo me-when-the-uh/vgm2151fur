@@ -23,8 +23,6 @@ Remaining:
 - `diag.pitch_runs()` chooses its stream from the source log's chip census, so
   `report --verify` on a combined module follows one family whatever channel it
   is asked about. Per-family verification today lives in `TestMergedRips`.
-- An OPL4 (YMF278B) side of a merged log is not converted; the module keeps
-  only whatever else writes.
 - The warning carries writes, key-ons and the selected family. Keep it that
   way.
 
@@ -53,9 +51,6 @@ Remaining:
   confidence. Do not move the loop when confidence is low.
 - Real-pack cases: Vulcan Venture track 15, Metal Slug 3 tracks 12 and 26. Assert the loop
   opens on the detected phrase head and not only on a pitch-class repeat.
-- `test_loopfind.py` still exposes the old within-bar `_phase_loop` and
-  `_phrase_seam` helpers. Production `apply_loop` does not use them. Remove
-  them or make the meter search use them.
 
 ## Operator macros beyond the level
 
@@ -112,7 +107,7 @@ volume and waveform instrument macros, AUDCTL macros and `11xx` effects, joined
 16-bit pairs, high-clock/15 kHz/filter modes, silent filter-control notes,
 exact-register pitch inversion and PAL/custom clocks. The seven-rip pack
 (including `porkyspokeys`) covers the common driver shapes, and the modules keep
-the source's unity mix.
+the source's mix levels.
 
 Remaining:
 
@@ -140,6 +135,11 @@ Remaining:
   module body; a segmented representation could preserve them exactly.
 - **PWM compressed banks.** The n-Bit copy and shift subtypes decode; table
   (`0x7F`) and DPCM-compressed banks are reported as unsupported.
+- **PWM chunk reuse.** Attack transients are the primary candidate starts;
+  repeated bodies and identical left/right bodies share one module sample.
+  Rest boundaries and 0.25-second chunks are the fallbacks.  Bodies shorter
+  than a quarter chunk fold into the next body, and silence-only pieces are
+  dropped.
 - **PWM direct level writes.** A log that writes registers 2/3/4 directly
   without DAC streams only gets point samples, not a continuous stream.
 

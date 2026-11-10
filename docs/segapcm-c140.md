@@ -1,9 +1,12 @@
-# SegaPCM, Namco C140 and Ricoh RF5C sample support
+# SegaPCM, Namco C140/C219 and Ricoh RF5C sample support
 
 The chips convert to their native Furnace systems, with no stand-in carrier.
-VGM writes `0xC0` (SegaPCM), `0xD4` (C140) and `0xB0`/`0xB1` (RF5C68/RF5C164)
-plus their ROM/ RAM blocks are parsed, samples are extracted per voice, and
-loops are preserved through the SMP2 loop points. The RF5C pair share one
+VGM writes `0xC0` (SegaPCM), `0xD4` (C140/C219) and `0xB0`/`0xB1`
+(RF5C68/RF5C164) plus their ROM/RAM blocks are parsed, samples are extracted
+per voice, and loops are preserved through the SMP2 loop points. C219 is the
+16-voice ASIC variant selected by header type byte 2 and uses Furnace system
+`0xCF`; its own register, bank, noise and mu-law rules are in
+`docs/c219.md`. The RF5C pair share one
 register model and one Furnace system; `chipType` picks the variant.
 
 VGM chip instances are kept apart.  A second SegaPCM uses address bit 15
@@ -223,6 +226,13 @@ Playback rate is `clock * step / 786432` bytes/second (Furnace's
 `CHIP_FREQBASE` for the core, 384 * 2048). The sample's usual step is C-4 and
 each hit's step becomes the note/E5 ratio.
 
+The step register is live, so a driver can hold one key on a tiny looped body
+and write the melody into `$02/$03` instead (unreeeal_superhero_3_2 does this
+for every note). Those writes are kept on the hit as a pitch trajectory and
+become `01xx`/`02xx` ramps or `E8xx`/`E9xx` jumps; the key-on step stays the
+note. A step write inside the 64-sample key burst is folded into that base
+instead, because it is the note's own step rather than a bend.
+
 **One-shot trick.** The chip has no loop-disable bit. Drivers that want a
 one-shot point the loop at the trailing silence just before the end marker,
 so a loop at `len-1` (the Xenon FM Towns rip does this for every hit) is
@@ -236,7 +246,8 @@ off. The loop is cut on the off so a looping sample does not ring forever.
 ## Limits
 
 - C140 sign-flip (mode bit6) and sign-magnitude (bit0) are ignored. libvgm,
-  which these VGMs are logged against, does not apply them either.
+  which these VGMs are logged against, does not apply them either. On C219,
+  bit 6 is the documented invert flag and is converted.
 - A C140 voice keyed with an invalid sample window (end below start) is
   stored as a 1-frame loop, which Furnace plays as a static buzz; the chip
   plays past `end` instead, so the body differs. Rare, and only when the

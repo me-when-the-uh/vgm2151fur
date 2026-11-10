@@ -348,8 +348,30 @@ def convert_vgm(
         "rf5c68_samples": len(song.rf5c68_samples) if pcm else 0,
         "rf5c164_samples": len(song.rf5c164_samples) if pcm else 0,
         "c140_samples": len(song.c140_samples) if pcm else 0,
+        "c219_samples": len(song.c219_samples) if pcm else 0,
+        "c219_notes": song.c219_count,
         "c352_samples": len(song.c352_samples) if pcm else 0,
         "k053260_samples": len(song.k053260_samples) if pcm else 0,
+        "k054539_samples": len(song.k054539_samples) if pcm else 0,
+        "k054539_notes": song.k054539_count,
+        "msm5205_samples": len(song.msm5205_samples) if pcm else 0,
+        "msm5205_notes": song.msm5205_count,
+        "ga20_samples": len(song.ga20_samples) if pcm else 0,
+        "ga20_notes": song.ga20_count,
+        "msm5232_notes": song.msm5232_count,
+        "mikey_samples": len(song.mikey_samples) if pcm else 0,
+        "mikey_notes": song.mikey_count,
+        "x1_010_samples": len(song.x1_010_samples) if pcm else 0,
+        "x1_010_notes": song.x1_010_count,
+        "qsound_samples": len(getattr(song, "qsound_samples", ())) if pcm else 0,
+        "qsound_notes": (
+            getattr(song, "qsound_count", 0)
+            + getattr(song, "qsound_adpcm_count", 0)
+        ),
+        "wonderswan_pcm_samples": (
+            len(getattr(song, "wonderswan_pcm_samples", ())) if pcm else 0
+        ),
+        "wonderswan_notes": getattr(song, "wonderswan_count", 0),
         "ym2610_a_samples": len(song.ym2610_a_samples) if pcm else 0,
         "ym2610_b_samples": len(song.ym2610_b_samples) if pcm else 0,
         "ym2610_a_notes": song.ym2610_a_count,

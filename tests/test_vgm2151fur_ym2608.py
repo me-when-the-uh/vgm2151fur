@@ -20,11 +20,11 @@ from pathlib import Path
 from vgm2151fur.analyze import analyze, format_report
 from vgm2151fur.furwrite import (
     CHIP_YM2608, CHIP_YM2608_EXT, INS_ADPCMA, INS_ADPCMB, INS_FM,
-    parse_fur_skeleton, write_fur,
+    _linked_ssg_volume, parse_fur_skeleton, write_fur,
 )
 from vgm2151fur.furnace import export_vgm, find_furnace
 from vgm2151fur.furio import (
-    CHIP_CHANNELS, iter_blocks, parse_smp2_payload,
+    CHIP_CHANNELS, iter_blocks, parse_fur, parse_smp2_payload,
 )
 from vgm2151fur.vgm import (
     ChipWrite, RomSlice, VgmFile, assemble_rom, chips_in_head, load_vgm,
@@ -39,6 +39,7 @@ from vgm2151fur.ym2608 import (
     collect_ym2608_delta_t,
     collect_ym2608_rhythm,
     deltat_store_body,
+    replay_deltat_memory,
 )
 from vgm2151fur.ym2612 import ym2612_note_for
 
@@ -525,6 +526,80 @@ class TestYm2608Analyze(unittest.TestCase):
         self.assertGreaterEqual(play.ins, len(song.fm_patches))
         ins = song.ym2608_b_samples
         self.assertEqual(len(ins), 1)
+
+    def test_linked_ssg_volume_sets_the_platform_flag(self):
+        # The extra-header 0x87 entry is the OPNA SSG mix. Its default is
+        # 0x80 (0.5), matching Furnace's ssgVol=128; a relative entry scales
+        # that base. Yuno's pack writes 0x80A0, i.e. 0x50.
+        writes = _fm_note(0)
+        vgm = _vgm(writes)
+        vgm.extra_volumes = {0x87: (0, 0x80A0)}
+        self.assertEqual(_linked_ssg_volume(vgm, 0x07), 0x50)
+        data = write_fur(analyze(vgm))
+        flags = [
+            blk.decode("utf-8", "replace")
+            for _o, mag, _s, blk in iter_blocks(data) if mag == b"FLAG"
+        ]
+        self.assertIn("ssgVol=80", "\n".join(flags))
+
+    def test_linked_ssg_volume_follows_the_ym2203_half_rule(self):
+        vgm = _vgm([])
+        vgm.extra_volumes = {0x86: (0, 0x8100)}   # relative 1.0
+        self.assertEqual(_linked_ssg_volume(vgm, 0x06), 0x80)
+        vgm.extra_volumes = {0x86: (0, 0x60)}     # absolute
+        self.assertEqual(_linked_ssg_volume(vgm, 0x06), 0x60)
+
+    def test_same_sample_global_levels_collapse_to_the_key_value(self):
+        # The driver ramps $11 several times at the key-on sample; the chip
+        # only holds the last byte. Placing the earlier values on following
+        # rows attacked the drum too loud, then dropped it a row late.
+        writes = [
+            ChipWrite(400, "ym2608", 0, 0x11, 0x30),
+            ChipWrite(400, "ym2608", 0, 0x11, 0x3C),
+            ChipWrite(400, "ym2608", 0, 0x18, 0xCF),
+            ChipWrite(400, "ym2608", 0, 0x10, 0x01),
+        ]
+        song = analyze(_vgm(writes))
+        mod = parse_fur(write_fur(song))
+        global_row = song.row_of(400)
+        pat, row = divmod(global_row, mod.pat_len)
+        cell = mod.patterns[(9, pat)][row]
+        self.assertIn((0x1F, 0x3C), cell.fx or ())
+
+    def test_deltat_register_upload_rebuilds_the_memory(self):
+        # PMD-style logs upload the ADPCM-B image through $108 instead of
+        # shipping a 0x81 data block; the block only declares the size.
+        data = bytes((i * 11 + 5) & 0xFF for i in range(31))
+        writes = [
+            ChipWrite(0, "ym2608", 0, 0x100, 0x01),   # reset
+            ChipWrite(0, "ym2608", 0, 0x101, 0x02),   # DRAM x8, shift 5
+            ChipWrite(0, "ym2608", 0, 0x102, 0x04),   # start byte 0x80
+            ChipWrite(0, "ym2608", 0, 0x103, 0x00),
+            ChipWrite(0, "ym2608", 0, 0x104, 0x04),   # stop byte 0x9F
+            ChipWrite(0, "ym2608", 0, 0x105, 0x00),
+            ChipWrite(0, "ym2608", 0, 0x100, 0x60),   # external write mode
+        ]
+        writes += [
+            ChipWrite(0, "ym2608", 0, 0x108, b) for b in data
+        ]
+        writes += [
+            ChipWrite(100, "ym2608", 0, 0x109, 0x00),
+            ChipWrite(100, "ym2608", 0, 0x10A, 0x40),
+            ChipWrite(100, "ym2608", 0, 0x10B, 200),
+            ChipWrite(100, "ym2608", 0, 0x101, 0xC0),
+            ChipWrite(101, "ym2608", 0, 0x100, 0xA0),  # play external memory
+        ]
+        vgm = _vgm(writes)
+        vgm.roms.append(RomSlice(0, 0x200, 0, b"", "ym2608_deltat"))
+        mem = replay_deltat_memory(
+            vgm, assemble_rom(vgm, "ym2608_deltat"),
+        )
+        self.assertEqual(mem[0x80:0x80 + len(data)], data)
+        song = analyze(vgm)
+        self.assertEqual(len(song.ym2608_b_samples), 1)
+        self.assertEqual(
+            song.ym2608_b_samples[0].data[:len(data)], data,
+        )
 
     def test_mixed_log_warns_and_keeps_the_opna(self):
         writes = _fm_note(0) + [

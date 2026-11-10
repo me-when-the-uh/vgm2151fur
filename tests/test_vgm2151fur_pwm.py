@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import array
 import unittest
 from pathlib import Path
 
@@ -44,6 +45,15 @@ def _vgm(**kw) -> VgmFile:
 
 
 class TestPwmCollector(unittest.TestCase):
+    def test_lossy_clustering16(self):
+        from vgm2151fur.samplecluster import cluster_fragments16
+        bodies = [(b"\x00\x00" * 100) + bytes((i, 0)) for i in range(40)]
+        keep, remap = cluster_fragments16(
+            bodies, [PWM_RATE] * 40, {i: 1 for i in range(40)},
+        )
+        self.assertLessEqual(len(keep), 32)
+        self.assertTrue(all(r >= 0 for r in remap))
+
     def test_two_sides(self):
         samples, warn = collect_pwm(_vgm())
         self.assertEqual(warn, [])
@@ -61,18 +71,111 @@ class TestPwmCollector(unittest.TestCase):
             step=1, step_base=0, bank=3, block=-1,
         )]
         samples, _warn = collect_pwm(v)
-        self.assertEqual(samples[0].data, samples[1].data)
+        self.assertEqual(len(samples), 1)
+        self.assertEqual({h.side for h in samples[0].hits}, {0, 1})
 
-    def test_long_stream_is_chunked(self):
+    def test_long_steady_stream_is_one_attack_body(self):
         from vgm2151fur.pwm import PWM_CHUNK_FRAMES
         frames = PWM_CHUNK_FRAMES * 2 + 10
         v = _vgm()
+        v.dac_stream_plays = [
+            DacStreamPlay(
+                sample=0, chip_type=STREAM_PWM, chip_id=0, stream=0,
+                port=0, reg=reg, offset=0, length=0, mode=3, rate=PWM_RATE,
+                step=1, step_base=0, bank=3, block=-1,
+            )
+            for reg in (2, 3)
+        ]
         v.pwm_bank = bytearray(_bank(frames))
         v.pwm_blocks = [bytes(v.pwm_bank)]
         v.total_samples = int(frames / PWM_RATE * 44100) + 100
         samples, _warn = collect_pwm(v)
-        self.assertEqual(len(samples), 6)  # three chunks per side
-        self.assertEqual(len({(s.chip_id, s.side) for s in samples}), 2)
+        # A steady body has no attack split, so it is one sample on both sides.
+        self.assertEqual(len(samples), 1)
+        self.assertEqual({h.side for h in samples[0].hits}, {0, 1})
+
+    def test_repeated_chunks_share_one_body(self):
+        from vgm2151fur import pwm as pwmmod
+        from vgm2151fur.pwm import PWM_CHUNK_FRAMES
+        old = pwmmod.PWM_ATTACK_MAX_SAMPLES
+        pwmmod.PWM_ATTACK_MAX_SAMPLES = 0  # force the chunk fallback
+        try:
+            v = _vgm()
+            v.dac_stream_plays = [
+                DacStreamPlay(
+                    sample=0, chip_type=STREAM_PWM, chip_id=0, stream=0,
+                    port=0, reg=reg, offset=0, length=0, mode=3, rate=PWM_RATE,
+                    step=1, step_base=0, bank=3, block=-1,
+                )
+                for reg in (2, 3)
+            ]
+            item = bytes((0x00, 0x01))  # a constant 0x100 PWM value
+            chunk = item * PWM_CHUNK_FRAMES
+            body = chunk + chunk
+            v.pwm_bank = bytearray(body)
+            v.pwm_blocks = [body]
+            v.total_samples = int(
+                (2 * PWM_CHUNK_FRAMES) / PWM_RATE * 44100
+            ) + 100
+            samples, _warn = collect_pwm(v)
+            self.assertEqual(len(samples), 1)
+            self.assertEqual(len(samples[0].hits), 4)  # two chunks, two sides
+        finally:
+            pwmmod.PWM_ATTACK_MAX_SAMPLES = old
+
+    def test_short_attacks_fold_and_long_bodies_split(self):
+        from vgm2151fur import pwm as pwmmod
+        from vgm2151fur.pwm import (
+            PWM_ATTACK_MAX_FRAMES, PWM_ATTACK_MIN_FRAMES, _attack_bodies,
+        )
+        # A short attack, a quiet gap, then one long steady body.
+        short = 100
+        gap = 300
+        old_max = pwmmod.PWM_ATTACK_MAX_FRAMES
+        pwmmod.PWM_ATTACK_MAX_FRAMES = 4 * PWM_ATTACK_MIN_FRAMES
+        try:
+            max_frames = pwmmod.PWM_ATTACK_MAX_FRAMES
+            long = max_frames + PWM_ATTACK_MIN_FRAMES // 2 - (short + gap)
+            vals = array.array("h")
+            for i in range(short):
+                vals.append(900 if i % 2 else -900)
+            vals.extend([0] * gap)
+            for i in range(long):
+                vals.append(900 if i % 2 else -900)
+            bodies = _attack_bodies(
+                vals.tobytes(), vals, 0, 10,
+            )
+        finally:
+            pwmmod.PWM_ATTACK_MAX_FRAMES = old_max
+        self.assertEqual(len(bodies), 2)
+        self.assertEqual(bodies[0][0], 0)  # the short attack was kept
+        self.assertTrue(all(
+            PWM_ATTACK_MIN_FRAMES <= len(body) // 2 <= max_frames
+            for _start, body in bodies
+        ))
+
+    def test_attack_bodies_share_repeated_hits(self):
+        from vgm2151fur.pwm import PWM_ATTACK_MIN_FRAMES
+        v = _vgm()
+        v.dac_stream_plays = [
+            DacStreamPlay(
+                sample=0, chip_type=STREAM_PWM, chip_id=0, stream=0,
+                port=0, reg=reg, offset=0, length=0, mode=3, rate=PWM_RATE,
+                step=1, step_base=0, bank=3, block=-1,
+            )
+            for reg in (2, 3)
+        ]
+        burst = PWM_ATTACK_MIN_FRAMES + 8
+        a = bytes((0x00, 0x01)) * burst  # burst A
+        b = bytes((0x00, 0x03)) * burst  # burst B
+        gap = bytes(2) * 300            # 300 frames of silence
+        body = a + gap + b + gap + a + gap + b + gap
+        v.pwm_bank = bytearray(body)
+        v.pwm_blocks = [body]
+        v.total_samples = int((len(body) // 2) / PWM_RATE * 44100) + 100
+        samples, _warn = collect_pwm(v)
+        self.assertEqual(len(samples), 2)
+        self.assertEqual([len(s.hits) for s in samples], [4, 4])
 
 
 class TestPwmModule(unittest.TestCase):

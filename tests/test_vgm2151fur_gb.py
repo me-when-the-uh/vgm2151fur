@@ -123,15 +123,80 @@ class TestGbNotes(unittest.TestCase):
         self.assertEqual(hits[0].vol, 6)
         self.assertEqual([o.sample_time for o in offs], [2000])
 
+    def test_pitch_correction_after_trigger_is_the_note_base(self):
+        # "Start the voice, then set the real frequency": the trigger carries
+        # one period and a low/high pair after it corrects the pitch at the
+        # same sample. The correction must be the note's base; applying the
+        # late trigger write over it left the note an octave or more high.
+        writes = _note(1000, 0x80, period=0x600)
+        writes += [
+            _gb(1000, 0x0A, 0x80),     # wave DAC on
+            _gb(1000, 0x0C, 0x20),     # 50%
+            _gb(1000, 0x0D, 0xE0),
+            _gb(1000, 0x0E, 0x87),     # trigger, period 0x7E0
+            _gb(1000, 0x0D, 0xB2),
+            _gb(1000, 0x0E, 0x06),     # correction, period 0x6B2
+        ]
+        hits, _o, _w, _warn = collect_gb(_vgm(writes))
+        pulse = [h for h in hits if h.voice == 0][0]
+        wave = [h for h in hits if h.voice == 2][0]
+        self.assertEqual(pulse.period, 0x600)
+        self.assertEqual(wave.period, 0x6B2)
+
+    def test_pitch_correction_without_a_complete_pair_keeps_the_trigger(self):
+        # Trigger-before-setup still applies the setup's high byte when only
+        # one half of the pair follows the trigger.
+        writes = [
+            _gb(1000, 0x04, 0x86),     # trigger, period high 6
+            _gb(1000, 0x03, 0x00),     # period low
+            _gb(1000, 0x02, 0x60),     # volume 6
+        ]
+        hits, _o, _w, _warn = collect_gb(_vgm(writes))
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0].period, 0x600)
+
     def test_frequency_write_without_a_trigger_is_a_bend(self):
-        # Arpeggios rewrite NRx3/NRx4 without a trigger, so the hardware
-        # envelope keeps running. Splitting there would restart the envelope
-        # and hold notes the source lets decay.
+        # Slow slides rewrite NRx3/NRx4 without a trigger, so the hardware
+        # envelope keeps running. They stay in pitch_pts and become row pitch
+        # steps, not a new note.
         writes = _note(1000, 0x61)
-        writes += [_gb(2000, 0x03, 0x86), _gb(2000, 0x04, 0x06)]
+        writes += [_gb(2000, 0x03, 0x10), _gb(2000, 0x04, 0x06)]
         hits, _o, _w, _warn = collect_gb(_vgm(writes))
         self.assertEqual(len(hits), 1)
         self.assertTrue(hits[0].pitch_pts)
+
+    def test_large_pitch_jump_is_a_legato_note(self):
+        # A clear semitone-or-more jump without a trigger is a legato melody
+        # move. It gets its own note cell with EAxx so the envelope continues.
+        writes = _note(1000, 0x61)
+        writes += [_gb(2000, 0x03, 0x86), _gb(2000, 0x04, 0x06)]
+        hits, _o, _w, _warn = collect_gb(_vgm(writes))
+        self.assertEqual(len(hits), 2)
+        self.assertTrue(hits[1].legato)
+        self.assertEqual(hits[1].sample_time, 2000)
+        self.assertEqual(hits[1].period, 0x686)
+
+    def test_two_byte_pitch_jump_uses_the_final_period(self):
+        # The low byte arrives first; splitting there would keep the old high
+        # byte and start the legato note on a lower pitch.
+        writes = _note(1000, 0x61)
+        writes += [_gb(2000, 0x03, 0x20), _gb(2000, 0x04, 0x07)]
+        hits, _o, _w, _warn = collect_gb(_vgm(writes))
+        self.assertEqual(len(hits), 2)
+        self.assertTrue(hits[1].legato)
+        self.assertEqual(hits[1].period, 0x720)
+        self.assertEqual(gb_note(4194304, hits[1].period), (122, 112))
+
+    def test_mid_note_volume_attack_is_a_note(self):
+        # A mid-note NRx2 write that raises the level is a software attack,
+        # not a zombie volume step inside the same note.
+        writes = _note(1000, 0x60)
+        writes += [_gb(3000, 0x02, 0x90)]
+        hits, _o, _w, _warn = collect_gb(_vgm(writes))
+        self.assertEqual(len(hits), 2)
+        self.assertFalse(hits[1].legato)
+        self.assertEqual(hits[1].sample_time, 3000)
+        self.assertEqual(hits[1].vol, 9)
 
     def test_note_off_on_dac_disable(self):
         writes = _note(1000, 0xF0)
@@ -304,6 +369,21 @@ class TestGbWave(unittest.TestCase):
     @staticmethod
     def _wave_cmds(sample, image: bytes):
         return [_gb(sample, 0x20 + i, b) for i, b in enumerate(image)]
+
+    def test_wave_large_pitch_jump_is_a_legato_note(self):
+        # The wave voice uses the same legato split as the pulses: a clear
+        # period jump after the refit window changes pitch without a trigger.
+        writes = [
+            _gb(0, 0x0A, 0x80), _gb(0, 0x0C, 0x40),
+            _gb(0, 0x0D, 0x00), _gb(0, 0x0E, 0x86),
+            _gb(2000, 0x0D, 0x20), _gb(2000, 0x0E, 0x07),
+        ]
+        hits, _o, _w, _warn = collect_gb(_vgm(writes))
+        wave = [h for h in hits if h.voice == 2]
+        self.assertEqual(len(wave), 2)
+        self.assertTrue(wave[1].legato)
+        self.assertEqual(wave[1].sample_time, 2000)
+        self.assertEqual(wave[1].period, 0x720)
 
     def test_wave_trigger_while_muted_starts_at_the_level_rise(self):
         # Kirby's Dream Land 2 starts the wave voice with NR32 = 0 and raises

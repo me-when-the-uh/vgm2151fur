@@ -42,7 +42,12 @@ CHIP_LABELS = (
     ("c140", "C140"),
     ("c352", "C352"),
     ("k053260", "K053260"),
-    ("c219", "C219 (unsupported)"),
+    ("c219", "C219"),
+    ("k054539", "K054539"),
+    ("ga20", "GA20"),
+    ("es5503", "ES5503"),
+    ("msm5205", "MSM5205"),
+    ("msm5232", "MSM5232"),
     ("msm6295", "MSM6295"),
     ("msm6258", "MSM6258"),
     ("scc_plus", "SCC+"),
@@ -50,6 +55,9 @@ CHIP_LABELS = (
     ("ay8910", "AY-8910"),
     ("saa1099", "SAA1099"),
     ("pokey", "POKEY"),
+    ("fds", "FDS"),
+    ("wonderswan", "WonderSwan"),
+    ("qsound", "QSound"),
 )
 
 

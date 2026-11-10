@@ -277,6 +277,31 @@ class TestT6W28Module(unittest.TestCase):
         self.assertEqual(mod.chips, [CHIP_SMS, CHIP_SMS])
         self.assertEqual(mod.n_ch, 8)
 
+    def test_dual_sn76489_carries_each_chip_clock(self):
+        # A dual log can run the two chips from different crystals; the note
+        # table for each hit must invert the clock that instance's system
+        # gets, and both custom clocks must reach their FLAG blocks.
+        writes = _left(0, 0, 254, 0) + [
+            ChipWrite(0, "sn76489", 1, 0, 0x80 | (200 & 0x0F)),
+            ChipWrite(0, "sn76489", 1, 0, (200 >> 4) & 0x3F),
+            ChipWrite(0, "sn76489", 1, 0, 0x90 | 0),
+        ]
+        writes += [
+            ChipWrite(5000, "sn76489", 0, 0, 0x9F),
+            ChipWrite(5000, "sn76489", 1, 0, 0x9F),
+        ]
+        song = analyze(_vgm(
+            writes, sn76489_clock=2_858_084, sn76489_clock_2=3_150_000,
+            sn76489_dual=True, total_samples=8000,
+        ))
+        clocks = sorted({
+            e.tone_clock for e in song.events if e.on and e.tone_chip == 3
+        })
+        self.assertEqual(clocks, [2_858_084.0, 3_150_000.0])
+        data = write_fur(song, include_pcm=False)
+        self.assertIn(b"customClock=2858084", data)
+        self.assertIn(b"customClock=3150000", data)
+
 
 class TestDualCommands(unittest.TestCase):
     def _load(self, body: bytes, clock_off: int, clock: int):
@@ -665,7 +690,7 @@ class TestDualK007232(unittest.TestCase):
             ChipWrite(t, "k007232", cid, 0x14, 0x00),
             ChipWrite(t, "k007232", cid, 0x10, 0x88),
             ChipWrite(t, "k007232", cid, 0x11, 0x88),
-            ChipWrite(t, "k007232", cid, 0x1F, 0x00),
+            ChipWrite(t, "k007232", cid, 0x05, 0x00),
         ]
 
     def test_second_bank_and_voice_are_converted(self):
@@ -683,6 +708,8 @@ class TestDualK007232(unittest.TestCase):
         chans = sorted(e.ch for e in song.events if e.on and e.pcm)
         self.assertEqual(len(chans), 2)
         self.assertEqual(chans[1] - chans[0], 2)
+        # Each short body reaches its 0x80 end marker before the song ends.
+        self.assertEqual(sum(1 for e in song.events if e.pcm and not e.on), 2)
         mod = parse_fur(write_fur(song, include_pcm=True))
         self.assertEqual(
             mod.chips, [CHIP_YM2151, CHIP_K007232, CHIP_K007232],

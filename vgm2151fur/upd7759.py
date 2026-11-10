@@ -32,6 +32,7 @@ import wave
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from vgm2151fur.samplecluster import cluster_fragments16
 from vgm2151fur.vgm import VGM_RATE, VgmFile, assemble_rom
 
 STANDARD_CLOCK = 640_000
@@ -287,7 +288,7 @@ UPD_MAX_PHRASE_SECONDS = 30.0
 
 
 def collect_upd7759(
-    vgm: "VgmFile",
+    vgm: "VgmFile", *, lossy: bool = False,
 ) -> tuple[list[Upd7759Sample], list[str]]:
     """Turn uPD7759 register traffic into PCM phrase bodies and note hits."""
     warnings: list[str] = []
@@ -466,6 +467,24 @@ def collect_upd7759(
 
     audible = [s for s in samples.values() if s.hits and s.frames > 0]
     audible.sort(key=lambda s: (s.chip_id, s.phrase, s.name))
+    if lossy and len(audible) > 32:
+        keep, remap = cluster_fragments16(
+            [s.data for s in audible],
+            [UPD_OUTPUT_RATE] * len(audible),
+            {i: len(s.hits) for i, s in enumerate(audible)},
+        )
+        compact = [audible[i] for i in keep]
+        for old, smp in enumerate(audible):
+            new = remap[old]
+            if new < 0 or keep[new] == old:
+                continue
+            compact[new].hits.extend(smp.hits)
+        if len(compact) < len(audible):
+            warnings.append(
+                f"uPD7759: lossy sample clustering {len(audible)} -> "
+                f"{len(compact)} bodies"
+            )
+        audible = compact
     warnings = list(dict.fromkeys(warnings))
     return audible, warnings
 

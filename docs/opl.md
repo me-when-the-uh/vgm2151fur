@@ -386,10 +386,16 @@ volume-0 point), and an f-num/octave change becomes a pitch bend: 1/64-semitone
 row steps emitted as `E8xx`/`E9xx` plus `E5xx`, the same encoding ADPCM-B uses.
 Before this a held OPL4 sample only ever played its key-on pitch.
 
-A trailing `TL=0x7F` (silence) is dropped when no later write raises the level.
-The following key-off already stops the note; keeping the step only produced a
-volume-00 row that the source player never sounded, and row rounding could push
-it past the next key-on and mute a fresh note.
+A trailing `TL=0x7F` (silence) is dropped only when it sits within
+`OPL4_TAIL_MUTE` (2048 samples) of the key-off and no later write raises the
+level. The key-off already stops the note there; keeping the step only
+produced a volume-00 row the source player never sounded, and row rounding
+could push it past the next key-on and mute a fresh note.
+
+The opposite case is a driver that silences a slot with TL/pan 8 and leaves the
+key on for seconds before the key-off (The Lost Vikings does this on its intro
+wave slots). That mute is the audible cut and must stay: dropping it made the
+notes ring through their whole gate.
 
 The hardware pan table is 0 = centre, 1-7 = right (left falls), 8 = both off,
 9-15 = left (right falls). Furnace's PCM path derives the slot nibble from the

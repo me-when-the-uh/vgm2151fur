@@ -14,9 +14,17 @@ rip says otherwise.
 
 A dual YM2151 log (header `0x30` bit 30, second stream on command `0xA4`)
 becomes two YM2151 systems in chip order, channels 0-7 and 8-15.  Both share
-the header clock.  Chip-wide LFO effects are taken from the first instance
-only; per-note PMS/AMS, sweeps and carrier-TL moves are collected separately
-for each chip.  Without bit 30 an `0xA4` write is dropped and reported.
+the header clock.  Each instance has its own LFO, so the chip-wide speed,
+waveform, PMD and AMD writes (`17xx`/`18xx`/`1Fxx`/`1Exx`) are emitted on the
+second chip's own first column rather than the first chip's; per-note PMS/AMS,
+sweeps and carrier-TL moves are collected separately for each chip.  Without
+bit 30 an `0xA4` write is dropped and reported.
+
+The `$20` RL field is bit 6 = left, bit 7 = right (libvgm's
+`pan[2*ch]`/`pan[2*ch+1]`), so the 2-bit value is 1 for left-only and 2 for
+right-only — the opposite bit order from the OPN's `$B4` register. `08xy`
+then uses the usual left nibble / right nibble order. Getting these backwards
+swaps the stereo image of every YM2151 note.
 
 The clock flag alone does not fix playback pitch: Furnace keeps a note at
 its musical frequency at *any* clock (`baseFreqOff` in `arcade.cpp`

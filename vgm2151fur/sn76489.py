@@ -32,6 +32,10 @@ from vgm2151fur.vgm import VgmFile
 PSG_FURNACE_CLOCK = 315_000_000.0 / 88.0
 PSG_DEFAULT_CLOCK = 3579545
 PSG_DIVIDER = 64
+# The writer asks for Furnace's named COLOR_NTSC clock when the header value
+# is within this many hertz of it; the note/pitch tables must then use that
+# named clock too, or the emitted period is a fraction of a unit off.
+PSG_CLOCK_TOLERANCE = 2
 # Furnace's T6W28 platform uses its own clock (3072000 Hz) and the SN pitch
 # tables with dividers 16 (tone) and 15 (noise).
 T6W28_CLOCK = 3_072_000
@@ -40,6 +44,11 @@ T6W28_NOISE_DIVIDER = 15
 PSG_MAX_PERIOD = 0x3FF
 PSG_MIN_NOTE = 100          # shorter gates are driver housekeeping
 PSG_NOTE_JUMP_ST = 1.0      # a larger period jump is a new note
+PSG_ATTACK_STEP = 2         # a volume rise this large is a new attack
+# E8xx/E9xx move at most 15 semitones on one row. A larger channel-3 noise
+# period jump is split into a pitch-only legato note instead of a multi-row
+# slide, because the source changes the period register in one write.
+PSG_NOISE_LEGATO_ST = 15.0
 
 
 @dataclass
@@ -50,14 +59,35 @@ class PsgHit:
     vol: int                # Furnace volume 0-15 (15 = loudest)
     off_sample: int = 0
     chip: int = 0           # 0 = first SN76489, 1 = second/T6W28 right half
+    # The instance's own clock. A dual log may run the two chips from
+    # different crystals; the note table has to invert the same clock the
+    # module ends up using, or the register period is rescaled.
+    clock: int = 0
     noise: bool = False
     noise_mode: int = 0
+    # Register mode while the gate is still open. `noise_mode` stays the
+    # mode the note started with, so analyze emits that as the note's own
+    # 20xy and the later changes ride `mode_pts`.
+    noise_mode_now: int = -1
+    # Fixed noise rate / channel-3 select (bits 0-1 of the noise register).
+    # Furnace derives that rate from the note, not from effect 20xy, so a
+    # mid-note change needs a new note with the new `noise_mode`.
+    noise_spec: int = 0
     # Game Gear 08xy pan value (0xF0 left, 0x0F right, 0xFF both). Zero when
     # the source did not declare stereo.  On a T6W28 this is the independent
     # x=left / y=right split computed from the two attenuation nibbles.
     pan: int = 0
     opened_pan: int = 0
     t6w28: bool = False
+    # This note only changes pitch; it continues the previous noise gate.
+    # A channel-3 noise period jump larger than E8xx can carry in one row is
+    # split here and committed with EA01, so the new period lands instantly
+    # instead of sliding over several rows.
+    legato: bool = False
+    # The note this split continued. If the new note is muted on the same
+    # sample it has no duration and is discarded; the predecessor then still
+    # needs its key-off, or the noise channel rings until the next key-on.
+    split_from: PsgHit | None = None
     # T6W28 left/right attenuation steps and their pan at the same instant.
     mix_pts: list[tuple[int, int, int]] = field(default_factory=list)
     pan_pts: list[tuple[int, int]] = field(default_factory=list)
@@ -95,15 +125,32 @@ def _period_note(period: int, clock: float, divider: float) -> tuple[int, int]:
     )
 
 
-def psg_note(period: int) -> tuple[int, int]:
+def psg_module_clock(clock: int | float | None) -> float:
+    """The clock the SMS system will actually run at.
+
+    The writer leaves a clock within `PSG_CLOCK_TOLERANCE` of the header
+    default on Furnace's named COLOR_NTSC selection; every other clock goes
+    out as `customClock`. The period table must use the same value.
+    """
+    value = float(clock or PSG_DEFAULT_CLOCK)
+    if abs(value - PSG_DEFAULT_CLOCK) <= PSG_CLOCK_TOLERANCE:
+        return PSG_FURNACE_CLOCK
+    return value
+
+
+def psg_note(
+    period: int, clock: int | float | None = None,
+) -> tuple[int, int]:
     """10-bit SN76489 period -> (Furnace note, E5) for the same register.
 
-    Period values below the pitch table's highest note (a very high source
-    frequency, e.g. 14) cannot be represented by a note; clamp to the
-    shortest period the table can produce instead of letting the platform
-    fall back to its slowest one (1023).
+    `clock` is the chip instance's own clock (a dual log can run two
+    crystals); the inverse table must use it so the module writes the source
+    period back unchanged. Period values below the pitch table's highest note
+    (a very high source frequency, e.g. 14) cannot be represented by a note;
+    clamp to the shortest period the table can produce instead of letting the
+    platform fall back to its slowest one (1023).
     """
-    return _period_note(period, PSG_FURNACE_CLOCK, PSG_DIVIDER)
+    return _period_note(period, psg_module_clock(clock), PSG_DIVIDER)
 
 
 def t6w28_note(period: int, clock: int) -> tuple[int, int]:
@@ -150,8 +197,13 @@ def collect_sn76489(
     stereo = bool(getattr(vgm, "sn76489_stereo", False))
     hits: list[PsgHit] = []
     offs: list[PsgOff] = []
+    second_clock = getattr(vgm, "sn76489_clock_2", 0)
     for cid in sorted(by_chip):
-        h, o, warn = _collect_plain(by_chip[cid], clock, stereo, cid)
+        # libvgm gives the second instance the first one's clock when the
+        # extra header has no entry for it; a VGM 1.70+ log may carry a
+        # different crystal and the writer passes that one through.
+        chip_clock = second_clock if (cid == 1 and second_clock) else clock
+        h, o, warn = _collect_plain(by_chip[cid], chip_clock, stereo, cid)
         hits.extend(h)
         offs.extend(o)
         warnings.extend(warn)
@@ -173,6 +225,10 @@ def _collect_plain(
     hits: list[PsgHit] = []
     offs: list[PsgOff] = []
     glitches = 0
+    # A driver retriggers a tone by writing the same period and a new volume
+    # on one sample. Remember the period rewrite until the volume write at
+    # the same sample turns it into a note. -1 means none pending.
+    retrigger_t = [-1, -1, -1, -1]
 
     def pan_for(voice: int) -> int:
         """The 08xy value for one voice under the current Game Gear mask."""
@@ -188,6 +244,13 @@ def _collect_plain(
         if hit is None:
             return
         hit.off_sample = t
+        if t > 0:
+            # Nothing at or after the close is heard on this note. A noise
+            # mode write and the gate-off can share one source sample; the
+            # point belongs to the next note, not this one.
+            hit.mode_pts = [pt for pt in hit.mode_pts if pt[0] < t]
+            hit.pitch_pts = [pt for pt in hit.pitch_pts if pt[0] < t]
+            hit.vol_pts = [pt for pt in hit.vol_pts if pt[0] < t]
         if t <= 0:
             # End of the log while the gate is still open: a held note.
             hits.append(hit)
@@ -197,19 +260,36 @@ def _collect_plain(
                 offs.append(PsgOff(t, voice, chip))
         else:
             glitches += 1
+            if hit.split_from is not None:
+                # This split note was muted on the sample it started, so it
+                # never sounds. The note it continued still has to stop.
+                offs.append(PsgOff(t, voice, chip))
         active[voice] = None
 
     def noise_period() -> int:
         return max(0, min(PSG_MAX_PERIOD, freq[2]))
 
-    def set_noise_period(hit: PsgHit, t: int) -> None:
+    def set_noise_period(hit: PsgHit, t: int) -> bool:
+        """Follow a channel-3 period write. True when the note was split."""
         period = noise_period()
         if hit.period == period:
-            return
+            return False
         if t == hit.sample_time:
             hit.period = period
-        elif not hit.pitch_pts or hit.pitch_pts[-1][1] != period:
+            return False
+        last = hit.pitch_pts[-1][1] if hit.pitch_pts else hit.period
+        if _jump_st(last, period) > PSG_NOISE_LEGATO_ST:
+            old = hit
+            close(3, t, emit_off=False)
+            open_hit(3, t)
+            new = active[3]
+            if new is not None:
+                new.legato = True
+                new.split_from = old
+            return True
+        if not hit.pitch_pts or hit.pitch_pts[-1][1] != period:
             hit.pitch_pts.append((t, period))
+        return False
 
     def open_hit(voice: int, t: int) -> None:
         pan = pan_for(voice)
@@ -229,8 +309,11 @@ def _collect_plain(
             ),
             vol=level,
             chip=chip,
+            clock=clock,
             noise=voice == 3,
             noise_mode=noise_mode if voice == 3 else 0,
+            noise_mode_now=noise_mode if voice == 3 else -1,
+            noise_spec=(noise_mode & 3) if voice == 3 else 0,
             pan=pan,
             opened_pan=pan,
         )
@@ -244,6 +327,30 @@ def _collect_plain(
         # cannot divide by it). It must close the note, not become a new one.
         on = freq_high[voice] and vol[voice] < 15 and freq[voice] > 0
         hit = active[voice]
+        if retrigger_t[voice] >= 0:
+            level = 15 - vol[voice]
+            last_level = (
+                hit.vol_pts[-1][1] if hit is not None and hit.vol_pts
+                else (hit.vol if hit is not None else level)
+            )
+            if (
+                retrigger_t[voice] == t
+                and on
+                and hit is not None
+                and level != last_level
+            ):
+                # The driver wrote this voice's period again at this sample
+                # without changing it, and is now writing a different volume.
+                # That pair is a note retrigger, not a volume step on the held
+                # note. A volume write with the same level is housekeeping.
+                retrigger_t[voice] = -1
+                old = hit
+                close(voice, t, emit_off=False)
+                open_hit(voice, t)
+                if active[voice] is not None:
+                    active[voice].split_from = old
+                return
+            retrigger_t[voice] = -1
         if on and hit is None:
             open_hit(voice, t)
             return
@@ -270,13 +377,23 @@ def _collect_plain(
                     return
                 if not hit.pitch_pts or hit.pitch_pts[-1][1] != period:
                     hit.pitch_pts.append((t, period))
-        if hit.vol != 15 - vol[voice]:
-            level = 15 - vol[voice]
+        level = 15 - vol[voice]
+        last_level = hit.vol_pts[-1][1] if hit.vol_pts else hit.vol
+        if last_level != level:
             if t == hit.sample_time:
                 hit.vol = level
-            else:
-                if not hit.vol_pts or hit.vol_pts[-1][1] != level:
-                    hit.vol_pts.append((t, level))
+            elif level >= last_level + PSG_ATTACK_STEP:
+                # A clear attenuation jump back up is a new attack, not
+                # just a volume step. Put a note on the row so it shows in
+                # the pattern; the SN76489 has no envelope to restart.
+                old = hit
+                close(voice, t, emit_off=False)
+                open_hit(voice, t)
+                if active[voice] is not None:
+                    active[voice].split_from = old
+                return
+            elif not hit.vol_pts or hit.vol_pts[-1][1] != level:
+                hit.vol_pts.append((t, level))
 
     def evaluate_noise(t: int) -> None:
         on = vol[3] < 15
@@ -289,17 +406,46 @@ def _collect_plain(
                 close(3, t)
             return
         assert hit is not None
-        if hit.noise_mode != noise_mode:
+        current = hit.noise_mode_now if hit.noise_mode_now >= 0 else hit.noise_mode
+        if current != noise_mode:
+            spec = noise_mode & 3
             if t == hit.sample_time:
                 hit.noise_mode = noise_mode
+                hit.noise_mode_now = noise_mode
+                hit.noise_spec = spec
+            elif hit.noise_spec != spec:
+                # The fixed rate (or the channel-3 switch) selects the note
+                # on this platform; 20xy only carries the white/periodic and
+                # channel-3 bits. A rate change is therefore a new note, just
+                # like the source's noise-register write.
+                old = hit
+                close(3, t, emit_off=False)
+                open_hit(3, t)
+                if active[3] is not None:
+                    active[3].split_from = old
+                return
             else:
-                hit.mode_pts.append((t, noise_mode))
+                if not hit.mode_pts or hit.mode_pts[-1][1] != noise_mode:
+                    hit.mode_pts.append((t, noise_mode))
+                hit.noise_mode_now = noise_mode
+                hit.noise_spec = spec
         if (noise_mode & 3) == 3:
-            set_noise_period(hit, t)
+            if set_noise_period(hit, t):
+                return
         level = 15 - vol[3]
-        if hit.vol != level:
+        last_level = hit.vol_pts[-1][1] if hit.vol_pts else hit.vol
+        if last_level != level:
             if t == hit.sample_time:
                 hit.vol = level
+            elif level >= last_level + PSG_ATTACK_STEP:
+                # Same attack rule as the tone voices: a clear jump back
+                # up is a new note, not a volume step inside one note.
+                old = hit
+                close(3, t, emit_off=False)
+                open_hit(3, t)
+                if active[3] is not None:
+                    active[3].split_from = old
+                return
             elif not hit.vol_pts or hit.vol_pts[-1][1] != level:
                 hit.vol_pts.append((t, level))
 
@@ -354,9 +500,21 @@ def _collect_plain(
             if latch_vol or latch_ch == 3:
                 continue
             data = b & 0x3F
-            freq[latch_ch] = (freq[latch_ch] & 0x00F) | (data << 4)
+            old_period = freq[latch_ch]
+            freq[latch_ch] = (old_period & 0x00F) | (data << 4)
             freq_high[latch_ch] = True
+            existing = active[latch_ch]
+            retrigger = (
+                old_period > 0
+                and freq[latch_ch] == old_period
+                and existing is not None
+                and t > existing.sample_time
+            )
             evaluate_tone(latch_ch, t)
+            if retrigger:
+                # Wait for a volume write at this sample. A bare period
+                # refresh is only housekeeping.
+                retrigger_t[latch_ch] = t
 
     for voice in range(4):
         if active[voice] is not None:
@@ -442,8 +600,10 @@ def _collect_t6w28(
             ),
             vol=level,
             chip=0,
+            clock=clock,
             noise=voice == 3,
             noise_mode=(4 if noise_white else 0) if voice == 3 else 0,
+            noise_mode_now=(4 if noise_white else 0) if voice == 3 else -1,
             pan=pan,
             opened_pan=pan,
             t6w28=True,
@@ -507,11 +667,17 @@ def _collect_t6w28(
             return
         assert hit is not None
         mode = 4 if noise_white else 0
-        if hit.noise_mode != mode:
+        current = hit.noise_mode_now if hit.noise_mode_now >= 0 else hit.noise_mode
+        if current != mode:
             if t == hit.sample_time:
                 hit.noise_mode = mode
-            elif not hit.mode_pts or hit.mode_pts[-1][1] != mode:
-                hit.mode_pts.append((t, mode))
+            else:
+                if not hit.mode_pts or hit.mode_pts[-1][1] != mode:
+                    hit.mode_pts.append((t, mode))
+            hit.noise_mode_now = mode
+        # The T6W28 noise select also picks the extra period (0x100/0x200/
+        # 0x400/right register). That changes the period, and the note's
+        # pitch points already carry it, so the select itself is not a note.
         period = noise_period()
         if hit.period != period:
             if t == hit.sample_time:

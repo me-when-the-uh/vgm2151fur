@@ -17,6 +17,7 @@ from vgm2151fur.furio import (
     CHIP_CHANNELS, decompress_fur, iter_blocks, parse_fur,
 )
 from vgm2151fur.furwrite import (
+    CHIP_YM2151,
     CHIP_YM2612,
     CHIP_YM2612_EXT,
     INS_FM,
@@ -25,8 +26,13 @@ from vgm2151fur.furwrite import (
     write_fur,
 )
 from vgm2151fur.furnace import export_vgm, find_furnace
-from vgm2151fur.vgm import ChipWrite, VgmFile, chips_in_head, load_vgm
+from vgm2151fur.vgm import (
+    ChipWrite, VgmFile, _decompress_data_block, _parse_compression_table,
+    chips_in_head, load_vgm,
+)
+from vgm2151fur.pitch import pitch_table
 from vgm2151fur.sn76489 import (
+    PSG_DIVIDER, PSG_MAX_PERIOD,
     collect_sn76489, psg_note, psg_pitch_table,
 )
 from vgm2151fur.ym2612 import (
@@ -179,6 +185,27 @@ class TestYm2612Parsing(unittest.TestCase):
         self.assertIn("ym2612_dual", kinds)
         # The YM2151 lives at 0x30; a YM2612-only header must not claim it.
         self.assertNotIn("ym2151", kinds)
+
+    def test_compressed_dac_block_uses_the_7f_table(self):
+        # Type 0x40 is the compressed form of the YM2612 PCM bank. Some
+        # rips compress it with 4-bit Delta-PCM and a 0x7F table.
+        table_payload = (
+            bytes((0x01, 0x00, 0x08, 0x04))
+            + (4).to_bytes(2, "little")
+            + bytes((1, 2, 0xFF, 0))
+        )
+        table = _parse_compression_table(table_payload)
+        self.assertEqual(table, (1, 0, 8, 4, [1, 2, 255, 0]))
+        # four 8-bit outputs from 0x80, deltas +1, +2, -1, 0
+        block = (
+            bytes((0x01, 0x04, 0x00, 0x00, 0x00, 0x08, 0x04, 0x00,
+                   0x80, 0x00))
+            + bytes((0x01, 0x23))
+        )
+        self.assertEqual(
+            _decompress_data_block(0x40, block, table),
+            bytes((0x81, 0x83, 0x82, 0x82)),
+        )
 
     def test_stray_second_chip_is_first_with_warning(self):
         p = TMP / "ym2612_stray.vgm"
@@ -335,6 +362,121 @@ class TestGenesisPsgDac(unittest.TestCase):
         self.assertEqual((noise.period, noise.noise_mode), (14, 7))
         self.assertEqual(noise.pitch_pts, [(400, 30)])
 
+    def test_mid_note_noise_rate_change_is_a_new_note(self):
+        # Modes 4 and 6 are both white, so 20xy does not change. Furnace
+        # still takes the fixed rate from the note, so a rate write inside a
+        # gate has to become a new note or the old rate keeps playing.
+        ws = [
+            ChipWrite(0, "sn76489", 0, 0, 0xE4),
+            ChipWrite(0, "sn76489", 0, 0, 0xF0),
+            ChipWrite(500, "sn76489", 0, 0, 0xE6),
+            ChipWrite(900, "sn76489", 0, 0, 0xFF),
+        ]
+        hits, _offs, _warn = collect_sn76489(
+            _vgm(ws, sn76489_clock=3579545),
+        )
+        noise = [h for h in hits if h.noise]
+        self.assertEqual([(h.sample_time, h.noise_mode) for h in noise],
+                         [(0, 4), (500, 6)])
+
+    def test_same_period_rewrite_with_a_volume_write_retriggers(self):
+        # Some GG drivers retrigger a held tone by writing the same period
+        # again and then the new volume on one sample. Without the volume
+        # pair a period refresh is housekeeping; with it the driver means a
+        # new note, and the pattern must show the note-on.
+        ws = [
+            ChipWrite(0, "sn76489", 0, 0, 0x84),
+            ChipWrite(0, "sn76489", 0, 0, 0x06),  # period 100
+            ChipWrite(0, "sn76489", 0, 0, 0x90),
+            ChipWrite(300, "sn76489", 0, 0, 0x84),  # refresh only
+            ChipWrite(300, "sn76489", 0, 0, 0x06),
+            ChipWrite(600, "sn76489", 0, 0, 0x84),  # retrigger
+            ChipWrite(600, "sn76489", 0, 0, 0x06),
+            ChipWrite(600, "sn76489", 0, 0, 0x97),
+            ChipWrite(900, "sn76489", 0, 0, 0x9F),
+        ]
+        hits, _offs, _warn = collect_sn76489(
+            _vgm(ws, sn76489_clock=3579540),
+        )
+        tone = [h for h in hits if h.voice == 0]
+        self.assertEqual([(h.sample_time, h.off_sample, h.vol) for h in tone],
+                         [(0, 600, 15), (600, 900, 8)])
+
+    def test_rate_change_and_mute_on_one_sample_still_emits_off(self):
+        # A Game Gear driver changes the noise rate and mutes the voice on the
+        # same sample. The rate split opens a zero-length note, which is
+        # discarded, but the note it replaced must still get its key-off or
+        # the periodic noise rings until the next key-on.
+        ws = [
+            ChipWrite(0, "sn76489", 0, 0, 0xE0),
+            ChipWrite(0, "sn76489", 0, 0, 0xF0),
+            ChipWrite(500, "sn76489", 0, 0, 0xE1),
+            ChipWrite(500, "sn76489", 0, 0, 0xFF),
+        ]
+        hits, offs, _warn = collect_sn76489(
+            _vgm(ws, sn76489_clock=3579540),
+        )
+        noise = [h for h in hits if h.noise]
+        self.assertEqual([(h.sample_time, h.off_sample) for h in noise],
+                         [(0, 500)])
+        self.assertIn((500, 3), [(o.sample_time, o.voice) for o in offs])
+
+    def test_large_channel3_noise_jump_is_a_legato_note(self):
+        # A period jump beyond what E8xx can carry on one row must land at
+        # once. The source writes the register in one go; splitting the note
+        # and marking it legato keeps the new period exact without
+        # restarting the noise generator.
+        ws = [
+            ChipWrite(0, "sn76489", 0, 0, 0xCE),  # ch2 tone period 14
+            ChipWrite(0, "sn76489", 0, 0, 0x00),
+            ChipWrite(0, "sn76489", 0, 0, 0xE7),  # mode 3 + white
+            ChipWrite(0, "sn76489", 0, 0, 0xF0),
+            ChipWrite(500, "sn76489", 0, 0, 0xC0),  # ch2 period 0x200
+            ChipWrite(500, "sn76489", 0, 0, 0x20),
+            ChipWrite(900, "sn76489", 0, 0, 0xFF),
+        ]
+        hits, _offs, _warn = collect_sn76489(
+            _vgm(ws, sn76489_clock=3579545),
+        )
+        noise = [h for h in hits if h.noise]
+        self.assertEqual(len(noise), 2)
+        self.assertEqual((noise[0].period, noise[0].legato), (14, False))
+        self.assertEqual((noise[1].period, noise[1].legato), (0x200, True))
+
+    def test_psg_system_disables_easy_noise(self):
+        # Furnace's easy-noise shortcut clamps channel-3 noise periods below
+        # 16 to 0. The converter writes real periods, so the flag must say so.
+        ws = [
+            ChipWrite(0, "sn76489", 0, 0, 0x8F),
+            ChipWrite(0, "sn76489", 0, 0, 0x01),
+            ChipWrite(0, "sn76489", 0, 0, 0x90),
+        ]
+        song = analyze(_vgm(ws, clock=0, sn76489_clock=3579545))
+        self.assertIn(b"noEasyNoise=true", write_fur(song))
+
+    def test_psg_rows_snap_to_the_write_lattice(self):
+        # A PSG-only driver writes one frame at a time. The row grid follows
+        # that interval, so a volume step and the next note never land on the
+        # same row and a column step cannot be pulled back to the row start.
+        step = 1470
+        writes = []
+        for i in range(64):
+            t = i * step
+            per = 200 + (i % 4) * 40
+            writes += [
+                ChipWrite(t, "sn76489", 0, 0, 0x80 | (per & 0x0F)),
+                ChipWrite(t, "sn76489", 0, 0, per >> 4),
+                ChipWrite(t, "sn76489", 0, 0, 0x90),
+            ]
+        writes.append(ChipWrite(64 * step, "sn76489", 0, 0, 0x9F))
+        song = analyze(_vgm(
+            writes, clock=0, total_samples=64 * step,
+            sn76489_clock=3579545,
+        ))
+        per_write = step / song.samples_per_row
+        self.assertAlmostEqual(per_write, round(per_write), delta=1e-6)
+        self.assertGreaterEqual(round(per_write), 1)
+
     def test_psg_note_is_the_same_period(self):
         tbl = psg_pitch_table()
         for period in (2, 14, 31, 100, 511, 1023):
@@ -343,6 +485,28 @@ class TestGenesisPsgDac(unittest.TestCase):
                 tbl.value(note, e5 - 0x80), period,
                 (period, note, e5),
             )
+
+    def test_psg_note_uses_the_source_clock(self):
+        # Ice1.vgz runs two SN76489s from a 2,858,084 Hz crystal. Looking the
+        # period up in the 3,579,545 Hz default table made the module rescale
+        # every register and play the whole conversion ~4 semitones sharp.
+        clock = 2_858_084
+        tbl = pitch_table(float(clock), PSG_DIVIDER, maximum=PSG_MAX_PERIOD)
+        for period in (2, 14, 31, 100, 254, 511, 1023):
+            note, e5 = psg_note(period, clock)
+            self.assertEqual(
+                tbl.value(note, e5 - 0x80), period,
+                (period, note, e5),
+            )
+
+    def test_psg_custom_clock_reaches_the_module_flag(self):
+        ws = [
+            ChipWrite(0, "sn76489", 0, 0, 0x8F),
+            ChipWrite(0, "sn76489", 0, 0, 0x01),
+            ChipWrite(0, "sn76489", 0, 0, 0x90),
+        ]
+        song = analyze(_vgm(ws, clock=0, sn76489_clock=2_858_084))
+        self.assertIn(b"customClock=2858084", write_fur(song))
 
     @unittest.skipUnless(HAVE_FURNACE, "furnace console build missing")
     def test_psg_module_round_trip(self):
@@ -686,6 +850,28 @@ class TestYm2612DacSlices(unittest.TestCase):
         self.assertEqual(len(plays), 2)
         song = analyze(src, speed=6, dac_slices=True)
         self.assertEqual(song.dac_count, 2)
+
+    def test_second_block_play_cuts_the_first(self):
+        # Starting a 0x95 stream stops the previous block.  Expanding both
+        # copies to their full length leaves two PCM streams interleaved, and
+        # the later word wins at each frame (a garbled waveform).
+        body = bytes(range(0x80, 0x80 + 100))
+        src = _vgm(
+            self._marker(), dac_blocks=[body],
+            dac_block_plays=[(0, 0, 11025), (200, 0, 11025)],
+            total_samples=9000,
+        )
+        samples, plays, warn, _stats = collect_dac(src, slices=True)
+        self.assertFalse(warn)
+        # 200 VGM samples at 11025 Hz is 50 source bytes.
+        self.assertEqual(len(samples), 2)
+        self.assertEqual(samples[0].data, self._signed(body[:50]))
+        self.assertEqual(samples[1].data, self._signed(body))
+        self.assertEqual(sorted(p.onset for p in plays), [0, 200])
+
+        _s, _p, _w, stats = collect_dac(src)
+        self.assertEqual(stats.get("dac_block_plays_cut"), 1)
+        self.assertNotIn("dac_same_time_runs", stats)
 
     @unittest.skipUnless(HAVE_FURNACE, "furnace console build missing")
     def test_export_starts_and_bodies_match_the_slices(self):
@@ -1063,6 +1249,18 @@ class TestYm2612Analyze(unittest.TestCase):
         self.assertEqual(on[0].end, t)
         self.assertNotEqual(on[0].ins, on[1].ins)
         self.assertEqual(song.fm_patches[on[1].ins].alg, 2)
+        # The key stayed down: the patch swap is a legato split, not a new
+        # attack. EA01 lets the new instrument's macros take over without
+        # resetting the voice; the next real key-on writes EA00.
+        self.assertTrue(on[1].legato)
+        mod = parse_fur(write_fur(song, include_pcm=False, include_fm=True))
+        self.assertTrue(any(
+            row.note == on[1].note
+            and row.ins == on[1].ins
+            and any(cmd == 0xEA and val == 1 for cmd, val in row.fx)
+            for (ch, _pat), rows in mod.patterns.items() if ch == 4
+            for row in rows
+        ), "legato split lost the instrument change")
 
     def test_patch_load_before_key_on_does_not_split(self):
         # The patch bytes just before a key transition belong to the next
@@ -2122,6 +2320,39 @@ class TestYm2612PitchRoundTrip(unittest.TestCase):
                 pitch_runs(src, back, ch, threshold_st=0.25, min_run_ms=60),
                 [], f"ch{ch}",
             )
+
+
+class TestOpmWithDacOnlyYm2612(unittest.TestCase):
+    def test_dac_only_chip_stays_beside_the_opm(self):
+        # A log can score the music on a YM2151 and use a second YM2612 only
+        # as a DAC stream. The YM2612 keys no FM note, but its PCM is music,
+        # so both systems belong in the module.
+        bank = bytes((0x80 + (i % 31) - 15) & 0xFF for i in range(300))
+        events = [(0, 0, 0)] + [(i * 4, 1, 4) for i in range(300)]
+        vgm = VgmFile(
+            path=Path("synthetic.vgm"), buf=b"", version=0x161,
+            total_samples=400000, loop_samples=0, loop_file_pos=None,
+            loop_sample=None, ym2151_clock=3579545, k007232_clock=0,
+            gd3={}, roms=[],
+            writes=[
+                ChipWrite(0, "ym2151", 0, 0x08, 0x78),
+                ChipWrite(0, "ym2612", 0, 0x22, 0x00),
+            ],
+            ym2612_clock=7670453,
+            dac_data=bytearray(bank), dac_events=events,
+        )
+        song = analyze(vgm)
+        self.assertEqual(
+            [s.kind for s in song.fm_systems], ["ym2151", "ym2612"],
+        )
+        self.assertEqual(song.dac_count, 1)
+        self.assertTrue(any(e.on and e.dac for e in song.events))
+        self.assertFalse(
+            any("YM2612 writes in this log" in w for w in song.warnings)
+        )
+        mod = parse_fur(write_fur(song, include_pcm=True))
+        self.assertEqual(mod.chips, [CHIP_YM2151, CHIP_YM2612])
+        self.assertEqual(len(mod.samples), 1)
 
 
 if __name__ == "__main__":

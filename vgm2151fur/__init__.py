@@ -3,10 +3,10 @@
 A 90/10 tool, not a general VGM importer. It wires YM2151 (OPM) key-on, KC,
 KF and patch writes, YM2203 (OPN) three-operator FM plus its AY-compatible
 SSG, and YM2612 (OPN2) six-channel FM, plus the chips around them: the
-sample players K007232, K053260, MSM6295, MSM6258, SegaPCM, C140, C352 and
-YMZ280B, the pitched Konami SCC/SCC+ (K051649 / K052539) and AY-8910, the
-Philips SAA1099 (Creative Music System / Game Blaster), and the Nintendo
-Virtual Boy VSU.
+sample players K007232, K053260, K054539, MSM5205, MSM6295, MSM6258, SegaPCM,
+C140, C219, C352, YMZ280B and Irem GA20, the pitched OKI MSM5232, the Konami
+SCC/SCC+ (K051649 / K052539) and AY-8910, the Philips SAA1099 (Creative Music
+System / Game Blaster), and the Nintendo Virtual Boy VSU.
 Furnace 0.6.8.3 does not emulate C352 (chip 0xD0); those channels are still
 written. See docs/k053260.md, docs/c352.md, docs/ymz280b.md, docs/vsu.md,
 docs/scc-ay8910.md, docs/saa1099.md, docs/ym2203.md and docs/ym2612.md.

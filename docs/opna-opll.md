@@ -21,6 +21,13 @@ Clock header offset **0x48** (v1.71 grid). YM2612 remains 0x2C, YM3812 0x50.
 Delta-T ROM data blocks are type **0x81**; ADPCMB sample RAM is loaded with
 normal `$57` register writes (the reference rip embeds 0x81 blocks).
 
+The extra-header volume list can carry the **linked SSG** mix as type
+**0x86/0x87/0x88** (bit 7 = linked). Its default is `0x80` (0.5), scaled by a
+relative entry (bit 15) or overridden by an absolute one. The writer puts the
+result on Furnace's `ssgVol` platform flag (128 = 0.5), so e.g. the Yuno OPNA
+pack's `0x80A0` becomes `ssgVol=80` instead of the 128 default. Without this
+the SSG half stayed at Furnace's default and was too loud against the FM half.
+
 Port decode (`ymfm_opn.cpp`, `ym2608::write_data` / `_hi`, lines
 1179-1255). The spec calls the two address ports "port 0" and "port 1"
 (vgmspec171.txt:369-370) and so does this repo: in the flattened register
@@ -296,11 +303,26 @@ at 3 and the levels full. Zeroed defaults folded an unwritten voice to silence
 and then discarded its notes as muted.
 
 Combined attenuation is `(31 ^ level) + (63 ^ global)` (`ymfm_adpcm.cpp:226`),
-so the converter folds the source's `$11` into each hit's 0-31 column and
-leaves Furnace's global at its full default: verified, every level the log
+so the converter keeps the per-voice `$18` on the hit's 0-31 column and `$11`
+as a `1Fxx` chip effect. A driver that ramps `$11` several times at the same
+sample (Yuno's OPNA pack does, just before each kit key) must collapse to the
+last byte before the key: the chip sees only that value, and spreading the
+ramp over following rows attacked the drum at the first, louder level and then
+dropped it a row late. The writer therefore keeps one value per
+register/sample, not just per row.
+
+The design leaves Furnace's global at its full default: verified, every level the log
 asked for comes back through Furnace unchanged.
 
 ### Delta-T: cut at 32, store at 256
+
+A 0x81 block can also be only a size declaration: the driver then uploads the
+ADPCM-B image through port 1 (`$100 = $60` external write mode, start/stop in
+`$102-$105`, bytes in `$108`). `replay_deltat_memory` rebuilds that image with
+libvgm's `YM_DELTAT_ADPCM_Write` rules (memory-type shift, auto-incrementing
+address, stop before the end byte) before the collector slices it. Without the
+replay the declaration is a zero-filled ROM, so every delta-T sample is silent
+or garbage even though VGMPlay plays it.
 
 `$102-$105` address blocks of **32** bytes, so `collect_ym2608_delta_t` slices
 exactly the span the log named. It must not round down to a 256-byte bank the

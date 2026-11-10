@@ -30,10 +30,23 @@ falls back to `4194304`.
 
 Furnace's GB core divides the clock by 16 and writes `2048 - freq` to
 NRx3/NRx4. The analyzer inverts that (`gb_note`) so the exported register
-matches the source exactly. Only an NRx4/NR44 trigger starts a new note; a
-frequency write without a trigger keeps the hardware envelope running, so it
-becomes a pitch macro (this is how the drivers build arpeggios). Splitting
-those would restart the envelope and hold notes the source lets decay.
+matches the source exactly.
+
+An NRx4/NR44 trigger starts a normal note. A pulse or wave frequency write
+without a trigger is handled by size:
+
+- a clear jump of about 0.75 semitone or more becomes its own note cell with
+  Furnace's `EAxx` legato effect. The cell changes pitch without restarting
+  the hardware envelope, so the pattern shows the melody note while the
+  source's decay keeps running;
+- a slower slide stays inside the note and becomes `E8xx`/`E9xx`/`E5xx` row
+  effects when the writes fit the pattern rows;
+- only sub-row motion that cannot reach the row grid falls back to a pitch
+  macro.
+
+A clear mid-note NRx2 write that raises the initial volume is a software
+attack and starts a normal note cell. Ordinary decay-rate changes and zombie
+volume ramps keep their existing split/macro handling.
 
 Writes that share a VGM sample are applied to the chip in stream order. A
 merged or re-exported log can keep the sample group but put the trigger byte
@@ -43,6 +56,14 @@ silent; a plain VGM player renders those pulse channels as silence. The
 collector moves NRx4/NR44 trigger writes to the end of their sample group, the
 same way the YM2612 key-on handling does, so the note takes the setup written
 beside it. Correctly ordered logs are unchanged.
+
+The opposite idiom is equally common: trigger the voice with one period and
+immediately write the real low/high pair at the same sample. The trigger's own
+NRx4 high byte must not overwrite that correction, so when a complete pair
+follows the trigger in its group, the trigger keeps the pair's high byte. A
+same-sample pitch write also counts as the note's opening pitch (the refit
+window accepts `t - trigger <= 735`), not as a bend. Without this, the note
+plays at the trigger's throwaway period, which is often an octave or more high.
 
 Noise has no period register: `gb_noise_note` inverts Furnace's `noiseTable`.
 The note number is a table index, not a 12-TET pitch: each chromatic step moves
@@ -116,8 +137,9 @@ source bytes.
 A wave trigger counts even when NR32 (output level) is still 0: some drivers
 start the voice muted and raise the level a few samples later. NR32 changes
 while the voice is open become volume-column steps, including the mute gaps.
-A frequency write just after the trigger is the note's base pitch rather than
-a bend, because those same drivers set NRx3/NRx4 right after the trigger.
+A frequency write at or just after the trigger is the note's base pitch rather
+than a bend, because those same drivers set NRx3/NRx4 right after the trigger
+(including at the trigger's own sample).
 
 ## Stereo
 

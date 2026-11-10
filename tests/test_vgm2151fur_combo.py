@@ -27,6 +27,7 @@ from vgm2151fur.furwrite import (
 from vgm2151fur.furio import CHIP_CHANNELS, iter_blocks, parse_fur
 from vgm2151fur.furnace import export_vgm, find_furnace
 from vgm2151fur.opl import N as OPL_N, OPLState, SLOT_ADDR
+from vgm2151fur.sn76489 import collect_sn76489
 from vgm2151fur.vgm import (
     ChipWrite, DacStreamPlay, RomSlice, VGM_RATE, VgmFile, load_vgm,
 )
@@ -450,6 +451,39 @@ class TestStandaloneSmsPsg(unittest.TestCase):
         self.assertEqual(mod.n_ch, 4)
         # The plain SMS core is mono; no Game Gear chipType.
         self.assertNotIn(b"chipType=3", data)
+
+    def test_sn_volume_attack_is_a_note(self):
+        # A clear attenuation jump back up is a new attack on the pattern,
+        # not a volume step inside one note.
+        writes = [
+            ChipWrite(0, "sn76489", 0, 0, 0x80 | ((0x200 >> 8) & 0x0F)),
+            ChipWrite(0, "sn76489", 0, 0, 0x200 & 0xFF),
+            ChipWrite(1, "sn76489", 0, 0, 0x80 | 0x10 | 10),
+            ChipWrite(3000, "sn76489", 0, 0, 0x80 | 0x10 | 4),
+            ChipWrite(9000, "sn76489", 0, 0, 0x80 | 0x10 | 15),
+        ]
+        v = _vgm(writes, sn76489_clock=3579545)
+        hits, _offs, _warn = collect_sn76489(v)
+        self.assertEqual(len(hits), 2)
+        self.assertEqual(hits[1].sample_time, 3000)
+        self.assertEqual(hits[1].vol, 11)
+
+    def test_sn_volume_returning_to_start_level_is_an_attack(self):
+        # The attack is compared with the level the voice is on now, not the
+        # note's starting level. A swell that comes back to its start level
+        # must still start a new note.
+        writes = [
+            ChipWrite(0, "sn76489", 0, 0, 0x80 | ((0x200 >> 8) & 0x0F)),
+            ChipWrite(0, "sn76489", 0, 0, 0x200 & 0xFF),
+            ChipWrite(1, "sn76489", 0, 0, 0x80 | 0x10 | 5),
+            ChipWrite(2000, "sn76489", 0, 0, 0x80 | 0x10 | 9),
+            ChipWrite(3000, "sn76489", 0, 0, 0x80 | 0x10 | 5),
+        ]
+        v = _vgm(writes, sn76489_clock=3579545)
+        hits, _offs, _warn = collect_sn76489(v)
+        self.assertEqual(len(hits), 2)
+        self.assertEqual(hits[1].sample_time, 3000)
+        self.assertEqual(hits[1].vol, 10)
 
     def test_game_gear_stereo_mask_pans_the_voice(self):
         # 0xF0 is the all-left mask; voice 2 is left-only, right off.

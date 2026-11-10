@@ -13,7 +13,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from vgm2151fur.furwrite import (
-    CHIP_AY8910, CHIP_C140, CHIP_C352, CHIP_GB, CHIP_K007232, CHIP_K051649,
+    CHIP_AY8910, CHIP_C140, CHIP_C219, CHIP_C352, CHIP_GB, CHIP_K007232,
+    CHIP_K051649,
     CHIP_K052539,
     CHIP_K053260, CHIP_MSM6258, CHIP_MSM6295, CHIP_OPL, CHIP_OPL2,
     CHIP_NES, CHIP_PCE, CHIP_OPLL, CHIP_OPL2_DRUMS, CHIP_OPLL_DRUMS, CHIP_OPL3,
@@ -23,7 +24,7 @@ from vgm2151fur.furwrite import (
     CHIP_YM2608, CHIP_YM2608_EXT,
     CHIP_YM2610, CHIP_YM2610B, CHIP_YM2612, CHIP_YM2612_CSM, CHIP_YM2612_EXT,
     CHIP_YMZ280B, CHIP_VBOY,
-    CHIP_MULTIPCM, CHIP_PCM_DAC,
+    CHIP_MULTIPCM, CHIP_PCM_DAC, CHIP_GA20, CHIP_MSM5232,
     FUR_MAGIC, decompress_fur,
 )
 
@@ -76,12 +77,19 @@ CHIP_CHANNELS = {
     CHIP_YMZ280B: 8,  # Yamaha YMZ280B (PCMD8)
     CHIP_MULTIPCM: 28,  # Yamaha YMW258-F (MultiPCM)
     CHIP_PCM_DAC: 1,  # Generic PCM DAC (one system per uPD7759/PWM side)
+    CHIP_GA20: 4,  # Irem GA20
+    CHIP_MSM5232: 8,  # OKI MSM5232
     CHIP_VBOY: 6,  # Virtual Boy VSU: five wave voices + noise
     CHIP_K051649: 5,  # Konami SCC
     CHIP_K052539: 5,  # Konami SCC+
     CHIP_AY8910: 3,  # AY-3-8910
     CHIP_SAA1099: 6,  # Philips SAA1099
     CHIP_POKEY: 4,  # Atari POKEY
+    0xA8: 4,  # Atari Lynx Mikey: four LFSR/DAC voices
+    0x8A: 1,  # Famicom Disk System: one wavetable voice
+    0x96: 4,  # Bandai WonderSwan: four wavetable/PCM voices
+    0xE0: 19,  # Capcom QSound: sixteen PCM + three ADPCM voices
+    0xB0: 16,  # Seta/Allumer X1-010: sixteen wavetable/PCM voices
     0x03: 4,  # TI SN76489 (three tone + noise)
     0xBF: 4,  # Toshiba T6W28 (stereo SN76489 derivative)
     0xBB: 8,  # Namco C30 WSG
@@ -90,8 +98,9 @@ CHIP_CHANNELS = {
 
 # Chips whose samples carry playable 8-bit bodies (VOX depths stay out).
 _PCM_BODY_CHIPS = (
-    CHIP_K007232, CHIP_SEGAPCM, CHIP_RF5C68, CHIP_C140, CHIP_C352,
-    CHIP_K053260, CHIP_YMZ280B, CHIP_MULTIPCM, CHIP_PCM_DAC,
+    CHIP_K007232, CHIP_SEGAPCM, CHIP_RF5C68, CHIP_C140, CHIP_C219,
+    CHIP_C352, CHIP_K053260, CHIP_YMZ280B, CHIP_MULTIPCM, CHIP_PCM_DAC,
+    CHIP_GA20,
 )
 
 

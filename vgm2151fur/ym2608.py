@@ -272,6 +272,80 @@ def collect_ym2608_rhythm(vgm) -> tuple[list[RhythmHit], list[str]]:
     return hits, warnings
 
 
+# libvgm's ym2608 delta-T memory: address shift 5 for ROM and 8-bit DRAM,
+# 2 for 1-bit DRAM (ymdeltat.c, dram_rightshift).
+DELTAT_PORT_SHIFT = 5
+_DELTAT_DRAM_SHIFT = (3, 0, 0, 0)
+
+
+def replay_deltat_memory(vgm, base: bytes = b"", chip_id: int = 0) -> bytes:
+    """Rebuild the ADPCM-B memory from the port-B data-register writes.
+
+    A VGM can upload a delta-T sample instead of shipping a ROM block: the
+    driver puts the unit in external-memory write mode (``$100 = $60``), sets
+    the start/stop address and writes bytes through ``$108``.  VGMPlay does
+    exactly what the chip does (``YM_DELTAT_ADPCM_Write`` in
+    ``ymdeltat.c``), so the sample only exists after replaying that stream.
+    The 0x81 block in such a log declares the memory size and carries no data,
+    which otherwise leaves a zero-filled ROM and silent/wrong samples.
+    """
+    size = len(base)
+    mem = bytearray(base)
+    regs = [0] * 16
+    portstate = 0
+    control2 = 0
+    shift = DELTAT_PORT_SHIFT
+    memread = 0
+    now_addr = 0
+    start = end = 0
+    mask = size - 1 if size and (size & (size - 1)) == 0 else 0
+    for w in vgm.writes:
+        if w.chip != "ym2608" or w.chip_id != chip_id:
+            continue
+        if not (w.reg & 0x100):
+            continue
+        r = w.reg & 0xFF
+        if r > 0x0F:
+            continue
+        v = w.val & 0xFF
+        regs[r] = v
+        if r == 0x00:
+            portstate = v & (0x80 | 0x40 | 0x20 | 0x10 | 0x01)
+            if portstate & 0x20:
+                now_addr = start << 1
+                memread = 2
+                if not mem:
+                    portstate = 0
+            else:
+                now_addr = 0
+        elif r == 0x01:
+            if (v & 3) != (control2 & 3):
+                new_shift = DELTAT_PORT_SHIFT - _DELTAT_DRAM_SHIFT[v & 3]
+                if new_shift != shift:
+                    shift = new_shift
+                    start = ((regs[0x03] << 8) | regs[0x02]) << shift
+                    end = (((regs[0x05] << 8) | regs[0x04]) << shift)
+                    end |= (1 << shift) - 1
+            control2 = v
+        elif r in (0x02, 0x03):
+            start = ((regs[0x03] << 8) | regs[0x02]) << shift
+        elif r in (0x04, 0x05):
+            end = (((regs[0x05] << 8) | regs[0x04]) << shift)
+            end |= (1 << shift) - 1
+        elif r == 0x08:
+            if (portstate & 0xE0) != 0x60 or not mem:
+                continue
+            if memread:
+                now_addr = start << 1
+                memread = 0
+            if now_addr != (end << 1):
+                index = now_addr >> 1
+                index = index & mask if mask else index % size
+                mem[index] = v
+                now_addr += 2
+    return bytes(mem)
+
+
 def deltat_store_body(data: bytes) -> bytes:
     """Pad a delta-T body out to the 256-byte length Furnace will play.
 

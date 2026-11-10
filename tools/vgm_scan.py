@@ -38,6 +38,14 @@ the hits per pack directory:
              bit 8 of the register byte. $104 in port 1 pairs channels for
              four-operator voices, so a channel count says nothing about it.
 
+    ga20     Irem GA20 at header 0xE0 (VGM 1.71+); four native sample
+             voices, command 0xBF, ROM block 0x93
+    es5503   Ensoniq ES5503 at header 0xCC (VGM 1.71+); command 0xD5 and
+             RAM blocks 0xE1. Converts as one Generic PCM DAC system per
+             used oscillator
+    msm5205  OKI MSM5205 at header 0xF0 (VGM 1.72+); streamed ADPCM
+    msm5232  OKI MSM5232 at header 0xF4 (VGM 1.72+); eight tone/noise voices
+
 Detection is heuristic (header clocks plus the extra-header clock list).
 Run it before batch convert requests so the pack list is complete, and
 after adding packs. Reads .vgz through zlib; unreadable files are skipped
@@ -59,6 +67,7 @@ SKIP = {"output", "third_party", ".git", "__pycache__", ".commandcode",
         "node_modules", "soundcheck"}
 
 CENSUS_KINDS = {"segapcm", "c140", "c219", "c352", "k053260", "ymz280b",
+                "ga20", "es5503", "msm5205", "msm5232",
                 "vsu", "vsu_dual", "k051649",
                 "scc_plus", "ay8910", "ym2203", "ym2612",
                 # The OPL family is FM rather than a sample chip, but a census

@@ -61,6 +61,25 @@ and PWM use Generic PCM DAC systems because Furnace has no native platform
 (`docs/upd7759.md`, `docs/pwm32x.md`).  A log with only these chips likewise
 suppresses the legacy YM2151 placeholder.
 
+Namco C219 follows PWM as its native 16-column system (`0xCF`). Konami
+K054539 follows C219 as eight Generic PCM DAC systems, one per hardware voice;
+a K054539-only log suppresses the legacy placeholder just like C219. C219
+keeps each source sample bank in its own Furnace bank; trailing silence in
+the previous real body supplies the gap instead of a visible padding sample.
+
+OKI MSM5205 and Irem GA20 follow the sample-engine order: MSM5205 uses one
+Generic PCM DAC system per chip, while GA20 is native system `0xC7` with four
+columns. OKI MSM5232 is the first pitched system after the sample engines
+(`0xBC`, eight columns). Ensoniq ES5503 follows MSM5232 with one Generic PCM
+DAC system per used oscillator. A log containing only these chips suppresses
+the legacy YM2151 placeholder. See `docs/msm5205.md`, `docs/ga20.md`,
+`docs/msm5232.md` and `docs/es5503.md`.
+
+Famicom Disk System (`0x8A`, one wave column), WonderSwan (`0x96`, four
+wave/PCM columns) and Capcom QSound (`0xE0`, sixteen PCM plus three ADPCM
+columns) follow X1-010 in that order. FDS and WonderSwan bind through the tone
+instrument pass; QSound uses sample instruments.
+
 Virtual Boy VSU is a pitched chip and comes after Game Boy: six columns per
 chip (`0x9C`). A VSU-only log likewise suppresses the placeholder, so the
 Jack Bros and Galactic Pinball references are six real columns
@@ -83,6 +102,13 @@ OPN, a live YM2151 over a YM2203.
 `is_combo`: the narrower Zone 66 shape - a YM2612 with zero FM key-ons but real
 DAC audio beside an OPL that carries the tune. The OPN2 contributes a system
 with no notes on five of its six columns and PCM on the sixth.
+
+A DAC-only YM2612 beside a **YM2151** is the same shape: the OPM owns the
+music columns, the YM2612 follows as its own system with PCM on channel 6
+(or 9 in Ext mode). `opn2_dac` keeps the pair even though the normal arcade
+precedence would let the YM2151 displace the YM2612, and marks the OPN2 as
+converted so it is not reported as a lost family. `03 In the Beginning.vgz`
+is this shape (OPM music plus a YM2612 DAC stream).
 
 ## Silence is not a system
 
@@ -153,6 +179,7 @@ uv run --with pytest -q python -m pytest tests/test_vgm2151fur_combo.py -q
   census, so `report --verify` on a combined module follows the arcade family
   whatever channel it is asked about. Per-family verification today happens in
   `TestMergedRips` by reading each chip's own registers.
-- An OPL4 (YMF278B) side, as in `merged_opl4_fmpcm_*.vgm`, is not emulated by
-  this tool at all; those logs keep only whatever else writes.
+- An OPL4 (YMF278B) side, as in `merged_opl4_fmpcm_*.vgm`, converts through
+  the OPL4 path; ROM wave IDs still need the `VGM2151FUR_YRW801` image and
+  RAM-only IDs need the VGM RAM dump.
 - A YM2610 or YM2608 merged with an OPL family still converts one side only.

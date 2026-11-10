@@ -17,8 +17,10 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from vgm2151fur.furwrite import (
-    CHIP_AY8910, CHIP_C140, CHIP_C352, CHIP_K007232, CHIP_K051649, CHIP_K052539,
+    CHIP_AY8910, CHIP_C140, CHIP_C219, CHIP_C352, CHIP_K007232, CHIP_K051649,
+    CHIP_K052539,
     CHIP_K053260, CHIP_MSM6258, CHIP_MSM6295, CHIP_OPL, CHIP_OPL2,
+    CHIP_GA20, CHIP_MSM5232,
     CHIP_OPL2_DRUMS, CHIP_OPL3, CHIP_OPL3_DRUMS, CHIP_OPL_DRUMS, CHIP_SEGAPCM,
     CHIP_YM2610, CHIP_YM2610B, CHIP_YM2612, CHIP_YM2612_CSM, CHIP_YM2612_EXT,
     FUR_MAGIC, compress_fur,
@@ -39,10 +41,16 @@ CHIP_NAMES = {
     CHIP_K007232: "K007232",
     CHIP_SEGAPCM: "SegaPCM",
     CHIP_C140: "C140",
+    CHIP_C219: "C219",
     CHIP_C352: "C352",
+    CHIP_GA20: "GA20",
+    CHIP_MSM5232: "MSM5232",
     CHIP_K053260: "K053260",
     CHIP_K051649: "SCC",
     CHIP_K052539: "SCC+",
+    0x8A: "FDS",
+    0x96: "WonderSwan",
+    0xE0: "QSound",
     CHIP_AY8910: "AY8910",
     # OPL family, named as Furnace names the system. A rhythm module is not the
     # same instrument set: bank A's last channels are the kit.

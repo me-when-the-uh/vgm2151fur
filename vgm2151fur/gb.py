@@ -49,6 +49,9 @@ GB_REFIT_SAMPLES = 735
 GB_ENV_REFIT = 16
 # Two mid-note NRx2 writes mean the driver is doing a software volume ramp.
 GB_SOFT_ENV_WRITES = 2
+# A held pitch jump of at least this many 1/64 semitones (0.75 st) is a
+# legato note change, not a slide. The pattern gets a note cell there.
+GB_LEGATO_UNITS = 48
 # A whole-wave RAM rewrite is a burst of byte writes; writes this close belong
 # to the same morph step.
 GB_WAVE_BURST = 64
@@ -186,6 +189,9 @@ class GbHit:
     pan_pts: list[tuple[int, int]] = field(default_factory=list)
     sweep: int = 0
     sweep_pts: list[tuple[int, int]] = field(default_factory=list)
+    # A pitch-only split: the pattern gets a note cell with EAxx legato so
+    # the hardware envelope is not restarted.
+    legato: bool = False
 
 
 @dataclass
@@ -289,6 +295,35 @@ def collect_gb(
         return bool(w.val & 0x80) and (
             reg in (REG_P1_HI, REG_P2_HI, REG_W_HI) or reg == REG_N_CTL
         )
+
+    # The trigger's NRx4 also carries the period high bits. If the driver
+    # follows the trigger with a full low+high pitch correction at the same
+    # sample (a very common "start the voice, then set the real frequency"
+    # idiom), the correction is the note's base. Do not let the late trigger
+    # write put the trigger's high byte back over it.
+    pitch_lo = {
+        REG_P1_HI: REG_P1_LO,
+        REG_P2_HI: REG_P2_LO,
+        REG_W_HI: REG_W_LO,
+    }
+    trigger_high: dict[int, bool] = {}
+    for i, w in enumerate(writes):
+        if not is_trigger(w):
+            continue
+        reg = w.reg & 0x7F
+        lo = pitch_lo.get(reg)
+        if lo is None:
+            continue
+        low_after = high_after = False
+        for nxt in writes[i + 1:]:
+            if nxt.sample != w.sample:
+                break
+            nreg = nxt.reg & 0x7F
+            if nreg == lo:
+                low_after = True
+            elif nreg == reg and not is_trigger(nxt):
+                high_after = True
+        trigger_high[id(w)] = not (low_after and high_after)
 
     writes.sort(key=lambda w: (w.sample, 1 if is_trigger(w) else 0))
 
@@ -457,16 +492,33 @@ def collect_gb(
 
     def record_pitch(voice: int, t: int) -> None:
         hit = active[voice]
-        if hit is None or t <= hit.sample_time:
+        if hit is None or t < hit.sample_time:
             return
         if period[voice] == prev_period[voice]:
             return
+        old_period = prev_period[voice]
         prev_period[voice] = period[voice]
         # A pitch write just after the trigger is the note's real base, not a
         # bend. This matters for a voice started muted whose frequency is set
         # a few samples before the output level rises (Kirby DL2 wave).
         if t - hit.sample_time <= GB_REFIT_SAMPLES and not hit.pitch_pts:
             hit.period = period[voice]
+            return
+        # A pulse driver that plays a legato melody writes a new NRx3/NRx4
+        # without a trigger. A clear jump of about a semitone or more becomes
+        # its own note cell, marked legato so Furnace changes pitch without
+        # restarting the hardware envelope. Slow slides stay in pitch_pts and
+        # become row effects later.
+        if (
+            voice != 3
+            and abs(gb_period_delta(old_period, period[voice]))
+            >= GB_LEGATO_UNITS
+        ):
+            close(voice, t, emit_off=False)
+            open_hit(voice, t)
+            new_hit = active[voice]
+            if new_hit is not None:
+                new_hit.legato = True
             return
         # A frequency write without a trigger keeps the hardware envelope
         # running. It is a pitch bend, not a new note: splitting here (an
@@ -477,10 +529,25 @@ def collect_gb(
         elif not hit.pitch_pts or hit.pitch_pts[-1][1] != period[voice]:
             hit.pitch_pts.append((t, period[voice]))
 
+    pending_pitch: set[int] = set()
+    group_sample: int | None = None
+
+    def flush_pitch(sample: int) -> None:
+        # A pitch change is a two-byte write (NRx3 then NRx4). Splitting on
+        # the first byte would use the previous high byte and leave the new
+        # note on the wrong pitch, so evaluate once per sample group.
+        for voice in sorted(pending_pitch):
+            record_pitch(voice, sample)
+        pending_pitch.clear()
+
     for w in writes:
         reg = w.reg & 0x7F
         val = w.val & 0xFF
         t = w.sample
+
+        if group_sample is not None and t != group_sample:
+            flush_pitch(group_sample)
+        group_sample = t
 
         if reg == REG_SWEEP:
             sweep = val
@@ -518,6 +585,21 @@ def collect_gb(
                     hit.env_raw = val
                     hit.vol = val >> 4
                     continue
+                if (
+                    hit.env_len == 0
+                    and (val >> 4) > 0
+                    and (val & 0xF8) != 0
+                    and not env_writes[voice]
+                    and (val >> 4) >= hit.env_vol
+                ):
+                    # A mid-note NRx2 write that raises the initial volume
+                    # without a trigger is the driver's software attack. It
+                    # is a real note start in the pattern, not a zombie volume
+                    # step: restart the note at the current pitch and keep the
+                    # envelope fields the write carries.
+                    close(voice, t, emit_off=False)
+                    open_hit(voice, t, vol_override=val >> 4)
+                    continue
                 if hit.env_len > 0:
                     # A hardware envelope whose period or direction changes
                     # mid-note is how drivers speed a decay up or slow it
@@ -538,17 +620,19 @@ def collect_gb(
         elif reg in (REG_P1_LO, REG_P2_LO, REG_W_LO):
             voice = {REG_P1_LO: 0, REG_P2_LO: 1, REG_W_LO: 2}[reg]
             period[voice] = (period[voice] & 0x700) | val
-            record_pitch(voice, t)
+            pending_pitch.add(voice)
         elif reg in (REG_P1_HI, REG_P2_HI, REG_W_HI):
             voice = {REG_P1_HI: 0, REG_P2_HI: 1, REG_W_HI: 2}[reg]
-            period[voice] = (period[voice] & 0xFF) | ((val & 7) << 8)
+            triggered = bool(val & 0x80)
+            if not triggered or trigger_high.get(id(w), True):
+                period[voice] = (period[voice] & 0xFF) | ((val & 7) << 8)
             length_en[voice] = bool(val & 0x40)
-            if val & 0x80:
+            if triggered:
                 if voice == 2:
                     wave_started = True
                 trigger(voice, t)
             else:
-                record_pitch(voice, t)
+                pending_pitch.add(voice)
         elif reg == REG_W_ON:
             was_on = wave_on
             wave_on = bool(val & 0x80)
@@ -636,6 +720,8 @@ def collect_gb(
             wave_now(t, record=True)
         # 0x14 master volume: the module mix is normalised separately.
 
+    if group_sample is not None:
+        flush_pitch(group_sample)
     for voice in range(4):
         if active[voice] is not None:
             close(voice, 0, emit_off=False)

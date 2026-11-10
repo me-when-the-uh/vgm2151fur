@@ -17,10 +17,18 @@ The converter follows the stream timeline, applies the cycle register's offset
 and scale, and renders one 16-bit PCM body per side.  Because Furnace has no
 32X PWM platform, each chip becomes **two Generic PCM DAC systems** (left and
 right) with hard pan.  The module sample rate is 22020 Hz, matching the chip's
-device rate.  Each side is cut into 0.25-second chunks and grouped through a
-120-slot sample map, the same approach as the YM2612 DAC path, so the module
-stays editable and does not hold one multi-megabyte sample.  When the VGM
-loops, the pattern/order loop repeats the chunk sequence.
+device rate.  Each side is scanned for attack transients: a rise out of the
+idle level marks a candidate sample start, including inside a longer musical
+passage.  The bodies are trimmed, silence-only pieces are dropped, and the
+remaining bodies are banked through a 120-slot sample map.  A body shorter
+than a quarter chunk (about 62 ms) is folded into the next body rather than
+taking a slot on its own.  A sustained body is cut at one second with a
+balanced split so no tiny tail remains.  If a side has no useful attacks, the
+converter falls back to rest boundaries and then to 0.25-second chunks.  Bodies are
+deduplicated: a repeated body is stored once, and a body shared by the left
+and right streams (including a fully mono PWM log) is played by both sides
+from one sample.  When the VGM loops, the pattern/order loop repeats the
+sequence.
 
 ## Limits
 
@@ -29,3 +37,5 @@ loops, the pattern/order loop repeats the chunk sequence.
   never uses the DAC stream has no continuous audio to reconstruct.
 - The PWM output is stored as decoded PCM, so the module does not retain the
   source's per-sample register writes.
+- `--lossy-sample-clustering` compares 16-bit attack bodies after removing
+  each body's DC and keeps at most 32 anchors.

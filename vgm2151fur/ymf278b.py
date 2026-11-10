@@ -52,6 +52,10 @@ OPL4_DEFAULT_CLOCK = 33868800
 # attack, so those writes belong to the hit's initial state instead of
 # becoming a step on the next row.  A real mid-note move comes much later.
 OPL4_ATTACK_GAP = 128
+# A TL=0/pan-8 mute this close to a key-off is the driver's trailing silence;
+# the note-off already stops the voice. A mute earlier than this is real
+# silence and must survive to the pattern.
+OPL4_TAIL_MUTE = 2048
 SMP_DEPTH_8BIT = 8
 SMP_DEPTH_16BIT = 16
 

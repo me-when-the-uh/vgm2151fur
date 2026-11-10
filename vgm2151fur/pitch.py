@@ -111,15 +111,20 @@ class PeriodPitchTable:
             return hit
         # A semitone of offset moves the register by the local table
         # difference, so a log2 estimate lands within a couple of hundred units
-        # and the value falls monotonically from there.
+        # and the value moves monotonically from there.  Period tables fall
+        # with a higher note; frequency tables rise.
         here = self.value(note, 0)
-        span = 128.0 * 12.0 * math.log2(here / target) if here > 0 else 0.0
+        first = self.value(note, -128)
+        last = self.value(note, 127)
+        descending = last < first
+        ratio = (here / target) if descending else (target / here)
+        span = 128.0 * 12.0 * math.log2(ratio) if here > 0 and target > 0 else 0.0
         est = max(-24000, min(24000, (note << 7) + int(round(span))))
         lo = max(-32768, est - 400)
         hi = min(32768, est + 400)
         while lo < hi:
             mid = (lo + hi) // 2
-            if self._value_offset(mid) > target:
+            if (self._value_offset(mid) > target) == descending:
                 lo = mid + 1
             else:
                 hi = mid
@@ -147,8 +152,61 @@ class PeriodPitchTable:
         return root + ((diff * frac) >> 7)
 
 
+class FrequencyPitchTable(PeriodPitchTable):
+    """DivPitchTable in frequency mode, for one (tuning, clock, divider).
+
+    The X1-010 writes ``freq`` directly: its register value is the pitch-table
+    value, not a period.  Furnace builds this table with
+    ``fbase * divider / clock`` and shifts the root *down* for higher octaves.
+    """
+
+    def __init__(self, tuning: float, clock: float, divider: float,
+                 maximum: int = 0xFFFF):
+        self.tuning = tuning
+        self.clock = clock
+        self.divider = divider
+        self.max = maximum
+        self.shift = 14
+        while self.shift > 0:
+            nbase = (self.shift - 5) * 12
+            fbase = tuning * 2.0 ** ((nbase + 3) / 12.0)
+            if round(fbase * (divider / clock)) <= maximum:
+                break
+            self.shift -= 1
+        self.pitch = [0] * 13
+        self.diff = [0] * 13
+        for i in range(13):
+            nbase = i + (self.shift - 5) * 12
+            fbase = tuning * 2.0 ** ((nbase + 3) / 12.0)
+            self.pitch[i] = round(fbase * (divider / clock))
+        for i in range(12):
+            self.diff[i] = self.pitch[i + 1] - self.pitch[i]
+        self._offsets: dict[tuple[int, int], int] = {}
+
+    def note_fraction(self, value: int) -> float:
+        """Note plus fraction a frequency-register value stands for."""
+        if value <= 0:
+            return 0.0
+        freq = value * self.clock / self.divider
+        return 57.0 + 12.0 * math.log2(freq / self.tuning)
+
+    def _value_offset(self, offset: int) -> int:
+        coarse = offset >> 7
+        if coarse < 0:
+            coarse = 0
+        frac = offset & 127
+        index = coarse % 12
+        octave = self.shift - (coarse // 12)
+        if octave < 0:
+            return self.max
+        root, diff = self._shift_pair(self.pitch[index], self.diff[index], octave)
+        return root + ((diff * frac) >> 7)
+
+
 _TABLES: dict[tuple, PeriodPitchTable] = {}
 _NOTES: dict[tuple, tuple[int, int]] = {}
+_FREQ_TABLES: dict[tuple, FrequencyPitchTable] = {}
+_FREQ_NOTES: dict[tuple, tuple[int, int]] = {}
 
 
 def pitch_table(clock: float, divider: float, maximum: int = 0xFFF) -> PeriodPitchTable:
@@ -157,6 +215,17 @@ def pitch_table(clock: float, divider: float, maximum: int = 0xFFF) -> PeriodPit
     if tbl is None:
         tbl = PeriodPitchTable(FURNACE_TUNING, clock, divider, maximum)
         _TABLES[key] = tbl
+    return tbl
+
+
+def frequency_pitch_table(
+    clock: float, divider: float, maximum: int = 0xFFFF,
+) -> FrequencyPitchTable:
+    key = (round(clock), divider, maximum)
+    tbl = _FREQ_TABLES.get(key)
+    if tbl is None:
+        tbl = FrequencyPitchTable(FURNACE_TUNING, clock, divider, maximum)
+        _FREQ_TABLES[key] = tbl
     return tbl
 
 
@@ -229,4 +298,41 @@ def furnace_period_note(
     assert best is not None
     result = (best[2], E5_CENTER + best[3])
     _NOTES[cache_key] = result
+    return result
+
+
+def furnace_frequency_note(
+    clock: float,
+    divider: float,
+    value: int,
+    *,
+    maximum: int = 0xFFFF,
+) -> tuple[int, int]:
+    """Inverse of Furnace's frequency-mode pitch table (the X1-010 wave path).
+
+    Returns the ``(note, E5)`` pair whose register value is closest to
+    ``value``.  Unlike a period table there is no ``period_offset``; the X1
+    platform writes the table value to the chip unchanged.
+    """
+    cache_key = (round(clock), divider, maximum, value)
+    hit = _FREQ_NOTES.get(cache_key)
+    if hit is not None:
+        return hit
+    tbl = frequency_pitch_table(clock, divider, maximum)
+    target = max(1, value)
+    base = tbl.note_fraction(target)
+    best: tuple[int, int, int, int] | None = None  # (err, |fine|, note, fine)
+    center = int(math.floor(base))
+    lo = max(0, center - 2)
+    hi = min(NOTE_MAX, center + 2)
+    if lo > hi:
+        lo = hi = max(0, min(NOTE_MAX, center))
+    for note in range(lo, hi + 1):
+        fine, err = _closest_fine(tbl, note, target)
+        cand = (err, abs(fine), note, fine)
+        if best is None or cand < best:
+            best = cand
+    assert best is not None
+    result = (best[2], E5_CENTER + best[3])
+    _FREQ_NOTES[cache_key] = result
     return result

@@ -7,9 +7,11 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from vgm2151fur.analyze import _fold_saw, _saw_anchors, _unit_saw, analyze
+from vgm2151fur.analyze import (
+    _fold_saw, _saw_anchors, _tone_pitch_tick_scale, _unit_saw, analyze,
+)
 from vgm2151fur.ay8910 import (
-    FX_MODE, FX_NOISE, ay_note, ay_rate, collect_ay8910,
+    FX_ENV_SET, FX_MODE, FX_NOISE, ay_note, ay_rate, collect_ay8910,
 )
 from vgm2151fur.furio import CHIP_CHANNELS, iter_blocks, parse_fur
 from vgm2151fur.furwrite import (
@@ -305,6 +307,74 @@ class TestAyCollect(unittest.TestCase):
         hits, _offs, _warn = collect_ay8910(_vgm(writes, ay8910_clock=1789773))
         self.assertEqual(hits[0].vol, 4)
 
+    def test_opening_envelope_cleared_in_the_burst_becomes_fixed_volume(self):
+        # The gate opens while the previous note's envelope bit is still set,
+        # then the real fixed volume arrives a few samples later. Keeping the
+        # queued shape/period would re-enable the generator after the mode-off
+        # write and make the note click or follow the envelope instead of its
+        # fixed level.
+        writes = [
+            ChipWrite(0, "ay8910", 0, 7, 0xFE),
+            ChipWrite(0, "ay8910", 0, 0, 254),
+            ChipWrite(0, "ay8910", 0, 1, 0),
+            ChipWrite(0, "ay8910", 0, 11, 66),
+            ChipWrite(0, "ay8910", 0, 12, 0),
+            ChipWrite(0, "ay8910", 0, 13, 8),
+            ChipWrite(100, "ay8910", 0, 8, 0x12),  # envelope, level 2
+            ChipWrite(103, "ay8910", 0, 8, 0x08),  # fixed level 8
+            ChipWrite(6000, "ay8910", 0, 8, 0),
+        ]
+        hits, _offs, _warn = collect_ay8910(_vgm(writes, ay8910_clock=1789773))
+        hit = hits[0]
+        self.assertEqual(hit.vol, 8)
+        self.assertFalse(hit.env)
+        self.assertFalse(any(fx == FX_ENV_SET for _t, fx, _v in hit.fx_pts))
+        modes = [val for _t, fx, val in hit.fx_pts if fx == FX_MODE]
+        self.assertTrue(modes)
+        self.assertEqual((modes[-1] + 1) & 4, 0)
+
+    def test_opening_shape_change_settles_on_the_note_row(self):
+        # The gate opens with the previous shape 8, then the real shape 9
+        # arrives 17 samples later in the same opening burst. A whole-tick
+        # shape-8 macro would restart the hardware envelope at the wrong
+        # waveform, so the settled row value must be shape 9.
+        writes = [
+            ChipWrite(0, "ay8910", 0, 7, 0xFE),
+            ChipWrite(0, "ay8910", 0, 0, 254),
+            ChipWrite(0, "ay8910", 0, 1, 0),
+            ChipWrite(0, "ay8910", 0, 11, 160),
+            ChipWrite(0, "ay8910", 0, 12, 0),
+            ChipWrite(0, "ay8910", 0, 13, 8),
+            ChipWrite(100, "ay8910", 0, 8, 0x12),
+            ChipWrite(117, "ay8910", 0, 13, 9),
+            ChipWrite(6000, "ay8910", 0, 8, 0),
+        ]
+        song = analyze(_vgm(writes, ay8910_clock=1789773))
+        ev = [e for e in song.events if e.on and e.tone_chip == 2][0]
+        fx = {cmd: val for _t, cmd, val in ev.tone_fx_pts}
+        self.assertEqual(fx[FX_ENV_SET], 0x91)
+        ins = song.ay_ins[ev.ins - len(song.scc_ins)]
+        self.assertEqual(ins.env_shape, ())
+
+    def test_tick_scale_uses_the_fastest_active_tone_voice(self):
+        # Voice 0 writes every ~700 samples and voice 1 is sparse. A combined
+        # median picks the sparse voice and leaves the row tick too coarse.
+        writes: list[ChipWrite] = [
+            ChipWrite(0, "ay8910", 0, 7, 0x38),
+        ]
+        for i in range(10):
+            writes.append(ChipWrite(i * 700, "ay8910", 0, 0, i))
+            writes.append(ChipWrite(i * 700, "ay8910", 0, 2, i))
+        writes.append(ChipWrite(0, "ay8910", 0, 2, 0))
+        for i in range(10):
+            writes.append(ChipWrite(10000 + i * 10000, "ay8910", 0, 2, i))
+        self.assertEqual(
+            _tone_pitch_tick_scale(
+                _vgm(writes, ay8910_clock=1789773), 60.0, 1,
+            ),
+            2,
+        )
+
     def test_noise_enable_carries_the_period_written_while_off(self):
         # A snare often sets the noise period and then turns the mixer's noise
         # bit on. The period write lands while noise is off, so the mixer turn
@@ -487,16 +557,46 @@ class TestFurEmission(unittest.TestCase):
             struct.unpack_from("<H", block, 2)[0]
             for _off, mag, _size, block in iter_blocks(data) if mag == b"INS2"
         ]
-        self.assertEqual(ins_types, [INS_AY])
-        # the phase-reset macro must be in the instrument (file code 14)
-        ins = [block for _off, mag, _size, block in iter_blocks(data) if mag == b"INS2"][0]
-        self.assertIn(bytes([14, 2, 255, 255, 0, 1, 0, 1, 1, 0]), ins)
+        # One instrument for the envelope note and one plain tone instrument.
+        self.assertEqual(ins_types, [INS_AY, INS_AY])
+        # Only the envelope instrument carries the phase-reset macro (file
+        # code 14); a plain note must not rewrite the shared $0D register.
+        reset = bytes([14, 2, 255, 255, 0, 1, 0, 1, 1, 0])
+        ins = [
+            block for _off, mag, _size, block in iter_blocks(data)
+            if mag == b"INS2"
+        ]
+        self.assertEqual(sum(reset in block for block in ins), 1)
         # the envelope effects reach the pattern
         fx = [fx for rows in mod.patterns.values() for row in rows for fx in row.fx]
         cmds = {cmd for cmd, _val in fx}
         self.assertIn(0x22, cmds)
         self.assertIn(0x23, cmds)
         self.assertIn(0x24, cmds)
+
+    def test_mid_note_envelope_write_is_a_new_hit(self):
+        # The chip re-arms the envelope on every $0D write, even one that
+        # repeats the current shape. A tracker can only restart it with a
+        # note, so a mid-gate $0D write splits the held hit at the source's
+        # own rate instead of folding into an unchanged shape macro.
+        writes = [
+            ChipWrite(0, "ay8910", 0, 7, 0xFE),   # tone A on
+            ChipWrite(0, "ay8910", 0, 0, 254),
+            ChipWrite(0, "ay8910", 0, 1, 0),
+            ChipWrite(0, "ay8910", 0, 11, 66),
+            ChipWrite(0, "ay8910", 0, 12, 0),
+            ChipWrite(0, "ay8910", 0, 13, 0x0A),
+            ChipWrite(100, "ay8910", 0, 8, 0x10),  # envelope on
+            ChipWrite(5000, "ay8910", 0, 13, 0x0A),  # same shape: re-arm
+            ChipWrite(9000, "ay8910", 0, 13, 0x0A),
+            ChipWrite(15000, "ay8910", 0, 8, 0),
+        ]
+        song = analyze(_vgm(writes, ay8910_clock=1789773))
+        self.assertEqual(song.ay_count, 3)
+        self.assertEqual(
+            [e.sample for e in song.events if e.on and e.ch == 8],
+            [100, 5000, 9000],
+        )
 
     def test_ay_mode_macro_uses_the_pre_193_encoding(self):
         # Furnace adds one to every DIV_INS_AY wave-macro value when loading
@@ -1027,6 +1127,32 @@ class TestToneMacros(unittest.TestCase):
         self.assertGreater(lo, 1)
         self.assertEqual([h.sample_time for h in hits], [100])
         self.assertEqual([o.sample_time for o in offs], [2000])
+
+
+    def test_pitch_split_keeps_the_mode_it_starts_in(self):
+        # A quick tone-to-noise handover after a pitch split: the split's
+        # own fx list starts at the handover, so the settled tone mode has
+        # to be seeded. Without it the instrument's mode macro starts on
+        # noise and never switches (PSG3's percussion in Breeze).
+        writes = [
+            ChipWrite(0, "ay8910", 0, 7, 0x38),      # tone on, noise off
+            ChipWrite(0, "ay8910", 0, 0, 0x00),
+            ChipWrite(0, "ay8910", 0, 1, 0x04),
+            ChipWrite(0, "ay8910", 0, 8, 12),
+            ChipWrite(2000, "ay8910", 0, 0, 0x00),
+            ChipWrite(2000, "ay8910", 0, 1, 0x02),   # octave up: splits
+            ChipWrite(3500, "ay8910", 0, 7, 0x31),   # tone off, noise on
+            ChipWrite(6000, "ay8910", 0, 8, 0),
+        ]
+        song = analyze(_vgm(writes, ay8910_clock=1789772))
+        notes = [e for e in song.events if e.on and e.tone_chip == 2]
+        self.assertEqual([n.sample for n in notes], [0, 2000])
+        self.assertIn((2000, FX_MODE, 0), notes[1].tone_fx_pts)
+        self.assertIn((3500, FX_MODE, 1), notes[1].tone_fx_pts)
+        spec = song.ay_ins[notes[1].ins]
+        self.assertTrue(spec.mode)
+        self.assertEqual(spec.mode[0], 1)   # tone at the segment start
+        self.assertIn(2, spec.mode)         # switches to noise later
 
 
 def _levels_vgm(levels: list[int], *, wave: bytes = SINE, origin: int = 0) -> VgmFile:

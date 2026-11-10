@@ -316,12 +316,13 @@ class TestOpl4Wave(unittest.TestCase):
         self.assertEqual(ev.pitch_steps, ((4000, 768),))
 
     def test_trailing_silence_step_is_not_a_volume_zero_row(self):
-        # spc2vgm silences a slot with TL=0x7F just before its key-off. The
-        # key-off stops the note, so the trailing zero is inaudible in the
-        # source; writing it as a pattern step only adds volume-00 rows.
+        # spc2vgm silences a slot with TL=0x7F immediately before its
+        # key-off. The key-off stops the note, so the trailing zero is
+        # inaudible in the source; writing it as a pattern step only adds
+        # volume-00 rows.
         sample = bytes(range(1, 21))
         writes = _wave_note(100, wave=16, off=9000)
-        writes.insert(5, ChipWrite(4000, "ymf278b", 0, _wave_reg(0, 3), 0xFE))
+        writes.insert(5, ChipWrite(8800, "ymf278b", 0, _wave_reg(0, 3), 0xFE))
         v = _vgm(writes, roms=[
             RomSlice(0, 0, 0, _rom(16, sample), "ymf278b_rom"),
         ])
@@ -329,7 +330,22 @@ class TestOpl4Wave(unittest.TestCase):
         ev = next(e for e in song.events if e.on and e.ch == 18)
         self.assertFalse(any(value == 0 for _t, value, _pan in ev.vol_pts))
         # A later rise must keep the silent step: it is real, not a tail.
-        writes.insert(6, ChipWrite(6000, "ymf278b", 0, _wave_reg(0, 3), 0x42))
+        writes.insert(6, ChipWrite(8900, "ymf278b", 0, _wave_reg(0, 3), 0x42))
+        v = _vgm(writes, roms=[
+            RomSlice(0, 0, 0, _rom(16, sample), "ymf278b_rom"),
+        ])
+        song = analyze(v)
+        ev = next(e for e in song.events if e.on and e.ch == 18)
+        self.assertTrue(any(value == 0 for _t, value, _pan in ev.vol_pts))
+
+    def test_mute_far_before_the_key_off_is_kept(self):
+        # The Lost Vikings keys a slot, then silences it with TL=0x7F and
+        # pan 8 while leaving the key on; the next key-off can be seconds
+        # later. That mute is the audible cut, not the driver's tail.
+        sample = bytes(range(1, 21))
+        writes = _wave_note(100, wave=16, off=9000)
+        writes.insert(5, ChipWrite(4000, "ymf278b", 0, _wave_reg(0, 3), 0xFE))
+        writes.insert(6, ChipWrite(4000, "ymf278b", 0, _wave_reg(0, 4), 0x88))
         v = _vgm(writes, roms=[
             RomSlice(0, 0, 0, _rom(16, sample), "ymf278b_rom"),
         ])

@@ -49,6 +49,9 @@ AY_GATE_PAIR = 1000
 # roll), so absorbing the first frame would throw away the peak and make the
 # transient too quiet.
 AY_GATE_DROP = 6
+# A shape write this soon after the gate belongs to the note's opening
+# register burst. Anything later re-arms the envelope and is its own hit.
+AY_ENV_OPEN = 64
 # A level jump this large while the gate stays open is a retriggered drum
 # (a snare roll writes the next hit straight from the decayed level back up).
 # Without it the whole roll stayed one note with a volume macro.
@@ -109,6 +112,11 @@ class AyHit:
     env_shape: int  # register 13
     env_period: int  # registers 11/12, 16-bit
     off_sample: int = 0  # gate-off sample (0 = still sounding at the end)
+    # When a retrigger closes this note silently and then the new gate turns
+    # out to be a sub-frame glitch, this holds the last note that really
+    # sounded. Its key-off has to be emitted at the glitch's close, or the
+    # predecessor rings until the voice's next note.
+    split_from: "AyHit | None" = None
     # Mid-note register writes while the voice sounds.
     freq_pts: list[tuple[int, int]] = field(default_factory=list)
     vol_pts: list[tuple[int, int]] = field(default_factory=list)
@@ -169,7 +177,12 @@ def _audible(reg: list[int], voice: int, min_period: int = 0) -> bool:
         period = reg[REG_TONE_LO[voice]] | ((reg[REG_TONE_HI[voice]] & 0x0F) << 8)
         tone = period >= max(1, min_period)
     if not (tone or _noise_on(reg, voice)):
-        return False
+        # The AY mixes tone and noise into the DAC; with both disabled the
+        # channel outputs a constant at the volume level. A *fixed* level is
+        # DC and inaudible, but the hardware envelope makes that level an
+        # audio-rate waveform (the `$0D` decay heard under a muted voice).
+        # Keep the note alive while the envelope drives it.
+        return bool(reg[REG_VOL[voice]] & 0x10)
     if reg[REG_VOL[voice]] & 0x10:
         return True  # the hardware envelope drives this channel
     return (reg[REG_VOL[voice]] & 0x0F) > 0
@@ -218,7 +231,41 @@ def collect_ay8910(
             fx.append((FX_ENV_HI, (env_period(reg) >> 8) & 0xFF))
         return fx
 
-    def open_hit(st: dict, cid: int, voice: int, t: int) -> None:
+    def drop_env_fx(hit: AyHit) -> None:
+        """Remove a note-start envelope setup that a volume write turned off.
+
+        The note opens while the previous envelope bit is still set, so
+        `note_fx` queues the shape/period. If the real volume write a few
+        samples later clears bit 4, keeping that setup would turn the envelope
+        back on after the mode-off write and make the note follow the generator
+        instead of its fixed level.
+        """
+        hit.fx_pts = [
+            entry for entry in hit.fx_pts
+            if entry[1] not in (FX_ENV_SET, FX_ENV_LO, FX_ENV_HI)
+        ]
+
+    def settle_env_off(hit: AyHit, sample: int) -> None:
+        """Turn the note's opening state into fixed volume.
+
+        Used when the envelope bit clears inside the opening write burst. The
+        pattern row can only carry the settled state, so drop the envelope
+        setup and replace the opening mode value rather than appending a
+        second mode write: the last value on the row wins.
+        """
+        hit.env = False
+        drop_env_fx(hit)
+        off_mode = ay_mode(hit.tone, hit.noise, False) - 1
+        for i, (t, fx, _val) in enumerate(hit.fx_pts):
+            if fx == FX_MODE and t <= hit.sample_time:
+                hit.fx_pts[i] = (t, fx, off_mode)
+                return
+        hit.fx_pts.append((sample, FX_MODE, off_mode))
+
+    def open_hit(
+        st: dict, cid: int, voice: int, t: int,
+        split_from: AyHit | None = None,
+    ) -> None:
         reg = st["reg"]
         env = bool(reg[REG_VOL[voice]] & 0x10)
         hit = AyHit(
@@ -234,6 +281,7 @@ def collect_ay8910(
             noise_period=reg[REG_NOISE] & 0x1F,
             env_shape=reg[REG_ENV_SHAPE] & 0x0F,
             env_period=env_period(reg),
+            split_from=split_from,
         )
         hit.fx_pts = [(t, fx, val) for fx, val in note_fx(reg, voice)]
         st["active"][voice] = hit
@@ -247,6 +295,12 @@ def collect_ay8910(
             hits.append(hit)
             if emit_off:
                 offs.append(AyOff(t, cid, voice))
+        elif hit.split_from is not None and emit_off:
+            # The note before this one was closed without a key-off by the
+            # same retrigger. This gate never sounded, so the predecessor is
+            # still ringing and needs the cut it never got.
+            acc["glitch"] += 1
+            offs.append(AyOff(t, cid, voice))
         else:
             acc["glitch"] += 1
         st["active"][voice] = None
@@ -255,9 +309,11 @@ def collect_ay8910(
         on = _audible(st["reg"], voice, min_period)
         active = st["active"][voice]
         if on and (active is None or retrigger):
+            root = None
             if active is not None:
+                root = active.split_from or active
                 close_hit(st, cid, voice, t, emit_off=False)
-            open_hit(st, cid, voice, t)
+            open_hit(st, cid, voice, t, split_from=root)
         elif not on:
             close_hit(st, cid, voice, t)
 
@@ -271,7 +327,10 @@ def collect_ay8910(
             continue
         r = w.reg
         val = w.val & 0xFF
-        if reg[r] == val:
+        # A same-value $0D write still re-arms the envelope on real hardware
+        # (set_shape resets the counter), so it must not be dropped. It is
+        # handled below as either the opening burst or a new hit.
+        if reg[r] == val and r != REG_ENV_SHAPE:
             continue
         reg[r] = val
         voice = None
@@ -319,8 +378,9 @@ def collect_ay8910(
                     # up for the next hit. Close this one silently and let the
                     # new level open a fresh note, so the roll reaches the
                     # pattern instead of living only in the volume macro.
+                    root = hit.split_from or hit
                     close_hit(st, cid, voice, w.sample, emit_off=False)
-                    open_hit(st, cid, voice, w.sample)
+                    open_hit(st, cid, voice, w.sample, split_from=root)
                     continue
             if (w.sample - hit.sample_time <= AY_GATE_PAIR
                     and hit.vol - level >= AY_GATE_DROP):
@@ -332,16 +392,19 @@ def collect_ay8910(
                 window = hit.sample_time + AY_GATE_PAIR
                 hit.vol_pts = [p for p in hit.vol_pts if p[0] > window]
                 if hit.env:
-                    hit.env = False
-                    hit.fx_pts.append((
-                        w.sample, FX_MODE,
-                        ay_mode(hit.tone, hit.noise, False) - 1,
-                    ))
+                    settle_env_off(hit, w.sample)
                 continue
             if hit.env:
-                # The level write also clears the envelope bit; the channel
-                # mode has to follow or the register keeps using the
-                # generator.
+                # The level write also clears the envelope bit. Inside the
+                # opening burst, the settled fixed level is the note's real
+                # start. After that the envelope has run for several rows, so
+                # keep its note-start setup and append the mode-off write.
+                if w.sample - hit.sample_time <= AY_GATE_PAIR:
+                    hit.vol = level
+                    window = hit.sample_time + AY_GATE_PAIR
+                    hit.vol_pts = [p for p in hit.vol_pts if p[0] > window]
+                    settle_env_off(hit, w.sample)
+                    continue
                 hit.env = False
                 hit.fx_pts.append((
                     w.sample, FX_MODE, ay_mode(hit.tone, hit.noise, False) - 1,
@@ -395,8 +458,21 @@ def collect_ay8910(
         if r == REG_ENV_SHAPE:
             for voice in range(AY_VOICES):
                 hit = st["active"][voice]
-                if hit is not None and hit.env:
-                    hit.fx_pts.append((w.sample, FX_ENV_SET, ((val & 0x0F) << 4) | 1))
+                if hit is None or not hit.env:
+                    continue
+                if w.sample - hit.sample_time > AY_ENV_OPEN:
+                    # The chip re-arms the envelope on every $0D write, even
+                    # one that repeats the current shape. A tracker can only
+                    # restart it with a note (the instrument's phase-reset
+                    # macro forces the write), so this is a new hit at the
+                    # source's own rate instead of one long held note.
+                    root = hit.split_from or hit
+                    close_hit(st, cid, voice, w.sample, emit_off=False)
+                    open_hit(st, cid, voice, w.sample, split_from=root)
+                else:
+                    hit.fx_pts.append((
+                        w.sample, FX_ENV_SET, ((val & 0x0F) << 4) | 1,
+                    ))
             continue
         if r in (REG_ENV_LO, REG_ENV_HI):
             period = env_period(reg)
