@@ -46,9 +46,12 @@ With no arguments the tool opens a menu. Type a number, or paste a path to a VGM
  5  render     .fur to WAV
  6  report     analysis, nothing written
  7  condense   write copies of tracks with 1x..4x lower BPM
+ 8  gui        the same tools in a browser page
 ```
 
 `packs` is the place to start. It scans a folder (remembered next time), lists the packs with track counts and chips, and opens a track list with a dash next to tracks that have no `.fur` yet. `c` converts all tracks or a selection (`2-6`, `1,4`, or a single number), `e` changes a chip volume on the converted tracks, and `r` renders one to WAV so you can hear it. Conversion asks `optimise for pattern density? (Y/n)`, then a separate `detect and optimise for LFO loops? (Y/n)` (both default yes), then `experimental aggressive (lossy) sample clustering? (y/N)` (default no), then `normalize/verify through Furnace? (y/N)`; the default is no, so the menu does not launch Furnace unless you ask it to. The LFO answer is remembered for pasted-path conversions; the experimental lossy-clustering answer is only latched for the current menu session and is not persisted, so a new run defaults back to off. The menu stores its state in `~/.vgm2151fur.json`.
+
+Item 8, or `python -m vgm2151fur gui` directly, opens the same tools as a local web page. The server binds to 127.0.0.1 on a free port (`--port N` pins it, `--no-browser` does not open the browser) and serves one page: pack browsing with per-track "no .fur yet" markers, background convert/report jobs whose rows fill in while you keep working, chip-volume edits with per-chip targets, render-to-WAV with an inline player, the compare dialog, and drag-drop or paste to open paths. The options panel covers every convert flag — grid (ticks per row or a BPM cap), chip restriction, workers, the condense ladder with a preview of which factors an optimize pick keeps, normalize/verify through Furnace, LFO and lossy-sample switches, dirs layout. An optimize pick other than `none` converts as the condense ladder, like `--variants`. "Remember these" saves the options into the same `~/.vgm2151fur.json` the menu reads (under a `gui` key; the output folder and lossy sampling stay per-session). Nothing is installed beyond the standard library, and without Furnace only render, compare, and normalize stay off.
 
 ## Commands
 
