@@ -93,6 +93,7 @@ def _banner(state: dict) -> str:
         "  5  render     .fur to WAV",
         "  6  report     analysis, nothing written",
         "  7  condense   write copies of tracks with 1x..4x lower BPM",
+        "  8  gui        the same tools in a browser page",
         _TONE.dim("  paste a path, or a number.  m menu, q quit, Ctrl+C quit"),
     ]
     last = state.get("browse_root")
@@ -160,7 +161,18 @@ def _dispatch(read, out, state, state_path, raw: str, key: str):
     if key == "7":
         cmd_condense(read, out, state, state_path)
         return None
+    if key == "8":
+        rc = cmd_gui(out, state_path)
+        return "menu" if rc == 0 else None
     return _open_typed_path(read, out, state, state_path, raw)
+
+
+def cmd_gui(out, state_path: Path) -> int:
+    """Open the browser GUI and serve it until Ctrl+C."""
+    from vgm2151fur.gui import launch
+
+    out("  starting the browser GUI; Ctrl+C here closes it")
+    return launch(state_path=state_path)
 
 
 # ---------------------------------------------------------------- state
@@ -724,7 +736,7 @@ def cmd_edit(read, out) -> None:
 
 
 def cmd_compare(read, out) -> None:
-    from vgm2151fur.diag import compare_fur_to_source
+    from vgm2151fur.diag import DiagError, compare_fur_to_source
 
     src = _ask_file(read, out, "source VGM/VGZ")
     if src is None:
@@ -740,7 +752,7 @@ def cmd_compare(read, out) -> None:
         return
     try:
         runs, exported = compare_fur_to_source(src, fur, channel)
-    except FurnaceError as exc:
+    except (FurnaceError, DiagError) as exc:
         out(f"  {exc}")
         return
     out(f"  export: {exported.name}")

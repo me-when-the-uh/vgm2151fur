@@ -4,7 +4,7 @@ Converts arcade and console VGM/VGZ rips into Furnace Tracker modules.
 Supported chips:
 - Yamaha: YM2151, YM2203, YM2612, YM2610/YM2610B, YM2608, YM2413, YM3526, YM3812, YMF262, Y8950, YMF278B, YMZ280B, YMW258-F (MultiPCM) and YM2149.
 - General Instrument: AY-3-8910.
-- Konami: VRC7, K007232, K053260, K054539 and SCC/SCC+.
+- Konami: VRC7, K007232, K053260, K054539, SCC/SCC+ and the K005289 (Bubble System WSG).
 - Atari: POKEY and Lynx/Mikey.
 - Seta: X1-010.
 - Capcom: QSound.
@@ -46,9 +46,12 @@ With no arguments the tool opens a menu. Type a number, or paste a path to a VGM
  5  render     .fur to WAV
  6  report     analysis, nothing written
  7  condense   write copies of tracks with 1x..4x lower BPM
+ 8  gui        the same tools in a browser page
 ```
 
 `packs` is the place to start. It scans a folder (remembered next time), lists the packs with track counts and chips, and opens a track list with a dash next to tracks that have no `.fur` yet. `c` converts all tracks or a selection (`2-6`, `1,4`, or a single number), `e` changes a chip volume on the converted tracks, and `r` renders one to WAV so you can hear it. Conversion asks `optimise for pattern density? (Y/n)`, then a separate `detect and optimise for LFO loops? (Y/n)` (both default yes), then `experimental aggressive (lossy) sample clustering? (y/N)` (default no), then `normalize/verify through Furnace? (y/N)`; the default is no, so the menu does not launch Furnace unless you ask it to. The LFO answer is remembered for pasted-path conversions; the experimental lossy-clustering answer is only latched for the current menu session and is not persisted, so a new run defaults back to off. The menu stores its state in `~/.vgm2151fur.json`.
+
+Item 8, or `python -m vgm2151fur gui` directly, opens the same tools as a local web page. The server binds to 127.0.0.1 on a free port (`--port N` pins it, `--no-browser` does not open the browser) and serves one page: pack browsing with per-track "no .fur yet" markers, background convert/report jobs whose rows fill in while you keep working, chip-volume edits with per-chip targets, render-to-WAV with an inline player, the compare dialog, and drag-drop or paste to open paths. The options panel covers every convert flag — grid (ticks per row or a BPM cap), chip restriction, workers, the condense ladder with a preview of which factors an optimize pick keeps, normalize/verify through Furnace, LFO and lossy-sample switches, dirs layout. An optimize pick other than `none` converts as the condense ladder, like `--variants`. "Remember these" saves the options into the same `~/.vgm2151fur.json` the menu reads (under a `gui` key; the output folder and lossy sampling stay per-session). Nothing is installed beyond the standard library, and without Furnace only render, compare, and normalize stay off.
 
 ## Commands
 
@@ -70,7 +73,7 @@ python -m vgm2151fur render out/01.Track.fur --loops 2
 
 `edit` lists or changes chip volumes. `--chip` takes a number, a chip name, or `all`; `--factor 1.1` raises the volume by 10%, and `--value 0.9` sets it outright.
 
-`compare` exports the `.fur` through Furnace and reports stretches where its pitch stream differs from the source VGM by more than half a semitone for at least 100 ms. A run is worth listening to; no runs means the two register streams agree where it matters.
+`compare` exports the `.fur` through Furnace and reports stretches where its pitch stream differs from the source VGM by more than half a semitone for at least 100 ms. A run is worth listening to; no runs means the two register streams agree where it matters. Furnace's VGM exporter does not write the Bubble System WSG, so its channels are compared against the `.fur`'s own pattern notes and instrument pitch macros instead; the AY channels still use the export.
 
 `render` writes a WAV of a `.fur` so you can hear the conversion.
 
@@ -94,7 +97,7 @@ tests/          unittest suite
 docs/           operating guide, format notes, chip notes
 ```
 
-Project state and workflow are in `docs/portable-context.md` and `docs/implementation-notes.md`. Chip details are in `docs/opm-notes.md`, `docs/ym2203.md`, `docs/ym2612.md`, `docs/ym2610.md`, `docs/opna-opll.md`, `docs/opl.md`, `docs/k053260.md`, `docs/scc-ay8910.md`, `docs/segapcm-c140.md`, `docs/c219.md`, `docs/k054539.md`, `docs/ga20.md`, `docs/msm5205.md`, `docs/msm5232.md`, `docs/es5503.md`, `docs/ssg-pcm.md`, `docs/nes-vrc7.md`, `docs/fds.md`, `docs/gb.md`, `docs/huc6280.md`, `docs/c352.md`, `docs/ymz280b.md`, `docs/multipcm.md`, `docs/upd7759.md`, `docs/pwm32x.md`, `docs/pokey.md`, `docs/mikey.md`, `docs/x1-010.md`, `docs/wonderswan.md`, `docs/qsound.md`, `docs/vsu.md`, `docs/saa1099.md` and `docs/t6w28.md`. `docs/merged-logs.md` covers multi-family modules, and `docs/psg-open-items.md` tracks the remaining AY accuracy gaps.
+Project state and workflow are in `docs/portable-context.md` and `docs/implementation-notes.md`. Chip details are in `docs/opm-notes.md`, `docs/ym2203.md`, `docs/ym2612.md`, `docs/ym2610.md`, `docs/opna-opll.md`, `docs/opl.md`, `docs/k053260.md`, `docs/scc-ay8910.md`, `docs/bubble-system.md`, `docs/segapcm-c140.md`, `docs/c219.md`, `docs/k054539.md`, `docs/ga20.md`, `docs/msm5205.md`, `docs/msm5232.md`, `docs/es5503.md`, `docs/ssg-pcm.md`, `docs/nes-vrc7.md`, `docs/fds.md`, `docs/gb.md`, `docs/huc6280.md`, `docs/c352.md`, `docs/ymz280b.md`, `docs/multipcm.md`, `docs/upd7759.md`, `docs/pwm32x.md`, `docs/pokey.md`, `docs/mikey.md`, `docs/x1-010.md`, `docs/wonderswan.md`, `docs/qsound.md`, `docs/vsu.md`, `docs/saa1099.md` and `docs/t6w28.md`. `docs/merged-logs.md` covers multi-family modules, and `docs/psg-open-items.md` tracks the remaining AY accuracy gaps.
 
 Open follow-ups are tracked in [TODO.md](./TODO.md).
 
@@ -146,6 +149,7 @@ Open follow-ups are tracked in [TODO.md](./TODO.md).
   - Volume stays the source's linear 0-255 value and the control-register output mask becomes `08xy` panning; each DAC system stays at 1.0 and the module master carries the VGM main-volume gain.
   - Sync/AM and swap modes are approximated as one-shot with a warning.
 - RF5C68 and RF5C164 share one Furnace system selected by `chipType`, and a looping SSG PCM DAC stream plays once because the AY sample instrument is one-shot.
+- Konami K005289 (Bubble System WSG) converts both wavetable voices from the 512-byte 4-bit PROM (8 waveforms per channel) on Furnace system `0xAD`. Volume and waveform come from the chip's `0x42` control writes; the AY-8910 that drives the board's volume/wave-select ports stays an ordinary AY-8910 (the VGM already carries the resolved WSG writes). `compare` checks the WSG channels against the `.fur`'s own patterns because Furnace's VGM exporter does not write the chip; render the WAV for listening.
 - SN76489 converts as four channels, and extreme periods or two notes on the same channel/row are approximated.
   - A clear attenuation jump back up becomes a note-on in the pattern; gradual swells stay in the volume column.
   - Held period motion becomes `E8xx`/`E9xx`/`E5xx` row effects when it fits the rows, with pitch macros reserved for sub-row motion.

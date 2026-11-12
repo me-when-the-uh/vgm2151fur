@@ -28,6 +28,13 @@ pack lands in its own subfolder. `edit` and `render` accept the pack folder
 after that: they read the `.fur` files in `fur/`. A pasted path can be
 quoted, and a glob the shell did not expand (`*.vgz`) is expanded by the tool.
 
+A Bubble System pack (Gradius, TwinBee and friends) carries two AY-8910s and
+the K005289 wavetable chip. The converter writes the AY systems plus a
+"Konami Bubble System WSG" system with two wavetable voices; the module keeps
+both AY chips even when one only drives the WSG control ports.
+`docs/bubble-system.md` covers the register map, the waveform PROM and the
+compare caveat.
+
 ### Condensed variants
 
 Furnace's BPM is `15 x rows/s`, so the way to make a track more readable is to
@@ -156,6 +163,45 @@ If the grid sounds wrong (notes landing between rows), run `report` on the
 offending track, find the measured rows per second, and pin it with
 `--speed N`. The analyzer prints its estimate and the evidence it used.
 
+## The browser GUI
+
+The menu's item 8, or `python -m vgm2151fur gui`, starts a local web server
+on 127.0.0.1 and opens the page in your browser. `--port N` pins a fixed
+port instead of a free one, and `--no-browser` keeps the browser closed when
+you would rather paste the printed URL yourself. The server serves that one
+page and its JSON API, talks to nothing else on the network, and stops with
+Ctrl+C in the terminal.
+
+The left half is a pack browser: scan a folder of packs, open one, and tick
+tracks. `convert selected` and `report selected` run in the background —
+each job appears as a chip below, its per-track rows fill in as files
+finish, and the log line matches what the commands print. A conversion with
+an optimize pick other than `none` is the condense ladder: every factor
+lands in that track's variants table with its keys/miss counts, the picked
+factor highlighted, and `condense.tsv` plus the `default/` /
+`xN optimised/` folders written when dirs layout is on. Tracks that already
+have a module get buttons for chip volumes, a WAV render (it plays in the
+bar at the bottom of the page), and a compare dialog. Dragging a file or
+folder onto the page, or pasting a path outside an input field, opens it
+directly.
+
+The options panel mirrors the `convert` flags: ticks per row or a BPM cap,
+the chip restriction, workers, the condense ladder (a custom factor list
+overrides it), `optimize` mode, normalize/verify through Furnace, the LFO
+and lossy-sample switches, dirs layout, C352 quad output, render loops and
+the compare channel. The BPM cap becomes a row length exactly as the command
+line computes it. `remember these` writes the options into the `gui` key of
+`~/.vgm2151fur.json`, the same file the menu reads; the output folder and
+the lossy-sampling switch stay per-session and never persist.
+
+Heavy jobs (convert, report) run one after another on their own queue, so a
+long conversion cannot starve the fast ones (render, compare), and any
+queued job can still be cancelled from its detail view. Renders serve their
+WAV through a handle that only exists while the GUI runs, so nothing on
+disk is served beyond what was just rendered. Without Furnace found, render,
+compare, and normalize stay off; convert, report, and chip volumes still
+work.
+
 ## Raising one chip
 
 A converted pack often needs a level tweak before it sits right in a mix.
@@ -181,7 +227,11 @@ the capped value.
 Three levels of checking exist, cheapest first.
 
 1. `compare` (or `tools/vgmdiff.py` on an exported VGM): pitch runs on one
-   channel. Fast, no audio, catches base-pitch and glide errors.
+   channel. Fast, no audio, catches base-pitch and glide errors. `--channel`
+   names a module column; on a Bubble System module the AY chips own 0-5 and
+   the WSG voices 6-7. The WSG side is checked against the `.fur`'s own
+   patterns because Furnace's VGM exporter does not include that system;
+   `render` is still the listening check.
 2. `tools/vgmchroma.py`: chroma similarity per 100 ms window between the
    source and an exported VGM, both through the same renderer. Finds windows
    where the music differs, then you explain them with level 1.

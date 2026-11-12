@@ -14,6 +14,7 @@ from pathlib import Path
 
 from vgm2151fur.furwrite import (
     CHIP_AY8910, CHIP_C140, CHIP_C219, CHIP_C352, CHIP_GB, CHIP_K007232,
+    CHIP_K005289,
     CHIP_K051649,
     CHIP_K052539,
     CHIP_K053260, CHIP_MSM6258, CHIP_MSM6295, CHIP_OPL, CHIP_OPL2,
@@ -82,6 +83,7 @@ CHIP_CHANNELS = {
     CHIP_VBOY: 6,  # Virtual Boy VSU: five wave voices + noise
     CHIP_K051649: 5,  # Konami SCC
     CHIP_K052539: 5,  # Konami SCC+
+    CHIP_K005289: 2,  # Konami Bubble System WSG (two wavetable voices)
     CHIP_AY8910: 3,  # AY-3-8910
     CHIP_SAA1099: 6,  # Philips SAA1099
     CHIP_POKEY: 4,  # Atari POKEY

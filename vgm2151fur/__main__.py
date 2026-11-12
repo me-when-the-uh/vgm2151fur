@@ -27,7 +27,7 @@ from vgm2151fur.furnace import FurnaceError, render_wav
 from vgm2151fur.packs import pack_tracks
 from vgm2151fur.paths import clean_text, dedupe, expand_token, fur_targets, vgm_targets
 
-COMMANDS = {"convert", "report", "edit", "compare", "render", "menu"}
+COMMANDS = {"convert", "report", "edit", "compare", "render", "menu", "gui"}
 _WORKERS_HELP = (
     "tracks at once, at low priority (default: logical CPUs minus one or two "
     "threads, capped at 16; requests cap at threads minus one, 31 max)"
@@ -373,7 +373,7 @@ def _edit(args) -> int:
 
 
 def _compare(args) -> int:
-    from vgm2151fur.diag import compare_fur_to_source
+    from vgm2151fur.diag import DiagError, compare_fur_to_source
 
     source = Path(clean_text(str(args.source)))
     fur = Path(clean_text(str(args.fur)))
@@ -385,7 +385,7 @@ def _compare(args) -> int:
         return 1
     try:
         runs, exported = compare_fur_to_source(source, fur, args.channel)
-    except FurnaceError as exc:
+    except (FurnaceError, DiagError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
     from vgm2151fur.audit import compare_ym2608_samples, compare_ym2610_samples
@@ -599,6 +599,16 @@ def build_parser() -> argparse.ArgumentParser:
     render.add_argument("--loops", type=int, default=1, help="song loops to render")
 
     sub.add_parser("menu", help="interactive menu")
+
+    gui = sub.add_parser("gui", help="the same tools in a browser page")
+    gui.add_argument(
+        "--port", type=int, default=None,
+        help="fixed port (default: any free one on 127.0.0.1)",
+    )
+    gui.add_argument(
+        "--no-browser", action="store_true",
+        help="serve without opening the browser automatically",
+    )
     return ap
 
 
@@ -708,6 +718,10 @@ def _main(argv: list[str] | None = None) -> int:
         return _compare(args)
     if args.cmd == "render":
         return _render(args)
+    if args.cmd == "gui":
+        from vgm2151fur.gui import launch
+
+        return launch(port=args.port, open_browser=not args.no_browser)
     return 2
 
 
