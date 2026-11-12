@@ -28,6 +28,13 @@ pack lands in its own subfolder. `edit` and `render` accept the pack folder
 after that: they read the `.fur` files in `fur/`. A pasted path can be
 quoted, and a glob the shell did not expand (`*.vgz`) is expanded by the tool.
 
+A Bubble System pack (Gradius, TwinBee and friends) carries two AY-8910s and
+the K005289 wavetable chip. The converter writes the AY systems plus a
+"Konami Bubble System WSG" system with two wavetable voices; the module keeps
+both AY chips even when one only drives the WSG control ports.
+`docs/bubble-system.md` covers the register map, the waveform PROM and the
+compare caveat.
+
 ### Condensed variants
 
 Furnace's BPM is `15 x rows/s`, so the way to make a track more readable is to
@@ -220,7 +227,11 @@ the capped value.
 Three levels of checking exist, cheapest first.
 
 1. `compare` (or `tools/vgmdiff.py` on an exported VGM): pitch runs on one
-   channel. Fast, no audio, catches base-pitch and glide errors.
+   channel. Fast, no audio, catches base-pitch and glide errors. `--channel`
+   names a module column; on a Bubble System module the AY chips own 0-5 and
+   the WSG voices 6-7. The WSG side is checked against the `.fur`'s own
+   patterns because Furnace's VGM exporter does not include that system;
+   `render` is still the listening check.
 2. `tools/vgmchroma.py`: chroma similarity per 100 ms window between the
    source and an exported VGM, both through the same renderer. Finds windows
    where the music differs, then you explain them with level 1.

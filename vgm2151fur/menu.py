@@ -736,7 +736,7 @@ def cmd_edit(read, out) -> None:
 
 
 def cmd_compare(read, out) -> None:
-    from vgm2151fur.diag import compare_fur_to_source
+    from vgm2151fur.diag import DiagError, compare_fur_to_source
 
     src = _ask_file(read, out, "source VGM/VGZ")
     if src is None:
@@ -752,7 +752,7 @@ def cmd_compare(read, out) -> None:
         return
     try:
         runs, exported = compare_fur_to_source(src, fur, channel)
-    except FurnaceError as exc:
+    except (FurnaceError, DiagError) as exc:
         out(f"  {exc}")
         return
     out(f"  export: {exported.name}")

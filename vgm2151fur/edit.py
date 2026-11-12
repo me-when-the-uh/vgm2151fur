@@ -17,7 +17,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from vgm2151fur.furwrite import (
-    CHIP_AY8910, CHIP_C140, CHIP_C219, CHIP_C352, CHIP_K007232, CHIP_K051649,
+    CHIP_AY8910, CHIP_C140, CHIP_C219, CHIP_C352, CHIP_K007232,
+    CHIP_K005289, CHIP_K051649,
     CHIP_K052539,
     CHIP_K053260, CHIP_MSM6258, CHIP_MSM6295, CHIP_OPL, CHIP_OPL2,
     CHIP_GA20, CHIP_MSM5232,
@@ -48,6 +49,7 @@ CHIP_NAMES = {
     CHIP_K053260: "K053260",
     CHIP_K051649: "SCC",
     CHIP_K052539: "SCC+",
+    CHIP_K005289: "Bubble System WSG",
     0x8A: "FDS",
     0x96: "WonderSwan",
     0xE0: "QSound",

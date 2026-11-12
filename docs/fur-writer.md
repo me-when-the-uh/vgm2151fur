@@ -80,7 +80,8 @@ triples start 31 bytes plus 12 per chip before the first ADIR pointer.
   `0xAA` MSM6295, `0xAB` MSM6258,
   `0x9B` SegaPCM, `0xCE` C140, `0xCC` Konami K053260, `0xD0` C352,
   `0xA1` Konami SCC (K051649),
-  `0xB4` Konami SCC+ (K052539), `0x80` AY-3-8910, `0x97` SAA1099,
+  `0xB4` Konami SCC+ (K052539), `0xAD` Konami K005289 (Bubble System WSG),
+  `0x80` AY-3-8910, `0x97` SAA1099,
   `0x9D` Konami VRC7,
   `0x06` NES APU (five channels: two pulses, triangle, noise, DPCM). A module lists
   the chips the source had usable samples for: a melody-only track opens with
@@ -127,11 +128,14 @@ triples start 31 bytes plus 12 per chip before the first ADIR pointer.
   anything else. Furnace builds its pitch table from the double, so sending a
   nearly identical clock would shift a table entry here and there. The AY
   flag also carries `chipType=1` for the YM2149 family (VGM type 0x10/0x11).
+  The WSG flag is empty at 3579545 Hz (Furnace's COLOR_NTSC default) and
+  carries `customClock=` otherwise.
 - The volume byte per chip comes from the reference player's mix, not a flat
   unity: libvgm defaults, extra-header volume entries, the C140 core scale
   (2/3) and instance division. `_FURNACE_VOLUME_SCALE` corrects the Furnace
   cores against measured renders (AY 1.46, SCC 1.04; measured on two-chip
   modules because the player normalizes a lone chip and Furnace does not).
+  Bubble System modules are the exception: every system is written at 1.0.
   The K053260 core is exactly half the reference core: MAME shifts the voice
   product by 6 bits and the Furnace core by 7. The desired gain is 2.0. The
   writer raises the master to 2.0, stores the K053260 at 1.0 and scales the
@@ -228,6 +232,13 @@ list (`WAVE` blocks, addressed by the INFO wave pointer table). The chip
 reads signed bytes and Furnace's wavetable is unsigned with 128 as the
 center, so each byte is stored as `signed + 128`. Notes with the same image
 and the same macros share an instrument.
+
+The Bubble System WSG (`0xAD`) uses the same `DIV_INS_SCC` instrument, but
+its wavetable height is 15: the PROM holds unsigned 4-bit samples (8 is the
+center), so the writer stores the PROM bytes unchanged instead of
+`signed + 128`. Its `WAVE` blocks follow the WonderSwan blocks (last in the
+list), and the instrument's wave and wave-macro indices are shifted by that
+base.
 
 The AY instrument (`DIV_INS_AY`, type 6) carries a phase-reset macro (file
 code 14) - the chip restarts its hardware envelope only when the shape

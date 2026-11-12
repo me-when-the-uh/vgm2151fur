@@ -123,6 +123,9 @@ CHIP_C352 = 0xD0
 CHIP_K051649 = 0xA1
 CHIP_K052539 = 0xB4
 CHIP_AY8910 = 0x80
+# Konami K005289 (Bubble System WSG): two 32x16 wavetable voices.  Furnace's
+# platform uses the SCC instrument editor and defaults to COLOR_NTSC.
+CHIP_K005289 = 0xAD
 # DIV_SYSTEM_POKEY: four voices, AUDCTL waveform/filter/join features.
 CHIP_POKEY = 0x94
 # DIV_SYSTEM_LYNX: Atari Lynx Mikey, four LFSR/DAC voices.
@@ -961,11 +964,14 @@ def _wave_label(wave: bytes) -> str:
     return f"{h:04x}"
 
 
-def _write_ins_scc(b: Buf, name: str, ins) -> None:
+def _write_ins_scc(
+    b: Buf, name: str, ins, *, wave_base: int = 0,
+) -> None:
     """DIV_INS_SCC: the note starts on wavetable `ins.wave`.
 
     `ins.waves` and `ins.pitch` carry the driver's per-tick wave and pitch
     motion. The platform reads them as `std.wave` and `std.pitch`.
+    `wave_base` maps the family's own list onto the module-wide wave list.
     """
     size_off, start = b.begin_block(b"INS2")
     b.u16(FUR_VERSION)
@@ -980,8 +986,9 @@ def _write_ins_scc(b: Buf, name: str, ins) -> None:
     ws_size = len(b.b)
     b.u16(0)
     ws_start = len(b.b)
-    b.u32(ins.wave)  # wave1
-    b.u32(ins.wave)  # wave2, only used by the dual-wave effects
+    wave_index = wave_base + max(0, int(ins.wave))
+    b.u32(wave_index)  # wave1
+    b.u32(wave_index)  # wave2, only used by the dual-wave effects
     b.u8(1)  # rateDivider
     b.u8(0)  # effect: none
     b.u8(1)  # enabled
@@ -992,7 +999,7 @@ def _write_ins_scc(b: Buf, name: str, ins) -> None:
     b.u8(0)  # param3
     b.u8(0)  # param4
     b.b[ws_size:ws_size + 2] = int(len(b.b) - ws_start).to_bytes(2, "little")
-    _write_tone_macros(b, ins, wave=True)
+    _write_tone_macros(b, ins, wave=True, wave_base=wave_base)
     b.raw(b"EN")
     b.end_block(size_off, start)
 
@@ -1036,7 +1043,7 @@ def _write_ins_pce(b: Buf, name: str, ins) -> None:
 
 def _write_tone_macros(
     b: Buf, ins, *, wave: bool, reset: bool = False,
-    ay_compat: bool = True,
+    ay_compat: bool = True, wave_base: int = 0,
 ) -> None:
     """MA feature for an SCC/AY/SAA instrument.
 
@@ -1073,9 +1080,10 @@ def _write_tone_macros(
             b, 2, ins.duty, speed=ins.duty_speed, loop=ins.duty_loop,
         )
     if wave and ins.waves:
+        wave_values = tuple(wave_base + v for v in ins.waves)
         _write_macro(
-            b, 3, ins.waves, speed=ins.wave_speed, loop=ins.wave_loop,
-            width=2 if max(ins.waves) > 127 else 1,
+            b, 3, wave_values, speed=ins.wave_speed, loop=ins.wave_loop,
+            width=2 if max(wave_values) > 127 else 1,
         )
     if ins.mode:
         # AY mode bits (tone 1, noise 2, envelope 4). Before file version
@@ -2105,6 +2113,14 @@ def k051649_flag_text(clock: int) -> str:
     if module_clock(clock) != FURNACE_CLOCK_DEFAULT:
         return f"customClock={clock}"
     return ""
+
+
+def k005289_flag_text(clock: int) -> str:
+    """WSG custom clock, or "" for Furnace's COLOR_NTSC default."""
+    clk = clock or 3579545
+    if abs(clk - 3579545) <= 2:
+        return ""
+    return f"customClock={clk}"
 
 
 # Furnace's POKEY clock list: NTSC (default) and PAL.  COLOR_PAL*2/5 is
@@ -4816,6 +4832,7 @@ def write_fur(
         or getattr(song, "fds_ids", ())
         or getattr(song, "wonderswan_ids", ())
         or getattr(song, "qsound_ids", ())
+        or getattr(song, "k005289_ids", ())
         # YMZ280B is a sample engine with real module columns; a YMZ-only log
         # must not gain an empty YM2151 placeholder above it.
         or getattr(song, "ymz280b_samples", ())
@@ -5081,8 +5098,12 @@ def write_fur(
     qsound_specs = list(getattr(song, "qsound_ins", ()) or ())
     qsound_smps = list(getattr(song, "qsound_samples", ()) or ())
     scc_chip = CHIP_K052539 if song.vgm.k051649_plus else CHIP_K051649
+    k005289_ids = list(getattr(song, "k005289_ids", ()) or ())
+    k005289_waves = list(getattr(song, "k005289_waves", ()) or ())
+    k005289_specs = list(getattr(song, "k005289_ins", ()) or ())
     n_scc = 5 * len(scc_ids)
     n_ay = 3 * len(ay_ids)
+    n_k005289 = 2 * len(k005289_ids)
     n_psg = 4 * len(psg_ids)
     n_nes = 5 * len(nes_ids)
     n_huc6280 = 6 * len(huc6280_ids)
@@ -5146,6 +5167,7 @@ def write_fur(
         + len(es5503_oscs) + len(psg_dac_voices)
         + n_scc + n_ay + n_nes + n_huc6280 + n_gb + n_vsu + n_saa
         + n_pokey + n_mikey + n_x1 + n_fds + n_wonderswan + n_qsound
+        + n_k005289
     )
     if n_ch == 0:
         raise ValueError("write_fur: need include_fm and/or include_pcm")
@@ -5175,6 +5197,7 @@ def write_fur(
         + len(scc_specs) + len(ay_specs) + len(psg_specs) + len(nes_specs)
         + len(huc6280_specs) + len(gb_specs) + len(vsu_specs)
         + len(saa_specs) + len(mikey_specs) + len(x1_specs)
+        + len(k005289_specs)
     )
     n_smp = (
         len(pcm_smps) + len(oki_smps) + len(adpcm_smps)
@@ -5194,7 +5217,7 @@ def write_fur(
     n_wav = (
         len(scc_waves) + len(huc6280_waves) + len(gb_waves) + len(vsu_waves)
         + len(x1_waves) + len(x1_envs)
-        + len(fds_waves) + len(wonderswan_waves)
+        + len(fds_waves) + len(wonderswan_waves) + len(k005289_waves)
     )
     # The VSU's 10xx effects name a wavetable in the module-wide list.  Keep
     # the block order in step with the index the patterns use.
@@ -5203,6 +5226,7 @@ def write_fur(
     x1_env_base = x1_wave_base + len(x1_waves)
     fds_wave_base = x1_env_base + len(x1_envs)
     wonderswan_wave_base = fds_wave_base + len(fds_waves)
+    k005289_wave_base = wonderswan_wave_base + len(wonderswan_waves)
 
     # Analysis numbers sample-chip channels after the FM block. With no FM
     # they shift down to stay inside n_ch.
@@ -5304,7 +5328,7 @@ def write_fur(
         + len(huc6280_specs) + len(gb_specs) + len(vsu_specs)
         + len(saa_specs) + len(pokey_specs) + len(mikey_specs)
         + len(x1_specs) + len(fds_specs) + len(wonderswan_specs)
-        + len(qsound_specs)
+        + len(qsound_specs) + len(k005289_specs)
     )
     n_smp = (
         len(pcm_smps) + len(oki_smps) + len(adpcm_smps)
@@ -5500,6 +5524,10 @@ def write_fur(
         for voice in range(3):
             names_long.append(f"QSound ADPCM {voice + 1} ({cid + 1})")
             names_short.append(f"QA{cid + 1}-{voice + 1}")
+    for cid in k005289_ids:
+        for voice in range(2):
+            names_long.append(f"WSG {cid + 1}-{voice + 1}")
+            names_short.append(f"W{cid + 1}-{voice + 1}")
 
     label_parts: list[str] = []
     if fm_present:
@@ -5611,6 +5639,8 @@ def write_fur(
         label_parts.append("WonderSwan")
     if qsound_ids:
         label_parts.append("Capcom QSound")
+    if k005289_ids:
+        label_parts.append("Konami Bubble System WSG")
     chip_label = " + ".join(label_parts) or "empty"
 
     comment = (
@@ -6083,6 +6113,9 @@ def write_fur(
         flag_texts.append(
             f"echoDelay={delay}\nechoFeedback={feedback}"
         )
+    for _cid in k005289_ids:
+        chips.append(CHIP_K005289)
+        flag_texts.append(k005289_flag_text(song.vgm.k005289_clock))
     n_chips = len(chips)
     # MultiPCM owns a 2 MB / 512-sample memory.  Do not let every other
     # sample body in a combined module fill it; only the bodies written with
@@ -6129,10 +6162,12 @@ def write_fur(
     psg_dac_set = set(psg_dac_sys.values())
     msm5205_set = set(msm5205_sys.values())
     for i, chip in enumerate(chips):
-        # Twin16 K007232 sits under the OPM; the rip's mix says how far. Every
-        # other sample chip uses the player's mix (defaults + extra-header
-        # entries) through _sample_chip_volume.
-        if chip == CHIP_K007232 and include_fm:
+        # Bubble System modules ship with a flat mixer: every system at unity.
+        # (The reference player halves the dual AY pair and the cores have
+        # different output scales; adjust the sliders in Furnace to taste.)
+        if k005289_ids:
+            cv = 1.0
+        elif chip == CHIP_K007232 and include_fm:
             cv = k_vol
         elif i in pwm_pan:
             # VGMPlay's 32X PWM default is 0xE0 for the stereo chip; each
@@ -6710,6 +6745,20 @@ def write_fur(
         _write_ins_qsound(b, name, replace(
             spec, sample=qsound_smp_base + max(0, spec.sample),
         ))
+    for i, spec in enumerate(k005289_specs):
+        ins_ptrs.append(len(b))
+        wave = (
+            k005289_waves[spec.wave]
+            if spec.wave < len(k005289_waves) else b""
+        )
+        name = f"WSG {i:02d} {_wave_label(wave)}"
+        if spec.waves:
+            name += "+morph"
+        if spec.pitch:
+            name += "+pitch"
+        _write_ins_scc(
+            b, name, spec, wave_base=k005289_wave_base,
+        )
 
     smp_ptrs: list[int] = []
     for i, smp in enumerate(pcm_smps):
@@ -7097,6 +7146,12 @@ def write_fur(
         # WonderSwan wave RAM is 32 4-bit samples per channel.
         wave_ptrs.append(_write_wave(
             b, f"ws_wave_{_wave_label(wave)}", bytes(wave), maximum=15,
+        ))
+    for wave in k005289_waves:
+        # The WSG PROM holds 32 4-bit samples per waveform (8 banks per
+        # channel); Furnace's platform subtracts 8 when it loads them.
+        wave_ptrs.append(_write_wave(
+            b, f"wsg_wave_{_wave_label(wave)}", bytes(wave), maximum=15,
         ))
 
     for i, p in enumerate(ins_ptrs):

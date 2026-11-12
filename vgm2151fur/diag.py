@@ -22,6 +22,7 @@ from pathlib import Path
 from vgm2151fur.analyze import kc_kf_units
 from vgm2151fur.ay8910 import ay_min_period
 from vgm2151fur.furnace import export_vgm
+from vgm2151fur.k005289 import K005289_DEFAULT_CLOCK
 from vgm2151fur.opl import (
     N as OPL_N, SLOT_ADDR, OPLState, channel_count, is_drum_channel,
     opl_pitch_units,
@@ -50,6 +51,10 @@ class PitchRun:
             f"{self.t0 / 44100:7.3f}-{self.t1 / 44100:7.3f}s "
             f"({(self.t1 - self.t0) / 44.1:5.0f} ms)  {self.worst_st:+.2f} st"
         )
+
+
+class DiagError(Exception):
+    """The comparison cannot be made: the exported VGM has no such chip."""
 
 
 def kc_kf_stream(vgm, ch: int) -> list[tuple[int, int]]:
@@ -596,6 +601,310 @@ def _ym2610_ssg_stream(vgm, cid: int, ssg: int) -> list[tuple[int, int]]:
                        vgm.ym2610_clock or YM2610_DEFAULT_CLOCK, 32)
 
 
+def k005289_units(period: int) -> float:
+    """Pitch for a WSG counter value (``0xFFF - register``); larger is higher.
+
+    The voice sounds at ``clock / (32 * (period + 1))``, so the clock and
+    divider cancel between two logs (source and Furnace export).
+    """
+    return -768.0 * math.log2(max(1, period + 1))
+
+
+def k005289_pitch_stream(
+    vgm, cid: int, voice: int,
+) -> list[tuple[int, int]]:
+    """(sample, pitch units) after each TG write on one WSG voice."""
+    out: list[tuple[int, int]] = []
+    latch = 0
+    have = False
+    for w in vgm.writes:
+        if w.chip != "k005289" or w.chip_id != cid:
+            continue
+        off = w.reg & 0x0F
+        if off == 2 + voice:
+            latch = w.val & 0xFFF
+            have = True
+        elif off == 4 + voice and have:
+            out.append((w.sample, round(k005289_units(0xFFF - latch))))
+    return out
+
+
+def k005289_keyed_intervals(
+    vgm, cid: int, voice: int,
+) -> list[tuple[int, int]]:
+    """Spans where one WSG voice has a non-zero control volume.
+
+    The chip has no key-on bit; the 4-bit volume is the only gate.
+    """
+    out: list[tuple[int, int]] = []
+    on = False
+    start = 0
+    for w in vgm.writes:
+        if w.chip != "k005289" or w.chip_id != cid:
+            continue
+        if (w.reg & 0x0F) != voice:
+            continue
+        now = (w.val & 0x0F) > 0
+        if now and not on:
+            start = w.sample
+            on = True
+        elif not now and on:
+            out.append((start, w.sample))
+            on = False
+    if on:
+        out.append((start, vgm.total_samples or (
+            max((w.sample for w in vgm.writes), default=start) + 1)))
+    return out
+
+
+def _tone_layout(vgm) -> list[tuple[str, int, int]] | None:
+    """(family, chip id, voices) in module order for a Bubble System module.
+
+    The writer puts the AY systems first and the WSG last.  Only that shape is
+    mapped here; a module with another tone family keeps the existing
+    single-family comparison path.
+    """
+    wsg = sorted({
+        w.chip_id for w in vgm.writes if w.chip == "k005289"
+    })
+    if not wsg:
+        return None
+    other_tones = {
+        "k051649", "nes", "huc6280", "gb", "vsu", "saa1099", "pokey",
+        "mikey", "x1_010", "fds", "wonderswan", "qsound",
+    }
+    if any(w.chip in other_tones for w in vgm.writes):
+        return None
+    ay = sorted({
+        w.chip_id for w in vgm.writes if w.chip == "ay8910"
+    })
+    if ay and getattr(vgm, "ay8910_dual", False):
+        ay = sorted(set(ay) | {0, 1})
+    return (
+        [("ay8910", cid, 3) for cid in ay]
+        + [("k005289", cid, 2) for cid in wsg]
+    )
+
+
+def tone_pitch_stream(
+    vgm, ch: int, layout: list[tuple[str, int, int]],
+) -> list[tuple[int, int]]:
+    """Pitch stream for one module channel of a tone-only module."""
+    for family, cid, voices in layout:
+        if ch < voices:
+            if family == "ay8910":
+                return _ssg_stream(
+                    vgm, "ay8910", cid, ch,
+                    vgm.ay8910_clock or 3579545, 8,
+                )
+            return k005289_pitch_stream(vgm, cid, ch)
+        ch -= voices
+    return []
+
+
+def tone_keyed_intervals(
+    vgm, ch: int, layout: list[tuple[str, int, int]],
+) -> list[tuple[int, int]]:
+    """Sounding spans for one module channel of a tone-only module."""
+    for family, cid, voices in layout:
+        if ch < voices:
+            if family == "ay8910":
+                return _ssg_keyed_intervals(
+                    vgm, "ay8910", cid, ch,
+                    vgm.ay8910_clock or 3579545, 8,
+                )
+            return k005289_keyed_intervals(vgm, cid, ch)
+        ch -= voices
+    return []
+
+
+def _macro_pitch_values(block: bytes) -> tuple | None:
+    """(values, speed, delay, loop, mode) of an INS2 block's pitch macro."""
+    try:
+        pos = block.index(b"MA")
+    except ValueError:
+        return None
+    size = int.from_bytes(block[pos + 2:pos + 4], "little")
+    cursor = pos + 4 + 2  # skip the macro header length field
+    end = pos + 4 + size
+    while cursor + 8 <= end and block[cursor] != 0xFF:
+        code, length, loop, _rel, mode, word, delay, speed = (
+            block[cursor:cursor + 8]
+        )
+        cursor += 8
+        width = word >> 6
+        values: list[int] = []
+        for _ in range(length):
+            if width == 2:
+                values.append(int.from_bytes(
+                    block[cursor:cursor + 2], "little", signed=True,
+                ))
+                cursor += 2
+            elif width == 3:
+                values.append(int.from_bytes(
+                    block[cursor:cursor + 4], "little", signed=True,
+                ))
+                cursor += 4
+            else:
+                values.append(block[cursor])
+                cursor += 1
+        if code == 4:
+            return (tuple(values), max(1, speed), delay, loop, mode)
+    return None
+
+
+def _macro_at(macro, tick: int) -> int:
+    """The pitch-macro value at one tick, following Furnace's delay/loop."""
+    if not macro:
+        return 0
+    values, speed, delay, loop, mode = macro
+    if not values:
+        return 0
+    seq: list[int] = [values[0]] * (delay + 1)
+    for value in values[1:]:
+        seq.extend([value] * speed)
+    if loop != 255 and loop < len(values):
+        tail: list[int] = []
+        for value in values[loop:]:
+            tail.extend([value] * speed)
+        while tail and len(seq) <= tick:
+            seq.extend(tail)
+    if tick < len(seq):
+        value = seq[tick]
+    else:
+        value = seq[-1]
+    if mode:
+        # Relative macro: each step adds to the previous offset.
+        total = 0
+        for i in range(min(tick, len(seq) - 1) + 1):
+            total += seq[i]
+        return total
+    return value
+
+
+def _fur_wsg_stream(
+    fur: Path, ch: int, clock: int,
+) -> tuple[list[tuple[int, int]], list[tuple[int, int]]]:
+    """(pitch stream, keyed intervals) for one WSG channel of a .fur.
+
+    Furnace's VGM export has no Bubble System WSG case, so the module's own
+    patterns are the independent record of what the .fur asks the chip to
+    play.  This walks them with the same pitch table the platform uses
+    (linear pitch, 32x divider) and folds in each instrument's pitch macro.
+    """
+    from vgm2151fur.furio import (
+        CHIP_CHANNELS, iter_blocks, load_fur_bytes, parse_fur,
+    )
+    from vgm2151fur.furwrite import CHIP_K005289
+    from vgm2151fur.pitch import PeriodPitchTable
+
+    data = load_fur_bytes(fur)
+    mod = parse_fur(data)
+    start = 0
+    voice: int | None = None
+    for chip in mod.chips:
+        span = CHIP_CHANNELS.get(chip, 1)
+        if start <= ch < start + span:
+            if chip != CHIP_K005289:
+                return [], []
+            voice = ch - start
+            break
+        start += span
+    if voice is None:
+        return [], []
+
+    macros = [
+        _macro_pitch_values(block)
+        for _off, mag, _size, block in iter_blocks(data) if mag == b"INS2"
+    ]
+    tick = 44100.0 / max(1e-6, float(mod.hz or 60.0))
+    row_samples = max(1, int(round(tick * max(1, mod.speed))))
+    table = PeriodPitchTable(440.0, float(clock or K005289_DEFAULT_CLOCK), 32)
+
+    notes: list[tuple[int, int, int, int, int]] = []
+    intervals: list[tuple[int, int]] = []
+    open_note: list | None = None
+    cur_ins = 0
+    orders = mod.orders[ch] if ch < len(mod.orders) else []
+    order = 0
+    row = 0
+    time_row = 0
+    steps = 0
+    # Dxx breaks to the next order and Bxx is the loop jump at the end; a
+    # hard cap keeps a malformed module from looping forever here.
+    while 0 <= order < len(orders) and steps < 8192:
+        pidx = orders[order]
+        rows = mod.patterns.get((ch, pidx), [])
+        if row < 0 or row >= len(rows):
+            order += 1
+            row = 0
+            continue
+        cell = rows[row]
+        row_sample = time_row * row_samples
+        if cell.ins >= 0:
+            cur_ins = cell.ins
+        if cell.note == 180:
+            if open_note is not None:
+                intervals.append((open_note[0], row_sample))
+                notes.append((
+                    open_note[0], row_sample, open_note[1],
+                    open_note[2], open_note[3],
+                ))
+                open_note = None
+        elif 0 <= cell.note < 180:
+            if open_note is not None:
+                intervals.append((open_note[0], row_sample))
+                notes.append((
+                    open_note[0], row_sample, open_note[1],
+                    open_note[2], open_note[3],
+                ))
+            delay = next((v for c, v in cell.fx if c == 0xED), 0)
+            e5 = next((v for c, v in cell.fx if c == 0xE5), 0x80)
+            open_note = [
+                int(round(row_sample + delay * tick)),
+                cell.note, cur_ins, e5,
+            ]
+        brk = next((v for c, v in cell.fx if c == 0x0D), None)
+        jump = next((v for c, v in cell.fx if c == 0x0B), None)
+        time_row += 1
+        steps += 1
+        if brk is not None:
+            order += 1
+            row = brk
+        elif jump is not None:
+            # The loop jump sits on the last content row; the first pass is
+            # complete here.
+            break
+        else:
+            row += 1
+            if row >= len(rows):
+                order += 1
+                row = 0
+    last_sample = time_row * row_samples
+    if open_note is not None:
+        intervals.append((open_note[0], last_sample))
+        notes.append((
+            open_note[0], last_sample, open_note[1],
+            open_note[2], open_note[3],
+        ))
+
+    stream: list[tuple[int, int]] = []
+    for start_sample, end_sample, note, ins, e5 in notes:
+        macro = macros[ins] if 0 <= ins < len(macros) else None
+        end_sample = max(start_sample + 1, end_sample)
+        ticks = max(1, int(round((end_sample - start_sample) / tick)))
+        last = None
+        for i in range(ticks + 1):
+            sample = int(round(start_sample + i * tick))
+            fine = (e5 - 0x80) + _macro_at(macro, i)
+            value = max(1, table.value(note, fine))
+            units = round(-768.0 * math.log2(value))
+            if units != last:
+                stream.append((sample, units))
+                last = units
+    return stream, intervals
+
+
 def ym2610_pitch_stream(vgm, ch: int) -> list[tuple[int, int]]:
     """(sample, pitch units) for one YM2610 module channel.
 
@@ -842,6 +1151,7 @@ def pitch_runs(
     opn = any(w.chip == "ym2203" for w in src_vgm.writes)
     opn2 = any(w.chip == "ym2612" for w in src_vgm.writes)
     opl = _opl_kind(src_vgm) is not None
+    tone_layout = _tone_layout(src_vgm)
     if opnb:
         stream = ym2610_pitch_stream
     elif opna:
@@ -852,6 +1162,9 @@ def pitch_runs(
         stream = opn_pitch_stream
     elif opl:
         stream = opl_pitch_stream
+    elif tone_layout is not None:
+        def stream(vgm, c):
+            return tone_pitch_stream(vgm, c, tone_layout)
     else:
         stream = kc_kf_stream
     a = stream(src_vgm, ch)
@@ -864,32 +1177,14 @@ def pitch_runs(
         limit = other_vgm.total_samples
         if src_vgm.total_samples:
             limit = min(limit, src_vgm.total_samples)
-    times = {s for s, _v in a} | {s for s, _v in b}
-    if limit is not None:
-        times = {t for t in times if t <= limit}
-    keyed_at = None
+    intervals: list[tuple[int, int]] | None = None
     if opnb or opna:
         intervals = (ym2610_keyed_intervals if opnb else ym2608_keyed_intervals)(
             src_vgm, ch)
-        times |= {s for s, _e in intervals}
-        times |= {e for _s, e in intervals}
-
-        def keyed_at(t: int) -> bool:
-            return any(s <= t < e for s, e in intervals)
     elif opn2:
         intervals = ym2612_keyed_intervals(src_vgm, ch)
-        times |= {s for s, _e in intervals}
-        times |= {e for _s, e in intervals}
-
-        def keyed_at(t: int) -> bool:
-            return any(s <= t < e for s, e in intervals)
     elif opn:
         intervals = opn_keyed_intervals(src_vgm, ch)
-        times |= {s for s, _e in intervals}
-        times |= {e for _s, e in intervals}
-
-        def keyed_at(t: int) -> bool:
-            return any(s <= t < e for s, e in intervals)
     elif opl:
         # The OPL keeps the last f-num in its register after a release, and a
         # rhythm column shares one register with another drum. Only the spans
@@ -901,22 +1196,46 @@ def pitch_runs(
         trim = int(0.035 * VGM_RATE)
         intervals = [(s + trim, e - trim) for s, e in opl_keyed_intervals(src_vgm, ch)
                      if e - s > 2 * trim]
+    elif tone_layout is not None:
+        # AY uses its mixer/level gate; the WSG uses its control volume.
+        intervals = tone_keyed_intervals(src_vgm, ch, tone_layout)
+    return _runs_between(a, b, intervals, limit, threshold_st, min_run_ms)
+
+
+def _runs_between(
+    a: list[tuple[int, int]],
+    b: list[tuple[int, int]],
+    intervals: list[tuple[int, int]] | None,
+    limit: int | None,
+    threshold_st: float,
+    min_run_ms: float,
+) -> list[PitchRun]:
+    """Compare two (sample, pitch units) streams over keyed spans.
+
+    Every write time of either stream and every interval edge is sampled. A
+    short mismatch inside a glide is ignored while a held wrong pitch is
+    reported with its full span.
+    """
+    times = {s for s, _v in a} | {s for s, _v in b}
+    if intervals is not None:
         times |= {s for s, _e in intervals}
         times |= {e for _s, e in intervals}
-
-        def keyed_at(t: int) -> bool:
-            return any(s <= t < e for s, e in intervals)
     if limit is not None:
         times = {t for t in times if t <= limit}
     times = sorted(times)
     threshold = threshold_st * 64
     min_run = int(min_run_ms * 44.1)
 
+    def keyed_at(t: int) -> bool:
+        if intervals is None:
+            return True
+        return any(s <= t < e for s, e in intervals)
+
     runs: list[PitchRun] = []
     cur: PitchRun | None = None
     ia = ib = 0
     for t in times:
-        if keyed_at is not None and not keyed_at(t):
+        if not keyed_at(t):
             if cur is not None:
                 cur.t1 = t
                 if cur.t1 - cur.t0 >= min_run:
@@ -987,6 +1306,24 @@ def export_fur(fur: Path, out: Path | None = None) -> Path:
     return export_vgm(fur, Path(out))
 
 
+def _module_chip_voice(fur: Path, ch: int) -> tuple[int, int] | None:
+    """(chip id, voice) of one module channel from the .fur's system list."""
+    from vgm2151fur.edit import read_chips_file
+    from vgm2151fur.furio import CHIP_CHANNELS
+
+    try:
+        chips = read_chips_file(fur)
+    except Exception:
+        return None
+    start = 0
+    for chip in chips:
+        span = CHIP_CHANNELS.get(chip.id, 1)
+        if start <= ch < start + span:
+            return chip.id, ch - start
+        start += span
+    return None
+
+
 def compare_fur_to_source(
     src_vgm: Path,
     fur: Path,
@@ -996,8 +1333,44 @@ def compare_fur_to_source(
     min_run_ms: float = 100.0,
     export_to: Path | None = None,
 ) -> tuple[list[PitchRun], Path]:
-    """Export the .fur and return the pitch divergences on one channel."""
+    """Export the .fur and return the pitch divergences on one channel.
+
+    Furnace's VGM exporter has no case for the Bubble System WSG, so the
+    export carries no K005289 writes.  A WSG channel is therefore compared
+    against the .fur's own pattern/instrument data, which is the module's
+    independent record of the pitch it asks the chip to play.
+    """
+    from vgm2151fur.furwrite import CHIP_K005289
+
     exported = export_fur(fur, export_to)
     src = load_vgm(src_vgm)
     other = load_vgm(exported)
-    return pitch_runs(src, other, ch, threshold_st=threshold_st, min_run_ms=min_run_ms), exported
+    info = _module_chip_voice(fur, ch)
+    if info is not None and info[0] == CHIP_K005289 and not any(
+        w.chip == "k005289" for w in other.writes
+    ):
+        clock = src.k005289_clock or K005289_DEFAULT_CLOCK
+        try:
+            mod_stream, _mod_intervals = _fur_wsg_stream(fur, ch, clock)
+        except Exception as exc:
+            raise DiagError(
+                f"could not read the .fur's WSG patterns: {exc}"
+            ) from exc
+        cids = sorted({
+            w.chip_id for w in src.writes if w.chip == "k005289"
+        })
+        cid = cids[0] if cids else 0
+        src_stream = k005289_pitch_stream(src, cid, info[1])
+        intervals = k005289_keyed_intervals(src, cid, info[1])
+        limit = src.total_samples or None
+        if other.total_samples:
+            limit = (
+                other.total_samples if limit is None
+                else min(limit, other.total_samples)
+            )
+        return _runs_between(
+            src_stream, mod_stream, intervals, limit,
+            threshold_st, min_run_ms,
+        ), exported
+    return pitch_runs(src, other, ch, threshold_st=threshold_st,
+                      min_run_ms=min_run_ms), exported

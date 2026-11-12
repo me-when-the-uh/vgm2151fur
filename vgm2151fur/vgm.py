@@ -101,6 +101,10 @@ CMD_DAC_ENABLE = 0x2B
 CMD_YM2203 = 0x55
 CMD_YM2203_2 = 0xA5
 CMD_K007232 = 0x41
+# 0x42 is the Konami K005289 (Bubble System WSG): a 4-bit register offset in
+# the high nibble of the first operand and a 12-bit value.  The waveform PROM
+# is a 0xC3 data block (16-bit address, then 512 bytes).
+CMD_K005289 = 0x42
 CMD_AY8910 = 0xA0
 CMD_MSM6258 = 0xB7
 CMD_MSM6295 = 0xB8
@@ -310,6 +314,12 @@ MSM6258_CLOCK_OFF = 0x90
 MSM6295_CLOCK_OFF = 0x98
 K051649_CLOCK_OFF = 0x9C
 K007232_EXTRA_CLOCK_OFF = 0xE8
+# Konami K005289 (Bubble System WSG) clock 0xEC (VGM 1.71+).  Furnace's WSG
+# platform defaults to COLOR_NTSC and divides by 32; the 512-byte 4-bit PROM
+# (8 waveforms per channel) arrives as a 0xC3 RAM block.
+K005289_CLOCK_OFF = 0xEC
+K005289_DEFAULT_CLOCK = 3579545
+K005289_RAM_TYPE = 0xC3
 C140_CLOCK_OFF = 0xA8
 C140_TYPE_OFF = 0x96
 # Philips SAA1099 header 0xC8 (VGM 1.71+).  6 square/noise voices with two
@@ -605,9 +615,10 @@ class ChipWrite:
     chip: str  # "ym2151" | "ym2203" | "ym2612" | "ym2610" | "opl" | "opl2" |
     #            "opl3" | "k007232" | "msm6295" | "msm6258" | "segapcm" |
     #            "c140" | "c352" | "k053260" | "ay8910" | "k051649" |
-    #            "ymz280b" | "vsu" | "sn76489" (chip_id 1 = T6W28 right half) |
-    #            "multipcm" | "upd7759" | "multipcm_bank" (reg = mask,
-    #            val = bank number; 0xC3 preserves its stream position)
+    #            "k005289" | "ymz280b" | "vsu" | "sn76489" (chip_id 1 =
+    #            T6W28 right half) | "multipcm" | "upd7759" |
+    #            "multipcm_bank" (reg = mask, val = bank number; 0xC3
+    #            preserves its stream position)
     chip_id: int
     reg: int
     val: int
@@ -817,6 +828,10 @@ class VgmFile:
     k051649_dual: bool = False
     # K007232 header 0xE8 (VGM 1.71+); register bit 7 selects a second chip.
     k007232_dual: bool = False
+    # Konami K005289 (Bubble System WSG) header 0xEC (VGM 1.71+).  Register
+    # writes arrive on command 0x42; the 512-byte 4-bit waveform PROM is a
+    # 0xC3 RAM block.
+    k005289_clock: int = 0
     # YMW258-F (MultiPCM) header 0x88 (VGM 1.61+).  Writes arrive on 0xB5 as
     # (register, value); command 0xC3 selects a Sega ROM bank.  Bit 30 marks a
     # second chip and the extra header (id 0x15) can give it another clock.
@@ -1340,6 +1355,9 @@ def chips_in_head(buf: bytes) -> set[str]:
             kinds.add("k007232")
             if raw & 0x40000000:
                 kinds.add("k007232_dual")
+    if version >= 0x171 and _field_in_header(buf, K005289_CLOCK_OFF, 4):
+        if 100_000 <= _header_clock(buf, K005289_CLOCK_OFF) <= 40_000_000:
+            kinds.add("k005289")
     if len(buf) >= 0xC0:
         clocks, _volumes = _extra_chip_lists(buf)
         if clocks.get(EXTRA_YM2612, 0):
@@ -1748,6 +1766,10 @@ def load_vgm(path: Path | str) -> VgmFile:
         k051_clock = _sane_clock(clocks.get(EXTRA_K051649, 0))
     k007232_header = _header_raw(buf, K007232_EXTRA_CLOCK_OFF) if ver >= 0x171 else 0
     k007232_dual = bool(k007232_header & 0x40000000)
+    # K005289 clock 0xEC (VGM 1.71+).  The field has no flag bits.
+    k005289_clock = 0
+    if ver >= 0x171 and _field_in_header(buf, K005289_CLOCK_OFF, 4):
+        k005289_clock = _sane_clock(_header_raw(buf, K005289_CLOCK_OFF))
 
     # MultiPCM clock 0x88 (VGM 1.61+).  Bit 30 is a second instance; the
     # extra-header clock list can carry its clock.  The VGM field is based on
@@ -1961,6 +1983,7 @@ def load_vgm(path: Path | str) -> VgmFile:
         k051649_plus=k051_plus,
         k051649_dual=k051649_dual,
         k007232_dual=k007232_dual,
+        k005289_clock=k005289_clock,
         multipcm_clock=multipcm_clock,
         multipcm_clock_2=multipcm_clock_2,
         multipcm_dual=multipcm_dual,
@@ -2131,6 +2154,17 @@ def load_vgm(path: Path | str) -> VgmFile:
                     start = int.from_bytes(payload[0:4], "little")
                     vgm.roms.append(RomSlice(
                         chip_id, 0x20000, start, payload[4:], "es5503",
+                        time=sample,
+                    ))
+            elif typ == K005289_RAM_TYPE:
+                # C3: the K005289's 512-byte 4-bit waveform PROM.  C0-DF RAM
+                # blocks put a 16-bit start address before the payload; the
+                # chip has one instance, so the block's size bit is not a
+                # second-chip flag here.
+                if len(payload) >= 2:
+                    start = int.from_bytes(payload[0:2], "little")
+                    vgm.roms.append(RomSlice(
+                        0, 0x200, start, payload[2:], "k005289",
                         time=sample,
                     ))
             else:
@@ -2686,6 +2720,15 @@ def load_vgm(path: Path | str) -> VgmFile:
             vgm.writes.append(ChipWrite(sample, "k007232", cid, aa & 0x7F, buf[pos + 2]))
             pos += 3
             continue
+        if cmd == CMD_K005289 and pos + 3 <= n:
+            # 0x42: high nibble of the first operand is the 4-bit register
+            # offset, the rest is a 12-bit value.  Offsets 0/1 set volume and
+            # waveform bank, 2/3 latch the 12-bit pitch, 4/5 trigger it.
+            off = (buf[pos + 1] >> 4) & 0x0F
+            val = ((buf[pos + 1] & 0x0F) << 8) | buf[pos + 2]
+            vgm.writes.append(ChipWrite(sample, "k005289", 0, off, val))
+            pos += 3
+            continue
         if cmd == CMD_POKEY and pos + 3 <= n:
             # 0xBB: register, then data. Bit 7 of the register selects the
             # second chip (Dual Chip Support #2); the register is 4 bits.
@@ -3025,6 +3068,17 @@ def load_vgm(path: Path | str) -> VgmFile:
         vgm.warnings.append("AY-3-8910 clock is missing or out of range; using 1789772")
     if any(w.chip == "k051649" for w in vgm.writes) and not vgm.k051649_clock:
         vgm.warnings.append("K051649 clock is missing or out of range; using 1789772")
+    if any(w.chip == "k005289" for w in vgm.writes):
+        if not vgm.k005289_clock:
+            vgm.warnings.append(
+                f"K005289 clock is missing or out of range; using "
+                f"{K005289_DEFAULT_CLOCK}"
+            )
+        if not any(r.kind == "k005289" for r in vgm.roms):
+            vgm.warnings.append(
+                "K005289 waveform PROM data block is missing; the WSG voices "
+                "have no waveform and stay silent"
+            )
     if any(w.chip == "huc6280" for w in vgm.writes) and not vgm.huc6280_clock:
         vgm.warnings.append(
             f"HuC6280 clock is missing or out of range; using {HUC6280_DEFAULT_CLOCK}"

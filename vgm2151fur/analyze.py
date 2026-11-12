@@ -151,6 +151,14 @@ from vgm2151fur.msm5232 import (
     collect_msm5232,
     msm5232_volume_fx,
 )
+from vgm2151fur.k005289 import (
+    K005289_DEFAULT_CLOCK,
+    K005289_DIVIDER,
+    K005289_REFIT_SAMPLES,
+    K005289_VOICES,
+    collect_k005289,
+    k005289_note,
+)
 from vgm2151fur.mikey import (
     MIKEY_DEFAULT_CLOCK,
     MIKEY_DIVIDER,
@@ -693,8 +701,9 @@ class NoteEvent:
     # gate at volume peaks needs the pitch at each new note start, which the
     # note/E5 pair encodes only indirectly.
     tone_period: int = 0
-    # 0 = not a tone-chip note, 1 = SCC, 2 = AY, 8 = SAA1099. The phase-2
-    # pass finds the instrument for these once the tick rate is known.
+    # 0 = not a tone-chip note, 1 = SCC, 2 = AY, 8 = SAA1099, 16 = WSG.
+    # The phase-2 pass finds the instrument for these once the tick rate is
+    # known.
     tone_chip: int = 0
     # SAA1099 only: (sample, left, right) raw amplitude nibbles after the
     # opening.  The platform multiplies them through the panning macros, so
@@ -781,7 +790,7 @@ class NoteEvent:
 
 @dataclass(frozen=True)
 class ToneIns:
-    """One SCC/AY instrument: a starting wave plus per-tick macro values.
+    """One SCC/AY/WSG instrument: a starting wave plus per-tick macro values.
 
     ``pitch`` is the engine's ``pitch`` unit (1/128 semitone) and lands on the
     platform's ``std.pitch``, which for a period table adds straight to the
@@ -1200,6 +1209,13 @@ class Song:
     scc_waves: list[bytes] = field(default_factory=list)
     scc_ins: list[ToneIns] = field(default_factory=list)
     scc_count: int = 0
+    # Konami K005289 (Bubble System WSG): two wavetable voices per chip.
+    # `k005289_waves` holds the 32-byte 4-bit PROM images the instruments
+    # play; `k005289_ins` is one instrument per distinct wave/macro set.
+    k005289_ids: list[int] = field(default_factory=list)
+    k005289_waves: list[bytes] = field(default_factory=list)
+    k005289_ins: list[ToneIns] = field(default_factory=list)
+    k005289_count: int = 0
     # AY-8910 channels: one instance per chip id, `ay_count` notes, and one
     # instrument per distinct pitch macro. The hardware envelope, noise
     # frequency and channel mode ride on channel_fx.
@@ -1574,6 +1590,10 @@ def _tone_pitch_tick_scale(vgm: VgmFile, hz: float, speed: int) -> int:
             key = (w.chip, w.chip_id, w.reg)
         elif w.chip == "k051649" and w.reg % 2 == 0 and w.reg < 10:
             key = (w.chip, w.chip_id, w.reg // 2)
+        elif w.chip == "k005289" and w.reg in (4, 5):
+            # TG applies the latched pitch, so the TG writes are the voice's
+            # note-change lattice.
+            key = (w.chip, w.chip_id, w.reg - 4)
         elif (hz < 100 and w.chip == "ym2203"
               and w.reg in (0xA0, 0xA1, 0xA2)):
             # A 60 Hz fallback is especially coarse for a driver that sweeps
@@ -1839,8 +1859,9 @@ def _vsu_sw_effect(sweep: int, ev1: int) -> tuple[int, int]:
 
 def _plain_tone(spec: ToneIns, tone_chip: int) -> ToneIns:
     """The same timbre with no per-note motion, so notes can share it."""
-    if tone_chip in (1, 5):
-        # SCC and PCE are wavetable chips: the wave is the timbre.
+    if tone_chip in (1, 5, 16):
+        # SCC, PCE and the Bubble System WSG are wavetable chips: the wave is
+        # the timbre.
         return ToneIns(wave=spec.wave)
     if tone_chip == 7:
         # Keep the starting waveform and modulation table so a budget
@@ -2338,6 +2359,7 @@ def _bind_tone_instruments(
     fds_ins: list[ToneIns],
     wonderswan_ins: list[ToneIns],
     qsound_ins: list[ToneIns],
+    k005289_ins: list[ToneIns],
     tone_ins_base: int,
     scc_clock: int,
     ay_clock: int,
@@ -2352,6 +2374,7 @@ def _bind_tone_instruments(
     x1_clock: int,
     fds_clock: int,
     wonderswan_clock: int,
+    k005289_clock: int,
     hz: float,
     total_samples: int,
     use_speed: int = 1,
@@ -2384,6 +2407,7 @@ def _bind_tone_instruments(
     fds_map: dict[ToneIns, int] = {}
     wonderswan_map: dict[ToneIns, int] = {}
     qsound_map: dict[ToneIns, int] = {}
+    k005289_map: dict[ToneIns, int] = {}
     ins_cap = max(1, INS_TARGET - tone_ins_base)
     # QSound is sample-based: every distinct sample needs a base instrument
     # before pitch/volume macro copies can spend the budget.  Otherwise a late
@@ -2446,6 +2470,7 @@ def _bind_tone_instruments(
     tone_order += [e for e in events if e.on and e.tone_chip == 13]
     tone_order += [e for e in events if e.on and e.tone_chip == 14]
     tone_order += [e for e in events if e.on and e.tone_chip == 15]
+    tone_order += [e for e in events if e.on and e.tone_chip == 16]
     for e in tone_order:
         end = e.end or track_end
         # 255 macro values times the largest speed byte. Long SSG pads can
@@ -2534,6 +2559,14 @@ def _bind_tone_instruments(
             clock = QSOUND_OUT_RATE
             divider = QSOUND_FREQ_DIV
             maximum = QSOUND_MAX_FREQ
+        elif e.tone_chip == 16:
+            # Konami K005289 (Bubble System WSG): COLOR_NTSC with a 32x
+            # divider and a 12-bit period.
+            clock = (
+                e.tone_clock or k005289_clock or K005289_DEFAULT_CLOCK
+            )
+            divider = K005289_DIVIDER
+            maximum = 0xFFF
         else:
             # AY and the YM2203's SSG share the instrument path but not the
             # clock or Furnace's divider (8 vs 16).
@@ -3144,6 +3177,16 @@ def _bind_tone_instruments(
                 + len(x1_ins) + len(fds_ins) + len(wonderswan_ins),
                 ins_cap, 14 if e.tone_chip == 14 else 15,
             )
+        elif e.tone_chip == 16:
+            idx, kept = take(
+                spec, k005289_map, k005289_ins,
+                len(scc_ins) + len(ay_ins) + len(psg_ins) + len(nes_ins)
+                + len(huc6280_ins) + len(gb_ins) + len(vsu_ins)
+                + len(saa_ins) + len(pokey_ins) + len(mikey_ins)
+                + len(x1_ins) + len(fds_ins) + len(wonderswan_ins)
+                + len(qsound_ins),
+                ins_cap, 16,
+            )
         else:
             # AY runs first, so the SCC list is still empty and `others` is 0.
             idx, kept = take(spec, ay_map, ay_ins, 0, early_cap, 2)
@@ -3268,6 +3311,7 @@ def _bind_tone_instruments(
     for bucket in (
         scc_ins, ay_ins, psg_ins, nes_ins, huc6280_ins, gb_ins,
         vsu_ins, saa_ins, x1_ins, fds_ins, wonderswan_ins, qsound_ins,
+        k005289_ins,
     ):
         _compress_tone_delays(bucket)
 
@@ -3310,6 +3354,8 @@ def _bind_tone_instruments(
             fds_ins, family_notes.get(12), tick_samples, use_speed),
         13: _merge_tone_prefixes(
             wonderswan_ins, family_notes.get(13), tick_samples, use_speed),
+        16: _merge_tone_prefixes(
+            k005289_ins, family_notes.get(16), tick_samples, use_speed),
     }
     for i, (event, idx) in enumerate(bound):
         mapping = tone_maps.get(event.tone_chip)
@@ -3383,6 +3429,12 @@ def _bind_tone_instruments(
                 tone_ins_base + n_scc + n_ay + n_psg + n_nes + n_huc
                 + n_gb + n_vsu + n_saa + n_pokey + n_mikey + n_x1
                 + n_fds + n_ws + idx
+            )
+        elif event.tone_chip == 16:
+            event.ins = (
+                tone_ins_base + n_scc + n_ay + n_psg + n_nes + n_huc
+                + n_gb + n_vsu + n_saa + n_pokey + n_mikey + n_x1
+                + n_fds + n_ws + len(qsound_ins) + idx
             )
         else:
             # AY-8910 (tone_chip 2) binds first, so its list starts at SCC end.
@@ -3504,6 +3556,7 @@ def _tone_instrument_demand(
     x1_clock: int,
     fds_clock: int,
     wonderswan_clock: int,
+    k005289_clock: int,
     hz: float,
     total_samples: int,
     use_speed: int = 1,
@@ -3526,15 +3579,16 @@ def _tone_instrument_demand(
     fds = []
     wonderswan = []
     qsound = []
+    k005289 = []
     _bind_tone_instruments(
         tone, scc, ay, psg, nes, huc, gb, vsu, saa, pokey, mikey, x1,
-        fds, wonderswan, qsound,
+        fds, wonderswan, qsound, k005289,
         # A negative base leaves the instrument cap effectively unlimited, so
         # every distinct macro shape is counted.
         -1000,
         scc_clock, ay_clock, psg_clock, nes_clock, huc6280_clock,
         gb_clock, vsu_clock, saa_clock, pokey_clock, mikey_clock, x1_clock,
-        fds_clock, wonderswan_clock,
+        fds_clock, wonderswan_clock, k005289_clock,
         hz, total_samples,
         use_speed,
         lfo_loop=lfo_loop,
@@ -3543,7 +3597,7 @@ def _tone_instrument_demand(
         len(bucket)
         for bucket in (
             scc, ay, psg, nes, huc, gb, vsu, saa, pokey, mikey, x1,
-            fds, wonderswan, qsound,
+            fds, wonderswan, qsound, k005289,
         )
     )
 
@@ -11978,8 +12032,9 @@ def analyze(
         (len(nes_pcm_samples) + NES_PCM_MAP_SLOTS - 1) // NES_PCM_MAP_SLOTS
     )
 
-    # SCC and AY are pitched chips and convert even under --melody-only. Their
-    # channels follow the FM block and every sample chip.
+    # SCC, AY and the Bubble System WSG are pitched chips and convert even
+    # under --melody-only. Their channels follow the FM block and every sample
+    # chip.
     tone_base = (
         fm_end + 2 * len(pcm_ids)
         + 4 * len({s.chip_id for s in oki_samples}) + n_adpcm_ch
@@ -13655,6 +13710,119 @@ def analyze(
                     delay & 0xFF,
                 ))
 
+    # Konami K005289 (Bubble System WSG): two wavetable columns per chip,
+    # after every other tone family in module order.
+    k005289_ids: list[int] = []
+    k005289_waves: list[bytes] = []
+    k005289_ins: list[ToneIns] = []
+    k005289_count = 0
+    k005289_notes, k005289_offs, k005289_wave_list, k005289_warn = (
+        collect_k005289(vgm)
+    )
+    warnings.extend(k005289_warn)
+    if k005289_notes:
+        k005289_ids = sorted({n.hit.chip_id for n in k005289_notes})
+        k005289_waves = list(k005289_wave_list)
+        k005289_wave_index = {
+            img: i for i, img in enumerate(k005289_waves)
+        }
+        k005289_base = (
+            tone_base + SCC_VOICES * len(scc_ids) + AY_VOICES * len(ay_ids)
+            + NES_CHANNELS * len(nes_ids)
+            + (HUC6280_CHANNELS if huc6280_ids else 0)
+            + (4 * len(gb_ids))
+            + VSU_CHANNELS * len(vsu_ids)
+            + SAA_VOICES * len(saa_ids)
+            + POKEY_VOICES * len(pokey_ids)
+            + MIKEY_VOICES * len(mikey_ids)
+            + X1_CHANNELS * len(x1_ids)
+            + len(fds_ids) + WS_VOICES * len(wonderswan_ids)
+            + QSOUND_CHANNELS * len(qsound_ids)
+        )
+        k005289_at = {
+            cid: k005289_base + K005289_VOICES * i
+            for i, cid in enumerate(k005289_ids)
+        }
+        k005289_clock = vgm.k005289_clock or K005289_DEFAULT_CLOCK
+        for n in k005289_notes:
+            h = n.hit
+            ch = k005289_at.get(h.chip_id)
+            if ch is None or not any(h.wave):
+                continue
+            gate_end = h.off_sample or (vgm.total_samples or h.sample_time)
+            segs = segment_periods(
+                [(h.sample_time, h.period), *h.freq_pts],
+                gate_end, k005289_clock, K005289_DIVIDER, 1,
+            )
+            for i, (st, period, intra) in enumerate(segs):
+                nxt = segs[i + 1][0] if i + 1 < len(segs) else 0
+                seg_end = nxt or h.off_sample
+                wave = _value_at(h.wave_pts, st, h.wave)
+                if not any(wave):
+                    # An all-zero image is silence; end the sounding note
+                    # rather than holding the previous pitch across a hole.
+                    events.append(NoteEvent(
+                        sample=st, ch=ch + h.voice, on=False, note=180,
+                        ins=-1, vol=-1, e5=0x80, pan=0,
+                    ))
+                    continue
+                bound = nxt or gate_end
+                vol = _value_at(h.vol_pts, st, h.vol)
+                vol_pts = tuple(
+                    (t, v, None) for t, v in h.vol_pts if st < t < bound
+                )
+                steps = _tone_steps(
+                    intra, st, K005289_REFIT_SAMPLES if i == 0 else 0,
+                )
+                wave_steps: list[tuple[int, int]] = []
+                for t, img in merge_step_writes(
+                    [(t, img) for t, img in h.wave_pts if st < t < bound],
+                    gap=64,
+                ):
+                    idx = k005289_wave_index.get(img)
+                    if idx is None:
+                        idx = len(k005289_waves)
+                        k005289_wave_index[img] = idx
+                        k005289_waves.append(img)
+                    if wave_steps and wave_steps[-1][1] == idx:
+                        continue
+                    wave_steps.append((t, idx))
+                wave_index = k005289_wave_index.get(wave)
+                if wave_index is None:
+                    wave_index = len(k005289_waves)
+                    k005289_wave_index[wave] = wave_index
+                    k005289_waves.append(wave)
+                note, e5 = k005289_note(k005289_clock, period)
+                events.append(NoteEvent(
+                    sample=st,
+                    ch=ch + h.voice,
+                    on=True,
+                    note=note,
+                    ins=tone_ins_base,
+                    vol=vol,
+                    e5=e5,
+                    pan=0,
+                    end=seg_end,
+                    vol_pts=vol_pts,
+                    tone_pitch_pts=tuple(steps),
+                    tone_wave_pts=tuple(wave_steps),
+                    tone_wave=wave_index,
+                    tone_period_offset=1,
+                    tone_period=period,
+                    tone_clock=k005289_clock,
+                    tone_div=K005289_DIVIDER,
+                    tone_chip=16,
+                ))
+                k005289_count += 1
+        for off in k005289_offs:
+            base = k005289_at.get(off.chip_id)
+            if base is None:
+                continue
+            events.append(NoteEvent(
+                sample=off.sample_time, ch=base + off.voice, on=False,
+                note=180, ins=-1, vol=-1, e5=0x80, pan=0,
+            ))
+
     # The YM2203 SSG rides in the same six-channel system: 0-2 FM, 3-5 PSG. Its
     # notes share the AY instrument list.
     ssg_pcm, ssg_pcm_hits = _ssg_pcm("ym2203_ssg")
@@ -14073,13 +14241,15 @@ def analyze(
     if (
         scc_ids or ay_ids or psg_ids or nes_ids or huc6280_ids
         or gb_ids or vsu_ids or saa_ids or pokey_ids or mikey_ids or x1_ids
-        or fds_ids or wonderswan_ids or qsound_ids
+        or fds_ids or wonderswan_ids or qsound_ids or k005289_ids
     ):
         tone_demand = _tone_instrument_demand(
             events, vgm.k051649_clock or SCC_DEFAULT_CLOCK, ay_note_clock,
             psg_clock, nes_clock, huc6280_clock, gb_clock, vsu_clock,
             saa_clock, pokey_clock, mikey_clock, x1_clock,
-            fds_clock, wonderswan_clock, hz,
+            fds_clock, wonderswan_clock,
+            vgm.k005289_clock or K005289_DEFAULT_CLOCK,
+            hz,
             vgm.total_samples,
             use_speed,
             lfo_loop=lfo_loop,
@@ -14224,7 +14394,7 @@ def analyze(
     tone_merged = _bind_tone_instruments(
         events, scc_ins, ay_ins, psg_ins, nes_ins, huc6280_ins, gb_ins,
         vsu_ins, saa_ins, pokey_ins, mikey_ins, x1_ins,
-        fds_ins, wonderswan_ins, qsound_ins,
+        fds_ins, wonderswan_ins, qsound_ins, k005289_ins,
         tone_ins_base,
         vgm.k051649_clock or SCC_DEFAULT_CLOCK,
         ay_note_clock,
@@ -14239,6 +14409,7 @@ def analyze(
         x1_clock,
         fds_clock,
         wonderswan_clock,
+        vgm.k005289_clock or K005289_DEFAULT_CLOCK,
         hz, vgm.total_samples, use_speed,
         merge_tol=tone_merge_tol, lfo_loop=lfo_loop,
     )
@@ -14637,6 +14808,10 @@ def analyze(
         scc_waves=scc_waves,
         scc_ins=scc_ins,
         scc_count=scc_count,
+        k005289_ids=k005289_ids,
+        k005289_waves=k005289_waves,
+        k005289_ins=k005289_ins,
+        k005289_count=k005289_count,
         ay_ids=ay_ids,
         ay_ins=ay_ins,
         ay_count=ay_count,
@@ -14911,6 +15086,14 @@ def format_report(song: Song) -> str:
         lines.append(
             f"AY notes    {song.ay_count}  ({len(song.ay_ids)} chip"
             f"{'s' if len(song.ay_ids) > 1 else ''}, {song.vgm.ay8910_clock} Hz)"
+        )
+    if song.k005289_ids:
+        lines.append(
+            f"WSG notes   {song.k005289_count}  ("
+            f"{len(song.k005289_ids)} chip"
+            f"{'s' if len(song.k005289_ids) > 1 else ''}, "
+            f"{len(song.k005289_waves)} waveforms, "
+            f"{song.vgm.k005289_clock or K005289_DEFAULT_CLOCK} Hz)"
         )
     if song.saa_ids:
         lines.append(

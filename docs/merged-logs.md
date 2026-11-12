@@ -87,6 +87,12 @@ Jack Bros and Galactic Pinball references are six real columns
 keeps the VSU wave blocks after the SCC/PCE/GB blocks and drops a wave
 change that would land past index 255.
 
+Konami K005289 (Bubble System WSG, `0xAD`, two wave columns) comes last in
+the tone order, after QSound. The Bubble System header's AY dual bit keeps
+both AY systems, so the reference Gradius pack converts to six AY columns
+and two WSG columns (module channels 0-5 and 6-7), matching Furnace's
+"Konami Bubble System" preset. `docs/bubble-system.md` has the register map.
+
 ## Who is allowed to share
 
 `share_fm`: one arcade family plus one OPL-family system coexist when the
@@ -177,8 +183,11 @@ uv run --with pytest -q python -m pytest tests/test_vgm2151fur_combo.py -q
 
 - `diag.pitch_runs()` still picks its stream from the *source* log's chip
   census, so `report --verify` on a combined module follows the arcade family
-  whatever channel it is asked about. Per-family verification today happens in
-  `TestMergedRips` by reading each chip's own registers.
+  whatever channel it is asked about. The tone-only AY+WSG shape is the
+  exception: it maps each module channel to its family (AY channels through
+  the Furnace export, WSG channels through the `.fur`'s own patterns). Per-family
+  verification today happens in `TestMergedRips` by reading each chip's own
+  registers.
 - An OPL4 (YMF278B) side, as in `merged_opl4_fmpcm_*.vgm`, converts through
   the OPL4 path; ROM wave IDs still need the `VGM2151FUR_YRW801` image and
   RAM-only IDs need the VGM RAM dump.

@@ -373,7 +373,7 @@ def _edit(args) -> int:
 
 
 def _compare(args) -> int:
-    from vgm2151fur.diag import compare_fur_to_source
+    from vgm2151fur.diag import DiagError, compare_fur_to_source
 
     source = Path(clean_text(str(args.source)))
     fur = Path(clean_text(str(args.fur)))
@@ -385,7 +385,7 @@ def _compare(args) -> int:
         return 1
     try:
         runs, exported = compare_fur_to_source(source, fur, args.channel)
-    except FurnaceError as exc:
+    except (FurnaceError, DiagError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
     from vgm2151fur.audit import compare_ym2608_samples, compare_ym2610_samples
