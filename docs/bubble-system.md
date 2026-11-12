@@ -54,11 +54,11 @@ AY-8910s stay ordinary AY-8910s in the module.
   one is silent. For the reference pack that gives six AY columns followed by
   two WSG columns (module channels 6 and 7 for the WSG voices). Chip order is
   the writer's usual one: AY systems first, WSG last.
-- **Mix.** Bubble System modules are written with a flat mixer: every system
-  gets volume 1.0, so the AY pair and the WSG start at the same setting.
-  The reference player's own mix differs (VGMPlay halves the dual AY pair
-  and the cores have different output scales), so adjust the three sliders
-  in Furnace if you want that balance instead.
+- **Mix.** The module reproduces the reference player. VGMPlay halves the dual
+  AY pair (0.5 each), and Furnace's AY core is 1.46x quieter, so each AY is
+  stored at 0.73. The K005289 is a single instance, but Furnace's WSG core
+  scales its output by 64 where libvgm scales by 16, so its system volume is
+  0.25. The AY pair and the WSG then come out at the same audible level.
 
 ## Verification
 

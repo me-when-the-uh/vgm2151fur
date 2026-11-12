@@ -13771,6 +13771,19 @@ def analyze(
                 vol_pts = tuple(
                     (t, v, None) for t, v in h.vol_pts if st < t < bound
                 )
+                # A TG usually lands a few samples before the driver writes
+                # the new note's volume.  When that first write is a rise in
+                # the opening frame, it is the attack, not a macro step:
+                # starting the segment on the previous note's tail made those
+                # notes begin quiet and pop up one tick later.
+                if vol_pts:
+                    first_t, first_v, _first_fx = vol_pts[0]
+                    if (
+                        first_t <= st + K005289_REFIT_SAMPLES
+                        and first_v > vol
+                    ):
+                        vol = first_v
+                        vol_pts = vol_pts[1:]
                 steps = _tone_steps(
                     intra, st, K005289_REFIT_SAMPLES if i == 0 else 0,
                 )

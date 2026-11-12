@@ -135,7 +135,8 @@ triples start 31 bytes plus 12 per chip before the first ADIR pointer.
   (2/3) and instance division. `_FURNACE_VOLUME_SCALE` corrects the Furnace
   cores against measured renders (AY 1.46, SCC 1.04; measured on two-chip
   modules because the player normalizes a lone chip and Furnace does not).
-  Bubble System modules are the exception: every system is written at 1.0.
+  The K005289 uses 0.25 because libvgm's WSG core scales by 16 and Furnace's
+  by 64 at the same system volume.
   The K053260 core is exactly half the reference core: MAME shifts the voice
   product by 6 bits and the Furnace core by 7. The desired gain is 2.0. The
   writer raises the master to 2.0, stores the K053260 at 1.0 and scales the

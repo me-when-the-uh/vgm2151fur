@@ -379,6 +379,7 @@ _DEV_DEFAULT_VOLUME = {
     0x28: 0x280,  # Irem GA20
     0x2C: 0x100,  # OKI MSM5205
     0x2D: 0x100,  # OKI MSM5232
+    0x2B: 0x100,  # Konami K005289 (Bubble System WSG)
 }
 _DEV_CORE_PATCH = {
     0x19: lambda v: v * 8 // 5,  # K051649 SCC core scale
@@ -390,6 +391,10 @@ _DEV_CORE_PATCH = {
 _FURNACE_VOLUME_SCALE = {
     0x00: 1.0, 0x03: 1.0, 0x04: 1.0, 0x12: 1.46, 0x16: 0.61, 0x18: 1.0,
     0x1C: 0.7, 0x19: 1.04,
+    # libvgm's K005289 core writes ``mix * 16``; Furnace's WSG platform
+    # writes ``out << 6`` (4x).  A quarter of the player's level matches the
+    # source, so the WSG is not 12 dB hot in the module.
+    0x2B: 0.25,
     # YMZ280B's Furnace core is 1.27x quieter than VGMPlay's at the same
     # system volume (measured on the two-chip Stage 4 module).
     0x0F: 1.27,
@@ -418,6 +423,7 @@ _CHIP_DEV = {CHIP_YM2151: 0x03, CHIP_SEGAPCM: 0x04, CHIP_MSM6295: 0x18,
              CHIP_SMS: 0x00, CHIP_T6W28: 0x00,
              CHIP_K051649: 0x19, CHIP_K052539: 0x19,
              CHIP_AY8910: 0x12,
+             CHIP_K005289: 0x2B,
              CHIP_POKEY: 0x1E,
              CHIP_X1_010: 0x26,
              CHIP_GA20: 0x28, CHIP_MSM5232: 0x2D,
@@ -6162,12 +6168,10 @@ def write_fur(
     psg_dac_set = set(psg_dac_sys.values())
     msm5205_set = set(msm5205_sys.values())
     for i, chip in enumerate(chips):
-        # Bubble System modules ship with a flat mixer: every system at unity.
-        # (The reference player halves the dual AY pair and the cores have
-        # different output scales; adjust the sliders in Furnace to taste.)
-        if k005289_ids:
-            cv = 1.0
-        elif chip == CHIP_K007232 and include_fm:
+        # Twin16 K007232 sits under the OPM; the rip's mix says how far. Every
+        # other chip uses the player's mix (defaults + extra-header entries)
+        # through _sample_chip_volume.
+        if chip == CHIP_K007232 and include_fm:
             cv = k_vol
         elif i in pwm_pan:
             # VGMPlay's 32X PWM default is 0xE0 for the stereo chip; each

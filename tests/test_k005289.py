@@ -288,6 +288,33 @@ class TestK005289Analysis(unittest.TestCase):
         ]
         self.assertTrue(any(b"\x03" in block for block in ins))
 
+    def test_split_note_starts_on_its_attack(self):
+        # The driver latches/triggers the next pitch, then writes its volume
+        # a few samples later.  The split note must start on that attack, not
+        # on the previous note's tail (4), or it begins quiet and pops a tick
+        # later.
+        writes = [
+            ChipWrite(0, "k005289", 0, 0, 0),
+            ChipWrite(0, "k005289", 0, 1, 0),
+            ChipWrite(100, "k005289", 0, 2, 0xF00),
+            ChipWrite(100, "k005289", 0, 4, 0),
+            ChipWrite(106, "k005289", 0, 0, 12),
+            ChipWrite(5000, "k005289", 0, 0, 4),      # decay tail
+            ChipWrite(10000, "k005289", 0, 2, 0xE00),
+            ChipWrite(10000, "k005289", 0, 4, 0),
+            ChipWrite(10006, "k005289", 0, 0, 12),    # next note's attack
+            ChipWrite(30000, "k005289", 0, 0, 0),
+        ]
+        song = analyze(_vgm(writes, roms=_ramp_prom(),
+                            k005289_clock=3579545, total_samples=40000))
+        notes = [e for e in song.events if e.on and e.tone_chip == 16]
+        self.assertEqual(len(notes), 2)
+        self.assertEqual(notes[1].sample, 10000)
+        self.assertEqual(notes[1].vol, 12)
+        self.assertFalse([
+            v for t, v, _fx in notes[1].vol_pts if t == 10006
+        ])
+
     def test_condensed_module_keeps_wsg(self):
         writes = _song_writes(off=60000)
         song = analyze(
@@ -388,10 +415,11 @@ class TestGradiusPack(unittest.TestCase):
             [c.name for c in read_chips_file(fur)],
             ["AY8910", "AY8910", "Bubble System WSG"],
         )
-        # Bubble System modules use a flat mixer: every system at 1.0.
+        # Reference mix: the dual AY pair is halved (0.73 each after the AY
+        # core correction) and the WSG's 4x-hot core takes 0.25.
         self.assertEqual(
             [round(c.volume, 2) for c in read_chips_file(fur)],
-            [1.0, 1.0, 1.0],
+            [0.73, 0.73, 0.25],
         )
         for ch in (6, 7):
             runs, _exported = compare_fur_to_source(
