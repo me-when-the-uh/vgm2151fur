@@ -26,7 +26,7 @@ from vgm2151fur.furwrite import (
     NOTE_OFF, ym_dt_to_furnace, pack_dt_mul, write_fur,
 )
 from vgm2151fur.pcm import (
-    PcmHit, PcmSample, k007232_rate, pcm7_to_s8, scale_pcm7,
+    PcmHit, PcmSample, collect_pcm_hits, k007232_rate, pcm7_to_s8, scale_pcm7,
 )
 from vgm2151fur.furio import fx_pan_amps, list_fur_samples, parse_fur
 from vgm2151fur.oki import (
@@ -102,6 +102,94 @@ class TestDTRemap(unittest.TestCase):
     def test_pack_keeps_mult(self):
         self.assertEqual(pack_dt_mul(0x01) & 0x0F, 1)
         self.assertEqual(pack_dt_mul(0x73) & 0x0F, 3)
+
+
+class TestK007232ReadTriggers(unittest.TestCase):
+    """K007232 key-on handling: VGM reads, repeats, and zero-volume starts.
+
+    A VGM 0x41 write to offset 0x1F is a chip read, not a register write:
+    libvgm passes the value as the read offset, and the core keys a voice only
+    when that offset is 0x05/0x0B.  Several Konami drivers read the trigger
+    register twice in a row to start a voice; treating each as a separate hit
+    put a duplicate note on the next row.
+    """
+
+    @staticmethod
+    def _hits(writes):
+        vgm = VgmFile(
+            path=Path("synthetic.vgm"), buf=b"", version=0x171,
+            total_samples=10_000, loop_samples=0, loop_file_pos=None,
+            loop_sample=None, ym2151_clock=0, k007232_clock=3579545,
+            gd3={}, writes=list(writes),
+        )
+        return collect_pcm_hits(vgm)
+
+    @staticmethod
+    def _setup(t0, *triggers):
+        return [
+            ChipWrite(t0, "k007232", 0, 0x00, 0xD3),
+            ChipWrite(t0, "k007232", 0, 0x01, 0x0F),
+            ChipWrite(t0, "k007232", 0, 0x02, 0x00),
+            ChipWrite(t0, "k007232", 0, 0x03, 0x01),
+            ChipWrite(t0, "k007232", 0, 0x04, 0x00),
+            ChipWrite(t0, "k007232", 0, 0x10, 0x55),
+            ChipWrite(t0, "k007232", 0, 0x11, 0x55),
+            *triggers,
+        ]
+
+    def test_two_trigger_reads_are_one_keyon(self):
+        for gap in (0, 1, 2):
+            with self.subTest(gap=gap):
+                hits = self._hits(self._setup(
+                    877,
+                    ChipWrite(877, "k007232", 0, 0x1F, 0x05),
+                    ChipWrite(877 + gap, "k007232", 0, 0x1F, 0x05),
+                ))
+                self.assertEqual(len(hits), 1)
+                self.assertEqual(hits[0].pitch, 0xFD3)
+
+    def test_later_keyon_beyond_the_window_is_kept(self):
+        hits = self._hits(self._setup(
+            877,
+            ChipWrite(877, "k007232", 0, 0x1F, 0x05),
+            ChipWrite(1000, "k007232", 0, 0x1F, 0x05),
+        ))
+        self.assertEqual(len(hits), 2)
+
+    def test_reads_of_other_offsets_do_not_trigger(self):
+        hits = self._hits(self._setup(
+            877,
+            ChipWrite(877, "k007232", 0, 0x1F, 0x00),
+            ChipWrite(878, "k007232", 0, 0x1F, 0x0A),
+        ))
+        self.assertEqual(hits, [])
+
+    def test_zero_volume_keyon_starts_silent(self):
+        # The driver keys voice 0 with both volume registers at zero and only
+        # opens them later.  Writing the note at full scale would put an
+        # audible blip on the first row that the source does not have.
+        body = bytes(range(0x40, 0x80)) + b"\x80"
+        writes = [
+            ChipWrite(0, "k007232", 0, 0x00, 0xD3),
+            ChipWrite(0, "k007232", 0, 0x01, 0x0F),
+            ChipWrite(0, "k007232", 0, 0x02, 0x00),
+            ChipWrite(0, "k007232", 0, 0x03, 0x00),
+            ChipWrite(0, "k007232", 0, 0x04, 0x00),
+            ChipWrite(0, "k007232", 0, 0x05, 0x00),
+            ChipWrite(3000, "k007232", 0, 0x10, 0x55),
+            ChipWrite(3000, "k007232", 0, 0x11, 0x55),
+        ]
+        vgm = VgmFile(
+            path=Path("synthetic.vgm"), buf=b"", version=0x171,
+            total_samples=10_000, loop_samples=0, loop_file_pos=None,
+            loop_sample=None, ym2151_clock=0, k007232_clock=3579545,
+            gd3={}, roms=[RomSlice(0, 0x1000, 0, body, "k007232")],
+            writes=writes,
+        )
+        song = analyze(vgm)
+        hit = next(e for e in song.events if e.pcm and e.on)
+        self.assertEqual(hit.vol, 0)
+        self.assertEqual(hit.pan, 0)
 
 
 class TestVolAndKF(unittest.TestCase):
