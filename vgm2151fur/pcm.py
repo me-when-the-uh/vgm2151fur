@@ -12,6 +12,14 @@ from pathlib import Path
 
 from vgm2151fur.vgm import VgmFile, assemble_k007232_rom, K007232_TRIGGER_REG
 
+# A key-on repeated within this many VGM samples is the same hit.  Drivers key
+# the K007232 by reading register 0x05/0x0B, and several read it twice in a
+# row; the logger puts the pair 0-1 samples apart.  libvgm and Furnace's core
+# retrigger on every read, but the second restart lands before the chip can
+# fetch another byte and is inaudible.  It also cannot be a separate row: the
+# module's finest timing is one tick, tens of samples.
+KEYON_MERGE_SAMPLES = 2
+
 
 def k007232_rate(clock: int, pitch: int) -> float:
     """Hardware playback rate in Hz for a 12-bit pitch register.
@@ -211,23 +219,43 @@ def _collect_pcm_chip(writes: list, chip_id: int) -> list[PcmHit]:
             loop_en = v
         elif r in (0x05, 0x0B, K007232_TRIGGER_REG):
             # Registers 0x05 and 0x0B are the real per-voice key-on triggers.
-            # 0x1F is accepted for older synthetic fixtures that used the wrong
-            # offset; the hardware core has no 0x1F trigger.
+            # 0x1F is how the parser records the VGM read command: libvgm
+            # passes its value as the read offset, and only reading 0x05/0x0B
+            # keys a voice.  Any other read returns register data and is not a
+            # trigger.
             if r == 0x05:
                 ch = 0
             elif r == 0x0B:
                 ch = 1
             else:
-                ch = 1 if (v & 0x7F) == 11 else 0
+                ch = {0x05: 0, 0x0B: 1}.get(v)
+                if ch is None:
+                    continue
             addr = (ch_start[ch] & 0x1FFFF) | ((ch_bank[ch] & 0xFF) << 17)
+            pitch = ch_pitch[ch] & 0xFFF
+            vol_l, vol_r = vol[ch * 2], vol[ch * 2 + 1]
+            prev = active[ch]
+            if (
+                prev is not None
+                and w.sample - prev.sample_time <= KEYON_MERGE_SAMPLES
+            ):
+                # A key-on this close is one hit.  The later write owns the
+                # playback state; the first read is the audible onset.
+                prev.start = addr
+                prev.pitch = pitch
+                prev.bank = ch_bank[ch]
+                prev.vol_l = vol_l
+                prev.vol_r = vol_r
+                prev.loop = bool(loop_en)
+                continue
             hits.append(PcmHit(
                 sample_time=w.sample,
                 ch=ch,
                 start=addr,
-                pitch=ch_pitch[ch] & 0xFFF,
+                pitch=pitch,
                 bank=ch_bank[ch],
-                vol_l=vol[ch * 2],
-                vol_r=vol[ch * 2 + 1],
+                vol_l=vol_l,
+                vol_r=vol_r,
                 chip_id=chip_id,
                 loop=bool(loop_en),
             ))

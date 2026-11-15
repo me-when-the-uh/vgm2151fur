@@ -10577,15 +10577,19 @@ def analyze(
                     for t, l, r in h.vol_pts
                     if t > h.sample_time
                 )
+                # A hit keyed with both registers at zero is a fade-in or a
+                # mute. Start silent on Furnace's default balance; 08 00
+                # would mute the voice forever.
+                fade_in = vol == 0 and any(v > 0 for _t, v, _p in vol_pts)
                 events.append(NoteEvent(
                     sample=h.sample_time,
                     ch=ch,
                     on=True,
                     note=note,
                     ins=ins,
-                    vol=vol if vol else 15,
+                    vol=(0 if fade_in else vol if vol else 15),
                     e5=e5,
-                    pan=pcm_pan_fx(vl, vr),
+                    pan=0 if fade_in else pcm_pan_fx(vl, vr),
                     pcm=True,
                     vol_pts=vol_pts,
                 ))

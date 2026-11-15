@@ -2149,6 +2149,36 @@ class TestYm2612DacPitchClusters(unittest.TestCase):
             {samples[0].c4_rate, samples[1].c4_rate}, {11025, 7350},
         )
 
+    def test_one_short_gap_does_not_raise_the_playback_rate(self):
+        # A 4-wait read with a single 3-wait command boundary is still
+        # 11,025 Hz.  Taking the smallest interval made the whole body play a
+        # fourth too high whenever it was reused (Alien Soldier's E-0 drum).
+        waits = [4] * 63
+        waits[31] = 3
+        samples, plays = _collect_source([self._run(0, waits, 1)], {}, [])
+        self.assertEqual(len(samples), 1)
+        self.assertEqual(len(plays), 1)
+        self.assertEqual(samples[0].c4_rate, 11025)
+
+
+class TestYm2612DacAlienSoldier(unittest.TestCase):
+    """A real rip where a short wait inside a regular read changed pitch."""
+
+    SRC = Path(r"D:\Downloads\Alien Soldier\21 - Soldiers Song.vgz")
+
+    @unittest.skipUnless(SRC.exists(), "Alien Soldier reference rip missing")
+    def test_e0_drum_keeps_its_nominal_rate(self):
+        song = analyze(load_vgm(self.SRC))
+        base = len(song.fm_patches)
+        notes = [e for e in song.events if e.on and e.dac and e.note == 64]
+        self.assertTrue(notes)
+        indexes = {
+            (e.ins - base) * 120 + (e.note - 60) for e in notes
+        }
+        self.assertEqual(
+            {song.dac_samples[i].c4_rate for i in indexes}, {11025},
+        )
+
 
 class TestYm2612DacLongHolds(unittest.TestCase):
     """A bank read held through a long rest must not carry it into a sample."""
@@ -2353,6 +2383,62 @@ class TestOpmWithDacOnlyYm2612(unittest.TestCase):
         mod = parse_fur(write_fur(song, include_pcm=True))
         self.assertEqual(mod.chips, [CHIP_YM2151, CHIP_YM2612])
         self.assertEqual(len(mod.samples), 1)
+
+
+class TestYm2612PanOff(unittest.TestCase):
+    """A source pan byte of 00 turns both outputs off, not center."""
+
+    @staticmethod
+    def _rows(song, ch=0):
+        mod = parse_fur(write_fur(song, include_pcm=False, include_fm=True))
+        rows = {}
+        for oi, pidx in enumerate(mod.orders[ch]):
+            for ri, row in enumerate(mod.patterns.get((ch, pidx), [])):
+                rows[oi * mod.pat_len + ri] = row
+        return rows
+
+    def test_note_keyed_with_both_sides_off_is_muted(self):
+        ws = _fm_note(4, 1204, t=100, off=20000)
+        # The patch helper opens both sides; key this note with pan 00.
+        ws = [
+            ChipWrite(w.sample, w.chip, w.chip_id, w.reg, 0x00)
+            if (w.sample == 100 and w.reg == 0xB4) else w
+            for w in ws
+        ]
+        ws.append(ChipWrite(8000, "ym2612", 0, 0xB4, 0xC0))
+        song = analyze(_vgm(ws, total_samples=30000), speed=2)
+        ev = next(e for e in song.events if e.on)
+        self.assertEqual(ev.pan, 0x00)
+        rows = self._rows(song)
+        note_row = rows[song.place(100)[0]]
+        self.assertEqual(note_row.vol, 0)
+        self.assertNotIn((0x08, 0x00), note_row.fx)
+        # When the source opens both sides again the note's level comes back.
+        restore = [
+            row for row in rows.values() if (0x08, 0xFF) in (row.fx or ())
+        ]
+        self.assertTrue(restore)
+        self.assertTrue(any(row.vol == ev.vol for row in restore))
+
+    def test_mid_note_both_sides_off_is_a_volume_mute(self):
+        ws = _fm_note(4, 1204, t=100, off=30000)
+        ws += [
+            ChipWrite(10000, "ym2612", 0, 0xB4, 0x00),
+            ChipWrite(20000, "ym2612", 0, 0xB4, 0xC0),
+        ]
+        song = analyze(_vgm(ws, total_samples=40000), speed=2)
+        ev = next(e for e in song.events if e.on)
+        rows = self._rows(song)
+        self.assertFalse(
+            [row for row in rows.values() if (0x08, 0x00) in (row.fx or ())]
+        )
+        muted = [row for row in rows.values() if row.vol == 0]
+        self.assertTrue(muted)
+        restored = [
+            row for row in rows.values()
+            if (0x08, 0xFF) in (row.fx or ()) and row.vol == ev.vol
+        ]
+        self.assertTrue(restored)
 
 
 if __name__ == "__main__":

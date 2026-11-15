@@ -9,6 +9,7 @@ from __future__ import annotations
 import bisect
 import math
 import statistics
+from collections import Counter
 from dataclasses import dataclass
 
 from vgm2151fur.samplecluster import (
@@ -27,7 +28,7 @@ DAC_RUN_GAP = 2048
 # Two runs at one bank offset whose trimmed mean byte interval differ by more
 # than this are genuinely repitched and get their own sample.  4/5-wait
 # quantisation jitter at one nominal rate stays inside this window.
-DAC_WAIT_CLUSTER = 0.5
+DAC_WAIT_CLUSTER = 0.35
 DAC_TIMELINE_RATE = 22050
 # Keep the module below release Furnace's sample-count limit.
 DAC_RELEASE_SAMPLES = 240
@@ -962,13 +963,22 @@ def _source_runs(
 
 
 def _source_pitch(run: dict) -> int:
-    """Median byte cadence of a run, in bytes per second."""
+    """Most common byte cadence of a run, in bytes per second.
+
+    A driver's regular cadence is the wait it uses most often; one short
+    interval caused by a wait-command boundary must not set the whole run's
+    pitch.  Ties go to the shorter wait, which is the nominal 4-wait in a
+    4/5-alternating jitter pair.
+    """
     times = run["times"]
     waits = [b - a for a, b in zip(times, times[1:]) if b > a]
     if not waits:
         return VGM_RATE
+    counts = Counter(waits)
+    top = max(counts.values())
+    wait = min(w for w, n in counts.items() if n == top)
     return max(DAC_RATE_MIN, min(
-        DAC_RATE_MAX, int(round(VGM_RATE / statistics.median(waits))),
+        DAC_RATE_MAX, int(round(VGM_RATE / wait)),
     ))
 
 
@@ -1135,24 +1145,11 @@ def _collect_source(
             rep = max(cluster, key=lambda r: (
                 len(r["bytes"]), r["times"][-1] - r["times"][0],
             ))
-            duration = rep["times"][-1] - rep["times"][0]
-            n = len(rep["bytes"])
-            waits = [
-                b - a
-                for a, b in zip(rep["times"], rep["times"][1:]) if b > a
-            ]
-            if waits and len(set(waits)) == 1:
-                # A uniform cadence is exact: N bytes at one wait occupy N
-                # frames of VGM_RATE/wait, not (N-1).
-                dense = VGM_RATE / waits[0]
-            else:
-                dense = n * VGM_RATE / duration if duration > 0 else VGM_RATE
-            # The fastest interval must still have its own frame or its byte
-            # is overwritten when the body is laid out.
-            fastest = VGM_RATE / min(waits) if waits else float(VGM_RATE)
-            rate = max(1, min(
-                DAC_RATE_MAX, max(int(round(dense)), int(round(fastest))),
-            ))
+            # Playback pitch follows the run's regular byte interval, not one
+            # short gap inside it.  A single 3-sample wait in a 4-wait read
+            # otherwise stretched the whole body to 14.7 kHz and every reuse
+            # played a fourth too high; the most common interval ignores it.
+            rate = _source_pitch(rep)
             body = _frames_from_times(
                 [(t, b, 0) for t, b in zip(rep["times"], rep["bytes"])],
                 rate, stats,

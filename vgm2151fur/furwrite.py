@@ -3404,6 +3404,30 @@ def _place_chip_fx(
             _add_fx(cell, 0xED, delay, fx_cols, stats)
 
 
+# The OPN systems with a real hard-pan register.  The YM2203 is mono and
+# writes pan=0 on every note, so it must not be read as "both sides off".
+_OPN_KINDS = frozenset({"ym2612", "ym2608", "ym2610"})
+
+
+def _opn_module_channels(song: Song, n_ch: int, ch_offset: int = 0) -> set[int]:
+    """FM columns of the hard-panned OPN systems.
+
+    On Furnace's Genesis and OPN platforms ``08 00`` means "center", not
+    "both sides off".  The writer keeps the source byte and turns it into a
+    volume mute on those columns, so it needs to know which ones they are.
+    """
+    if ch_offset:
+        return set()
+    out: set[int] = set()
+    base = 0
+    for system in getattr(song, "fm_systems", ()) or ():
+        span = _system_span(system)
+        if system.kind in _OPN_KINDS:
+            out.update(range(base, min(n_ch, base + system.fm_channels)))
+        base += span
+    return out
+
+
 def _build_patterns(song: Song, n_ch: int, pat_len_max: int, fx_cols: int,
                     ch_offset: int = 0, stats: dict | None = None,
                     vsu_wave_base: int = 0) -> tuple[
@@ -3518,6 +3542,7 @@ def _build_patterns(song: Song, n_ch: int, pat_len_max: int, fx_cols: int,
     note_row_shift: dict[int, tuple[int, int]] = {}
     fx_row_shift: dict[tuple[int, int], tuple[int, int]] = {}
     shifted_rows: set[tuple[int, int]] = set()
+    opn_pan_ch = _opn_module_channels(song, n_ch, ch_offset)
     tone_rows: dict[int, dict[int, list[tuple[object, int]]]] = {}
     for ev in song.events:
         if not (ev.on and ev.tone_chip):
@@ -3848,11 +3873,22 @@ def _build_patterns(song: Song, n_ch: int, pat_len_max: int, fx_cols: int,
         note_e5[(ev_ch, row)] = ev.e5
         note_ev[(ev_ch, row)] = ev
         # PCM pan 0x00 is both channels off. Omitting it leaves Furnace's
-        # default (both full). FM pan 0 still means "no 08xx on this row".
+        # default (both full).  A hard-panned OPN voice's pan 0 is emitted
+        # here and folded into a volume mute below, because Furnace reads
+        # 08 00 as "center" on those platforms.
         if ev.quad is not None:
             _add_quad_fx(cell, ev.quad, fx_cols, stats)
-        elif (ev.pcm or ev.pan or ev.tone_chip in (7, 10)) and not ev.no_pan:
+        elif (
+            not ev.no_pan
+            and (
+                ev.pcm or ev.pan or ev.tone_chip in (7, 10)
+                or ev_ch in opn_pan_ch
+            )
+        ):
             # VSU LRV 0 is "both sides off", not "leave the previous pan".
+            # A hard-panned OPN voice can also be turned off on both sides;
+            # its 08 00 would read as "center" in Furnace, so keep the byte
+            # here and convert it to a volume mute in the pan pass below.
             _add_fx(cell, 0x08, ev.pan & 0xFF, fx_cols, stats)
         if ev.c219_noise:
             _add_fx(cell, 0x11, 1, fx_cols, stats)
@@ -4369,6 +4405,42 @@ def _build_patterns(song: Song, n_ch: int, pat_len_max: int, fx_cols: int,
             cell = _blank_row()
             grid[ch][row] = cell
         cell.vol = max(0, min(255, level))
+
+    # Furnace's Genesis/OPN platforms read 08 00 as "center".  The source's
+    # 00 pan byte is "both sides off", which is audible on a held note, so
+    # replace that effect with a volume mute and restore the note's level
+    # when the pan comes back.  A note row can carry the pan too (the source
+    # may key a voice while both outputs are off), and a volume step during
+    # the mute must only update the level restored later.
+    for ch in sorted(opn_pan_ch):
+        intended = EMPTY
+        muted = False
+        for row in sorted(grid[ch]):
+            cell = grid[ch][row]
+            pan_vals = [v for c, v in (cell.fx or ()) if c == 0x08]
+            pan_val = pan_vals[-1] if pan_vals else None
+            if cell.vol != EMPTY and not muted:
+                intended = cell.vol
+            if pan_val is None:
+                if muted:
+                    if cell.vol != EMPTY:
+                        intended = cell.vol
+                    cell.vol = 0
+                continue
+            if pan_val == 0:
+                cell.fx = [(c, v) for c, v in (cell.fx or ()) if c != 0x08]
+                if cell.vol != EMPTY:
+                    intended = cell.vol
+                if intended == EMPTY:
+                    intended = 127
+                cell.vol = 0
+                muted = True
+            elif muted:
+                muted = False
+                if cell.vol != EMPTY:
+                    intended = cell.vol
+                else:
+                    cell.vol = intended if intended != EMPTY else 127
 
     for ch in range(n_ch):
         for oi in range(n_ord):
