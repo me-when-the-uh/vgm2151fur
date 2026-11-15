@@ -15,7 +15,7 @@ Supported chips:
 - Sega: SegaPCM and 32X PWM.
 - Nintendo: NES APU (2A03), Famicom Disk System, Game Boy DMG, Virtual Boy VSU and Hudson HuC6280 (PC Engine).
 - OKI: MSM5205, MSM5232, MSM6295 and MSM6258.
-- Namco: C140, C219 and C352.
+- Namco: C140, C219 and C352. For C352, you'll need to use the build of the fork of Furnace in this repository, located in `./furnace-c352/furnace-c352.7z`, or [build it from source](https://github.com/me-when-the-uh/furnace-ports).
 - Irem: GA20.
 - Ensoniq: ES5503.
 - Ricoh: RF5C68 and RF5C164.
