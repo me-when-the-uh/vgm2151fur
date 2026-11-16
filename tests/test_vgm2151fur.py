@@ -192,6 +192,40 @@ class TestK007232ReadTriggers(unittest.TestCase):
         self.assertEqual(hit.pan, 0)
 
 
+class TestManualTickRate(unittest.TestCase):
+    """A manual ticks-per-row keeps the 60 Hz tick unless a rate is given."""
+
+    @staticmethod
+    def _vgm():
+        body = bytes(range(0x40, 0x80)) + b"\x80"
+        writes = [
+            ChipWrite(0, "k007232", 0, 0x00, 0xD3),
+            ChipWrite(0, "k007232", 0, 0x01, 0x0F),
+            ChipWrite(0, "k007232", 0, 0x05, 0x00),
+        ]
+        return VgmFile(
+            path=Path("synthetic.vgm"), buf=b"", version=0x171,
+            total_samples=10_000, loop_samples=0, loop_file_pos=None,
+            loop_sample=None, ym2151_clock=0, k007232_clock=3579545,
+            gd3={}, roms=[RomSlice(0, 0x1000, 0, body, "k007232")],
+            writes=writes,
+        )
+
+    def test_manual_speed_keeps_60_hz_by_default(self):
+        song = analyze(self._vgm(), speed=4)
+        self.assertEqual(song.speed, 4)
+        self.assertAlmostEqual(song.hz, 60.0)
+
+    def test_manual_speed_with_tick_rate(self):
+        song = analyze(self._vgm(), speed=4, tick_hz=120)
+        self.assertEqual(song.speed, 4)
+        self.assertAlmostEqual(song.hz, 120.0)
+
+    def test_tick_rate_without_speed_is_rejected(self):
+        with self.assertRaises(ValueError):
+            analyze(self._vgm(), tick_hz=120)
+
+
 class TestVolAndKF(unittest.TestCase):
     def test_k007232_volume_is_linear_amplitude(self):
         # MAME mixes a voice as sample * (vol * 2) / 32768, so 255 is full

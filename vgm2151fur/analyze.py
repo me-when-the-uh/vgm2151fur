@@ -7805,6 +7805,7 @@ def _family_sounds(vgm: VgmFile, names: set[str]) -> bool:
 
 def analyze(
     vgm: VgmFile, *, speed: int | None = None, pcm: bool = True,
+    tick_hz: float | None = None,
     tick_samples: float | None = None,
     min_row: float | None = None,
     condense: float = 1.0,
@@ -7824,6 +7825,8 @@ def analyze(
     """
     tick = TARGET_TICK_SAMPLES if tick_samples is None else float(tick_samples)
     row_floor = MIN_ROW_SAMPLES if min_row is None else float(min_row)
+    if tick_hz is not None and (not speed or speed < 1):
+        raise ValueError("a tick rate needs a manual ticks-per-row")
     ym = YM2151State()
     patches: dict[tuple, FMPatch] = {}
     patch_order: list[tuple] = []
@@ -13967,8 +13970,9 @@ def analyze(
     events.sort(key=lambda e: (e.sample, e.ch, 0 if e.on else 1))
 
     # Prefer the measured lattice: EDxx places events at their true write
-    # time. Manual --speed keeps the legacy 60 Hz path. A rip with no FM
-    # stream is measured from its sample-chip triggers.
+    # time. A manual ticks-per-row keeps the legacy 60 Hz tick, or the given
+    # tick rate when one is supplied. A rip with no FM stream is measured
+    # from its sample-chip triggers.
     pcm_onsets: dict[int, list[int]] = {}
     for e in events:
         # Every non-FM note-on counts as a rhythm marker, sample chips and the
@@ -13985,8 +13989,9 @@ def analyze(
 
     tone_hilight = False
     if speed and speed >= 1:
-        hz = 60.0
+        hz = float(tick_hz) if tick_hz else 60.0
         use_speed = speed
+        grid_note = f"manual {use_speed} ticks/row at {hz:g} Hz"
     else:
         def _grid(kind: str, **kw):
             """The grid estimate for the track, memoised across factors"""

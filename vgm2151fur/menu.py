@@ -467,17 +467,17 @@ def _pack_view(read, out, pack: Pack, state: dict, state_path: Path) -> str:
 def _run_convert(
     out, files: list[Path], dest: Path, speed: int | None,
     optimize: str = "all", verify: bool = False, lfo_loop: bool = True,
-    lossy_samples: bool = False,
+    lossy_samples: bool = False, tick_hz: float | None = None,
 ) -> int:
     if optimize != "none":
         return _run_variants(
             out, files, dest, 4, optimize, verify, lfo_loop=lfo_loop,
-            lossy_samples=lossy_samples,
+            lossy_samples=lossy_samples, speed=speed, tick_hz=tick_hz,
         )
     done = rc = 0
     for src, info, error in convert_folder(
-        files, dest, speed=speed, normalize=verify, lfo_loop=lfo_loop,
-        lossy_samples=lossy_samples,
+        files, dest, speed=speed, tick_hz=tick_hz, normalize=verify,
+        lfo_loop=lfo_loop, lossy_samples=lossy_samples,
         log=lambda message: out(f"  {message}"),
     ):
         if error is not None:
@@ -506,16 +506,17 @@ def _run_convert(
 def _run_variants(
     out, files: list[Path], dest: Path, factor: int, mode: str,
     verify: bool = False, layout: str = "dirs", lfo_loop: bool = True,
-    lossy_samples: bool = False,
+    lossy_samples: bool = False, speed: int | None = None,
+    tick_hz: float | None = None,
 ) -> int:
     done = rc = 0
     use_verify = verify and mode != "all"
     if use_verify:
         out("  rendering/verifying each variant through Furnace...")
     for src, info, error in convert_folder(
-        files, dest, variants=True, condense=factor, optimize=mode,
-        verify=verify, layout=layout, normalize=verify, lfo_loop=lfo_loop,
-        lossy_samples=lossy_samples,
+        files, dest, speed=speed, tick_hz=tick_hz, variants=True,
+        condense=factor, optimize=mode, verify=verify, layout=layout,
+        normalize=verify, lfo_loop=lfo_loop, lossy_samples=lossy_samples,
         log=lambda message: out(f"  {message}"),
     ):
         if error is not None:
@@ -654,11 +655,11 @@ def _pack_render(read, out, tracks, fur_dir: Path, *, spec: str | None = None) -
 def _convert_now(
     out, files: list[Path], dest: Path, speed: int | None,
     optimize: str = "all", verify: bool = False, lfo_loop: bool = True,
-    lossy_samples: bool = False,
+    lossy_samples: bool = False, tick_hz: float | None = None,
 ) -> int:
     return _run_convert(
         out, files, dest, speed, optimize, verify, lfo_loop=lfo_loop,
-        lossy_samples=lossy_samples,
+        lossy_samples=lossy_samples, tick_hz=tick_hz,
     )
 
 
@@ -691,6 +692,14 @@ def cmd_convert_file(read, out, state, state_path):
     default_out = str(vgms[0].parent / FUR_FOLDER)
     dst = Path(_ask(read, "output folder", default_out))
     speed = _ask(read, "ticks per row (blank = auto)")
+    tick_hz: float | None = None
+    if speed.isdigit():
+        raw_hz = _ask(read, "tick rate Hz (blank = 60)")
+        if raw_hz:
+            try:
+                tick_hz = float(raw_hz)
+            except ValueError:
+                out(f"  '{raw_hz}' is not a number; tick rate stays at 60 Hz")
     optimize = _ask_optimise(read)
     lfo_loop = _ask_lfo_loop(read)
     lossy_samples = _ask_lossy_samples(read)
@@ -703,6 +712,7 @@ def cmd_convert_file(read, out, state, state_path):
     return _convert_now(
         out, vgms, dst, int(speed) if speed.isdigit() else None, optimize,
         verify, lfo_loop=lfo_loop, lossy_samples=lossy_samples,
+        tick_hz=tick_hz,
     )
 
 

@@ -497,6 +497,111 @@ class TestLfoLoopPrompt(unittest.TestCase):
         self.assertFalse(calls[0]["lfo_loop"])
 
 
+class TestSpeedPrompt(unittest.TestCase):
+    """The ticks-per-row and tick-rate answers must reach convert_folder."""
+
+    @staticmethod
+    def _fake_convert():
+        calls: list[dict] = []
+        info = {
+            "dst": "out/a.fur", "bytes": 1, "speed": 8, "events": 1,
+            "gain": None, "loop": None, "warnings": [], "variants": [],
+        }
+
+        def fake_convert(files, dest, **kw):
+            calls.append(kw)
+            return iter([(files[0], info, None)])
+
+        return calls, fake_convert
+
+    def test_optimised_path_keeps_the_speed(self):
+        from unittest import mock
+
+        calls, fake_convert = self._fake_convert()
+        with mock.patch.object(menu, "convert_folder", fake_convert):
+            menu._run_convert(
+                lambda _message: None, [Path("a.vgm")], Path("out"), 8,
+                "all",
+            )
+        self.assertEqual(calls[0]["speed"], 8)
+        self.assertTrue(calls[0]["variants"])
+
+    def test_plain_path_keeps_the_speed(self):
+        from unittest import mock
+
+        calls, fake_convert = self._fake_convert()
+        with mock.patch.object(menu, "convert_folder", fake_convert):
+            menu._run_convert(
+                lambda _message: None, [Path("a.vgm")], Path("out"), 8,
+                "none",
+            )
+        self.assertEqual(calls[0]["speed"], 8)
+        self.assertFalse(calls[0].get("variants"))
+
+    def test_optimised_path_keeps_the_tick_rate(self):
+        from unittest import mock
+
+        calls, fake_convert = self._fake_convert()
+        with mock.patch.object(menu, "convert_folder", fake_convert):
+            menu._run_convert(
+                lambda _message: None, [Path("a.vgm")], Path("out"), 8,
+                "all", tick_hz=120.0,
+            )
+        self.assertEqual(calls[0]["speed"], 8)
+        self.assertEqual(calls[0]["tick_hz"], 120.0)
+        self.assertTrue(calls[0]["variants"])
+
+    def test_plain_path_keeps_the_tick_rate(self):
+        from unittest import mock
+
+        calls, fake_convert = self._fake_convert()
+        with mock.patch.object(menu, "convert_folder", fake_convert):
+            menu._run_convert(
+                lambda _message: None, [Path("a.vgm")], Path("out"), 8,
+                "none", tick_hz=120.0,
+            )
+        self.assertEqual(calls[0]["speed"], 8)
+        self.assertEqual(calls[0]["tick_hz"], 120.0)
+        self.assertFalse(calls[0].get("variants"))
+
+    def test_prompts_carry_the_tick_rate_end_to_end(self):
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "a.vgm"
+            src.write_bytes(_music_vgm())
+            answers = iter([
+                str(src),        # path
+                "",              # output folder (default)
+                "4",             # ticks per row
+                "120",           # tick rate Hz
+                "y",             # optimise -> variants path
+                "n",             # lfo loop
+                "",              # lossy samples
+                "n",             # verify
+            ])
+            calls: list[dict] = []
+            info = {
+                "dst": str(src.parent / "fur" / "a.fur"), "bytes": 1,
+                "speed": 4, "events": 1, "gain": None, "loop": None,
+                "warnings": [], "variants": [],
+            }
+
+            def fake_convert(files, dest, **kw):
+                calls.append(kw)
+                return iter([(files[0], info, None)])
+
+            with mock.patch.object(menu, "convert_folder", fake_convert):
+                menu.cmd_convert_file(
+                    lambda _prompt: next(answers),
+                    lambda _message: None,
+                    {}, Path(tmp) / "state.json",
+                )
+        self.assertEqual(calls[0]["speed"], 4)
+        self.assertEqual(calls[0]["tick_hz"], 120.0)
+        self.assertTrue(calls[0]["variants"])
+
+
 class TestLossySamplesPrompt(unittest.TestCase):
     def test_prompt_defaults_to_no(self):
         prompts: list[str] = []

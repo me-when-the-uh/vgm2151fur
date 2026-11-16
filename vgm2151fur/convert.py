@@ -300,6 +300,7 @@ def convert_vgm(
     out_path: Path,
     *,
     speed: int | None = None,
+    tick_hz: float | None = None,
     pcm: bool = True,
     tick_samples: float | None = None,
     min_row: float | None = None,
@@ -313,9 +314,9 @@ def convert_vgm(
 ) -> dict:
     vgm = load_vgm(path)
     song = analyze(
-        vgm, speed=speed, pcm=pcm, tick_samples=tick_samples,
-        min_row=min_row, condense=condense, c352_quad=c352_quad,
-        lfo_loop=lfo_loop, lossy_samples=lossy_samples,
+        vgm, speed=speed, tick_hz=tick_hz, pcm=pcm,
+        tick_samples=tick_samples, min_row=min_row, condense=condense,
+        c352_quad=c352_quad, lfo_loop=lfo_loop, lossy_samples=lossy_samples,
     )
     loop_note = None
     if loop_find:
@@ -504,6 +505,7 @@ def convert_variants(
     factors: Sequence[float] = (1, 2, 3, 4),
     mode: str = "all",
     speed: int | None = None,
+    tick_hz: float | None = None,
     pcm: bool = True,
     min_row: float | None = None,
     include_fm: bool = True,
@@ -530,9 +532,9 @@ def convert_variants(
     shared_gain: float | None = None
     grid_cache: dict = {}
     base = analyze(
-        vgm, speed=speed, pcm=pcm, min_row=min_row, condense=1.0,
-        grid_cache=grid_cache, c352_quad=c352_quad, lfo_loop=lfo_loop,
-        lossy_samples=lossy_samples,
+        vgm, speed=speed, tick_hz=tick_hz, pcm=pcm, min_row=min_row,
+        condense=1.0, grid_cache=grid_cache, c352_quad=c352_quad,
+        lfo_loop=lfo_loop, lossy_samples=lossy_samples,
     )
     loop_note = apply_loop(base) if loop_find else None
     for f in factors:
@@ -542,7 +544,7 @@ def convert_variants(
             variant_loop = loop_note
         else:
             song = analyze(
-                vgm, speed=speed, pcm=pcm, min_row=min_row,
+                vgm, speed=speed, tick_hz=tick_hz, pcm=pcm, min_row=min_row,
                 condense=factor, grid_cache=grid_cache,
                 c352_quad=c352_quad, lfo_loop=lfo_loop,
                 lossy_samples=lossy_samples,
@@ -774,14 +776,14 @@ _CFG: dict = {}
 
 
 def _variant_info(
-    src: Path, out_dir: Path, *, factors, mode, speed, pcm, min_row,
+    src: Path, out_dir: Path, *, factors, mode, speed, tick_hz=None, pcm, min_row,
     include_fm, normalize, loop_find, verify, layout, c352_quad=False,
     lfo_loop=True, lossy_samples=False,
 ) -> dict:
     """Write the 1x/2x/3x/4x set and return the pick's info plus the set."""
     results = convert_variants(
-        src, out_dir, factors=factors, mode=mode, speed=speed, pcm=pcm,
-        min_row=min_row, include_fm=include_fm, normalize=normalize,
+        src, out_dir, factors=factors, mode=mode, speed=speed, tick_hz=tick_hz,
+        pcm=pcm, min_row=min_row, include_fm=include_fm, normalize=normalize,
         loop_find=loop_find, verify=verify, layout=layout,
         c352_quad=c352_quad, lfo_loop=lfo_loop,
         lossy_samples=lossy_samples,
@@ -804,9 +806,10 @@ def _worker(path_str: str) -> dict:
         return _variant_info(
             src, Path(_CFG["out_dir"]),
             factors=_CFG["factors"], mode=_CFG["optimize"],
-            speed=_CFG["speed"], pcm=_CFG["pcm"], min_row=_CFG["min_row"],
-            include_fm=_CFG["include_fm"], normalize=_CFG["normalize"],
-            loop_find=_CFG["loop_find"], verify=_CFG["verify"],
+            speed=_CFG["speed"], tick_hz=_CFG.get("tick_hz"), pcm=_CFG["pcm"],
+            min_row=_CFG["min_row"], include_fm=_CFG["include_fm"],
+            normalize=_CFG["normalize"], loop_find=_CFG["loop_find"],
+            verify=_CFG["verify"],
             layout=_CFG["layout"], c352_quad=_CFG.get("c352_quad", False),
             lfo_loop=_CFG.get("lfo_loop", True),
             lossy_samples=_CFG.get("lossy_samples", False),
@@ -815,8 +818,8 @@ def _worker(path_str: str) -> dict:
         src,
         Path(_CFG["out_dir"]) / (src.stem + ".fur"),
         speed=_CFG["speed"],
+        tick_hz=_CFG.get("tick_hz"),
         pcm=_CFG["pcm"],
-        tick_samples=_CFG["tick_samples"],
         min_row=_CFG["min_row"],
         include_fm=_CFG["include_fm"],
         normalize=_CFG["normalize"],
@@ -827,16 +830,16 @@ def _worker(path_str: str) -> dict:
     )
 
 
-def _convert_serial(files, out_dir, *, speed, pcm, tick_samples, min_row,
-                    variants, factors, optimize, include_fm, normalize, loop_find,
-                    verify, layout, c352_quad=False, lfo_loop=True,
+def _convert_serial(files, out_dir, *, speed, tick_hz=None, pcm, tick_samples,
+                    min_row, variants, factors, optimize, include_fm, normalize,
+                    loop_find, verify, layout, c352_quad=False, lfo_loop=True,
                     lossy_samples=False):
     for f in files:
         try:
             if variants:
                 info = _variant_info(
                     f, out_dir, factors=factors, mode=optimize,
-                    speed=speed, pcm=pcm, min_row=min_row,
+                    speed=speed, tick_hz=tick_hz, pcm=pcm, min_row=min_row,
                     include_fm=include_fm, normalize=normalize, loop_find=loop_find,
                     verify=verify, layout=layout, c352_quad=c352_quad,
                     lfo_loop=lfo_loop, lossy_samples=lossy_samples,
@@ -846,6 +849,7 @@ def _convert_serial(files, out_dir, *, speed, pcm, tick_samples, min_row,
                     f,
                     out_dir / (f.stem + ".fur"),
                     speed=speed,
+                    tick_hz=tick_hz,
                     pcm=pcm,
                     tick_samples=tick_samples,
                     min_row=min_row,
@@ -867,6 +871,7 @@ def convert_folder(
     out_dir: Path,
     *,
     speed: int | None = None,
+    tick_hz: float | None = None,
     pcm: bool = True,
     tick_samples: float | None = None,
     min_row: float | None = None,
@@ -921,7 +926,7 @@ def convert_folder(
         if n_workers <= 1:
             with low_priority():
                 for result in _convert_serial(
-                    files, out_dir, speed=speed, pcm=pcm,
+                    files, out_dir, speed=speed, tick_hz=tick_hz, pcm=pcm,
                     tick_samples=tick_samples, min_row=min_row,
                     variants=variants, factors=factor_list, optimize=optimize,
                     include_fm=include_fm, normalize=normalize,
@@ -936,6 +941,7 @@ def convert_folder(
         cfg = {
             "out_dir": str(out_dir),
             "speed": speed,
+            "tick_hz": tick_hz,
             "pcm": pcm,
             "tick_samples": tick_samples,
             "min_row": min_row,
