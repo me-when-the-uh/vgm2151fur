@@ -24,6 +24,10 @@ A log that mixes several chip families is written as one module when the combina
 
 It runs on Windows and Linux with Python 3.11 or newer.
 
+## Feeling Rusty?
+
+[vgm2151fur-rs](https://github.com/djtuBIG-MaliceX/vgm2151fur-rs)
+
 ## Requirements
 
 - Python 3.11 or newer
