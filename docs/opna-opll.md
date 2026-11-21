@@ -22,11 +22,11 @@ Delta-T ROM data blocks are type **0x81**; ADPCMB sample RAM is loaded with
 normal `$57` register writes (the reference rip embeds 0x81 blocks).
 
 The extra-header volume list can carry the **linked SSG** mix as type
-**0x86/0x87/0x88** (bit 7 = linked). Its default is `0x80` (0.5), scaled by a
-relative entry (bit 15) or overridden by an absolute one. The writer puts the
-result on Furnace's `ssgVol` platform flag (128 = 0.5), so e.g. the Yuno OPNA
-pack's `0x80A0` becomes `ssgVol=80` instead of the 128 default. Without this
-the SSG half stayed at Furnace's default and was too loud against the FM half.
+**0x86/0x87/0x88** (bit 7 = linked), scaled by a relative entry or set
+absolutely. The writer ignores these entries and keeps Furnace's `ssgVol`
+default (128), leaving the balance for Chip Manager. The player's chip-volume
+units do not match Furnace's SSG mix calibration, so applying the header value
+made the SSG too loud against the FM half.
 
 Port decode (`ymfm_opn.cpp`, `ym2608::write_data` / `_hi`, lines
 1179-1255). The spec calls the two address ports "port 0" and "port 1"
