@@ -389,6 +389,39 @@ class TestGbWave(unittest.TestCase):
         self.assertEqual(wave[1].sample_time, 2000)
         self.assertEqual(wave[1].period, 0x720)
 
+    def test_nr51_mute_gates_the_wave_with_nr32(self):
+        # The Pokémon drivers gate the wave voice by clearing its NR51 bits.
+        # Furnace reads a 08 00 effect as "both on", so the gate must become an
+        # NR32 level change instead: 0 while muted, the register's level back
+        # when NR51 returns.
+        img = bytes(range(0x10, 0x20))
+        writes = self._wave_cmds(0, img)
+        writes += [
+            _gb(1000, 0x0A, 0x80),        # wave DAC on
+            _gb(1000, 0x0C, 0x20),        # 100%
+            _gb(1000, 0x0D, 0x00),
+            _gb(1000, 0x0E, 0x86),        # trigger
+            _gb(1000, 0x15, 0xFF),        # every voice both sides
+            _gb(5000, 0x15, 0xBB),        # wave off, everyone else stays
+            _gb(9000, 0x15, 0xFF),        # wave back
+        ]
+        hits, _o, _w, _warn = collect_gb(_vgm(writes))
+        wave = [h for h in hits if h.voice == 2]
+        self.assertEqual(len(wave), 1)
+        self.assertEqual(wave[0].vol_pts, [(5000, 0), (9000, 15)])
+        self.assertEqual(wave[0].pan, 0xFF)
+        self.assertNotIn(0, [p for _t, p in wave[0].pan_pts])
+
+        song = analyze(_vgm(writes))
+        cells = parse_fur(write_fur(song, include_pcm=True)).patterns[(2, 0)]
+        self.assertTrue(
+            any(r.vol == 0 for r in cells), "the gate must write NR32 = 0"
+        )
+        self.assertFalse(
+            any(c == 0x08 and v == 0 for r in cells for c, v in (r.fx or ())),
+            "08 00 is 'both on' on the GB platform",
+        )
+
     def test_wave_trigger_while_muted_starts_at_the_level_rise(self):
         # Kirby's Dream Land 2 starts the wave voice with NR32 = 0 and raises
         # the output level a few samples later. The rise starts the note.

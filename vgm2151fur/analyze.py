@@ -12996,11 +12996,10 @@ def analyze(
                         t, ch, 0x13, (((sw >> 4) & 7) << 4) | (sw & 7),
                     ))
                     channel_fx.append((t, ch, 0x14, (sw >> 3) & 1))
-            # Stereo: NR51's per-channel L/R map is Furnace's 08xy.
+            # Stereo: NR51's per-channel L/R map is Furnace's 08xy. A
+            # both-off write never reaches here: the collector turns it into an
+            # NR32 gate for the wave voice, and GB's 08 00 means "both on".
             ev_pan = h.pan
-            if ev_pan == 0:
-                # Both off: a real mute, not "leave the previous pan".
-                ev_pan = 0
             for t, p in h.pan_pts:
                 channel_fx.append((t, ch, 0x08, p))
             wave_steps: list[tuple[int, int]] = []

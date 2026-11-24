@@ -460,10 +460,14 @@ def collect_gb(
             if not wave_on:
                 return
             index = wave_now(t)
+            # NR51 both off: the voice is gated, and 08 00 cannot express that
+            # (Furnace forces both on), so start silent and let the restore
+            # write NR32 back (see the NR51 handler).
+            gated = pan[2] == 0
             active[voice] = GbHit(
                 sample_time=t, voice=2, period=period[2],
-                vol=wave_volume(wave_vol), duty=0, wave=index,
-                pan=pan[2],
+                vol=0 if gated else wave_volume(wave_vol), duty=0, wave=index,
+                pan=0xFF if gated else pan[2],
             )
             return
         if not dac_on(voice) and vol_override is None:
@@ -708,17 +712,36 @@ def collect_gb(
                 left = (val >> (4 + v)) & 1
                 right = (val >> v) & 1
                 new_pan = (0xF0 if left else 0) | (0x0F if right else 0)
-                if new_pan != pan[v]:
-                    pan[v] = new_pan
-                    hit = active[v]
-                    if hit is not None:
-                        if t - hit.sample_time <= GB_ENV_REFIT:
-                            # The driver writes NR51 at (or just after) the
-                            # trigger; that is this note's pan, not a mid-note
-                            # move.
-                            hit.pan = new_pan
-                        elif not hit.pan_pts or hit.pan_pts[-1][1] != new_pan:
-                            hit.pan_pts.append((t, new_pan))
+                if new_pan == pan[v]:
+                    continue
+                was_muted = pan[v] == 0
+                pan[v] = new_pan
+                hit = active[v]
+                if hit is None:
+                    continue
+                if new_pan == 0:
+                    # NR51 with both sides off. Furnace's GB platform reads a
+                    # 08 00 effect as "both on" (it forces pan 0x11), so a pan
+                    # effect cannot gate a voice. Drivers use this write to cut
+                    # the wavetable voice, which has no envelope of its own:
+                    # express it as NR32 = 0 so the note stops where the source
+                    # does and resumes when NR51 comes back.
+                    if v == 2 and t > hit.sample_time:
+                        if not hit.vol_pts or hit.vol_pts[-1][1] != 0:
+                            hit.vol_pts.append((t, 0))
+                    continue
+                if was_muted and v == 2 and t > hit.sample_time:
+                    # NR51 came back: NR32 never changed while the output was
+                    # off, so restore the level it still holds.
+                    level = wave_volume(wave_vol)
+                    if not hit.vol_pts or hit.vol_pts[-1][1] != level:
+                        hit.vol_pts.append((t, level))
+                if t - hit.sample_time <= GB_ENV_REFIT:
+                    # The driver writes NR51 at (or just after) the trigger;
+                    # that is this note's pan, not a mid-note move.
+                    hit.pan = new_pan
+                elif not hit.pan_pts or hit.pan_pts[-1][1] != new_pan:
+                    hit.pan_pts.append((t, new_pan))
         elif reg == REG_ON:
             on = bool(val & 0x80)
             if enabled and not on:

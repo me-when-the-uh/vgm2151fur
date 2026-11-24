@@ -157,6 +157,17 @@ NR51's per-channel L/R enables map to Furnace's `08xy` (binary left/right);
 the note carries the value in force at its start and mid-note moves become
 pan effects.
 
+Both sides off is the exception: Furnace's GB platform reads `08 00` as "both
+on" (`if (pan==0) pan=0x11`), so the effect cannot express a mute. The
+Pokémon drivers gate the wavetable voice with exactly that write - a few
+thousand times across the first-generation soundtrack, typically 20-350 ms
+per note, which is what makes the wave sound chopped rather than sustained.
+The collector therefore turns a wave NR51 mute into an NR32 level of 0 and
+restores the register's level when NR51 comes back (the register itself never
+changed while the output was off); the note keeps its phase and no pan effect
+is written. A wave note triggered while gated starts at level 0 for the same
+reason.
+
 ## Note-offs
 
 A voice stops when its DAC is cleared (NRx2 = 0x00 for pulse/noise, NR30 bit 7
