@@ -49,6 +49,10 @@ GB_REFIT_SAMPLES = 735
 GB_ENV_REFIT = 16
 # Two mid-note NRx2 writes mean the driver is doing a software volume ramp.
 GB_SOFT_ENV_WRITES = 2
+# Furnace's ``soundLen`` value for a voice whose length counter stays off
+# (``DivInstrumentGB::soundLen`` defaults to it together with
+# ``soundLenInfinite``). Any ``soundLen >= 64`` reads back as this value.
+GB_SOUND_LEN_INFINITE = 255
 # A held pitch jump of at least this many 1/64 semitones (0.75 st) is a
 # legato note change, not a slide. The pattern gets a note cell there.
 GB_LEGATO_UNITS = 48
@@ -177,7 +181,8 @@ class GbHit:
     env_vol: int = 0
     env_dir: int = 0
     env_len: int = 0
-    sound_len: int = 63        # Furnace field (63 = length disabled)
+    sound_len: int = GB_SOUND_LEN_INFINITE  # Furnace field (NRx1 encoding)
+    sound_len_inf: bool = True              # length counter stays off
     soft_env: bool = False
     env_raw: int = 0
     off_sample: int = 0
@@ -399,14 +404,16 @@ def collect_gb(
             return False
         return (e >> 4) > 0 or bool((e & 8) and (e & 7))
 
-    def final_sound_len(voice: int) -> int:
-        # Pulses disable length counting at ``soundLen == 63``; the noise
-        # platform tests ``soundLen < 64``, so 64 is its "disabled" value.
-        # Without that, every noise note is cut after 64 length ticks even
-        # when the source never enabled the counter.
+    def final_sound_len(voice: int) -> tuple[int, bool]:
+        # Furnace keeps the length counter off through the instrument's
+        # ``soundLenInfinite`` flag, not through a reserved value: without it
+        # the platform sets NRx4 bit 6 and the voice is cut after the length.
+        # The value itself is NRx1's encoding - pulses/noise store
+        # ``63 - length``, the wave voice ``255 - NR31`` (gb.cpp writes
+        # ``soundLen ^ 0xFF`` for it).
         if length_en[voice] and length_val[voice] > 0:
-            return 63 - length_val[voice]
-        return 64 if voice == 3 else 63
+            return (255 if voice == 2 else 63) - length_val[voice], False
+        return GB_SOUND_LEN_INFINITE, True
 
     def close(voice: int, t: int, *, emit_off: bool = True) -> None:
         nonlocal glitches
@@ -456,26 +463,30 @@ def collect_gb(
             active[voice] = GbHit(
                 sample_time=t, voice=2, period=period[2],
                 vol=wave_volume(wave_vol), duty=0, wave=index,
-                sound_len=63, pan=pan[2],
+                pan=pan[2],
             )
             return
         if not dac_on(voice) and vol_override is None:
             return
         start_vol = env[voice] >> 4 if vol_override is None else vol_override
         if voice == 3:
+            sound_len, sound_len_inf = final_sound_len(3)
             active[voice] = GbHit(
                 sample_time=t, voice=3, period=noise_period,
                 vol=start_vol, duty=noise_width,
                 env_vol=start_vol, env_dir=(env[3] >> 3) & 1,
-                env_len=env[3] & 7, sound_len=final_sound_len(3),
+                env_len=env[3] & 7, sound_len=sound_len,
+                sound_len_inf=sound_len_inf,
                 pan=pan[3], env_raw=env[3],
             )
         else:
+            sound_len, sound_len_inf = final_sound_len(voice)
             active[voice] = GbHit(
                 sample_time=t, voice=voice, period=period[voice],
                 vol=start_vol, duty=duty[voice],
                 env_vol=start_vol, env_dir=(env[voice] >> 3) & 1,
-                env_len=env[voice] & 7, sound_len=final_sound_len(voice),
+                env_len=env[voice] & 7, sound_len=sound_len,
+                sound_len_inf=sound_len_inf,
                 pan=pan[voice], sweep=sweep if voice == 0 else 0,
                 env_raw=env[voice],
             )

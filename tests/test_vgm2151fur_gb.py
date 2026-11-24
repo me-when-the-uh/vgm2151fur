@@ -11,6 +11,7 @@ from vgm2151fur.analyze import analyze
 from vgm2151fur.furio import iter_blocks, parse_fur
 from vgm2151fur.furwrite import CHIP_GB, INS_GB, write_fur
 from vgm2151fur.gb import (
+    GB_SOUND_LEN_INFINITE,
     collect_gb,
     gb_noise_note,
     gb_note,
@@ -301,15 +302,18 @@ class TestGbNotes(unittest.TestCase):
         )
         self.assertEqual(noise[1].pan, 0xFF)
 
-    def test_noise_length_disabled_uses_64(self):
-        # Furnace enables the noise length counter when soundLen < 64, so a
-        # source note with length counting off must carry 64, not 63.
+    def test_noise_length_disabled_is_infinite(self):
+        # A source note that never enables the counter must carry the
+        # instrument's infinite flag; the value alone would start the
+        # hardware length counter and cut the note.
         hits, _o, _w, _warn = collect_gb(_vgm(_noise_note(1000, 0xA1, 0x16)))
-        self.assertEqual(hits[0].sound_len, 64)
+        self.assertEqual(hits[0].sound_len, GB_SOUND_LEN_INFINITE)
+        self.assertTrue(hits[0].sound_len_inf)
         hits, _o, _w, _warn = collect_gb(
             _vgm(_noise_note(1000, 0xA1, 0x16, length=36, length_en=True))
         )
         self.assertEqual(hits[0].sound_len, 63 - 36)
+        self.assertFalse(hits[0].sound_len_inf)
 
     def test_hardware_envelope(self):
         # One NRx2 write at the trigger: the platform's hardware envelope.
@@ -463,10 +467,11 @@ class TestGbWave(unittest.TestCase):
             (hits[0].env_vol, hits[0].env_dir, hits[0].env_len), (9, 0, 1),
         )
 
-    def test_hardware_envelope_column_is_max_with_hwseq(self):
-        # The pattern column is the ceiling (15); the instrument's hardware
-        # sequence restores the source's initial envelope so the note is not
-        # raised to full level.
+    def test_hardware_envelope_needs_no_hwseq(self):
+        # Furnace applies the instrument's NRx2 fields at the note-on, so the
+        # note carries no volume column (which would overwrite the start
+        # level) and the instrument needs no hardware sequence: the sequence
+        # could only write the same envelope a second time.
         writes = _noise_note(1000, 0x21, 0x16)
         song = analyze(_vgm(writes))
         ev = next(
@@ -474,7 +479,7 @@ class TestGbWave(unittest.TestCase):
             if e.tone_chip == 6 and e.on and not e.tone_gb_wave
             and not e.gb_soft_env
         )
-        self.assertEqual(ev.vol, 15)
+        self.assertEqual(ev.vol, -1)
         data = write_fur(song, include_pcm=True)
         features = [
             block for _o, mag, _s, block in iter_blocks(data) if mag == b"INS2"
@@ -498,11 +503,11 @@ class TestGbWave(unittest.TestCase):
             if found is not None:
                 break
         self.assertIsNotNone(found)
-        self.assertEqual(found[3], 1)          # one hardware-sequence entry
-        cmd = found[4]
-        value = struct.unpack_from("<H", found, 5)[0]
-        self.assertEqual(cmd, 0)               # DIV_GB_HWCMD_ENVELOPE
-        self.assertEqual(value, (64 << 8) | (2 << 4) | (0 << 3) | 1)
+        self.assertEqual(found[0] & 15, 2)     # source start volume
+        self.assertEqual(found[0] >> 5, 1)     # envelope period
+        self.assertEqual(found[3], 0)          # no hardware-sequence entry
+        self.assertEqual(found[2] & 8, 8)      # soundLenInfinite
+        self.assertEqual(found[1], 255)
 
     def test_wave_images_become_wavetables(self):
         wave_a = bytes(range(0x10, 0x20))
@@ -523,7 +528,8 @@ class TestGbWave(unittest.TestCase):
         self.assertEqual(hits[0].wave, 0)
         self.assertEqual(hits[0].wave_pts, [(3000, 1)])
         self.assertEqual(hits[0].vol, 15)
-        self.assertEqual(hits[0].sound_len, 63)
+        self.assertEqual(hits[0].sound_len, GB_SOUND_LEN_INFINITE)
+        self.assertTrue(hits[0].sound_len_inf)
 
 
 class TestGbModule(unittest.TestCase):
@@ -554,6 +560,26 @@ class TestGbModule(unittest.TestCase):
         self.assertIn(INS_GB, types)
         # The GB chip flag picks the CGB-E core.
         self.assertIn(b"chipType=2", write_fur(song, include_pcm=True))
+
+    def test_finite_length_writes_the_counter(self):
+        # A source that does enable length counting keeps it: the instrument
+        # clears soundLenInfinite and stores NRx1's encoding, so Furnace
+        # writes NRx4 bit 6 with the same length the driver asked for.
+        writes = _noise_note(1000, 0xA1, 0x16, length=36, length_en=True)
+        song = analyze(_vgm(writes))
+        data = write_fur(song, include_pcm=True)
+        found = None
+        for _o, mag, _s, block in iter_blocks(data):
+            if mag != b"INS2":
+                continue
+            i = block.find(b"GB\x04\x00")
+            if i >= 0:
+                found = block[i+4:i+8]
+                break
+        self.assertIsNotNone(found)
+        self.assertEqual(found[1], 63 - 36)   # NRx1 low bits = 36
+        self.assertEqual(found[2] & 8, 0)     # length counter enabled
+        self.assertEqual(found[3], 0)         # still no hardware sequence
 
     def test_gb_scc_combo_keeps_both(self):
         # Header-only SCC declaration plus a GB write: the analyzer must keep

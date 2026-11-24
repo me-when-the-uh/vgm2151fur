@@ -754,7 +754,10 @@ class NoteEvent:
     gb_env_vol: int = 0
     gb_env_dir: int = 0
     gb_env_len: int = 0
-    gb_sound_len: int = 63
+    gb_sound_len: int = 255
+    # The source never enabled the length counter, so the instrument keeps
+    # Furnace's counter off (DIV_INS_GB ``soundLenInfinite``).
+    gb_sound_len_inf: bool = True
     # AY only: (sample, effect, value), including the state at the note start.
     tone_fx_pts: tuple[tuple[int, int, int], ...] = ()
     # 0 = volume macro or column, 1 = FA01 from the note, 2 = FA00 on the note.
@@ -869,7 +872,8 @@ class ToneIns:
     gb_env_vol: int = 0
     gb_env_dir: int = 0
     gb_env_len: int = 0
-    gb_sound_len: int = 63
+    gb_sound_len: int = 255
+    gb_sound_len_inf: bool = True
     gb_wave: bool = False
     # VSU only: which modulation-table image the instrument's FD feature
     # carries (channel 4).
@@ -1877,6 +1881,7 @@ def _plain_tone(spec: ToneIns, tone_chip: int) -> ToneIns:
             gb_env_dir=spec.gb_env_dir,
             gb_env_len=spec.gb_env_len,
             gb_sound_len=spec.gb_sound_len,
+            gb_sound_len_inf=spec.gb_sound_len_inf,
         )
     if tone_chip == 10:
         # Lynx: without the tap mask the voice is silent, so a budget
@@ -1964,7 +1969,7 @@ def _tone_close(a: ToneIns, b: ToneIns, tol: int) -> bool:
         "panl_speed", "panl_loop", "panr_speed", "panr_loop",
         "env", "env_speed", "env_loop",
         "gb_soft_env", "gb_env_vol", "gb_env_dir", "gb_env_len",
-        "gb_sound_len", "gb_wave", "vsu_mod",
+        "gb_sound_len", "gb_sound_len_inf", "gb_wave", "vsu_mod",
         # Sample-backed tone families (QSound) must never share an instrument
         # across sample bodies.  FDS modulation tables are part of the timbre.
         "sample", "sample_kind",
@@ -3080,7 +3085,8 @@ def _bind_tone_instruments(
             gb_env_vol=int(getattr(e, "gb_env_vol", 0)),
             gb_env_dir=int(getattr(e, "gb_env_dir", 0)),
             gb_env_len=int(getattr(e, "gb_env_len", 0)),
-            gb_sound_len=int(getattr(e, "gb_sound_len", 63)),
+            gb_sound_len=int(getattr(e, "gb_sound_len", 255)),
+            gb_sound_len_inf=bool(getattr(e, "gb_sound_len_inf", True)),
             gb_wave=bool(e.tone_gb_wave),
             vsu_mod=int(getattr(e, "tone_mod", 0)),
         )
@@ -13014,13 +13020,14 @@ def analyze(
                 on=True,
                 note=note,
                 ins=-1,
-                # The column is the note's maximum. A hardware envelope is
-                # restored by the instrument's hardware sequence (see
-                # _write_ins_gb), so it starts at the source's initial volume
-                # without the column capping it. The wave voice's column is
-                # NR32 (0/5/10/15) and soft-envelope notes carry their onset
-                # volume in the volume macro.
-                vol=(15 if h.voice != 2 and not h.soft_env else h.vol),
+                # A hardware envelope carries its own start volume, which the
+                # instrument's NRx2 fields supply at the note-on. A volume
+                # column would overwrite that start level (Furnace maps it to
+                # NRx2) without being able to express a rising envelope, so
+                # those notes leave the column empty. The wave voice's column
+                # is NR32 (0/5/10/15) and soft-envelope notes carry their
+                # onset volume in the volume macro.
+                vol=(-1 if h.voice != 2 and not h.soft_env else h.vol),
                 e5=e5,
                 pan=ev_pan,
                 end=h.off_sample,
@@ -13039,6 +13046,7 @@ def analyze(
                 gb_env_dir=h.env_dir,
                 gb_env_len=h.env_len,
                 gb_sound_len=h.sound_len,
+                gb_sound_len_inf=h.sound_len_inf,
                 legato=getattr(h, "legato", False),
             )
             events.append(ev)

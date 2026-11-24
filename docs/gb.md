@@ -104,14 +104,24 @@ nibble (which is the level the source audibly continues from) and carries the
 new period/direction. Keeping the original instrument would decay at the old
 rate and leave the note too loud for too long.
 
-The pattern volume column is the loudest level the note can reach, so a
-hardware-envelope pulse/noise note carries column 15. The instrument's
-*hardware sequence* then rewrites NRx2 to the source's initial volume,
-direction, period and length before the key-on write. Without that sequence
-the column would raise every drum to full level (or, if the column held the
-initial volume, a rising envelope would be capped). The wave voice's column
-is its NR32 level, and software-envelope notes carry their onset volume in
-the volume macro.
+A hardware-envelope pulse/noise note carries no volume column. Furnace maps
+the column straight onto NRx2, so any value there would override the start
+volume the instrument already carries (and a rising envelope cannot be
+written as one column value at all). With the column empty, the platform's
+`DIV_CMD_INSTRUMENT` and note-on apply the instrument's volume, direction,
+period and sound length, so NRx2 matches the source. The instrument therefore
+needs no hardware sequence: one would only write the same NRx2 a second time
+before the key-on. The wave voice's column is its NR32 level, and
+software-envelope notes carry their onset volume in the volume macro.
+
+The GB instrument's *sound length* field is NRx1's encoding (`63 - length`
+for pulses and noise, `255 - NR31` for the wave voice) and must stay
+disabled through `soundLenInfinite` (bit 3 of the flags byte; a value of 64 or
+more also reads back as infinite on modules older than format 259). A finite
+value enables NRx4 bit 6, and the hardware counter then cuts the note after
+its length ticks even when the driver never enabled counting. Most drivers
+never write that bit, so a note whose source leaves the counter off must be
+written as infinite.
 
 Drivers often write NRx2 and NR51 at, or a sample or two after, the trigger.
 Those writes are folded into the note's opening envelope and pan (a tiny

@@ -1348,8 +1348,9 @@ def _write_ins_gb(b: Buf, name: str, ins) -> None:
     """DIV_INS_GB: hardware envelope plus an optional wavetable (voice 3).
 
     The GB feature packs NRx2's initial volume/direction/period, the length
-    field and the soft-envelope flag.  A wavetable voice adds the same wave
-    synth the SCC uses; its ``wave1`` picks the 32-nibble waveform.
+    field, the length-counter flag and the soft-envelope flag.  A wavetable
+    voice adds the same wave synth the SCC uses; its ``wave1`` picks the
+    32-nibble waveform.
     """
     size_off, start = b.begin_block(b"INS2")
     b.u16(FUR_VERSION)
@@ -1370,26 +1371,22 @@ def _write_ins_gb(b: Buf, name: str, ins) -> None:
         | ((int(getattr(ins, "gb_env_dir", 0)) & 1) << 4)
         | (int(getattr(ins, "gb_env_vol", 0)) & 15)
     )
-    b.u8(int(getattr(ins, "gb_sound_len", 63)) & 0xFF)
+    # ``soundLen`` is NRx1's encoding; ``soundLenInfinite`` (bit 3 of the flags
+    # byte) is what keeps the hardware length counter off. Without the flag
+    # Furnace sets NRx4 bit 6 and every note is cut once its length runs out.
+    sound_len_inf = bool(getattr(ins, "gb_sound_len_inf", True))
+    sound_len = (
+        255 if sound_len_inf
+        else int(getattr(ins, "gb_sound_len", 255)) & 0xFF
+    )
+    b.u8(sound_len)
     soft = bool(getattr(ins, "gb_soft_env", False))
-    wave = bool(getattr(ins, "gb_wave", False))
-    b.u8(1 if soft else 0)
-    if soft or wave:
-        b.u8(0)  # no hardware envelope sequence
-    else:
-        # The pattern volume column is the maximum, so the note starts at 15.
-        # This sequence rewrites the hardware envelope to the source's initial
-        # volume (and length/direction) before the key-on write, so the column
-        # does not raise every drum to full level.
-        b.u8(1)
-        env_data = (
-            ((int(getattr(ins, "gb_sound_len", 63)) & 0xFF) << 8)
-            | ((int(getattr(ins, "gb_env_vol", 0)) & 15) << 4)
-            | ((int(getattr(ins, "gb_env_dir", 0)) & 1) << 3)
-            | (int(getattr(ins, "gb_env_len", 0)) & 7)
-        )
-        b.u8(0)  # DIV_GB_HWCMD_ENVELOPE
-        b.u16(env_data)
+    b.u8((8 if sound_len_inf else 0) | (1 if soft else 0))
+    # Furnace applies the DIV_INS_GB envelope fields at the note-on, so a
+    # hardware sequence holding the same values would only write NRx2 twice.
+    # The pattern leaves the volume column empty for these notes, so nothing
+    # overrides the start level and the sequence is not needed.
+    b.u8(0)  # no hardware envelope sequence
     b.b[gb_size:gb_size + 2] = int(len(b.b) - gb_start).to_bytes(2, "little")
     if getattr(ins, "gb_wave", False):
         b.raw(b"WS")
